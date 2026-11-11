@@ -1,0 +1,932 @@
+{
+  "fixture_format": "contract-examples-v1",
+  "schema_version": "research-contract-draft-v1",
+  "synthetic": true,
+  "digest_method": "SHA-256 of {source,payload}: UTF-8 JSON, sorted keys, compact separators, ensure_ascii=false, allow_nan=false",
+  "evidence_blobs": [
+    {
+      "evidence_ref": "evidence:complete",
+      "sha256": "c7af2292e8b883081a411315f2569fd02294c25cf905a7bf4eba5ffa46c4f6a7",
+      "source": {
+        "provider": "synthetic",
+        "tool": "offline_fixture",
+        "source_url": null,
+        "captured_at": "2000-02-02T00:00:00Z",
+        "observed_at": "2000-02-01T00:00:00Z",
+        "subject_ref": "synthetic:child-a",
+        "entity_grain": "child_asin",
+        "window": {
+          "start": "2000-01-01",
+          "end": "2000-01-31",
+          "timezone": "UTC",
+          "grain": "calendar_month",
+          "complete": true
+        },
+        "marketplace": "US"
+      },
+      "payload": {
+        "metric": "monthly_sellable_units",
+        "value": 120,
+        "unit": "sellable_unit"
+      }
+    },
+    {
+      "evidence_ref": "evidence:missing",
+      "sha256": "699f1f169154cac18f585eb0c8bcacf1f76353b46417d200eb7040ca37d70ee1",
+      "source": {
+        "provider": "synthetic",
+        "tool": "offline_fixture",
+        "source_url": null,
+        "captured_at": "2000-02-02T00:00:00Z",
+        "observed_at": "2000-02-01T00:00:00Z",
+        "subject_ref": "synthetic:child-a",
+        "entity_grain": "child_asin",
+        "window": {
+          "start": "2000-01-01",
+          "end": "2000-01-31",
+          "timezone": "UTC",
+          "grain": "calendar_month",
+          "complete": true
+        },
+        "marketplace": "US"
+      },
+      "payload": {
+        "metric": "rating_count",
+        "value": null,
+        "unit": "rating",
+        "known_zero": {
+          "metric": "observed_returns",
+          "value": 0,
+          "unit": "return"
+        }
+      }
+    },
+    {
+      "evidence_ref": "evidence:partial",
+      "sha256": "125a2297c68d50f0c1c48223a45a1c7fcb9e096e94d225e7fa3a886f926bc991",
+      "source": {
+        "provider": "synthetic",
+        "tool": "offline_fixture",
+        "source_url": null,
+        "captured_at": "2000-02-02T00:00:00Z",
+        "observed_at": "2000-02-01T00:00:00Z",
+        "subject_ref": "synthetic:child-a",
+        "entity_grain": "child_asin",
+        "window": {
+          "start": "2000-01-15",
+          "end": "2000-01-31",
+          "timezone": "UTC",
+          "grain": "day",
+          "complete": false
+        },
+        "marketplace": "US"
+      },
+      "payload": {
+        "metric": "monthly_sellable_units",
+        "value": 60,
+        "unit": "sellable_unit",
+        "observed_window": {
+          "start": "2000-01-15",
+          "end": "2000-01-31",
+          "timezone": "UTC",
+          "grain": "day",
+          "complete": false
+        },
+        "pagination": {
+          "returned": 1,
+          "total": null,
+          "has_more": true,
+          "pool_complete": false
+        }
+      }
+    },
+    {
+      "evidence_ref": "evidence:parent",
+      "sha256": "fd6bfffd335b05b9926d16194a5f5cbe76872c0241587f2cae40b838009c8a15",
+      "source": {
+        "provider": "synthetic",
+        "tool": "offline_fixture",
+        "source_url": null,
+        "captured_at": "2000-02-02T00:00:00Z",
+        "observed_at": "2000-02-01T00:00:00Z",
+        "subject_ref": "synthetic:parent-a",
+        "entity_grain": "parent_asin",
+        "window": {
+          "start": "2000-01-01",
+          "end": "2000-01-31",
+          "timezone": "UTC",
+          "grain": "calendar_month",
+          "complete": true
+        },
+        "marketplace": "US"
+      },
+      "payload": {
+        "metric": "monthly_sellable_units",
+        "value": 500,
+        "unit": "sellable_unit"
+      }
+    },
+    {
+      "evidence_ref": "evidence:unknown",
+      "sha256": "1e24504cd92e172cc74c5296c8ebacd7a9e4cc4bbd279b50090a0f252c857645",
+      "source": {
+        "provider": "synthetic",
+        "tool": "offline_fixture",
+        "source_url": null,
+        "captured_at": "2000-02-02T00:00:00Z",
+        "observed_at": "2000-02-01T00:00:00Z",
+        "subject_ref": "synthetic:child-a",
+        "entity_grain": "child_asin",
+        "window": {
+          "start": "2000-01-01",
+          "end": "2000-01-31",
+          "timezone": "UTC",
+          "grain": "calendar_month",
+          "complete": true
+        },
+        "marketplace": "US"
+      },
+      "payload": {
+        "stage": "generation",
+        "submission_started": true,
+        "transport_outcome": "timeout",
+        "resource_id": null,
+        "terminal_verified": false,
+        "usage_verified": false,
+        "cleanup_verified": false
+      }
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "complete",
+      "label": "完整的指定范围离线观察",
+      "request": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:complete",
+        "operation": "describe_frozen_evidence",
+        "target": {
+          "marketplace": "US",
+          "product_form_description": null,
+          "subject_refs": [
+            "synthetic:child-a"
+          ],
+          "product_form_description_status": "not_required"
+        },
+        "requested_scope": {
+          "metrics": [
+            "monthly_sellable_units"
+          ],
+          "comparison_population_ref": null,
+          "window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "entity_grain": "child_asin"
+        },
+        "rules": {
+          "version": "synthetic-observation-only-v1",
+          "status": "synthetic_not_approved_for_live_use",
+          "content": {
+            "allow_scoring": false,
+            "allow_external_calls": false
+          }
+        },
+        "evidence_refs": [
+          "evidence:complete"
+        ],
+        "execution_policy_ref": null
+      },
+      "result": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:complete",
+        "execution": {
+          "mode": "simulation",
+          "state": "completed",
+          "provider_state": "not_applicable",
+          "stage_attempts": [],
+          "closure": {
+            "terminal_verified": true,
+            "usage_verified": "not_applicable",
+            "cleanup_verified": "not_applicable"
+          },
+          "errors": []
+        },
+        "content": {
+          "state": "usable_for_requested_scope"
+        },
+        "observations": [
+          {
+            "metric": "monthly_sellable_units",
+            "value": 120,
+            "value_status": "present",
+            "basis": "observed",
+            "unit": "sellable_unit",
+            "subject_ref": "synthetic:child-a",
+            "entity_grain": "child_asin",
+            "window": {
+              "start": "2000-01-01",
+              "end": "2000-01-31",
+              "timezone": "UTC",
+              "grain": "calendar_month",
+              "complete": true
+            },
+            "as_of": "2000-02-01T00:00:00Z",
+            "evidence": [
+              {
+                "evidence_ref": "evidence:complete",
+                "selector": "/payload/value"
+              }
+            ],
+            "estimate_method_ref": null,
+            "marketplace": "US"
+          }
+        ],
+        "gaps": [],
+        "conflicts": [],
+        "coverage": {
+          "requested_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "observed_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "population_complete": true,
+          "period_complete": true
+        },
+        "recovery": {
+          "required": false,
+          "original_request_id": "synthetic:complete",
+          "private_locator_ref": null,
+          "next_action": "none",
+          "blocks_later_billable_submissions": false,
+          "automatic_resubmission_allowed": false
+        },
+        "usage": null,
+        "cost": {
+          "currency": "USD",
+          "spending_scope_ref": null,
+          "reservation_minor": null,
+          "reservation_state": "not_applicable",
+          "usage_estimate_minor": null,
+          "estimate_basis_ref": null,
+          "posted_billed_minor": null,
+          "billing_evidence_ref": null,
+          "quota_usage": null
+        }
+      },
+      "expected": [
+        "No provider execution occurred.",
+        "Usable only for the declared metric and subject; no product score or selection."
+      ]
+    },
+    {
+      "case_id": "missing",
+      "label": "缺数和明确的零值并存",
+      "request": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:missing",
+        "operation": "describe_frozen_evidence",
+        "target": {
+          "marketplace": "US",
+          "product_form_description": null,
+          "subject_refs": [
+            "synthetic:child-a"
+          ],
+          "product_form_description_status": "not_required"
+        },
+        "requested_scope": {
+          "metrics": [
+            "rating_count",
+            "observed_returns",
+            "verified_first_sale_date"
+          ],
+          "comparison_population_ref": null,
+          "window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "entity_grain": "child_asin"
+        },
+        "rules": {
+          "version": "synthetic-observation-only-v1",
+          "status": "synthetic_not_approved_for_live_use",
+          "content": {
+            "allow_scoring": false,
+            "allow_external_calls": false
+          }
+        },
+        "evidence_refs": [
+          "evidence:missing"
+        ],
+        "execution_policy_ref": null
+      },
+      "result": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:missing",
+        "execution": {
+          "mode": "simulation",
+          "state": "completed",
+          "provider_state": "not_applicable",
+          "stage_attempts": [],
+          "closure": {
+            "terminal_verified": true,
+            "usage_verified": "not_applicable",
+            "cleanup_verified": "not_applicable"
+          },
+          "errors": []
+        },
+        "content": {
+          "state": "insufficient_evidence"
+        },
+        "observations": [
+          {
+            "metric": "rating_count",
+            "value": null,
+            "value_status": "unknown",
+            "basis": "unknown",
+            "unit": "rating",
+            "subject_ref": "synthetic:child-a",
+            "entity_grain": "child_asin",
+            "window": {
+              "start": "2000-01-01",
+              "end": "2000-01-31",
+              "timezone": "UTC",
+              "grain": "calendar_month",
+              "complete": true
+            },
+            "as_of": "2000-02-01T00:00:00Z",
+            "evidence": [
+              {
+                "evidence_ref": "evidence:missing",
+                "selector": "/payload/value"
+              }
+            ],
+            "estimate_method_ref": null,
+            "marketplace": "US"
+          },
+          {
+            "metric": "observed_returns",
+            "value": 0,
+            "value_status": "present",
+            "basis": "observed",
+            "unit": "return",
+            "subject_ref": "synthetic:child-a",
+            "entity_grain": "child_asin",
+            "window": {
+              "start": "2000-01-01",
+              "end": "2000-01-31",
+              "timezone": "UTC",
+              "grain": "calendar_month",
+              "complete": true
+            },
+            "as_of": "2000-02-01T00:00:00Z",
+            "evidence": [
+              {
+                "evidence_ref": "evidence:missing",
+                "selector": "/payload/known_zero/value"
+              }
+            ],
+            "estimate_method_ref": null,
+            "marketplace": "US"
+          }
+        ],
+        "gaps": [
+          {
+            "metric": "rating_count",
+            "status": "unknown",
+            "reason": "Source value is null.",
+            "evidence_refs": [
+              "evidence:missing"
+            ]
+          },
+          {
+            "metric": "verified_first_sale_date",
+            "status": "unsupported",
+            "reason": "The checked fixture/source contract has no verified first-sale metric.",
+            "evidence_refs": [
+              "evidence:missing"
+            ]
+          }
+        ],
+        "conflicts": [],
+        "coverage": {
+          "requested_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "observed_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "population_complete": true,
+          "period_complete": true
+        },
+        "recovery": {
+          "required": false,
+          "original_request_id": "synthetic:missing",
+          "private_locator_ref": null,
+          "next_action": "none",
+          "blocks_later_billable_submissions": false,
+          "automatic_resubmission_allowed": false
+        },
+        "usage": null,
+        "cost": {
+          "currency": "USD",
+          "spending_scope_ref": null,
+          "reservation_minor": null,
+          "reservation_state": "not_applicable",
+          "usage_estimate_minor": null,
+          "estimate_basis_ref": null,
+          "posted_billed_minor": null,
+          "billing_evidence_ref": null,
+          "quota_usage": null
+        }
+      },
+      "expected": [
+        "Request lifecycle completed, but requested evidence is insufficient.",
+        "Unknown rating count stays null; an explicitly observed zero stays zero.",
+        "Unsupported metric is scoped to the selected source contract."
+      ]
+    },
+    {
+      "case_id": "partial",
+      "label": "返回成功但时间和样本覆盖不全",
+      "request": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:partial",
+        "operation": "describe_frozen_evidence",
+        "target": {
+          "marketplace": "US",
+          "product_form_description": null,
+          "subject_refs": [
+            "synthetic:child-a"
+          ],
+          "product_form_description_status": "not_required"
+        },
+        "requested_scope": {
+          "metrics": [
+            "monthly_sellable_units"
+          ],
+          "comparison_population_ref": null,
+          "window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "entity_grain": "child_asin"
+        },
+        "rules": {
+          "version": "synthetic-observation-only-v1",
+          "status": "synthetic_not_approved_for_live_use",
+          "content": {
+            "allow_scoring": false,
+            "allow_external_calls": false
+          }
+        },
+        "evidence_refs": [
+          "evidence:partial"
+        ],
+        "execution_policy_ref": null
+      },
+      "result": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:partial",
+        "execution": {
+          "mode": "simulation",
+          "state": "completed",
+          "provider_state": "not_applicable",
+          "stage_attempts": [],
+          "closure": {
+            "terminal_verified": true,
+            "usage_verified": "not_applicable",
+            "cleanup_verified": "not_applicable"
+          },
+          "errors": []
+        },
+        "content": {
+          "state": "partial"
+        },
+        "observations": [
+          {
+            "metric": "monthly_sellable_units",
+            "value": 60,
+            "value_status": "present",
+            "basis": "observed",
+            "unit": "sellable_unit",
+            "subject_ref": "synthetic:child-a",
+            "entity_grain": "child_asin",
+            "window": {
+              "start": "2000-01-15",
+              "end": "2000-01-31",
+              "timezone": "UTC",
+              "grain": "day",
+              "complete": false
+            },
+            "as_of": "2000-02-01T00:00:00Z",
+            "evidence": [
+              {
+                "evidence_ref": "evidence:partial",
+                "selector": "/payload/value"
+              }
+            ],
+            "estimate_method_ref": null,
+            "marketplace": "US"
+          }
+        ],
+        "gaps": [
+          {
+            "metric": "monthly_sellable_units",
+            "status": "unknown",
+            "reason": "The beginning of the requested month and additional population pages are unavailable.",
+            "evidence_refs": [
+              "evidence:partial"
+            ]
+          }
+        ],
+        "conflicts": [],
+        "coverage": {
+          "requested_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "observed_window": {
+            "start": "2000-01-15",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "day",
+            "complete": false
+          },
+          "population_complete": false,
+          "period_complete": false,
+          "pagination": {
+            "returned": 1,
+            "total": null,
+            "has_more": true,
+            "pool_complete": false
+          }
+        },
+        "recovery": {
+          "required": false,
+          "original_request_id": "synthetic:partial",
+          "private_locator_ref": null,
+          "next_action": "none",
+          "blocks_later_billable_submissions": false,
+          "automatic_resubmission_allowed": false
+        },
+        "usage": null,
+        "cost": {
+          "currency": "USD",
+          "spending_scope_ref": null,
+          "reservation_minor": null,
+          "reservation_state": "not_applicable",
+          "usage_estimate_minor": null,
+          "estimate_basis_ref": null,
+          "posted_billed_minor": null,
+          "billing_evidence_ref": null,
+          "quota_usage": null
+        }
+      },
+      "expected": [
+        "The observed value is limited to its actual window and population.",
+        "No full-month estimate or complete-population claim is manufactured."
+      ]
+    },
+    {
+      "case_id": "grain_conflict",
+      "label": "父子粒度冲突",
+      "request": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:grain_conflict",
+        "operation": "describe_frozen_evidence",
+        "target": {
+          "marketplace": "US",
+          "product_form_description": null,
+          "subject_refs": [
+            "synthetic:child-a"
+          ],
+          "product_form_description_status": "not_required"
+        },
+        "requested_scope": {
+          "metrics": [
+            "monthly_sellable_units"
+          ],
+          "comparison_population_ref": null,
+          "window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "entity_grain": "child_asin"
+        },
+        "rules": {
+          "version": "synthetic-observation-only-v1",
+          "status": "synthetic_not_approved_for_live_use",
+          "content": {
+            "allow_scoring": false,
+            "allow_external_calls": false
+          }
+        },
+        "evidence_refs": [
+          "evidence:complete",
+          "evidence:parent"
+        ],
+        "execution_policy_ref": null
+      },
+      "result": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:grain_conflict",
+        "execution": {
+          "mode": "simulation",
+          "state": "completed",
+          "provider_state": "not_applicable",
+          "stage_attempts": [],
+          "closure": {
+            "terminal_verified": true,
+            "usage_verified": "not_applicable",
+            "cleanup_verified": "not_applicable"
+          },
+          "errors": [
+            {
+              "category": "data_conflict",
+              "code": "ENTITY_GRAIN_MISMATCH",
+              "message": "The proposed comparison mixes parent and child scopes.",
+              "stage": "content_validation",
+              "evidence_refs": [
+                "evidence:parent",
+                "evidence:complete"
+              ],
+              "next_action": "review_scope_without_resubmission"
+            }
+          ]
+        },
+        "content": {
+          "state": "invalid"
+        },
+        "observations": [
+          {
+            "metric": "monthly_sellable_units",
+            "value": 500,
+            "value_status": "present",
+            "basis": "observed",
+            "unit": "sellable_unit",
+            "subject_ref": "synthetic:parent-a",
+            "entity_grain": "parent_asin",
+            "window": {
+              "start": "2000-01-01",
+              "end": "2000-01-31",
+              "timezone": "UTC",
+              "grain": "calendar_month",
+              "complete": true
+            },
+            "as_of": "2000-02-01T00:00:00Z",
+            "evidence": [
+              {
+                "evidence_ref": "evidence:parent",
+                "selector": "/payload/value"
+              }
+            ],
+            "estimate_method_ref": null,
+            "marketplace": "US"
+          },
+          {
+            "metric": "monthly_sellable_units",
+            "value": 120,
+            "value_status": "present",
+            "basis": "observed",
+            "unit": "sellable_unit",
+            "subject_ref": "synthetic:child-a",
+            "entity_grain": "child_asin",
+            "window": {
+              "start": "2000-01-01",
+              "end": "2000-01-31",
+              "timezone": "UTC",
+              "grain": "calendar_month",
+              "complete": true
+            },
+            "as_of": "2000-02-01T00:00:00Z",
+            "evidence": [
+              {
+                "evidence_ref": "evidence:complete",
+                "selector": "/payload/value"
+              }
+            ],
+            "estimate_method_ref": null,
+            "marketplace": "US"
+          }
+        ],
+        "gaps": [],
+        "conflicts": [
+          {
+            "code": "ENTITY_GRAIN_MISMATCH",
+            "metric": "monthly_sellable_units",
+            "requested_grain": "child_asin",
+            "observed_grains": [
+              "parent_asin",
+              "child_asin"
+            ],
+            "evidence_refs": [
+              "evidence:parent",
+              "evidence:complete"
+            ],
+            "resolution": "Keep both observations separate; caller must provide an explicitly compatible scope before aggregation."
+          }
+        ],
+        "coverage": {
+          "requested_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "observed_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "population_complete": true,
+          "period_complete": true
+        },
+        "recovery": {
+          "required": false,
+          "original_request_id": "synthetic:grain_conflict",
+          "private_locator_ref": null,
+          "next_action": "none",
+          "blocks_later_billable_submissions": false,
+          "automatic_resubmission_allowed": false
+        },
+        "usage": null,
+        "cost": {
+          "currency": "USD",
+          "spending_scope_ref": null,
+          "reservation_minor": null,
+          "reservation_state": "not_applicable",
+          "usage_estimate_minor": null,
+          "estimate_basis_ref": null,
+          "posted_billed_minor": null,
+          "billing_evidence_ref": null,
+          "quota_usage": null
+        }
+      },
+      "expected": [
+        "A completed operation may yield invalid content.",
+        "No sum, parent-to-child subtraction, blended comparison or score is produced."
+      ]
+    },
+    {
+      "case_id": "result_unknown",
+      "label": "结果未知并保留预留",
+      "request": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:result_unknown",
+        "operation": "illustrate_unknown_request",
+        "target": {
+          "marketplace": "US",
+          "product_form_description": null,
+          "subject_refs": [
+            "synthetic:child-a"
+          ],
+          "product_form_description_status": "not_required"
+        },
+        "requested_scope": {
+          "metrics": [
+            "monthly_sellable_units"
+          ],
+          "comparison_population_ref": null,
+          "window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "entity_grain": "child_asin"
+        },
+        "rules": {
+          "version": "synthetic-observation-only-v1",
+          "status": "synthetic_not_approved_for_live_use",
+          "content": {
+            "allow_scoring": false,
+            "allow_external_calls": false
+          }
+        },
+        "evidence_refs": [
+          "evidence:unknown"
+        ],
+        "execution_policy_ref": null
+      },
+      "result": {
+        "schema_version": "research-contract-draft-v1",
+        "request_id": "synthetic:result_unknown",
+        "execution": {
+          "mode": "simulation",
+          "state": "unknown",
+          "provider_state": "unknown",
+          "stage_attempts": [
+            {
+              "stage": "generation",
+              "attempt_id": "synthetic:attempt-1",
+              "provider_resource_id": null,
+              "http_trace_id": "synthetic:http-trace-only",
+              "phase": "submission_started",
+              "evidence_refs": [
+                "evidence:unknown"
+              ]
+            }
+          ],
+          "closure": {
+            "terminal_verified": false,
+            "usage_verified": false,
+            "cleanup_verified": false
+          },
+          "errors": [
+            {
+              "category": "transport",
+              "code": "SUBMISSION_RESULT_UNKNOWN",
+              "message": "The hypothetical connection timed out after submission began.",
+              "stage": "generation",
+              "evidence_refs": [
+                "evidence:unknown"
+              ],
+              "next_action": "await_original_resource_evidence"
+            }
+          ]
+        },
+        "content": {
+          "state": "not_evaluated"
+        },
+        "observations": [],
+        "gaps": [],
+        "conflicts": [],
+        "coverage": {
+          "requested_window": {
+            "start": "2000-01-01",
+            "end": "2000-01-31",
+            "timezone": "UTC",
+            "grain": "calendar_month",
+            "complete": true
+          },
+          "observed_window": null,
+          "population_complete": null,
+          "period_complete": null
+        },
+        "recovery": {
+          "required": true,
+          "original_request_id": "synthetic:result_unknown",
+          "private_locator_ref": "synthetic:recovery-record",
+          "next_action": "await_original_resource_evidence",
+          "blocks_later_billable_submissions": true,
+          "automatic_resubmission_allowed": false
+        },
+        "usage": null,
+        "cost": {
+          "currency": "USD",
+          "spending_scope_ref": "synthetic:shared-scope",
+          "reservation_minor": "123",
+          "reservation_state": "held_unknown",
+          "usage_estimate_minor": null,
+          "estimate_basis_ref": null,
+          "posted_billed_minor": null,
+          "billing_evidence_ref": null,
+          "quota_usage": null
+        }
+      },
+      "expected": [
+        "All lifecycle and fee values are synthetic; 123 minor units is not a quote or default.",
+        "HTTP trace ID does not identify a retrievable provider response.",
+        "Reservation remains held; usage and posted billing remain null.",
+        "No automatic replay or later billable submission in the same scope."
+      ]
+    }
+  ]
+}
