@@ -12,6 +12,8 @@ Use Grill Me for unresolved choices that materially affect the user's outcome, c
 
 Keep one maintained task/recovery record in `docs/STATE.md`: outcome, current evidence, remaining work, blockers, and next step. Update it at milestones, not after every tool call. Source transfer, code adoption, isolated execution, live integration, and useful business results are separate states.
 
+Use two ongoing chats: selection development owns product design, implementation, integration and final acceptance; API and Agent integration owns provider capabilities and their technical contracts. There is no separate permanent coordinator chat. API implementation uses a separate worktree/branch; shared accounts and budgets still require explicit coordination.
+
 One writer owns a checkout/file set. Other chats supply candidates in their own directories or use separate branches and worktrees. Coordinate assignments, actionable changes, blockers, and deliveries; batch ordinary progress and avoid acknowledgement loops.
 
 Use small coherent commits and reviewable changes. Preserve existing edits. Run checks that can expose plausible errors in changed behavior; reuse valid evidence and avoid unrelated whole-project testing. Public releases require inspection of the actual publishable files. Changes affecting spending, request recovery, or private-data handling need independent review.
