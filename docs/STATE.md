@@ -14,7 +14,7 @@ The previous whole-store automation project is no longer a development target. O
 | --- | --- | --- |
 | New repository, integration, migration acceptance | Coordinator | Sole writer of the integration checkout |
 | Product requirements, scoring design, unresolved questions | Radar | Supplies reviewed candidates; no concurrent writes to the integration checkout |
-| Provider APIs, Agent workflows, request recovery and cost state | API integration chat | Owns only the ignored `.local/migration/api-integration/` handoff directory; public integration remains with the coordinator |
+| Provider APIs, Agent workflows, request recovery and cost state | Create OpenAI API key chat | Owns only the ignored `.local/migration/api-integration/` handoff directory; public integration remains with the coordinator |
 
 Use separate worktrees if implementation is delegated. Do not use the old operating task board as this project's backlog.
 
@@ -25,16 +25,16 @@ Use separate worktrees if implementation is delegated. Do not use the old operat
 | New remote and local checkout | Prepared | Public repository with its original Apache 2.0 license; separate migration branch |
 | Privacy and usage scope | Confirmed | Migration Q1: public methods/configuration, private business data. Migration Q2: owner-use open source, not a public hosted service |
 | Radar design handoff | Reviewed v2 adopted locally | Q1-Q32 reconciled; Q11/Q31 relationship, confirmed trial budgets, pending mappings, and superseded proposals preserved. Two independent material reviews passed |
-| Public design files | Reviewed baseline in local checkout | Requirements and profile use Radar v2; decision notes include all five semantic corrections. Final publication readback remains pending |
+| Public design files | Reviewed migration baseline | Requirements and profile use Radar v2; decision notes include all five semantic corrections. Public file scope, links, profile invariants and privacy checks passed |
 | Legacy code inventory | Prepared locally | 53 Python source files retained as hash-verified local reference copies; external dependencies recorded. These are not installed application modules |
 | Provider/Agent migration | Reference handoff received and verified | Six API sources match the preserved copy; ten tests, three dependencies and four historical documents retained locally. Independent reference-transfer review passed. Live state remains disabled and unchanged; standalone adoption is pending |
 | Independent application | Not implemented | Architecture and remaining product choices must be aligned; then verify from an isolated checkout |
-| Public publication | Pending | Record the actual commit/PR after verification |
+| Public publication | [Delivery PR #1](https://github.com/Wekhoh/Product-selection-development-tools/pull/1) | Use the PR merge record and remote commit as the publication receipt; this is a design baseline, not an application release |
 | App project / future chats | Local folder ready; app registration pending | New chats must use this folder as the independent project's primary folder |
 
 ## Next work
 
-1. Complete publication readback of the reviewed migration baseline. API technical continuation is in `API-MIGRATION.md`.
+1. Verify this checkout against the delivery PR and remote main before resuming. API technical continuation is in `API-MIGRATION.md`.
 2. Register this local folder as an app project and use the prepared local new-chat entry when the owner opens a new chat.
 3. Continue the product discussion from the unresolved Q11/Q31 substance and Q32, then mapping, missingness, and end-to-end acceptance.
 4. Adopt or rewrite a module only when it serves that agreed design. Verify a bounded offline path before live integration.
