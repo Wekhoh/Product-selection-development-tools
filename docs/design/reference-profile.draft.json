@@ -1,0 +1,357 @@
+{
+  "document_kind": "reference_selection_profile_design_candidate",
+  "schema_version": 1,
+  "status": "incomplete_design_for_discussion",
+  "production_eligible": false,
+  "activate_by_import": false,
+  "purpose": "A configurable reference preference profile; not universal market truth, calibrated scoring software or a procurement decision.",
+  "group_budgets": [
+    {
+      "id": "profit",
+      "weight": 30,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "refund_adjusted_pre_ad_margin",
+          "weight": 22,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "unit_contribution",
+          "weight": 8,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "suggested_bid_pressure",
+      "weight": 15,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "relevant_purchase_entry_bid",
+          "weight": 15,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "initial_goods_investment",
+      "weight": 6,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "comparable_goods_and_inbound_estimate",
+          "weight": 6,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "niche_demand",
+      "weight": 10,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "purchase_demand_scale",
+          "weight": 2,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "supported_opportunity",
+          "weight": 4,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "purchase_entry_match",
+          "weight": 4,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "market_entry",
+      "weight": 10,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "product_dispersion",
+          "weight": 1.5,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "brand_dispersion",
+          "weight": 1.5,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "confirmed_operator_dispersion",
+          "weight": 4.5,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "entry_barriers",
+          "weight": 2.5,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "normal_newcomer",
+      "weight": 10,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "new_product_count_share",
+          "weight": null,
+          "weight_status": "pending",
+          "mapping": null
+        },
+        {
+          "id": "new_product_sales_share",
+          "weight": null,
+          "weight_status": "pending",
+          "mapping": null
+        },
+        {
+          "id": "low_rating_sales_performance",
+          "weight": null,
+          "weight_status": "pending",
+          "mapping": null
+        },
+        {
+          "id": "natural_visibility_development",
+          "weight": null,
+          "weight_status": "pending",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "need_fit",
+      "weight": 5,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "existing_solution_fit",
+          "weight": 4,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "feasible_light_differentiation",
+          "weight": 1,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "product_risk_and_operations",
+      "weight": 9,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "low_return_preference",
+          "weight": 4,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "storage_tolerance",
+          "weight": 2,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "transport_tolerance",
+          "weight": 2,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        },
+        {
+          "id": "routine_complexity",
+          "weight": 1,
+          "weight_status": "confirmed_for_trial",
+          "mapping": null
+        }
+      ]
+    },
+    {
+      "id": "rights_and_requirements",
+      "weight": 5,
+      "status": "confirmed_for_trial",
+      "items": [
+        {
+          "id": "specific_design_rights",
+          "weight": null,
+          "weight_status": "pending",
+          "mapping": null
+        },
+        {
+          "id": "applicable_public_requirements",
+          "weight": null,
+          "weight_status": "pending",
+          "mapping": null
+        }
+      ]
+    }
+  ],
+  "total_budget": 100,
+  "reference_screening": {
+    "comparable_reference_price": {
+      "currency": "USD",
+      "strictly_greater_than": 30,
+      "upper_limit": null,
+      "price_bands": null,
+      "basis": "Matched specification competitor reference price; launch discounts are a separate later strategy."
+    },
+    "margin": {
+      "minimum": 0.3,
+      "stage": "before_advertising",
+      "denominator": "refund_adjusted_net_revenue",
+      "exactly_at_minimum": "passes_this_condition_only",
+      "credible_interval_crosses_minimum": "needs_evidence",
+      "missing_cost": "unknown",
+      "narrow_cost_evidence_before_interval": true
+    },
+    "rights": {
+      "confirmed_conflict": "exclude_current_specification",
+      "suspected_or_unsearched": "needs_evidence",
+      "alternate_specification": "evaluate_independently"
+    },
+    "strong_holiday_or_date_dependency": {
+      "status": "defer_in_this_reference_profile",
+      "scope": "Not all ordinary seasonal demand; not a permanent category prohibition."
+    },
+    "minimum_rating_count": null,
+    "maximum_cpc": null,
+    "minimum_broad_category_new_share": null,
+    "total_score_cutoff": null
+  },
+  "economics": {
+    "recurring_or_expected_unit_cost_inputs": [
+      "procurement",
+      "packaging",
+      "first_leg_freight",
+      "selling_commission",
+      "fulfillment",
+      "inbound_placement",
+      "storage",
+      "refunds_and_returns",
+      "nonrecoverable_units",
+      "applicable_return_processing",
+      "collection_fee",
+      "exchange_rate_and_applicable_spread",
+      "other_applicable_unit_charges"
+    ],
+    "one_time_company_costs_excluded_from_unit_margin": [
+      "sampling",
+      "creative_assets",
+      "Vine_enrollment_or_initial_program_setup"
+    ],
+    "initial_goods_investment_is_not_total_company_cash_or_payback": true,
+    "ad_scenario": {
+      "ratio_of_reference_price": 0.15,
+      "label": "mature_stage_reference_only",
+      "not_launch_forecast": true,
+      "margin_denominator": "refund_adjusted_net_revenue"
+    },
+    "actual_new_product_cvr_cpc_cpa": "unknown_before_measurement",
+    "packaging": "Use a coherent matched-spec packed dimension/weight tuple; show actual and dimensional weight with the applicable freight and fulfillment rules separately.",
+    "fee_fx_and_return_inputs": "Retain source, applicable period, units and uncertainty; no invented current rates or zero-filled missing data."
+  },
+  "discovery": {
+    "primary": "observed_keyword_and_market_data",
+    "auxiliary": [
+      "community_pain_points",
+      "cross_platform_products",
+      "social_discussion_and_trends"
+    ],
+    "opportunity_types": [
+      "stable_demand",
+      "growth",
+      "supported_supply_gap"
+    ],
+    "fixed_seed_rotation_is_not_continuous_discovery": true,
+    "source_traceability_required": true,
+    "social_popularity_is_not_amazon_purchase_demand": true
+  },
+  "measurement": {
+    "scoring_subject": "Specific physical product form and its genuinely substitutable niche.",
+    "broad_bsr_context": "Preserve node, marketplace, timestamp and coverage; do not substitute a broad category denominator for the niche.",
+    "new_product_age_months": 3,
+    "ratings_and_written_reviews": "Separate counts and verify tool field meaning.",
+    "normal_start": "Verify launch history, old reviews, review-count jumps and drops, parent/child changes and confirmed operator links. Separate Vine, verified-purchase and other review evidence where observable. Vine is not itself evidence of an abnormal start; anomalies are hypotheses, not proof of manipulation. Unresolved cases stay in actual competition analysis but cannot be asserted as proven normal-start exemplars.",
+    "launch_cohorts": "Retain entrants, exits, failures and incomplete observation; no population success rate from a top-100 snapshot.",
+    "traffic": "Cross-check compatible SellerSprite and SIF evidence with sources and windows retained. Suggested bids are not actual CPC. Modeled visibility and keyword counts are not orders. Ad-heavy visibility alone does not establish failure or unprofitability; actual CVR and ad profitability remain unknown before measurement. Do not average incompatible sources.",
+    "aggregation": "Use deduplicated relevant buying entries. Major purchase entries must carry the main suggested-bid pressure; preserve core and longtail views and cheaper smaller-entry opportunities separately. Exact entry-importance estimation and aggregation remain pending real-card calibration. Search-volume research weights are not actual advertising allocation. Do not restore a fixed core/longtail split or equal-weight cheap terms to dilute major-entry pressure.",
+    "new_entry_reference_mapping": null,
+    "native_bid_point_and_range": {
+      "native_point": "Use the native suggested point for the main score; equal native points under the same mapping have equal main scores.",
+      "bounds": "Display lower/upper-bound score scenarios separately; they are not actual CPC forecasts or probability bounds.",
+      "range_width": "No automatic penalty merely for a wider range; do not silently rank only by its upper endpoint.",
+      "interval_only": "Retain a supported interval; do not invent a native midpoint.",
+      "mapping": null
+    },
+    "bsr_newcomer_entry_evidence": "Observe new entrants to a specified BSR top-100 node, their contemporaneous rating counts and entry/retention/exit paths, where historical coverage exists. Keep these observations separate from the comparable niche sales sample. A snapshot cannot establish all launches, timing, success rates or exact sales thresholds."
+  },
+  "workflow": {
+    "stages": [
+      "evidence_led_discovery",
+      "coarse_research",
+      "comparable_niche_analysis",
+      "evidence_qualified_scoring",
+      "brief_cards",
+      "prioritized_deep_research",
+      "owner_decision",
+      "later_real_world_feedback"
+    ],
+    "brief_card_requires_supplier_contact": false,
+    "future_supplier_leadtime_quality_actual_cvr": "Later verification, not fabricated initial inputs.",
+    "unknown_score": "Explicitly unavailable or supported interval; never zero, arbitrary midpoint or normalization of only known scores to 100.",
+    "display_directions_per_page": 10,
+    "page_size_is_candidate_limit": false,
+    "group_variants": "Group same direction; score material specification differences separately.",
+    "automatic_procurement_or_store_write": false,
+    "live_requests_during_migration": false,
+    "supplier_inquiry": {
+      "stage": "later_owner_approved_research",
+      "initial_channel_scope": "1688",
+      "required_before_sending": [
+        "owner_review_of_specific_supplier_targets",
+        "owner_review_of_complete_message_text",
+        "explicit_owner_authorization_to_send_that_message_to_those_targets"
+      ],
+      "blanket_permission": false,
+      "other_channels": "Require separately applicable authorization; a stage transition is not permission to message.",
+      "current_sending_authorization": false
+    },
+    "development_stage_preference": {
+      "initial_preference": "Existing designs that can plausibly be tested in small batches; public supply listings are evidence leads, not verified delivery commitments.",
+      "light_differentiation": "Optional, source-supported small changes may be researched; do not award points merely for an invented idea.",
+      "private_molds": "Usually consider after market and profit validation, with actual supply capability, MOQ, tooling cost and timing assessed separately; not a permanent exclusion.",
+      "pain_points": "Do not assume our team can solve an industry-wide issue because existing products have low ratings. Feasibility requires later evidence; no new star-rating cutoff."
+    }
+  },
+  "pending_design": [
+    "Q31: define the market reference, comparable niche cohort, observation windows, sales grain and contemporaneous rating accumulation; retain separate BSR top-100 newcomer entry/retention/exit evidence. Do not substitute arbitrary pairwise product comparisons for a market judgment. Median sales and lower-quartile rating references remain proposals. Internal 2/2/3/3, joint continuous mapping and aggregation remain unapproved.",
+    "Q32: internal rights/public-requirement 3/2 remains unapproved; confirmed specification-conflict handling is already established independently.",
+    "All score mapping curves, reference calibration, qualitative rubrics and cross-group duplicate-signal handling.",
+    "Missing-data ranking, aggregation and comparison rules without invented certainty.",
+    "Initial goods quantity and compatible quote/packaging/freight basis.",
+    "Complete end-to-end product design and real-card acceptance."
+  ],
+  "revision": 2
+}
