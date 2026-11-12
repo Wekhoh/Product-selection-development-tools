@@ -1,6 +1,14 @@
 # Project state
 
-Updated: 2026-11-11. Phase: selective migration and design alignment.
+Updated: 2026-11-12. API worktree checkpoint: ownership narrowed; no new implementation assignment.
+
+## Current API-seat recovery checkpoint
+
+The owner's 2026-11-12 clarification supersedes earlier broad provider ownership: the selection development seat owns SIF, SellerSprite and other selection-data MCP calls, data validation and workflow integration. This API seat owns OpenAI API tool development and compatibility, including OpenAI-specific input/output, error, cost and recovery contracts when commissioned. The clarification was received from the selection seat and checked against its current project working agreement and state record.
+
+The selection seat completed its own bounded native SIF probe. No selection-data query, probe reconciliation or duplicate call is assigned here. The earlier API-seat Q31 capability investigation remains historical design evidence; it does not retain ownership of selection-data integration. This record update grants no new spending, access or development authority.
+
+The integration checkout's `docs/STATE.md` remains the maintained project-wide recovery record. The migration baseline below is retained in this separate API worktree and does not mirror the latest business definitions. Before accepting a concrete OpenAI assignment, reconcile its scope with the current integration record and agreed first-release workflow. No OpenAI implementation task is currently queued here; no provider activation is implied.
 
 ## Objective and settled scope
 
@@ -14,8 +22,8 @@ The owner chose two ongoing chats on 2026-11-11. This replaces the earlier three
 
 | Area | Owner | Current boundary |
 | --- | --- | --- |
-| Product design, application development, repository integration and final acceptance | Selection development seat | Inherits the Radar decisions and unresolved questions; sole writer of the integration checkout |
-| Provider APIs, Agent workflows, request recovery and cost continuity | API and Agent integration seat | Develops in a separate worktree/branch against agreed input/output contracts; no concurrent edits to the integration checkout |
+| Product design, application development, repository integration and final acceptance, including selection-data MCP calls, data validation and workflow integration | Selection development seat | Owns SIF/SellerSprite and other selection-data work; sole writer of the integration checkout |
+| OpenAI API tool development and compatibility | API and Agent integration seat | Owns commissioned OpenAI-specific input/output, error, cost and recovery contracts; develops in a separate worktree/branch without concurrent edits to the integration checkout |
 
 The former coordinator and former Radar chat become historical handoff sources after the new seats take over; they are not additional concurrent developers. Do not auto-close or archive those chats. The API chat's migration package remains private reference material.
 
@@ -37,10 +45,10 @@ Use this record as the single project task/recovery entry. Coordinate assignment
 
 ## Next work
 
-1. Verify this checkout against the delivery PR and remote main before resuming. API technical continuation is in `API-MIGRATION.md`.
-2. Use the two reviewed local handoff prompts when the owner opens the new selection and API chats. Confirm each actual working directory and file ownership before editing.
-3. The selection development seat continues the unresolved Q11/Q31 substance and Q32, then mapping, missingness and end-to-end acceptance; the API seat continues only compatible authorized preparation.
-4. Adopt or rewrite a module only when it serves that agreed design. Verify a bounded offline path before live integration.
+1. Await a concrete OpenAI API development or compatibility assignment tied to the agreed product workflow; this ownership correction is not such an assignment.
+2. Read the current integration checkout's project state and applicable working agreement before resuming implementation. Keep this API worktree separate and preserve other writers' changes.
+3. Reuse existing OpenAI technical research and the inactive reference material in `API-MIGRATION.md` where relevant. Earlier SIF/SellerSprite findings are historical evidence, not pending API-seat queries or integration tasks.
+4. Adopt or rewrite an OpenAI module only when it serves the agreed assignment. Verify a bounded offline path before separately authorized live integration, preserving shared-account, cost and request-recovery constraints.
 
 No numerical mapping, current provider fee, or complete scoring algorithm has been approved merely by transferring these files. Live scans and paid research remain inactive.
 
