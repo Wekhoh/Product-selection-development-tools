@@ -15,13 +15,31 @@
           "id": "refund_adjusted_pre_ad_margin",
           "weight": 22,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "capped_linear_above_margin_floor",
+            "input_unit": "fraction",
+            "eligible_margin_floor": 0.3,
+            "score_at_floor": 11,
+            "full_score_at": 0.5,
+            "formula": "min(item_weight, score_at_floor + (item_weight - score_at_floor) * (m - eligible_margin_floor) / (full_score_at - eligible_margin_floor))",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use supported refund-adjusted pre-ad margin for one coherent saleable unit, with positive net revenue and all applicable net costs. The category return rate is a labeled initial estimate, not actual own-product performance. A supported single-plan margin below 30% fails that condition; for initial intervals, an upper bound below 30% excludes the current plan, while a range spanning the floor remains visible for owner review with its assumptions and gaps. Missing costs are not zero. Retain raw margins above the cap. This item uses the accepted revision-50 coherent scenario and ordering rules in workflow.scoring_and_ordering; real-data acceptance and calibration remain separate."
+          }
         },
         {
           "id": "unit_contribution",
           "weight": 8,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "capped_linear",
+            "input_unit": "USD_per_original_shipped_saleable_unit",
+            "full_score_at": 20,
+            "formula": "item_weight * min(G / full_score_at, 1)",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use supported nonnegative refund-adjusted pre-ad unit contribution from the same economic record as margin, in an otherwise eligible plan. Missing inputs are not zero; retain raw dollars above the cap. USD 20 is a trial score anchor, not a price limit, minimum viable contribution, first-batch quantity or purchase authorization."
+          }
         }
       ]
     },
@@ -34,45 +52,153 @@
           "id": "relevant_purchase_entry_bid",
           "weight": 15,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
-        }
-      ]
-    },
-    {
-      "id": "initial_goods_investment",
-      "weight": 6,
-      "status": "confirmed_for_trial",
-      "items": [
-        {
-          "id": "comparable_goods_and_inbound_estimate",
-          "weight": 6,
-          "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "source_mean_then_main_entry_search_weighted_capped_linear",
+            "input_currency": "USD",
+            "match_type": "exact",
+            "source_points": {
+              "sellersprite": [
+                "exactPpc",
+                "minExactPpc",
+                "maxExactPpc"
+              ],
+              "sellersprite_alternative": "ppc.exact.value/min/max",
+              "sif": [
+                "supporting_signals.cpc_fixed_exact",
+                "supporting_signals.cpc_fixed_exact_low",
+                "supporting_signals.cpc_fixed_exact_high"
+              ],
+              "both_sources": "b_i = (b_SS_i + b_SIF_i) / 2",
+              "one_source": "Use the sole usable native exact-match point and label its source; do not invent a second vote.",
+              "neither_source": "needs_evidence",
+              "strategy_scope": "SIF fixed/exact is selected. The tested SellerSprite batch omits strategy; its exact-match values may be used as approximate trial inputs with this limitation visible. Averaging does not establish aligned strategy or source accuracy; do not silently mix known incompatible strategies.",
+              "native_point_semantics": "The combined point is project-derived, not a provider-native suggestion or actual CPC. Keep both original points and ranges."
+            },
+            "entry_aggregation": {
+              "selection": "Use supported main purchase entries relevant to the specific form, including meaningful longtail queries. Deduplicate exact queries; keep cheap peripheral opportunities separate. No fixed word count, core/longtail 9/6 split or full-market claim.",
+              "weight_source": "SellerSprite monthly search volumes for a compatible common period and the selected main-entry set; do not mix SIF weekly volumes.",
+              "weight_formula": "a_i = v_i / sum(v_j for j in M)",
+              "reference_formula": "B = sum(a_i * b_i for i in M)",
+              "requires": "A supported main-entry set, valid nonnegative supported points/volumes, positive total volume, and consistent marketplace/currency/metric scope. Missing or placeholder data are not zero.",
+              "interpretation": "Research importance, not actual orders, candidate traffic shares or ad-budget allocation."
+            },
+            "full_score_at_or_below": 0.5,
+            "zero_score_at_or_above": 3,
+            "formula": "item_weight * min(1, max(0, (3.00 - B) / 2.50))",
+            "missingness": "If a required main-entry point is missing from both sources or required weighting volume is unavailable, leave the item unscored; do not omit that entry and renormalize the rest. Keep supported observations and gaps.",
+            "range_handling": "Retain each source range as source-labeled scenario evidence; no invented native midpoint, automatic range-width/conflict penalty, confidence claim or actual CPC forecast.",
+            "candidate_exclusion": false,
+            "rounding": "Keep computational precision until display.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "production_acceptance": false
+          }
         }
       ]
     },
     {
       "id": "niche_demand",
-      "weight": 10,
+      "weight": 16,
       "status": "confirmed_for_trial",
       "items": [
         {
           "id": "purchase_demand_scale",
-          "weight": 2,
+          "weight": 4,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "capped_piecewise_linear",
+            "input_unit": "estimated_sales_units_in_declared_comparable_niche_over_recent_30_days",
+            "anchors": [
+              [
+                0,
+                0
+              ],
+              [
+                100,
+                1
+              ],
+              [
+                500,
+                2
+              ],
+              [
+                2000,
+                3
+              ],
+              [
+                5000,
+                4
+              ]
+            ],
+            "formula": "Interpolate linearly between adjacent anchors; cap at item_weight for supported units >= 5000.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use a supported nonnegative unit estimate for a declared genuinely comparable niche and consistent recent-30-day period, without duplicate parent totals or overlapping variant observations. Search volumes, a broad category total, mixed-spec family totals and unchecked truncated pages are not substitutes. Materially unresolved scope, coverage, period or sales leaves the score null; missing is not zero. Do not extrapolate a short observation to a month or silently take a midpoint. Retain raw units above the cap. Actual acquisition coverage and feasibility remain unverified; no exhaustive market census, viable-market floor, own-sales forecast or live call is implied."
+          }
         },
         {
           "id": "supported_opportunity",
-          "weight": 4,
+          "weight": 6,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_evidence_rubric",
+            "routes": [
+              "stable_demand",
+              "sustained_growth",
+              "demand_side_supply_gap"
+            ],
+            "aggregation": "Assess the strongest supported route; do not add route bonuses. Stable demand may earn full points without growth.",
+            "anchors": [
+              {
+                "score": 0,
+                "meaning": "Adequate observed evidence supports none of the routes and contradicts the proposed opportunity; this is not merely an unsearched case."
+              },
+              {
+                "score": 2,
+                "meaning": "A real but weak opportunity signal remains after relevant evidence is inspected, such as a short spike that does not persist in observed follow-up."
+              },
+              {
+                "score": 4,
+                "meaning": "One route is supported, but observed counterevidence materially weakens its durability or extent, such as repeated reversals."
+              },
+              {
+                "score": 6,
+                "meaning": "At least one route is well supported in its observed context: durable recurring buying, sustained non-artifactual growth or repeated buying-intent evidence of an underserved need, without known material counterevidence defeating that interpretation."
+              }
+            ],
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Retain sources, observation periods, the selected route and a short reason. Inspect relevant low-base, seasonal/event and incomplete-period explanations using available evidence. Missing required history leaves the score null, not 0 or 2. Do not reward size, low concentration, newcomer share, duplicate provider signals or an invented improvement idea again. The candidate's ability to solve an unmet need belongs to need fit. Judgment consistency and acquisition effort remain unverified; causal proof or exhaustive disproof of alternatives is not required."
+          }
         },
         {
           "id": "purchase_entry_match",
-          "weight": 4,
+          "weight": 6,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_evidence_rubric",
+            "anchors": [
+              {
+                "score": 0,
+                "meaning": "The main purported buying entries demonstrably seek a materially different use or form."
+              },
+              {
+                "score": 2,
+                "meaning": "Only a limited part of the observed main intent fits; major entries mix substantially different needs."
+              },
+              {
+                "score": 4,
+                "meaning": "Main uses generally fit, but a material part of the entries seeks a different size, configuration or other consequential feature."
+              },
+              {
+                "score": 6,
+                "meaning": "The evidenced main buying intents match the candidate's core use and consequential requirements; minor wording differences do not matter."
+              }
+            ],
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use available search, product and traffic evidence rather than keyword wording alone. Keep core and longtail explanations visible; many tiny matching entries cannot conceal a main-entry mismatch. Broad words may match well. Do not award extra points for keyword counts, natural visibility, cheap bids or volume. Missing entry evidence leaves the score null. Actual performance and the ability to meet the intended need remain separate need-fit and later verification questions."
+          }
         }
       ]
     },
@@ -83,27 +209,156 @@
       "items": [
         {
           "id": "product_dispersion",
-          "weight": 1.5,
+          "weight": 3,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "bounded_descending_linear",
+            "input_unit": "native_concentration_fraction",
+            "valid_input_range": [
+              0,
+              1
+            ],
+            "full_score_at_or_below": 0.4,
+            "half_score_at": 0.6,
+            "zero_score_at_or_above": 0.8,
+            "formula": "item_weight * min(1, max(0, (0.80 - c) / 0.40))",
+            "anchors": [
+              [
+                0,
+                3
+              ],
+              [
+                0.4,
+                3
+              ],
+              [
+                0.5,
+                2.25
+              ],
+              [
+                0.6,
+                1.5
+              ],
+              [
+                0.7,
+                0.75
+              ],
+              [
+                0.8,
+                0
+              ],
+              [
+                1,
+                0
+              ]
+            ],
+            "interpolation": "Continuous linear between 40% and 80%; the owner delegates the 50% value and asks for decreasing points across all three items. Half means half the item maximum. No step buckets.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use the supported native product, brand or seller concentration from the same relevant SellerSprite market report. Preserve its source basis, head-group definition, period and units as labels. Missing or invalid data and materially incompatible inputs remain unscored; do not impute or renormalize. Do not add BSR-top-100 reconciliation, complete member recovery, custom market reconstruction, hidden-company tracing or an entity-count override as prerequisites. A supported value at or above 80% receives zero for this component, not automatic candidate rejection."
+          }
         },
         {
           "id": "brand_dispersion",
-          "weight": 1.5,
+          "weight": 3,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "bounded_descending_linear",
+            "input_unit": "native_concentration_fraction",
+            "valid_input_range": [
+              0,
+              1
+            ],
+            "full_score_at_or_below": 0.4,
+            "half_score_at": 0.6,
+            "zero_score_at_or_above": 0.8,
+            "formula": "item_weight * min(1, max(0, (0.80 - c) / 0.40))",
+            "anchors": [
+              [
+                0,
+                3
+              ],
+              [
+                0.4,
+                3
+              ],
+              [
+                0.5,
+                2.25
+              ],
+              [
+                0.6,
+                1.5
+              ],
+              [
+                0.7,
+                0.75
+              ],
+              [
+                0.8,
+                0
+              ],
+              [
+                1,
+                0
+              ]
+            ],
+            "interpolation": "Continuous linear between 40% and 80%; the owner delegates the 50% value and asks for decreasing points across all three items. Half means half the item maximum. No step buckets.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use the supported native product, brand or seller concentration from the same relevant SellerSprite market report. Preserve its source basis, head-group definition, period and units as labels. Missing or invalid data and materially incompatible inputs remain unscored; do not impute or renormalize. Do not add BSR-top-100 reconciliation, complete member recovery, custom market reconstruction, hidden-company tracing or an entity-count override as prerequisites. A supported value at or above 80% receives zero for this component, not automatic candidate rejection."
+          }
         },
         {
-          "id": "confirmed_operator_dispersion",
-          "weight": 4.5,
+          "id": "seller_dispersion",
+          "weight": 4,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
-        },
-        {
-          "id": "entry_barriers",
-          "weight": 2.5,
-          "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "bounded_descending_linear",
+            "input_unit": "native_concentration_fraction",
+            "valid_input_range": [
+              0,
+              1
+            ],
+            "full_score_at_or_below": 0.4,
+            "half_score_at": 0.6,
+            "zero_score_at_or_above": 0.8,
+            "formula": "item_weight * min(1, max(0, (0.80 - c) / 0.40))",
+            "anchors": [
+              [
+                0,
+                4
+              ],
+              [
+                0.4,
+                4
+              ],
+              [
+                0.5,
+                3
+              ],
+              [
+                0.6,
+                2
+              ],
+              [
+                0.7,
+                1
+              ],
+              [
+                0.8,
+                0
+              ],
+              [
+                1,
+                0
+              ]
+            ],
+            "interpolation": "Continuous linear between 40% and 80%; the owner delegates the 50% value and asks for decreasing points across all three items. Half means half the item maximum. No step buckets.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use the supported native product, brand or seller concentration from the same relevant SellerSprite market report. Preserve its source basis, head-group definition, period and units as labels. Missing or invalid data and materially incompatible inputs remain unscored; do not impute or renormalize. Do not add BSR-top-100 reconciliation, complete member recovery, custom market reconstruction, hidden-company tracing or an entity-count override as prerequisites. A supported value at or above 80% receives zero for this component, not automatic candidate rejection."
+          }
         }
       ]
     },
@@ -114,27 +369,80 @@
       "items": [
         {
           "id": "new_product_count_share",
-          "weight": null,
-          "weight_status": "pending",
-          "mapping": null
+          "weight": 3,
+          "weight_status": "confirmed_for_trial",
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "capped_linear",
+            "input_unit": "fraction",
+            "valid_input_range": [
+              0,
+              1
+            ],
+            "full_score_at": 0.2,
+            "formula": "item_weight * min(p / full_score_at, 1)",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Revision 50: use the supported native newcomer count share from one relevant SellerSprite market report with a three-month age setting. Use that same report and population for the 2-point unit-sales share. Select relevance before examining scores; preserve source population, family basis, window and coverage. A sales-ranked sample is not relabeled a current BSR top 100. Missing/invalid native inputs remain null; no broad/narrow score shopping or extra ratio points."
+          }
         },
         {
           "id": "new_product_sales_share",
-          "weight": null,
-          "weight_status": "pending",
-          "mapping": null
+          "weight": 2,
+          "weight_status": "confirmed_for_trial",
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "capped_linear",
+            "input_unit": "fraction",
+            "valid_input_range": [
+              0,
+              1
+            ],
+            "full_score_at": 0.3,
+            "formula": "item_weight * min(p / full_score_at, 1)",
+            "calibration_status": "pending_real_samples",
+            "evidence_requirement": "Revision 50: use the supported native newcomer sales-unit share from exactly the same relevant SellerSprite report/population as the 3-point count share, with three-month newcomer age and a source-labeled latest-30-day sales window. Do not use revenue share, mix member sets or silently substitute a calendar month. Missing or invalid inputs and a zero denominator remain unknown; preserve the source family basis and estimates."
+          }
         },
         {
           "id": "low_rating_sales_performance",
-          "weight": null,
-          "weight_status": "pending",
-          "mapping": null
+          "weight": 4,
+          "weight_status": "confirmed_for_trial",
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "capped_rating_components_then_top_two_mean",
+            "qualification_reference": "measurement.low_rating_reference_scope",
+            "observation_basis_reference": "measurement.q31_current_batch_observation",
+            "component_references": [
+              "measurement.low_rating_actual_count_component",
+              "measurement.low_rating_relative_count_component",
+              "measurement.low_rating_sales_cap"
+            ],
+            "example_score": "E = min(A + U, C), using the referenced approved components and sales ceiling",
+            "aggregation_reference": "measurement.low_rating_example_aggregation",
+            "eligibility": "Complete supported weaker-sales examples participate after the sales ceiling. q >= 0.80 permits the full ceiling; it is not a second eligibility filter.",
+            "missingness": "An unsupported input, qualification or nonpositive sales reference does not yield a complete example. True-zero rating median leaves the relative component unscored. Preserve supported partial/single-case observations without a complete direction score, imputation or renormalization.",
+            "sample_size": "Six was a synthetic teaching cohort, not a cap or minimum. The reference pool contains all observed qualifying comparable newcomers under the declared scope; two is only the exemplar aggregation count.",
+            "candidate_exclusion": false,
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "production_acceptance": false
+          }
         },
         {
           "id": "natural_visibility_development",
-          "weight": null,
-          "weight_status": "pending",
-          "mapping": null
+          "weight": 1,
+          "weight_status": "confirmed_for_trial",
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "mean_of_same_selected_pair_natural_scores",
+            "per_example_reference": "measurement.newcomer_natural_visibility_example_score",
+            "aggregation_reference": "measurement.newcomer_natural_visibility_example_aggregation",
+            "source_sufficiency_reference": "measurement.newcomer_natural_visibility_synthesis",
+            "selection": "Use exactly the pair selected by low_rating_sales_performance; do not choose a different pair for higher shares or easier source coverage.",
+            "missingness": "A missing SIF share cannot be inferred from keyword counts. One missing score in a fixed valid pair leaves the item null with the previously approved conditional range; both missing or no valid pair leaves the item pending. Preserve supported individual observations.",
+            "candidate_exclusion": false,
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "production_acceptance": false
+          }
         }
       ]
     },
@@ -147,13 +455,55 @@
           "id": "existing_solution_fit",
           "weight": 4,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_evidence_rubric",
+            "anchors": [
+              {
+                "score": 0,
+                "meaning": "Evidence demonstrates that the concrete form does not suit the core intended use."
+              },
+              {
+                "score": 2,
+                "meaning": "The form meets only part of the core need and has a material functional shortcoming."
+              },
+              {
+                "score": 3,
+                "meaning": "The core need is met, but a specific meaningful secondary shortcoming remains."
+              },
+              {
+                "score": 4,
+                "meaning": "Specification, structure and relevant use evidence support the intended requirements without a known material mismatch."
+              }
+            ],
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Assess the concrete candidate form and its supported change stage; do not score an imagined future repair as completed performance. Purchase-entry match describes buyer intent, not evidence of functional fitness. Missing material performance evidence leaves the score null, rather than 0 or full points. Initial evidence does not require supplier contact or a sample and does not prove realized quality. Retain source-grounded reasons and later verification needs."
+          }
         },
         {
           "id": "feasible_light_differentiation",
           "weight": 1,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_evidence_rubric",
+            "anchors": [
+              {
+                "score": 0,
+                "meaning": "The inspected opportunity has no supported useful light change, including a suitable ready-stock form that needs no change."
+              },
+              {
+                "score": 0.5,
+                "meaning": "An evidenced and initially feasible small change offers a modest practical benefit."
+              },
+              {
+                "score": 1,
+                "meaning": "An evidenced and initially feasible small change addresses a meaningful recurring pain point."
+              }
+            ],
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Document the use problem, proposed small change and initial feasibility basis, such as an existing structure or specification comparison. Novelty is optional; do not force changes merely to earn points. An invented idea does not earn points, and unresolved feasibility or unsearched evidence leaves the score null rather than 0. Supplier contact, samples or private tooling are not initial scoring prerequisites. Cost consequences remain in economics; rights, actual performance and later verification are separate."
+          }
         }
       ]
     },
@@ -166,25 +516,123 @@
           "id": "low_return_preference",
           "weight": 4,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "bounded_piecewise_linear",
+            "input_unit": "category_return_rate_fraction",
+            "valid_input_range": [
+              0,
+              1
+            ],
+            "anchors": [
+              [
+                0,
+                4
+              ],
+              [
+                0.02,
+                4
+              ],
+              [
+                0.05,
+                3
+              ],
+              [
+                0.1,
+                2
+              ],
+              [
+                0.2,
+                1
+              ],
+              [
+                0.3,
+                0
+              ],
+              [
+                1,
+                0
+              ]
+            ],
+            "formula": "Interpolate linearly between adjacent anchors; supported rates <= 0.02 earn 4 and rates >= 0.30 earn 0 within the valid input range.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use the corresponding source-labeled category return-rate proxy already selected for initial economics, retaining node, window, units and applicability. Missing, invalid or materially inapplicable data leaves the score null. The proxy is not realized candidate returns. These are preference anchors, not fee thresholds, industry standards or exclusion rules. Monetary return losses remain counted once in economics; retain raw rates beyond the score boundaries."
+          }
         },
         {
           "id": "storage_tolerance",
           "weight": 2,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_evidence_rubric",
+            "anchors": [
+              {
+                "score": 0,
+                "meaning": "Known deterioration or shelf-life constraints make the intended storage difficult."
+              },
+              {
+                "score": 1,
+                "meaning": "Meaningful but initially feasible storage conditions need control."
+              },
+              {
+                "score": 2,
+                "meaning": "Available evidence supports stability under ordinary expected storage conditions."
+              }
+            ],
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Assess the concrete form and relevant material, structure, storage instructions and use evidence. A material label or generic common-sense assertion alone does not establish the score. Missing material evidence leaves the score null. This is a sourced initial assessment, not a storage test or guarantee. Practical evidence sufficiency, acquisition effort and judgment consistency remain unverified; no supplier contact or sample is made an initial prerequisite."
+          }
         },
         {
           "id": "transport_tolerance",
           "weight": 2,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_evidence_rubric",
+            "anchors": [
+              {
+                "score": 0,
+                "meaning": "Known damage susceptibility remains difficult to control in the proposed shipment."
+              },
+              {
+                "score": 1,
+                "meaning": "Meaningful extra protection is needed but initially feasible."
+              },
+              {
+                "score": 2,
+                "meaning": "Available evidence supports a robust form and adequate ordinary protective packaging."
+              }
+            ],
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Use the concrete structure, relevant packaging and use/shipping evidence. Weight and dimensions alone support freight calculations, not protection performance. Missing material package evidence leaves the score null, not proof of damage or full protection. Glass, wood and battery labels do not automatically give zero. This initial assessment does not establish an actual shipment or drop-test result; evidence sufficiency and judgment consistency remain unverified."
+          }
         },
         {
           "id": "routine_complexity",
           "weight": 1,
           "weight_status": "confirmed_for_trial",
-          "mapping": null
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_evidence_rubric",
+            "anchors": [
+              {
+                "score": 0,
+                "meaning": "Known complex customization, installation or recurring troubleshooting needs create substantial routine work."
+              },
+              {
+                "score": 0.5,
+                "meaning": "Manageable assembly, compatibility or explanation work is needed."
+              },
+              {
+                "score": 1,
+                "meaning": "A straightforward standard product has few assembly, part-matching or troubleshooting dependencies."
+              }
+            ],
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "evidence_requirement": "Assess supported operating demands of the concrete form using available instructions, parts, compatibility and relevant use evidence. Missing evidence leaves the score null. This is an initial judgment rather than measured future customer-service workload; monetary losses are not deducted again. Practical acquisition and consistent judgment remain unverified."
+          }
         }
       ]
     },
@@ -195,15 +643,62 @@
       "items": [
         {
           "id": "specific_design_rights",
-          "weight": null,
-          "weight_status": "pending",
-          "mapping": null
+          "weight": 3,
+          "weight_status": "confirmed_for_trial",
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "bounded_preliminary_rights_screen",
+            "anchors": [
+              {
+                "points": 3,
+                "label": "preliminary_check_supports_further_research",
+                "evidence": "A recorded bounded review of relevant brand/content, appearance and functional-rights evidence for the exact form and intended market leaves no identified material conflict unresolved. Record search scope/date and limits. Generic appearance or many sellers is insufficient."
+              },
+              {
+                "points": 0,
+                "label": "confirmed_specific_form_conflict",
+                "evidence": "A rights conflict for this exact form and jurisdiction is actually confirmed.",
+                "screening_outcome": "exclude_current_specification"
+              }
+            ],
+            "missingness": "Unsearched, missing material brand/design/claim/status evidence or a potentially relevant unresolved right leaves the score null and needs_evidence. Do not invent a 1/2-point suspicion scale.",
+            "interpretation": "Three is a supported preliminary research result, not exhaustive clearance, certification, an infringement probability or permission to sell.",
+            "scope": "Other materially different forms are independently assessed; cosmetic change alone does not prove avoidance. Other points cannot offset a confirmed specification-level exclusion.",
+            "stage": "Initial cards need a bounded source-backed check, not completed supplier inquiry or definitive legal clearance. Retained forms receive targeted follow-up on the actual model and unresolved specialist questions.",
+            "double_counting": "Do not deduct monetary costs again here or add penalties for signals already handled elsewhere.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "production_acceptance": false
+          }
         },
         {
           "id": "applicable_public_requirements",
-          "weight": null,
-          "weight_status": "pending",
-          "mapping": null
+          "weight": 2,
+          "weight_status": "confirmed_for_trial",
+          "mapping": {
+            "status": "confirmed_for_trial",
+            "method": "coarse_known_entry_burden_rubric",
+            "anchors": [
+              {
+                "points": 2,
+                "evidence": "Applicable requirements and a practical route are supported; ordinary labeling/material/instruction steps suffice without an additional substantial product-specific testing/qualification or redesign hurdle."
+              },
+              {
+                "points": 1,
+                "evidence": "A specific additional testing/certification/documentation process is confirmed and has a supported practicable route for the present form; bounded work beyond ordinary labels/documents."
+              },
+              {
+                "points": 0,
+                "evidence": "Supported mandatory requirements entail substantial changes to the present form or a complex specialized qualification route; the simple ready-stock route is demonstrably difficult."
+              }
+            ],
+            "missingness": "Materially unresolved applicability, requirements or route feasibility leaves the score null. A supplier assertion alone is not proof; unknown is not a 0/1/2.",
+            "interpretation": "An initial assessment of established entry burden, not certification of a future supplier shipment. Material or product-category labels alone do not establish a score.",
+            "stage": "No upfront completed laboratory test, supplier contact or purchased sample is required just to make a supported initial path assessment. Verify actual model/documents and necessary deeper questions after owner retention; no score authorizes selling while applicable requirements are unmet.",
+            "candidate_exclusion": false,
+            "double_counting": "Known monetary costs belong in their proper economic scenario, without an additional amount-based deduction here. Keep storage/transport/concentration signals in their agreed items.",
+            "calibration_status": "pending_real_samples_across_categories_and_rounds",
+            "production_acceptance": false
+          }
         }
       ]
     }
@@ -222,7 +717,8 @@
       "stage": "before_advertising",
       "denominator": "refund_adjusted_net_revenue",
       "exactly_at_minimum": "passes_this_condition_only",
-      "credible_interval_crosses_minimum": "needs_evidence",
+      "credible_interval_crosses_minimum": "retain_for_owner_review_with_range_assumptions_and_gaps",
+      "credible_interval_upper_below_minimum": "exclude_current_specification",
       "missing_cost": "unknown",
       "narrow_cost_evidence_before_interval": true
     },
@@ -270,7 +766,15 @@
     },
     "actual_new_product_cvr_cpc_cpa": "unknown_before_measurement",
     "packaging": "Use a coherent matched-spec packed dimension/weight tuple; show actual and dimensional weight with the applicable freight and fulfillment rules separately.",
-    "fee_fx_and_return_inputs": "Retain source, applicable period, units and uncertainty; no invented current rates or zero-filled missing data."
+    "fee_fx_and_return_inputs": "Retain source, applicable period, units and uncertainty; no invented current rates or zero-filled missing data.",
+    "initial_margin_estimate": {
+      "presentation": "A supported margin interval, narrowed where practical; not a falsely exact realized margin.",
+      "price_and_procurement": "Use matched-spec competitor price evidence and comparable supplier price tiers; retain plausible variation without mixing different products, quantities or unsupported high prices.",
+      "packaging_estimate": "For initial 1688 ready-stock estimates, use the matched-spec quoted purchase price directly for the combined procurement-and-packaging amount, treating carton and labor as included. Do not add a separate carton, foam, corner-protector, insert or packaging/assembly-labor estimate, or require separate carton-price research first. Preserve CNY source prices and dated FX. Other applicable freight, platform and return costs remain in the margin calculation. Later actual costs may replace or adjust this initial estimate. This is the owner's selected initial accounting convention, not verified realized margin or a universal statement about supplier quotes.",
+      "scenario_consistency": "Keep complete saleable specification, packaging size/weight, purchase tier and logistics compatible within each scenario; recalculate dependent fees. Conservative assumptions must not combine mutually incompatible extremes.",
+      "unknowns": "An explicit supported estimate differs from a missing value. Never fill unknown material costs with zero; disclose remaining assumptions and gaps.",
+      "score_intervals": "Revision 50 confirms coherent supported-scenario scoring and ordering under workflow.scoring_and_ordering. Apply the unchanged point-input curves to compatible eligible scenarios, retain supported ranges, and never substitute a midpoint or independent incompatible endpoints. A margin interval spanning the floor remains pending for screening, not fully margin-qualified; materially missing inputs remain unknown."
+    }
   },
   "discovery": {
     "primary": "observed_keyword_and_market_data",
@@ -290,22 +794,330 @@
   },
   "measurement": {
     "scoring_subject": "Specific physical product form and its genuinely substitutable niche.",
+    "seller_identity": {
+      "status": "confirmed_scope_2026_11_13",
+      "score_item": "seller_dispersion",
+      "historical_item_id": "confirmed_operator_dispersion",
+      "scope": "Observed seller accounts and their product records from available SellerSprite/SIF fields; hidden cross-shop corporate ownership is outside this version's scope and is not a prerequisite for scoring or cards.",
+      "identity": "Prefer marketplace plus seller ID, retaining the observed seller name and brand separately. A brand is not a seller account. A name alone is a labeled fallback or unresolved identity; do not merge conflicting IDs merely because names match or invent independence because ownership was not investigated.",
+      "multiple_listings": "Supported identical seller IDs can associate multiple ASINs. Preserve parent-family relationships and differences in use or form: multiple child ASINs are not automatically independent launches, and the same category does not establish a directly comparable niche. Same-seller presence alone does not prove traffic transfer, review merging or unfair launch activity.",
+      "data_limits": "Preserve the provider's actual sample, window and seller-attribution meaning. A listing seller field, BuyBox attribution or seller count is not a complete seller-order ledger, full-store census or corporate-ownership proof. Missing fields remain explicit; adapt retrieval to verified tool capabilities without fabricating unsupported score inputs.",
+      "weight_and_mapping": "The owner accepts product 3 / brand 3 / observed seller 4 and the revised common trial curve: 40% or less full points, 60% half and 80% or more zero. The delegated intermediate conversion is continuous linear: 50% gives 75% of each maximum and 70% gives 25%. Use the three native concentrations from one relevant SellerSprite market report, preserving source labels without extra BSR reconciliation or seller-count branches. The earlier 40/70/100 curve and small-population exception were not adopted. Standalone entry barriers stay retired; actual data access, calibration and application acceptance remain pending. See COMPETITION.draft.md."
+    },
     "broad_bsr_context": "Preserve node, marketplace, timestamp and coverage; do not substitute a broad category denominator for the niche.",
     "new_product_age_months": 3,
+    "newcomer_count_share_basis": "Revision 50, accepted for trial: use one relevant native SellerSprite market report, three-month newcomer age, for both count-share 3 and unit-sales-share 2. Preserve its real population/period/family basis; source-defined recent-sales ranking is not a current BSR snapshot. Select the relevant market before score inspection; no broad/narrow switching, averaging of overlapping ratios or extra points. The prior niche-filtered current-BSR count input is superseded for this trial. Niche observations and observed entry/exit evidence remain visible without entering the native numerator.",
+    "comparable_materials": "Different materials may share a competitive market when actual buyer substitution, use and key functional requirements support it, while each distinct candidate form has separate costs and scores. Do not force grouping when required load capacity, durability or an explicit buyer material requirement differs. Preserve evidence, uncertainty and the distinction between claimed and physically verified performance.",
+    "native_newcomer_ratio": "Revision 50: native three-month newcomer count and unit-sales shares are the first 3/2 scoring inputs from the same relevant source report, with the unchanged capped-linear curves. They describe source-sample age composition, not proven normal starts, dispersed control or entrant success probability. Retain valid niche context separately; it does not replace these inputs opportunistically or add points.",
+    "newcomer_sales": "Use estimated unit counts as the primary measure, preferably at parent-listing grain. Preserve the source's actual grain, period and family coverage; deduplicate numerator and denominator consistently. A parent total is not the target specification's sales, and a new child does not reset an older family's launch history. Monetary sales remain context, not an additional approved scoring item.",
+    "newcomer_sales_window": {
+      "primary_days": 30,
+      "auxiliary_months": 3,
+      "status": "confirmed_for_trial",
+      "basis": "Use the same latest-30-day interval for numerator and denominator; retain comparable three-month observations as context. Newcomers need not have sold for 30 days. Preserve actual launch age and supported window units without extrapolating a short launch into a full month. The bounded real trial verified a usable declared ASIN-level recent-30-day estimate for its observed examples; wider coverage and accuracy still need calibration. Calendar-month or cumulative data cannot silently substitute for the requested window. The separately accepted item mappings and task-specific authorization still govern use."
+    },
+    "newcomer_natural_visibility": "Use relevant organic/ad keyword counts and source-defined SIF modeled overall exposure share from compatible product/period observations, interpreted alongside sales. Counts and share are different quantities and neither proves organic orders. Per-example score and same-pair aggregation are defined by the referenced trial rules. Revision 48 accepts labeled single-source SIF scoring when its scope/period and relevant-query evidence are usable; SellerSprite counts are corroboration. Ordinary provider count/update differences alone do not penalize the score. Material unresolved scope/period/entry conflicts and missing SIF shares stay pending. Preserve original readings, dates and supported single-example evidence, with no fabricated midpoint, true-population interval or source-equivalence claim. Retrieval quality, calibration and whole-flow acceptance remain unverified.",
+    "niche_average_star_reference": {
+      "status": "confirmed_for_reference",
+      "role": "descriptive_market_reference_not_score",
+      "population": "Observed current genuinely comparable niche offers, including established products and newcomers and relevant in-list/off-list offers.",
+      "metric": "Arithmetic mean of source-displayed product star values, with equal weight per eligible deduplicated rating unit.",
+      "formula": "sum(supported_displayed_star_values) / count(eligible_deduplicated_units_with_supported_star_values)",
+      "deduplication": "Do not count color variants sharing the same rating repeatedly. Identify mixed-family scope rather than invent specification-level stars.",
+      "missingness": "Missing or absent stars are not zero. Report valid sample size, observation date, excluded/missing coverage and reasons; no valid star observations means no supported mean.",
+      "weighting": "No rating-count or sales weighting, minimum-rating-count filter or low-star trimming is adopted.",
+      "scope_limit": "This is the mean of displayed product stars in the observed sample, not a pooled customer-rating mean or a claim of complete market coverage.",
+      "other_lists": "BSR and New Releases remain sample sources or supplementary context, not automatic substitutes for the comparable niche.",
+      "target_interpretation": "Above-average stars are a quality aspiration, not a selection cutoff, a prediction of the owner's eventual rating or a guarantee of commercial success.",
+      "changes_score_weights": false,
+      "changes_q31_newcomer_reference": false,
+      "validation_status": "Actual retrieval, comparable membership, shared-rating identity and coverage remain unverified."
+    },
+    "low_rating_reference_scope": {
+      "status": "confirmed_for_trial",
+      "scoring_item": "low_rating_sales_performance",
+      "primary_reference": "Comparable normal newcomers within the confirmed three-month definition, with documented top-100 observations for the specified relevant BSR node and supported rating/sales evidence.",
+      "new_releases_only": "Retain for discovery, tracking, competition and supporting sales observations; do not directly pool New-Releases-only records into the primary rating/sales medians.",
+      "shared_listings": "Deduplicate listings or compatible product families that appear in both lists; membership in two lists is not two independent observations.",
+      "current_and_historical_records": "Label current in-list and observed historical entry/exit states separately. A historical entrant can join only if newcomer qualification, comparable launch stage and the same selected observation basis remain supported. Never pool event-time ratings with current ratings or choose a favorable basis per example. Preserve weak, exited, immature and unknown records with their evidence status.",
+      "candidate_exclusion": false,
+      "count_share_scope": "Revision 50 separates the native market 3/2 sample from this genuine comparable-niche 4/1 cohort. Both currently in-list and still-qualified historical exited newcomers remain in the latter when observation and launch evidence are compatible.",
+      "verification_pending": "Verify each actual node, member, launch/family/rating history, source period and meaningful coverage in later real trials. Available evidence must support qualification without a material unresolved contradiction; no exhaustive historical recovery or hidden-company tracing is required. Source access, judgment quality and throughput are not yet accepted.",
+      "sample_definition": "The market is defined by genuine buyer substitution in use, function and consequential specifications, with conditional cross-material comparability. The primary median cohort contains all observed qualifying normal newcomers with documented observations in the relevant BSR top 100. New-Releases-only records remain auxiliary. Neither the six-row teaching fixture nor the two selected exemplars defines cohort size; disclose observed/usable/unknown counts and coverage instead of claiming a market census."
+    },
+    "low_rating_current_observation_fallback": {
+      "status": "confirmed_for_trial",
+      "trigger": "Entry-time accumulated rating history is unavailable, while current rating counts and compatible sales observations have supporting evidence.",
+      "population": "Retain the accepted relevant-BSR comparable normal-newcomer reference scope and comparable launch stages.",
+      "observation_basis": "Use explicitly labeled current rating counts paired with sales from a consistent observation period to describe present sales progress with few accumulated ratings.",
+      "distinct_from_entry_history": "This is not the rating count at first BSR entry and does not reconstruct the launch path. Preserve available entry-event evidence separately.",
+      "cohort_separation": "Do not backfill missing event history with current counts or pool current and entry-event observations into one reference median.",
+      "missingness": "Unsupported observations remain unknown; the fallback does not impute scores or exclude the candidate for missing entry history.",
+      "pending": "Actual coverage and stage comparability still require validation. For revision-50 current trial comparisons, q31_current_batch_observation supersedes the prior entry-time preference: use current ratings/latest-30-day sales consistently and retain entry-time data separately.",
+      "validation_status": "Actual retrieval, scoring applicability and business usefulness remain unverified.",
+      "sales_window": {
+        "status": "confirmed_for_trial",
+        "primary_days": 30,
+        "basis": "Supported sales units over the latest 30-day period ending at the observation date, paired with a dated current rating count.",
+        "short_launches": "Keep eligible launches shorter than 30 days. Record supported window units, actual launch age and actual coverage; do not extrapolate a daily average into a full month.",
+        "comparison": "Use comparable launch stages and observation coverage; do not treat short-launch exposure as a mature full-window record.",
+        "insufficient_reference": "Preserve the candidate and supported observations; affected scoring remains pending evidence rather than zero or an age-based exclusion.",
+        "source_limits": "Retain actual source dates, units, estimates, bands and coverage. Calendar-month, cumulative or banded returns do not automatically satisfy a rolling-30-day point-valued input.",
+        "eligibility_minimum_days": null,
+        "validation_status": "Actual rolling-window availability, stage matching and evidence sufficiency remain unverified."
+      }
+    },
+    "low_rating_progress_reference": "Use the defined observed comparable normal-newcomer reference cohort with documented relevant BSR-top-100 observations. Preserve all observed members and weak/exited/immature/unknown records with status; do not build median sales T or median accumulated rating count M only from the selected winners. For supported aligned values, each median is the middle sorted value or the mean of the two middle values. For this revision-50 batch follow q31_current_batch_observation: use dated current rating counts and compatible latest-30-day sales consistently, retaining entry-time observations separately rather than preferring them or mixing bases. Do not extrapolate short histories. Apply the unchanged actual-rating and relative-rating components, then the unchanged sales ceiling, and average the two highest complete qualified example scores including weaker-sales examples. True-zero M leaves only the relative component unscored; unsupported/nonpositive T gives no sales ratio; one complete example remains single-case evidence. No sample-count bonus, majority-success condition, universal rating ceiling, hidden-company investigation, causal claim or arbitrary AI adjustment is adopted. Suspicious launch clues do not prove manipulation; Vine enrollment does not guarantee a published-review count. Source/qualification accuracy, actual coverage, operational effort and real-sample calibration remain unverified. Shared totals, missingness and ordering are adopted for trial under revision 50; source coverage, grouping, normal-start judgments and calibration still require real-data verification. Earlier definitions and proposals are preserved in DECISIONS.md, Q31-NORMAL-NEWCOMER.draft.md and the revision-47 private before-snapshot.",
+    "low_rating_actual_count_component": {
+      "status": "confirmed_for_trial",
+      "component_max_points": 3,
+      "input_unit": "accumulated_rating_count",
+      "full_points_through": 10,
+      "decrease_per_additional_rating_above_10": 0.05,
+      "evidence_condition": "Applies to qualified comparable normal-start examples with supported aligned rating/sales evidence. Complete rating-derived scores are limited by low_rating_sales_cap, including weaker sales; q >= 0.80 is not required for pair eligibility. Zero ratings without supported sales do not create a complete score. Missing evidence remains unknown.",
+      "above_40_mapping": {
+        "status": "confirmed_for_trial",
+        "input_condition": "R > 40",
+        "formula": "1.5 * 40 / R",
+        "continuity_anchor": {
+          "rating_count": 40,
+          "points": 1.5
+        },
+        "finite_zero_threshold": null,
+        "fixed_score_floor": null
+      },
+      "above_40_boundary": "The owner confirms the reciprocal continuation for supported eligible cases. Rating count alone neither proves normality/manipulation nor excludes a candidate; unknown evidence remains pending. Do not substitute the prior linear slope or invent a zero threshold.",
+      "complete_item_mapping": true,
+      "calibration_status": "Pending real samples across niches; check both overly strict and overly lenient scores, including normal 30–40-rating cases and the above-40 continuation.",
+      "base_segment_input_range": [
+        0,
+        40
+      ],
+      "base_segment_formula": "3 if R <= 10 else 3 - 0.05 * (R - 10)"
+    },
+    "low_rating_relative_count_component": {
+      "status": "confirmed_for_trial",
+      "component_max_points": 1,
+      "actual_count_symbol": "R",
+      "reference_median_symbol": "M",
+      "input_condition": "M > 0; R is a supported nonnegative accumulated rating count",
+      "formula": "1 if R <= M else M / R",
+      "evidence_condition": "Use a supported eligible comparable-newcomer cohort, aligned observation scope/time and the accepted sales-progress context. Missing or unreliable evidence is not zero, a midpoint or a full-point award.",
+      "zero_median_mapping": {
+        "status": "confirmed_for_trial",
+        "input_condition": "M = 0 from verified, eligible and consistently observed rating counts; missing observations are not zeros.",
+        "outcome": "unscored_true_zero_reference",
+        "component_points": null,
+        "retained_evidence": "Preserve the full raw distribution, actual rating count, sales evidence and independently supported scores.",
+        "presentation": "Show the relative 1 point as unscored because the reference median is truly zero. Supported actual-count points remain a partial result, not a complete 4-point item score.",
+        "candidate_exclusion": false,
+        "imputation_or_renormalization": false,
+        "final_ranking": "Use the accepted revision-50 workflow.scoring_and_ordering rules. The zero-median relative component remains explicitly unscored; this exception adds no substitute value or separate ranking formula."
+      },
+      "zero_median_boundary": "The owner confirms an explicitly unscored relative component for a true zero median. Do not assign zero, midpoint or full points, extend the positive-median formula, replace the denominator, drop true-zero observations, transfer weights or exclude the candidate. A true zero reference is distinct from missing data; the affected component remains unscored, and shared partial-total display and ordering follow the accepted workflow.scoring_and_ordering rules.",
+      "complete_item_mapping": true,
+      "calibration_status": "Pending real samples across niches and joint review with the actual-count component."
+    },
     "ratings_and_written_reviews": "Separate counts and verify tool field meaning.",
-    "normal_start": "Verify launch history, old reviews, review-count jumps and drops, parent/child changes and confirmed operator links. Separate Vine, verified-purchase and other review evidence where observable. Vine is not itself evidence of an abnormal start; anomalies are hypotheses, not proof of manipulation. Unresolved cases stay in actual competition analysis but cannot be asserted as proven normal-start exemplars.",
+    "normal_start": "Verify available launch history, old reviews, review-count jumps and drops, parent/child changes and observable same-seller or same-brand listing context. Hidden cross-shop company tracing is outside this version's scope and is not an eligibility requirement. Separate Vine, verified-purchase and other review evidence where observable. Vine is not itself evidence of an abnormal start; anomalies and same-seller presence alone are not proof of manipulation or traffic support. Material unresolved in-scope launch evidence remains explicit; retain the product in actual competition analysis without certifying an unsupported normal-start exemplar. Owner clarification 2026-11-14: where old reviews clearly predate the purported recent launch, exclude the listing from the normal-from-zero reference without requiring investigation of the exact refurbishment/merge/seed-listing mechanism. Preserve the old-review evidence and other market observations; do not silently alter the separate source-native newcomer ratios or assert a specific manipulation technique.",
     "launch_cohorts": "Retain entrants, exits, failures and incomplete observation; no population success rate from a top-100 snapshot.",
     "traffic": "Cross-check compatible SellerSprite and SIF evidence with sources and windows retained. Suggested bids are not actual CPC. Modeled visibility and keyword counts are not orders. Ad-heavy visibility alone does not establish failure or unprofitability; actual CVR and ad profitability remain unknown before measurement. Do not average incompatible sources.",
     "aggregation": "Use deduplicated relevant buying entries. Major purchase entries must carry the main suggested-bid pressure; preserve core and longtail views and cheaper smaller-entry opportunities separately. Exact entry-importance estimation and aggregation remain pending real-card calibration. Search-volume research weights are not actual advertising allocation. Do not restore a fixed core/longtail split or equal-weight cheap terms to dilute major-entry pressure.",
     "new_entry_reference_mapping": null,
     "native_bid_point_and_range": {
-      "native_point": "Use the native suggested point for the main score; equal native points under the same mapping have equal main scores.",
+      "native_point": "Native exact-match points supply the confirmed source-combination and entry-weighting trial. Equal combined input B under the same curve gives equal main scores; the derived reference is not a provider-native point.",
       "bounds": "Display lower/upper-bound score scenarios separately; they are not actual CPC forecasts or probability bounds.",
       "range_width": "No automatic penalty merely for a wider range; do not silently rank only by its upper endpoint.",
       "interval_only": "Retain a supported interval; do not invent a native midpoint.",
-      "mapping": null
+      "mapping": {
+        "status": "confirmed_for_trial",
+        "authoritative_item": "relevant_purchase_entry_bid"
+      },
+      "match_type": "exact",
+      "match_type_status": "confirmed_2026_11_13",
+      "point_and_range_source": "Use explicitly exact-match SellerSprite ppc.exact.value/min/max or exactPpc/minExactPpc/maxExactPpc and SIF supporting_signals.cpc_fixed_exact/_low/_high. Preserve raw points/ranges and strategy/time limits. The owner accepted source mean, monthly-search entry weighting and the capped USD curve on 2026-11-13. Generic bid, phrase and broad fields are not substitutes."
     },
-    "bsr_newcomer_entry_evidence": "Observe new entrants to a specified BSR top-100 node, their contemporaneous rating counts and entry/retention/exit paths, where historical coverage exists. Keep these observations separate from the comparable niche sales sample. A snapshot cannot establish all launches, timing, success rates or exact sales thresholds."
+    "bsr_newcomer_entry_evidence": "Observe new entrants to a specified BSR top-100 node, their contemporaneous rating counts and entry/retention/exit paths, where historical coverage exists. Preserve event evidence separately from measured or estimated sales and from the current count-share snapshot. The low-rating item's primary reference now follows the separately confirmed BSR-main/New-Releases-supporting boundary; this does not exclude off-list competition or sales context. A snapshot cannot establish all launches, timing, success rates or exact sales thresholds.",
+    "low_rating_example_aggregation": {
+      "status": "confirmed_for_trial",
+      "item": "low_rating_sales_performance",
+      "eligible_examples": "Comparable normal-start newcomers in the accepted reference scope, with compatible launch stages and one observation basis, supported nonnegative sales, a supported positive sales median, and both rating components calculable. Rank their complete scores after the sales ceiling, including weaker-sales examples. q >= 0.80 is not an additional eligibility filter. Do not mix current and entry-event observations.",
+      "method": "arithmetic_mean_of_two_highest_complete_eligible_example_scores",
+      "number_of_examples": 2,
+      "formula": "(highest_eligible_example_score + second_highest_eligible_example_score) / 2",
+      "deduplication": "Color children sharing a parent, repeated source records and shared launch histories do not supply two examples. Retain observable same-seller/same-brand context and supported shared-launch evidence; account identity alone does not prove traffic support or wrongdoing. Hidden cross-shop corporate ownership is outside scope and is not an additional eligibility gap.",
+      "single_example": "Retain the supported example score and evidence as a single-case signal, not automatically as the direction's complete 4-point item score. Do not exclude the candidate, invent a second example, zero-fill or renormalize.",
+      "full_observed_set": "Retain all observed comparators, weaker outcomes, exits, immature records, unknowns and counterevidence. The accepted sales and rating medians still use their proper reference cohorts, not only the two selected examples.",
+      "interpretation": "A trial summary of observed few-rating sales breakthrough opportunity, not a typical-newcomer result or success probability. More observed examples can increase the selected top-two mean.",
+      "incomplete_components": "The confirmed true-zero rating-median exception remains unscored for its relative component; a partial example is not a complete example for this aggregation.",
+      "complete_item_mapping": true,
+      "pending": "Real source, grouping/launch qualification, coverage and cross-category calibration remain to validate. Revision 50 records current-batch observations, stable equal-score selection and shared card ordering; do not restore older pending shared rules.",
+      "validation_status": "Needs later authorized real-sample calibration across categories, including isolated high scores, single examples, linked examples and extensive counterevidence. No live execution is activated.",
+      "tie_break": {
+        "status": "confirmed_for_trial",
+        "order": [
+          "complete_example_score_desc_unrounded",
+          "frozen_canonical_family_id_ascending",
+          "asin_ascending"
+        ],
+        "prohibited_selection_basis": [
+          "higher_natural_share",
+          "easier_data_availability"
+        ],
+        "identity_correction": "Recompute and version dependent results if qualification or frozen identity changes."
+      }
+    },
+    "newcomer_natural_visibility_synthesis": {
+      "status": "confirmed_for_design",
+      "comparable_counts": "For the same metric meaning and comparable product scope/period, show the source-labeled observed spread of SellerSprite and SIF keyword counts; retain each original reading and its date.",
+      "separate_share": "Keep SIF's source-defined natural/ad traffic shares separate from keyword counts, with the effective-exposure-estimate meaning visible. Do not average unlike units or invent a consensus midpoint.",
+      "interpretation": "Explain whether the available evidence supports a compatible direction or contains an unresolved material disagreement; inspect timing, product/family scope and relevant keyword coverage before interpreting differences.",
+      "update_tolerance": "Exact counts and refresh timestamps need not agree. Ordinary provider differences alone do not cause a score penalty, candidate exclusion or automatic withholding of a card. Substantially incompatible periods or variants must not be merged into a range.",
+      "evidence_limits": "An observed cross-source range is neither a statistical confidence interval nor proof that the true keyword population lies within it. Two providers are not automatically two independent underlying datasets.",
+      "missingness": "Keep missing sources and unresolved conflicts explicit; do not fabricate complete dual-source availability or zero-fill.",
+      "scoring_status": "The trial mapping is complete at revision 48: supported per-example SIF shares use the accepted curve; average the same low-rating-selected pair. A usable SIF share with identified subject/period and meaningful relevant-query evidence can score with SellerSprite counts missing, labeled single-source. Keyword counts corroborate without extra points. Ordinary count/update differences, including opposite count directions, do not alone invalidate shares or deduct points. Material unresolved product/period/entry conflicts make the affected score pending.",
+      "live_validation_status": "A separately authorized bounded native SIF check returned overall share and keyword-count fields for one technical sample. Top-level arithmetic and request outcomes were checked; an anomalous optional nested ratio was quarantined. This does not establish source accuracy, newcomer/parent coverage, cross-provider reconciliation, scoring runtime, throughput or business effects.",
+      "single_source": "Usable SIF overall natural exposure share plus known scope/period and relevant-query evidence can support scoring without SellerSprite corroborating counts. Retain both sources when available. Missing SIF share is not reconstructible from SellerSprite keyword counts.",
+      "conflict_handling": "Inspect consequential subject, family, period and query-entry conflicts. Wrong-variant/wrong-period data or a material unresolved contradiction does not support the affected score; keep it pending. Ordinary counts or refresh disagreement alone causes neither a penalty nor withholding.",
+      "normal_collection": "Use compatible saved or newly retrieved SellerSprite and SIF organic/ad keyword counts for each selected example, plus the separate SIF overall exposure shares. Compare relevant buying entries and actual product/family/window; a multi-ASIN summary is not an individual example count. Do not add overlapping advertising categories, infer exposure from word-count ratios, add extra source points, or skip an available source merely because the labeled single-source fallback exists."
+    },
+    "newcomer_natural_visibility_example_score": {
+      "status": "confirmed_for_trial",
+      "component_max_points": 1,
+      "input": "p: supported SIF overall natural traffic share, interpreted as the provider's modeled exposure share",
+      "input_unit": "fraction",
+      "valid_input_range": [
+        0,
+        1
+      ],
+      "formula": "min(p / 0.70, 1)",
+      "full_points_at": 0.7,
+      "anchors": [
+        {
+          "natural_share": 0.35,
+          "points": 0.5
+        },
+        {
+          "natural_share": 0.7,
+          "points": 1
+        }
+      ],
+      "keyword_counts": "Retain SellerSprite and SIF source-labeled organic/ad keyword counts for corroboration; do not turn their count proportions into exposure shares or award extra count/source points.",
+      "evidence_boundary": "The curve applies to a supported comparable normal-start example, not every raw provider number. Missing, invalid or materially unsupported inputs are not zero or an arbitrary middle score. Use the revision-48 source-sufficiency and conflict rules in newcomer_natural_visibility_synthesis and the same-pair incomplete-case rules in newcomer_natural_visibility_example_aggregation; their definitions are accepted for trial, while actual retrieval and judgment remain unverified.",
+      "score_meaning": "A trial indicator of observed natural exposure composition, not natural orders, profit, proven growth or a requirement to stop advertising.",
+      "complete_item_mapping": true,
+      "multi_example_aggregation": "See newcomer_natural_visibility_example_aggregation: same selected pair, arithmetic mean, single-source sufficiency and incomplete-case handling are confirmed for trial. Cross-candidate totals, ranges, missingness and ordering follow the accepted revision-50 workflow.scoring_and_ordering rules.",
+      "calibration_status": "Pending real samples across niches, including overly strict/lenient anchors, sparse observations and potential newcomers still building visibility."
+    },
+    "newcomer_natural_visibility_example_aggregation": {
+      "status": "confirmed_for_trial",
+      "selection": "Reuse the same two eligible exemplars already selected under the low-rating sales-performance item's accepted rule, when that pair exists.",
+      "formula": "(natural_score_A + natural_score_B) / 2",
+      "input_condition": "Both selected exemplars have supported natural-visibility scores under the accepted per-example curve and applicable comparable observation scope.",
+      "no_favorable_substitution": "Do not separately select the two highest natural shares or replace a lower-scoring member merely to increase this item. New evidence invalidating eligibility requires a transparent cohort/selection correction and review of dependent scores.",
+      "interpretation": "Natural visibility of the same supported low-rating sales-progress exemplars, not the market-wide average or success probability.",
+      "evidence_preservation": "Retain all observed exemplars, counterevidence, deduplication and known relationship disclosures. Missing low-rating components do not erase independently supported natural observations.",
+      "incomplete_cases": "A fixed eligible pair with one valid natural score and one missing uses the accepted missing_member_display. Both missing leaves the item pending with explicit gaps. No eligible pair leaves supported single-example natural observations visible without a direction average. Do not replace a member merely for data availability; qualification corrections require transparent dependent-score review.",
+      "complete_item_mapping": true,
+      "calibration_status": "Pending real samples across niches; assess optimistic exemplar selection and useful alternative launch paths missed by the shared pair.",
+      "missing_member_display": {
+        "status": "confirmed_for_trial",
+        "scope": "A fixed otherwise-eligible selected pair, one supported natural score s and one missing natural score, with both pair eligibility and the known input remaining valid.",
+        "item_score": null,
+        "label": "needs_evidence",
+        "conditional_range": {
+          "lower": "s / 2",
+          "upper": "(s + 1) / 2",
+          "missing_score_domain": [
+            0,
+            1
+          ]
+        },
+        "interpretation": "Bounds on the possible two-example mean if the same pair remains valid and the missing example can later be scored under the agreed 0–1 curve; not observed outcomes, a forecast or a statistical confidence interval.",
+        "no_imputation": "Do not fill the missing member, use the range midpoint, add the lower bound as earned points, or normalize remaining weights.",
+        "invalid_premises": "Withhold the range if material uncertainty also affects the known score or selected-pair eligibility.",
+        "preserved_evidence": "Keep the supported single-example score, missingness reason and other supported item evidence; no candidate exclusion merely for this gap.",
+        "ranking_status": "This accepted display rule does not define cross-candidate total/ranking use; source sufficiency, both-missing and absent-pair handling are now specified in the revision-48 item rules."
+      }
+    },
+    "low_rating_sales_cap": {
+      "status": "confirmed_curve_for_complete_supported_point_inputs",
+      "item_max_points": 4,
+      "inputs": {
+        "sales_ratio": "q = S / T, with supported aligned sales units S and a supported positive comparable-newcomer sales median T",
+        "rating_score": "P: complete actual-count plus relative-rating score, using the accepted component curves and supported comparable normal-start evidence"
+      },
+      "confirmed_anchor": {
+        "sales_ratio": 0.5,
+        "max_points": 3,
+        "formula": "min(P, 3)"
+      },
+      "relation_to_existing_condition": "The accepted q >= 0.80 sales condition remains in force for the strong-progress direction; meeting it does not by itself award 4 points.",
+      "not_a_flat_band": "The confirmed ceiling is continuous: 0–3 below the 50% reference point, 3–4 through 80%, and capped at 4 thereafter. This is a local trial curve, not a universal linear preference.",
+      "missingness": "Unavailable, uncollected or ambiguous sales stay needs-evidence rather than zero. A raw provider zero requires its meaning and coverage to be verified. T must be supported and positive; missing or true-zero rating references do not supply a complete P. Preserve existing partial-evidence rules.",
+      "aggregation_boundary": "The owner now accepts complete supported weaker-sales examples in the same top-two pool after applying the ceiling. q >= 0.80 still allows a maximum ceiling of 4 but no longer filters pair membership. Natural visibility follows the resulting same pair.",
+      "pending_segments": [],
+      "pending_boundaries": [
+        "Actual source-zero meaning, observation coverage and estimation uncertainty require real-case validation",
+        "Cross-candidate partial-score and cross-basis ranking remain shared design; no within-cohort mixing or imputation"
+      ],
+      "unadopted_history": "The earlier P * min(S / (0.80 * T), 1) sales multiplier remains unadopted.",
+      "complete_item_mapping": true,
+      "calibration_status": "All point-input ceiling segments require later real-sample calibration across niches, including overly strict/lenient scores, sparse data and small-demand markets.",
+      "confirmed_middle_segment": {
+        "status": "confirmed_for_trial",
+        "input_condition": "0.50 <= q <= 0.80, with supported positive T and complete supported P under the existing comparable normal-start evidence conditions",
+        "ceiling_formula": "3 + (q - 0.50) / (0.80 - 0.50)",
+        "score_formula": "min(P, 3 + (q - 0.50) / (0.80 - 0.50))",
+        "endpoints": [
+          {
+            "sales_ratio": 0.5,
+            "max_points": 3
+          },
+          {
+            "sales_ratio": 0.8,
+            "max_points": 4
+          }
+        ],
+        "interpretation": "The ceiling increases continuously between the accepted anchors; it does not raise a lower rating-derived score or establish provider precision."
+      },
+      "confirmed_lower_segment": {
+        "status": "confirmed_for_trial",
+        "input_condition": "0 <= q <= 0.50, with supported positive T, complete supported P and the existing comparable normal-start observation conditions",
+        "ceiling_formula": "6 * q",
+        "score_formula": "min(P, 6 * q)",
+        "endpoints": [
+          {
+            "sales_ratio": 0,
+            "max_points": 0
+          },
+          {
+            "sales_ratio": 0.5,
+            "max_points": 3
+          }
+        ],
+        "zero_semantics": "Zero points apply to a supported zero-sales observation under valid qualification and scope, not an unavailable, uncollected, rounded/ambiguous or placeholder zero.",
+        "interpretation": "Partial sales progress receives a continuous ceiling below 3; no whole-candidate exclusion or prediction of future failure follows."
+      },
+      "complete_input_ceiling": {
+        "status": "confirmed_for_trial",
+        "formula": "6*q if 0 <= q <= 0.50; 3 + (q - 0.50)/(0.80 - 0.50) if 0.50 < q < 0.80; 4 if q >= 0.80",
+        "score_formula": "min(P, ceiling)",
+        "requires": "Supported positive T, nonnegative supported S, a complete supported P, and compatible eligible observations; not a missing-data fallback.",
+        "composition_note": "Combines the accepted lower, middle and full-ceiling segments. Revision 48 separately extends pair eligibility to complete weaker-sales examples after applying this unchanged ceiling."
+      }
+    },
+    "q31_current_batch_observation": {
+      "status": "confirmed_for_trial",
+      "revision": 50,
+      "scope": "current_bounded_real_trial_and_its_cross_card_comparison",
+      "basis": "Current accumulated rating count plus compatible latest-30-day supported sales units.",
+      "age_anchor": "Assess the three-month newcomer condition at the batch observation date. Preserve actual stage and coverage; do not extrapolate a short launch into 30 days.",
+      "reference_cohort": "All observed qualifying genuinely comparable normal-start newcomers with documented relevant BSR-top-100 observations, including eligible historical entrants now exited. Retain weak and unknown records with status. New-Releases-only observations remain auxiliary.",
+      "history": "Use available entry/family/review history for qualification and context. Keep event-time observations separately; they do not replace missing current values or mix into this batch median.",
+      "insufficient_current_basis": "Keep an event-only result as context, with current cross-card comparison pending; do not choose the more favorable basis.",
+      "supersedes_for_this_batch": "Entry-time preference in low_rating_current_observation_fallback; that historical rule remains preserved outside this adopted current-batch view."
+    }
   },
   "workflow": {
     "stages": [
@@ -342,16 +1154,53 @@
       "initial_preference": "Existing designs that can plausibly be tested in small batches; public supply listings are evidence leads, not verified delivery commitments.",
       "light_differentiation": "Optional, source-supported small changes may be researched; do not award points merely for an invented idea.",
       "private_molds": "Usually consider after market and profit validation, with actual supply capability, MOQ, tooling cost and timing assessed separately; not a permanent exclusion.",
-      "pain_points": "Do not assume our team can solve an industry-wide issue because existing products have low ratings. Feasibility requires later evidence; no new star-rating cutoff."
+      "pain_points": "Do not assume our team can solve an industry-wide issue because existing products have low ratings. Feasibility requires later evidence; no new star-rating cutoff.",
+      "evidence_staging": "Owner clarification, 2026-11-13: first define the trial rules, then run a bounded real workflow to identify acquisition/judgment/time bottlenecks. If some deeper investigations prevent useful card output, consider moving suitable checks after owner retention and deeper analysis. This does not silently defer every required initial check, relax a confirmed exclusion or permit invented scores. Initial cards may expose material gaps; keep their evidence and stage visible."
+    },
+    "scoring_and_ordering": {
+      "status": "confirmed_for_trial",
+      "revision": 50,
+      "scale": 100,
+      "complete_total": "Sum all fully supported item scores at original weights. Do not add AI impression adjustments or duplicate penalties.",
+      "supported_intervals": "Evaluate coherent supported scenarios with shared price/cost/refund inputs consistent across dependent items; keep the full resulting interval, not a midpoint or incompatible independent endpoints. Item-specific input rules still apply.",
+      "missing_total": null,
+      "missing_display": [
+        "supported_scored_portion",
+        "scored_weight_coverage",
+        "unscored_weights_and_specific_gaps",
+        "conditional_possible_range_when_valid"
+      ],
+      "conditional_bounds": "For fixed known points K and wholly unscored weight W, K..K+W is a broad mathematical bound conditional on remaining eligible, not an earned total or prediction. Approved tighter bounds may narrow it. A component lower bound is not counted as earned points; invalid premises withhold the range.",
+      "forbidden": [
+        "zero_or_50_imputation",
+        "normalize_known_weights_to_100",
+        "midpoint_total",
+        "upper_bound_as_predicted_score",
+        "extra_total_score_exclusion_threshold"
+      ],
+      "comparable_group": {
+        "eligibility": "All items supported and existing initial-screening conditions resolved.",
+        "order": "Complete total descending; supported intervals use the lower endpoint for conservative display while preserving the interval. Ties retain stable order; overlapping intervals do not prove quality differences."
+      },
+      "pending_group": {
+        "eligibility": "Missing item evidence or a material unresolved screening condition.",
+        "order": "Supported scored portion descending (its lower endpoint if a supported range), then covered weight descending, then stable display order.",
+        "meaning": "Follow-up priority, not full candidate-quality rank.",
+        "visibility": "Visible alongside comparable cards; show material gaps and valid possible upside above the current leader. Inspect promising lower-queue cases too; unknown-heavy upper bounds do not earn priority as proven quality."
+      },
+      "screening": "Existing specific-form exclusions, date-dependent deferrals and matched-price conditions remain. A credible margin upper bound below 30% excludes; a range spanning 30% remains pending. Never extend the eligible margin curve into failed scenarios or use a high total to clear a pending condition.",
+      "gap_resolution": "Record required input, evidence, blocker, remedy and score/screening effect. Recover existing requests before new submission, then recompute/version after evidence or an adopted rule correction. Recurring unscorable important dimensions do not pass workflow acceptance.",
+      "validation": "Synthetic rule checks and the authorized saved-product trial do not establish production, calibration or business outcomes."
     }
   },
   "pending_design": [
-    "Q31: define the market reference, comparable niche cohort, observation windows, sales grain and contemporaneous rating accumulation; retain separate BSR top-100 newcomer entry/retention/exit evidence. Do not substitute arbitrary pairwise product comparisons for a market judgment. Median sales and lower-quartile rating references remain proposals. Internal 2/2/3/3, joint continuous mapping and aggregation remain unapproved.",
-    "Q32: internal rights/public-requirement 3/2 remains unapproved; confirmed specification-conflict handling is already established independently.",
-    "All score mapping curves, reference calibration, qualitative rubrics and cross-group duplicate-signal handling.",
-    "Missing-data ranking, aggregation and comparison rules without invented certainty.",
-    "Initial goods quantity and compatible quote/packaging/freight basis.",
-    "Complete end-to-end product design and real-card acceptance."
+    "Competition: 3/3/4 and all three native-concentration trial mappings are recorded in revision 45. Use 40% full / 60% half / 80% zero with continuous interpolation; 50% is 75% of the maximum. Use the same relevant SellerSprite report and basic presence/unit/range checks. Source labels remain visible without requiring BSR-top-100 reconciliation, complete sample reconstruction or an entity-count exception. Later real-sample tests must verify usable fields, workflow effort, strictness and combined influence; do not revive withdrawn hypothetical branches or silently reweight. See COMPETITION.draft.md.",
+    "Q31: revision 50 adopts the native relevant same-report 3/2 population, current-basis 4/1 comparison, stable exemplar ties and two-source keyword corroboration, retaining all curves and the genuinely comparable normal-start BSR qualification for 4/1. The bounded real trial established a reproducible observed-cohort result; broader source coverage, grouping/qualification accuracy, sustainable runtime effort and cross-market calibration remain unverified.",
+    "Q32: revision 49 records the accepted rights 3 / requirements 2 trial package. Rights uses 3 for a supported bounded preliminary check, null for unsearched/materially unresolved evidence, and 0 plus the existing specification exclusion for an actually confirmed conflict. There is no invented 1/2-point suspicion scale. Requirements uses the accepted known-burden 2/1/0 rubric with material unknowns null; zero adds no new automatic category/candidate exclusion. Actual source acquisition, rights/requirements judgment, effort and usefulness require real-case validation and calibration. No exhaustive clearance or supplier-shipment compliance is claimed.",
+    "All 21 item mappings and the shared complete-total, supported-interval, missingness and card-ordering trial package are recorded at revision 50. Actual source validation, calibrated judgment, throughput, product implementation and useful real-card acceptance remain outstanding.",
+    "The owner confirms retiring the independent initial-goods 6-point score and transferring six points to niche demand at 4/6/6 for trial in revision 37, then separately accepts the complete demand proposal in revision 38. All three trial mappings are recorded; see DEMAND.draft.md. Actual niche coverage, source-field acquisition, economical and consistent opportunity/entry judgments and real-sample calibration remain unverified. First-batch units remain the owner's capital decision, with compatible procurement-tier, packaging and freight evidence still required for per-unit economics.",
+    "Complete end-to-end product design and real-card acceptance.",
+    "Suggested-bid revision 47 is confirmed for trial: equal native source points per query, labeled single-source fallback, consistent SellerSprite monthly-search importance across relevant main entries, and USD 0.50 full / USD 3.00 zero. Keep source points/ranges, approximate strategy/time limitations and missingness visible. This is not actual CPC, evidence of better accuracy, acceptance of a fixed collection size or activation of research. Later calibrated field/coverage/runtime acceptance remains pending."
   ],
-  "revision": 2
+  "revision": 50
 }
