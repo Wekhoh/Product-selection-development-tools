@@ -1,6 +1,6 @@
 # Development workflow
 
-Status: working process for the current design stage, updated 2026-11-13. This document organizes delivery; it does not select a product architecture or authorize live integrations.
+Status: development process, updated 2026-11-14. The first-release specification now admits a bounded native-research and offline-card implementation slice. This does not select the full product deployment or activate scheduled or paid-model integrations.
 
 ## Canonical records
 
@@ -10,7 +10,7 @@ Status: working process for the current design stage, updated 2026-11-13. This d
 | [PRODUCT.md](PRODUCT.md) | Product purpose, owner experience and requirements |
 | [Design decisions](design/DECISIONS.md) | Confirmed choices, their conditions, superseded proposals and open questions |
 | [Domain glossary](../GLOSSARY.md) | Domain meanings, without implementation instructions or a second task list |
-| [First-release draft](design/FIRST-RELEASE.draft.md) | Recovered automatic-discovery/scoring workflow, proposed technical acceptance and remaining implementation questions; not ready for implementation |
+| [First-release draft](design/FIRST-RELEASE.draft.md) | Automatic discovery/scoring workflow; the explicitly bounded trial slice is ready for implementation, with broader product acceptance still open |
 | [Draft reference profile](design/reference-profile.draft.json) | The 21 item mappings, 100-point budget and revision-50 shared trial rules; not production configuration |
 | [API migration](API-MIGRATION.md) | Historical capability and request/cost continuity constraints; not an adopted interface |
 | `docs/research/` | Dated primary-source investigations and reuse comparisons |
@@ -96,7 +96,7 @@ The installed v1.3.1 package was checked directly. Its user-invoked main flow in
 | `code-review` / `pr` | Fixed-scope standards/spec review, resolved findings and relevant acceptance evidence | Code adoption, offline operation, native integration, real-card usefulness and visual acceptance stay distinct |
 | `retro` | Evidence-based improvements to checks, navigation or engineering conventions | Improvements address observed problems; they do not automatically install tooling or create more process |
 
-Keep STATE as the single maintained task/recovery record. Use existing repository documents and issue conventions; do not mechanically reproduce a skill's sample tracker structure. Write a real spec once its scope is understandable, rather than creating a complete-looking document from unsettled assumptions. The current stage is clarification and research, not a completed spec or an instruction to start implementation.
+Keep STATE as the single maintained task/recovery record. Use existing repository documents and issue conventions; do not mechanically reproduce a skill's sample tracker structure. Write a real spec once its scope is understandable, rather than creating a complete-looking document from unsettled assumptions. The owner-authorized bounded discovery-to-card slice in FIRST-RELEASE is now being implemented and tested; broader application interaction and deployment remain open. Historical clarification-only checkpoints do not block this adopted slice.
 
 | Skill | Applicable work |
 | --- | --- |

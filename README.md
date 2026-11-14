@@ -2,7 +2,18 @@
 
 An independent, open-source product-selection tool for personal use and optional self-hosting.
 
-**Current stage: requirements alignment and selective migration.** The project is not yet a working automated selection application. The design profile is a discussion artifact; importing it does not activate scoring, research, or external requests.
+**Current stage: bounded discovery-to-card implementation and real-data trials.** The offline runner applies the 21 adopted revision-50 mappings to explicit local evidence and produces Chinese cards. Native research still runs through the authorized Codex tools; daily scheduling and full application acceptance remain open. Importing modules or the profile never starts requests.
+
+## Run the offline example
+
+Use Node.js 24 or newer; this slice has no package dependencies or credentials.
+
+```sh
+node --test
+node src/cli.mjs --input fixtures/synthetic-batch.json --profile docs/design/reference-profile.draft.json --output outputs/example
+```
+
+Open `outputs/example/index.html`. These cards are explicitly synthetic. For genuine research use the [input contract](docs/design/TRIAL-INPUT.md), keep the batch and outputs in ignored local directories, and retain original evidence. A missing total stays unknown; supported points are not scaled to 100. The CLI only reads supplied files and does not collect fresh data, spend credits, contact suppliers or change stores.
 
 ## Start here
 
@@ -19,19 +30,19 @@ The first version is for its owner's use. Other developers may inspect, fork, or
 
 ## Development workspace
 
-The project is in requirements and scoring design. Its documents distinguish confirmed decisions, proposals, unresolved rules and verified behavior.
+The project has adopted trial definitions and a bounded implementation. Its documents distinguish confirmed decisions, proposals, source limitations and verified behavior.
 
 | Start here | Purpose |
 | --- | --- |
 | [Current state](docs/STATE.md) | Current outcome, plan, evidence, blockers and exact next step |
 | [Product requirements](docs/PRODUCT.md) and [decisions](docs/design/DECISIONS.md) | What the tool must do, why, and what remains open |
 | [Domain glossary](GLOSSARY.md) | Shared meanings for discovery, candidates, evidence and scores |
-| [First-release draft](docs/design/FIRST-RELEASE.draft.md) | Proposed complete workflow and acceptance; not implementation-ready |
+| [First-release draft](docs/design/FIRST-RELEASE.draft.md) | Complete workflow and acceptance; bounded offline-card slice ready, broader product choices open |
 | [Scoring profile](docs/design/reference-profile.draft.json) | Confirmed trial weights and 21 item mappings; not active runtime configuration or a calibrated model |
 | [Development workflow](docs/DEVELOPMENT.md) | Matt Pocock skill usage, specification, task breakdown, review and recovery |
 
 Use this checkout as a separate project's primary folder. Start new chats here and read `AGENTS.md` and `docs/STATE.md`. Do not attach the retired operations repository as a prerequisite. Additional contributors should use separate branches/worktrees with explicit file ownership.
 
-In the Codex app, add this folder as a local project; existing chat membership and folder access are separate from cloning. The current source baseline contains design documents only, so no application install or launch command is advertised yet.
+In the Codex app, add this folder as a local project; existing chat membership and folder access are separate from cloning. Use the offline example above to verify the calculation and reading path without any external account.
 
 Licensed under [Apache 2.0](LICENSE).

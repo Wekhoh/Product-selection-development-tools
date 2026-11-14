@@ -1,0 +1,1403 @@
+{
+  "schema_version": 1,
+  "profile_revision": 50,
+  "presentation": {
+    "title": "离线选品试评演示",
+    "summary": "本页全部为合成教学数据。三个样本分别演示完整点值、完整情景区间和费用待补证；不构成任何市场或采购结论。",
+    "discovery": [
+      {
+        "label": "合成发现路径",
+        "detail": "模拟一条需求线索，随后形成教学候选。",
+        "source": "离线合成夹具",
+        "observed_at": "2026-11-13",
+        "status": "仅演示"
+      }
+    ],
+    "timings": [
+      {
+        "label": "真实采集",
+        "seconds": null,
+        "note": "本夹具没有进行真实采集。"
+      }
+    ],
+    "limitations": [
+      "全部候选身份、销量、竞价、费用和判断均为合成。",
+      "离线验证不能证明来源准确性、正式运行或业务效果。"
+    ]
+  },
+  "candidates": [
+    {
+      "id": "synthetic-complete",
+      "label": "合成样本 A · 完整点值",
+      "form": "教学用双件收纳架（完全合成，非真实商品）",
+      "evidence": [
+        {
+          "id": "synthetic-evidence",
+          "source": "离线合成夹具",
+          "observed_at": "2026-11-13",
+          "url": "https://example.com/synthetic-reference",
+          "scope": "全部观察和判断均为虚构教学输入。",
+          "limitations": "不用于采购、经营或市场结论。"
+        }
+      ],
+      "screening": {
+        "reference_price_usd": {
+          "value": 40,
+          "unit": "USD",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "matched_spec": true
+        },
+        "strong_date_dependency": {
+          "value": false,
+          "unit": "boolean",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        }
+      },
+      "metrics": {
+        "purchase_demand_scale": {
+          "value": 5000,
+          "unit": "units",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "niche": "合成可替代细分市场",
+          "period": "2026-10-15/2026-11-13",
+          "grain": "family",
+          "coverage_supported": true,
+          "deduplicated": true,
+          "window_days": 30,
+          "window_basis": "latest_30_days"
+        },
+        "low_return_preference": {
+          "value": 0.02,
+          "unit": "fraction",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "category": "合成节点",
+          "period": "2026-10",
+          "applicable": true
+        }
+      },
+      "judgments": {
+        "supported_opportunity": {
+          "anchor": 6,
+          "reason": "合成教学判断：假定已有持续需求证据。",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "route": "stable_demand"
+        },
+        "purchase_entry_match": {
+          "anchor": 6,
+          "reason": "合成教学判断：假定主要购买意图匹配。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "existing_solution_fit": {
+          "anchor": 4,
+          "reason": "合成教学判断：假定核心用途已经得到支持。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "feasible_light_differentiation": {
+          "anchor": 1,
+          "reason": "合成教学判断：假定小改进有依据且初步可行。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "storage_tolerance": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定普通储存稳定性有依据。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "transport_tolerance": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定结构及防护包装有依据。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "routine_complexity": {
+          "anchor": 1,
+          "reason": "合成教学判断：假定日常装配和说明工作简单。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "specific_design_rights": {
+          "anchor": 3,
+          "reason": "合成教学判断：假定已完成有范围、有日期和限制的初查，非权利保证。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "applicable_public_requirements": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定普通准入路径有据，非已完成产品合规。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        }
+      },
+      "market": {
+        "provider": "sellersprite",
+        "report_id": "synthetic-market",
+        "relevant": true,
+        "population": "合成原生近期销量样本；不是实际 BSR 榜单",
+        "family_basis": "合成 family 口径",
+        "period": "2026-10-15/2026-11-13",
+        "head_group": "合成原生前十组",
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "newcomer_age_months": 3,
+        "newcomer_sales_window": "latest_30_days",
+        "concentrations": {
+          "product": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "brand": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "seller": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          }
+        },
+        "newcomer": {
+          "count_share": {
+            "value": 0.2,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "unit_sales_share": {
+            "value": 0.3,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          }
+        }
+      },
+      "bids": {
+        "marketplace": "US",
+        "currency": "USD",
+        "match_type": "exact",
+        "volume_period": "2026-10",
+        "selection_reason": "两个入口均为合成教学输入，不是实际搜索需求。",
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "entries": [
+          {
+            "query": "synthetic organizer",
+            "volume": {
+              "value": 100,
+              "unit": "searches_per_month",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "sellersprite": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "unspecified",
+              "low": 0.2,
+              "high": 0.8
+            },
+            "sif": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.3,
+              "high": 1
+            }
+          },
+          {
+            "query": "synthetic organizer two piece",
+            "volume": {
+              "value": 300,
+              "unit": "searches_per_month",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "sellersprite": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.2,
+              "high": 0.8
+            },
+            "sif": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.3,
+              "high": 1
+            }
+          }
+        ]
+      },
+      "newcomer_cohort": {
+        "observation_basis": "current_latest_30_days",
+        "observation_date": "2026-11-13",
+        "period": "2026-10-15/2026-11-13",
+        "niche": "合成可比正常新品样本",
+        "grain": "family",
+        "relevant_bsr_node": "synthetic-node",
+        "reference_supported": true,
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "members": [
+          {
+            "family_id": "synthetic-family-a",
+            "asin": "synthetic-family-a-listing",
+            "status": "qualified",
+            "reason": "合成样本：假定可比、正常起步，且已有相关榜单观察；不代表真实商品。",
+            "evidence": [
+              "synthetic-evidence"
+            ],
+            "ratings": {
+              "value": 5,
+              "unit": "count",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "units_30d": {
+              "value": 100,
+              "unit": "units",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "natural": {
+              "value": 0.7,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "scope": "overall",
+              "period": "2026-10-15/2026-11-13",
+              "relevant_entries_evidence": [
+                "synthetic-evidence"
+              ],
+              "keyword_counts": {
+                "sellersprite": {
+                  "organic": {
+                    "value": 20,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 10,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                "sif": {
+                  "organic": {
+                    "value": 24,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 12,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "family_id": "synthetic-family-b",
+            "asin": "synthetic-family-b-listing",
+            "status": "qualified",
+            "reason": "合成样本：假定可比、正常起步，且已有相关榜单观察；不代表真实商品。",
+            "evidence": [
+              "synthetic-evidence"
+            ],
+            "ratings": {
+              "value": 5,
+              "unit": "count",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "units_30d": {
+              "value": 100,
+              "unit": "units",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "natural": {
+              "value": 0.7,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "scope": "overall",
+              "period": "2026-10-15/2026-11-13",
+              "relevant_entries_evidence": [
+                "synthetic-evidence"
+              ],
+              "keyword_counts": {
+                "sellersprite": {
+                  "organic": {
+                    "value": 20,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 10,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                "sif": {
+                  "organic": {
+                    "value": 24,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 12,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "economics": {
+        "saleable_unit": "一套合成双件收纳架",
+        "scenarios": [
+          {
+            "id": "synthetic-base",
+            "saleable_unit": "一套合成双件收纳架",
+            "coherent": true,
+            "assumptions": [
+              "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+            ],
+            "margin": {
+              "value": 0.5,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "contribution_usd": {
+              "value": 20,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            }
+          }
+        ]
+      },
+      "presentation": {
+        "summary": "全部证据齐全的合成演示，用于验证规则与展示。",
+        "blockers": [],
+        "procurement": [
+          {
+            "label": "采购证据",
+            "value": "无真实报价；本例只使用合成输入。"
+          }
+        ],
+        "economics_details": [
+          {
+            "label": "情景性质",
+            "value": "合成金额，不代表真实毛利"
+          }
+        ]
+      }
+    },
+    {
+      "id": "synthetic-range",
+      "label": "合成样本 B · 情景区间",
+      "form": "教学用双件收纳架（完全合成，非真实商品）",
+      "evidence": [
+        {
+          "id": "synthetic-evidence",
+          "source": "离线合成夹具",
+          "observed_at": "2026-11-13",
+          "url": "https://example.com/synthetic-reference",
+          "scope": "全部观察和判断均为虚构教学输入。",
+          "limitations": "不用于采购、经营或市场结论。"
+        }
+      ],
+      "screening": {
+        "reference_price_usd": {
+          "value": 40,
+          "unit": "USD",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "matched_spec": true
+        },
+        "strong_date_dependency": {
+          "value": false,
+          "unit": "boolean",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        }
+      },
+      "metrics": {
+        "purchase_demand_scale": {
+          "value": 5000,
+          "unit": "units",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "niche": "合成可替代细分市场",
+          "period": "2026-10-15/2026-11-13",
+          "grain": "family",
+          "coverage_supported": true,
+          "deduplicated": true,
+          "window_days": 30,
+          "window_basis": "latest_30_days"
+        },
+        "low_return_preference": {
+          "value": 0.02,
+          "unit": "fraction",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "category": "合成节点",
+          "period": "2026-10",
+          "applicable": true
+        }
+      },
+      "judgments": {
+        "supported_opportunity": {
+          "anchor": 6,
+          "reason": "合成教学判断：假定已有持续需求证据。",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "route": "stable_demand"
+        },
+        "purchase_entry_match": {
+          "anchor": 6,
+          "reason": "合成教学判断：假定主要购买意图匹配。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "existing_solution_fit": {
+          "anchor": 4,
+          "reason": "合成教学判断：假定核心用途已经得到支持。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "feasible_light_differentiation": {
+          "anchor": 1,
+          "reason": "合成教学判断：假定小改进有依据且初步可行。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "storage_tolerance": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定普通储存稳定性有依据。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "transport_tolerance": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定结构及防护包装有依据。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "routine_complexity": {
+          "anchor": 1,
+          "reason": "合成教学判断：假定日常装配和说明工作简单。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "specific_design_rights": {
+          "anchor": 3,
+          "reason": "合成教学判断：假定已完成有范围、有日期和限制的初查，非权利保证。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "applicable_public_requirements": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定普通准入路径有据，非已完成产品合规。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        }
+      },
+      "market": {
+        "provider": "sellersprite",
+        "report_id": "synthetic-market",
+        "relevant": true,
+        "population": "合成原生近期销量样本；不是实际 BSR 榜单",
+        "family_basis": "合成 family 口径",
+        "period": "2026-10-15/2026-11-13",
+        "head_group": "合成原生前十组",
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "newcomer_age_months": 3,
+        "newcomer_sales_window": "latest_30_days",
+        "concentrations": {
+          "product": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "brand": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "seller": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          }
+        },
+        "newcomer": {
+          "count_share": {
+            "value": 0.2,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "unit_sales_share": {
+            "value": 0.3,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          }
+        }
+      },
+      "bids": {
+        "marketplace": "US",
+        "currency": "USD",
+        "match_type": "exact",
+        "volume_period": "2026-10",
+        "selection_reason": "两个入口均为合成教学输入，不是实际搜索需求。",
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "entries": [
+          {
+            "query": "synthetic organizer",
+            "volume": {
+              "value": 100,
+              "unit": "searches_per_month",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "sellersprite": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "unspecified",
+              "low": 0.2,
+              "high": 0.8
+            },
+            "sif": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.3,
+              "high": 1
+            }
+          },
+          {
+            "query": "synthetic organizer two piece",
+            "volume": {
+              "value": 300,
+              "unit": "searches_per_month",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "sellersprite": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.2,
+              "high": 0.8
+            },
+            "sif": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.3,
+              "high": 1
+            }
+          }
+        ]
+      },
+      "newcomer_cohort": {
+        "observation_basis": "current_latest_30_days",
+        "observation_date": "2026-11-13",
+        "period": "2026-10-15/2026-11-13",
+        "niche": "合成可比正常新品样本",
+        "grain": "family",
+        "relevant_bsr_node": "synthetic-node",
+        "reference_supported": true,
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "members": [
+          {
+            "family_id": "synthetic-family-a",
+            "asin": "synthetic-family-a-listing",
+            "status": "qualified",
+            "reason": "合成样本：假定可比、正常起步，且已有相关榜单观察；不代表真实商品。",
+            "evidence": [
+              "synthetic-evidence"
+            ],
+            "ratings": {
+              "value": 5,
+              "unit": "count",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "units_30d": {
+              "value": 100,
+              "unit": "units",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "natural": {
+              "value": 0.7,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "scope": "overall",
+              "period": "2026-10-15/2026-11-13",
+              "relevant_entries_evidence": [
+                "synthetic-evidence"
+              ],
+              "keyword_counts": {
+                "sellersprite": {
+                  "organic": {
+                    "value": 20,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 10,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                "sif": {
+                  "organic": {
+                    "value": 24,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 12,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "family_id": "synthetic-family-b",
+            "asin": "synthetic-family-b-listing",
+            "status": "qualified",
+            "reason": "合成样本：假定可比、正常起步，且已有相关榜单观察；不代表真实商品。",
+            "evidence": [
+              "synthetic-evidence"
+            ],
+            "ratings": {
+              "value": 5,
+              "unit": "count",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "units_30d": {
+              "value": 100,
+              "unit": "units",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "natural": {
+              "value": 0.7,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "scope": "overall",
+              "period": "2026-10-15/2026-11-13",
+              "relevant_entries_evidence": [
+                "synthetic-evidence"
+              ],
+              "keyword_counts": {
+                "sellersprite": {
+                  "organic": {
+                    "value": 20,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 10,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                "sif": {
+                  "organic": {
+                    "value": 24,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 12,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "economics": {
+        "saleable_unit": "一套合成双件收纳架",
+        "scenarios": [
+          {
+            "id": "synthetic-higher-margin",
+            "saleable_unit": "一套合成双件收纳架",
+            "coherent": true,
+            "assumptions": [
+              "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+            ],
+            "margin": {
+              "value": 0.4,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "contribution_usd": {
+              "value": 10,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            }
+          },
+          {
+            "id": "synthetic-higher-contribution",
+            "saleable_unit": "一套合成双件收纳架",
+            "coherent": true,
+            "assumptions": [
+              "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+            ],
+            "margin": {
+              "value": 0.35,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "contribution_usd": {
+              "value": 15,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            }
+          }
+        ]
+      },
+      "presentation": {
+        "summary": "两个完整费用情景产生相互关联的区间；不取中点。",
+        "blockers": [],
+        "procurement": [
+          {
+            "label": "采购证据",
+            "value": "无真实报价；本例只使用合成输入。"
+          }
+        ],
+        "economics_details": [
+          {
+            "label": "情景性质",
+            "value": "合成金额，不代表真实毛利"
+          }
+        ]
+      }
+    },
+    {
+      "id": "synthetic-pending",
+      "label": "合成样本 C · 费用待补证",
+      "form": "教学用双件收纳架（完全合成，非真实商品）",
+      "evidence": [
+        {
+          "id": "synthetic-evidence",
+          "source": "离线合成夹具",
+          "observed_at": "2026-11-13",
+          "url": "https://example.com/synthetic-reference",
+          "scope": "全部观察和判断均为虚构教学输入。",
+          "limitations": "不用于采购、经营或市场结论。"
+        }
+      ],
+      "screening": {
+        "reference_price_usd": {
+          "value": 40,
+          "unit": "USD",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "matched_spec": true
+        },
+        "strong_date_dependency": {
+          "value": false,
+          "unit": "boolean",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        }
+      },
+      "metrics": {
+        "purchase_demand_scale": {
+          "value": 5000,
+          "unit": "units",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "niche": "合成可替代细分市场",
+          "period": "2026-10-15/2026-11-13",
+          "grain": "family",
+          "coverage_supported": true,
+          "deduplicated": true,
+          "window_days": 30,
+          "window_basis": "latest_30_days"
+        },
+        "low_return_preference": {
+          "value": 0.02,
+          "unit": "fraction",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "category": "合成节点",
+          "period": "2026-10",
+          "applicable": true
+        }
+      },
+      "judgments": {
+        "supported_opportunity": {
+          "anchor": 6,
+          "reason": "合成教学判断：假定已有持续需求证据。",
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "route": "stable_demand"
+        },
+        "purchase_entry_match": {
+          "anchor": 6,
+          "reason": "合成教学判断：假定主要购买意图匹配。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "existing_solution_fit": {
+          "anchor": 4,
+          "reason": "合成教学判断：假定核心用途已经得到支持。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "feasible_light_differentiation": {
+          "anchor": 1,
+          "reason": "合成教学判断：假定小改进有依据且初步可行。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "storage_tolerance": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定普通储存稳定性有依据。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "transport_tolerance": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定结构及防护包装有依据。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "routine_complexity": {
+          "anchor": 1,
+          "reason": "合成教学判断：假定日常装配和说明工作简单。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "specific_design_rights": {
+          "anchor": 3,
+          "reason": "合成教学判断：假定已完成有范围、有日期和限制的初查，非权利保证。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        },
+        "applicable_public_requirements": {
+          "anchor": 2,
+          "reason": "合成教学判断：假定普通准入路径有据，非已完成产品合规。",
+          "evidence": [
+            "synthetic-evidence"
+          ]
+        }
+      },
+      "market": {
+        "provider": "sellersprite",
+        "report_id": "synthetic-market",
+        "relevant": true,
+        "population": "合成原生近期销量样本；不是实际 BSR 榜单",
+        "family_basis": "合成 family 口径",
+        "period": "2026-10-15/2026-11-13",
+        "head_group": "合成原生前十组",
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "newcomer_age_months": 3,
+        "newcomer_sales_window": "latest_30_days",
+        "concentrations": {
+          "product": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "brand": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "seller": {
+            "value": 0.4,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          }
+        },
+        "newcomer": {
+          "count_share": {
+            "value": 0.2,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          },
+          "unit_sales_share": {
+            "value": 0.3,
+            "unit": "fraction",
+            "evidence": [
+              "synthetic-evidence"
+            ]
+          }
+        }
+      },
+      "bids": {
+        "marketplace": "US",
+        "currency": "USD",
+        "match_type": "exact",
+        "volume_period": "2026-10",
+        "selection_reason": "两个入口均为合成教学输入，不是实际搜索需求。",
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "entries": [
+          {
+            "query": "synthetic organizer",
+            "volume": {
+              "value": 100,
+              "unit": "searches_per_month",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "sellersprite": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "unspecified",
+              "low": 0.2,
+              "high": 0.8
+            },
+            "sif": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.3,
+              "high": 1
+            }
+          },
+          {
+            "query": "synthetic organizer two piece",
+            "volume": {
+              "value": 300,
+              "unit": "searches_per_month",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "sellersprite": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.2,
+              "high": 0.8
+            },
+            "sif": {
+              "value": 0.5,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "match_type": "exact",
+              "strategy": "fixed",
+              "low": 0.3,
+              "high": 1
+            }
+          }
+        ]
+      },
+      "newcomer_cohort": {
+        "observation_basis": "current_latest_30_days",
+        "observation_date": "2026-11-13",
+        "period": "2026-10-15/2026-11-13",
+        "niche": "合成可比正常新品样本",
+        "grain": "family",
+        "relevant_bsr_node": "synthetic-node",
+        "reference_supported": true,
+        "evidence": [
+          "synthetic-evidence"
+        ],
+        "members": [
+          {
+            "family_id": "synthetic-family-a",
+            "asin": "synthetic-family-a-listing",
+            "status": "qualified",
+            "reason": "合成样本：假定可比、正常起步，且已有相关榜单观察；不代表真实商品。",
+            "evidence": [
+              "synthetic-evidence"
+            ],
+            "ratings": {
+              "value": 5,
+              "unit": "count",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "units_30d": {
+              "value": 100,
+              "unit": "units",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "natural": {
+              "value": 0.7,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "scope": "overall",
+              "period": "2026-10-15/2026-11-13",
+              "relevant_entries_evidence": [
+                "synthetic-evidence"
+              ],
+              "keyword_counts": {
+                "sellersprite": {
+                  "organic": {
+                    "value": 20,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 10,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                "sif": {
+                  "organic": {
+                    "value": 24,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 12,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          {
+            "family_id": "synthetic-family-b",
+            "asin": "synthetic-family-b-listing",
+            "status": "qualified",
+            "reason": "合成样本：假定可比、正常起步，且已有相关榜单观察；不代表真实商品。",
+            "evidence": [
+              "synthetic-evidence"
+            ],
+            "ratings": {
+              "value": 5,
+              "unit": "count",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "units_30d": {
+              "value": 100,
+              "unit": "units",
+              "evidence": [
+                "synthetic-evidence"
+              ]
+            },
+            "natural": {
+              "value": 0.7,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "scope": "overall",
+              "period": "2026-10-15/2026-11-13",
+              "relevant_entries_evidence": [
+                "synthetic-evidence"
+              ],
+              "keyword_counts": {
+                "sellersprite": {
+                  "organic": {
+                    "value": 20,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 10,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                "sif": {
+                  "organic": {
+                    "value": 24,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  },
+                  "ad": {
+                    "value": 12,
+                    "unit": "count",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "economics": {
+        "saleable_unit": "一套合成双件收纳架",
+        "scenarios": [
+          {
+            "id": "synthetic-unknown",
+            "saleable_unit": "一套合成双件收纳架",
+            "coherent": true,
+            "assumptions": [
+              "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+            ],
+            "margin": {
+              "value": null,
+              "unit": "fraction",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "reason": "合成缺口：尚未取得匹配规格的完整费用证据。"
+            },
+            "contribution_usd": {
+              "value": null,
+              "unit": "USD",
+              "evidence": [
+                "synthetic-evidence"
+              ],
+              "reason": "合成缺口：贡献金额取决于尚缺的费用。"
+            }
+          }
+        ]
+      },
+      "presentation": {
+        "summary": "展示未知成本时的原始分数覆盖与补证任务。",
+        "blockers": [
+          {
+            "problem": "匹配规格的费用仍不完整，不能给出完整总分。",
+            "next_step": "补齐同一可售单位的费用证据后重新计算。"
+          }
+        ],
+        "procurement": [
+          {
+            "label": "采购证据",
+            "value": "无真实报价；本例只使用合成输入。"
+          }
+        ],
+        "economics_details": [
+          {
+            "label": "情景性质",
+            "value": "合成金额，不代表真实毛利"
+          }
+        ]
+      }
+    }
+  ]
+}
