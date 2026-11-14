@@ -1,5 +1,17 @@
 # Design decisions and open questions
 
+## Product words, additional discovery angles and discussion boundary — 2026-11-15
+
+The owner asks to align how a large sourced word pool becomes concrete products before executing that step. Pause dependent interpretation/research, preserve saved responses and continue read-only fault attribution and records. The proposal lives in FIRST-RELEASE and remains unadopted pending that alignment; this is not a new scoring interview.
+
+Broad generic product terms and long-tail product terms are both acceptable starting points. Prefer them over brand-specific searches, and distinguish pure shopping-promotion or delivery/navigation phrases from ordinary use/activity vocabulary. Social pain and emotional value can reveal buying reasons but are not mandatory or exclusive criteria. Growth, stable demand and supply gaps remain core hypotheses, without restricting discovery to three labels, sustained-growth lists or potential-market lists. Additional angles extend source-led investigation, not the 100-point score budget.
+
+The latest emphasis remains ten high-quality passing, fully scored cards, with excluded and pending forms outside that count. Reference price stays above USD 30; a higher price is not automatically better and there is no upper cap. Keep the existing 30% boundary and coherent margin-range treatment. The owner also reiterates avoiding high infringement risk. Apply the existing bounded initial rights checks and preserve factual support: this does not establish that every unknown or suspected case is a confirmed legal conflict, or adopt a new numerical cutoff. No runtime filter, score curve, paid-model path or scheduling change follows from this discussion.
+
+The owner then explicitly asks for an impact check across the workflow and scoring, including necessary additions/removals. The [current impact review](../reviews/20261113-scoring-overlap.md) distinguishes changed inputs, unchanged numerical rules and concrete possible rubric gaps. Its recommendation is a proposal: a discovery angle should not become extra points automatically, but a demonstrated omission or duplicate should lead to an explicit versioned correction. The owner has not yet selected a new weight or emotional-value anchor in this discussion.
+
+The next instruction sets the immediate deliverable to a proposal for later owner review, with repository maintenance continuing while the owner is away. Implementation and testing follow review. The adopted progression is one complete passing card, then multiple cards, then ten; the three-card intermediate size in FIRST-RELEASE is the implementer's recommendation. No new acquisition, schedule, score change or automatic execution is authorized by preparing this plan.
+
 ## Batch discovery breadth and staged delivery target — 2026-11-15
 
 The owner asks for substantially more source-backed words using different native lists and screening directions, rather than restricting discovery to sustained growth and potential-market modes. Batch acquisition, relevance assessment and shared research should support useful throughput; raw word count is not a product or card count. Existing five routes and growth/stable/gap hypotheses remain, without mandatory route quotas or a new score bonus.

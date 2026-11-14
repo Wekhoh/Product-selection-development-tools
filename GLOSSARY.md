@@ -12,6 +12,10 @@ _Avoid_: Proven opportunity, arbitrary seed word
 A demand, use or market area being investigated for potential product forms. It may yield several materially different candidates.
 _Avoid_: Candidate when no product form has been defined
 
+**Product search phrase (产品搜索词)**:
+A buyer expression naming a purchasable product type or a product with use, function or attribute qualifiers. Both broad generic terms and long-tail phrases can name products; a phrase alone does not establish demand, a unique candidate or eligible economics.
+_Avoid_: One keyword equals one candidate, promotion or delivery phrases as product identities
+
 **Normal-from-zero newcomer (正常从零起步新品)**:
 A genuinely recent launch whose observed start is suitable as a reference without an inherited older review base. A listing with old reviews clearly predating its purported recent launch falls outside this reference, regardless of the unestablished mechanism behind that history.
 _Avoid_: Source newcomer label alone as proof of a fresh start, a new child as proof of a new family
