@@ -32,6 +32,8 @@ STATE owns the current plan, task status, dependencies, blockers, validation evi
 
 Before resuming after context loss or a handoff, read STATE, inspect the current checkout, then read the requirement/decision/spec sections governing the next task. Preserve settled and withdrawn decisions; ask again only for a new conflict or a genuine remaining choice. At a milestone, update the records and actual acceptance evidence. This is a recovery procedure, not a claim that file presence guarantees automatic context loading.
 
+During execution, use those same governing sections before each consequential stage, not only at handoff. At a milestone, record the adopted decision, what the run actually did, any deviation and its reason, and the evidence needed to close the gap in STATE or its linked private run record. Surface consequential counterevidence and overlooked alternatives proactively; distinguish a proposed improvement from an adopted rule. Do not silently replace a settled business rule or create a second checklist that drifts from the owning records. Routine conforming tool calls need no repetitive documentation entry.
+
 Publish sanitized methods, design and development records to this repository through reviewable changes under the owner's publication instruction. Preserve a visible distinction between local edits, committed changes, remote publication and accepted implementation. Keep business evidence, raw conversations and secrets local under the existing boundary. A document can be published as a draft while its unresolved decisions remain explicit; publication is not production readiness.
 
 ## Reuse before architecture
