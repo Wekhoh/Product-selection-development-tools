@@ -15,6 +15,14 @@ node src/cli.mjs --input fixtures/synthetic-batch.json --profile docs/design/ref
 
 Open `outputs/example/index.html`. These cards are explicitly synthetic. For genuine research use the [input contract](docs/design/TRIAL-INPUT.md), keep the batch and outputs in ignored local directories, and retain original evidence. A missing total stays unknown; supported points are not scaled to 100. The CLI only reads supplied files and does not collect fresh data, spend credits, contact suppliers or change stores.
 
+To include the reviewed source-word-to-form trail, add the optional discovery bundle:
+
+```sh
+node src/cli.mjs --input fixtures/synthetic-batch.json --profile docs/design/reference-profile.draft.json --discovery fixtures/synthetic-discovery.json --output outputs/example-linked
+```
+
+This keeps original source rows and their separate metrics, validates explicit research dispositions and concrete-offer references, and shows the trail beside the existing scores. It does not classify words automatically or add discovery bonuses. The receipt hashes all supplied inputs. Actual research and supplier authentication still run through the authorized tools; a successful offline replay is not unattended discovery acceptance.
+
 ## Start here
 
 - [Project state and next steps](docs/STATE.md) — the single task and recovery record.

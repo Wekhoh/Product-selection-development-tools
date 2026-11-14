@@ -1,5 +1,12 @@
-/** Small adapters for two observed provider ambiguities. No retrieval or scoring. */
+/** Observation validation and small provider adapters. No retrieval or scoring. */
 const finite = n => typeof n === 'number' && Number.isFinite(n);
+
+export function validEvidenceDate(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,9})?)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d))?$/.test(value)) return false;
+  const day = value.slice(0, 10);
+  const parsedDay = Date.parse(`${day}T00:00:00Z`);
+  return Number.isFinite(Date.parse(value)) && Number.isFinite(parsedDay) && new Date(parsedDay).toISOString().slice(0, 10) === day;
+}
 
 export function categoryReturnObservation(ratioComparison) {
   const valid = n => finite(n) && n >= 0 && n <= 100;

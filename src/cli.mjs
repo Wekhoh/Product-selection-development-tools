@@ -6,8 +6,9 @@ import { performance } from 'node:perf_hooks';
 import { parseArgs } from 'node:util';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
+import { prepareDiscovery, attachDiscovery } from './discovery.mjs';
 
-const USAGE = '用法：node src/cli.mjs --input <batch.json> --profile <profile.json> --output <directory>\n';
+const USAGE = '用法：node src/cli.mjs --input <batch.json> --profile <profile.json> [--discovery <bundle.json>] --output <directory>\n';
 const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
 const milliseconds = value => Math.round(value * 1000) / 1000;
 const ioCode = error => typeof error?.code === 'string' && /^[A-Z_]+$/.test(error.code) ? error.code : 'IO_ERROR';
@@ -93,7 +94,7 @@ export async function runCli(args = process.argv.slice(2), streams = { stdout: p
     let values;
     try {
       ({ values } = parseArgs({ args, strict: true, allowPositionals: false, options: {
-        input: { type: 'string' }, profile: { type: 'string' }, output: { type: 'string' }, help: { type: 'boolean' },
+        input: { type: 'string' }, profile: { type: 'string' }, discovery: { type: 'string' }, output: { type: 'string' }, help: { type: 'boolean' },
       } }));
     } catch { throw new CliError(`参数无效。${USAGE.trim()}`); }
     if (values.help) { streams.stdout.write(USAGE); return 0; }
@@ -108,27 +109,36 @@ export async function runCli(args = process.argv.slice(2), streams = { stdout: p
     const inputStart = performance.now();
     const batch = await readJson(batchPath, '输入文件');
     const profile = await readJson(profilePath, '评分配置');
+    const discoveryPath = values.discovery === undefined ? null : resolve(values.discovery);
+    const discovery = discoveryPath ? await readJson(discoveryPath, '发现记录') : null;
     stages.read_inputs = milliseconds(performance.now() - inputStart);
+    const discoveryStart = performance.now();
+    const manifest = discovery ? prepareDiscovery(discovery.value?.pool, discovery.value?.decisions) : null;
+    const boundBatch = manifest ? attachDiscovery(batch.value, manifest) : batch.value;
+    if (manifest) stages.bind_discovery = milliseconds(performance.now() - discoveryStart);
     const scoreStart = performance.now();
-    const result = scoreBatch(batch.value, profile.value);
+    const result = scoreBatch(boundBatch, profile.value);
+    if (manifest) result.discovery = { ...manifest, summary: boundBatch.discovery_summary };
     stages.score = milliseconds(performance.now() - scoreStart);
     const renderStart = performance.now();
-    const htmlBytes = Buffer.from(renderReport(result, batch.value), 'utf8');
+    const htmlBytes = Buffer.from(renderReport(result, boundBatch), 'utf8');
     const resultBytes = Buffer.from(`${JSON.stringify(result, null, 2)}\n`, 'utf8');
     stages.render = milliseconds(performance.now() - renderStart);
     const output = resolve(values.output);
     try { await mkdir(output, { recursive: true }); }
     catch (error) { throw new CliError(`无法创建输出目录（${ioCode(error)}）。`); }
     const canonicalOutput = await realpath(output);
-    const protectedPaths = new Set((await Promise.all([realpath(batchPath), realpath(profilePath)])).map(pathKey));
+    const inputPaths = [batchPath, profilePath, ...(discoveryPath ? [discoveryPath] : [])];
+    const protectedPaths = new Set((await Promise.all(inputPaths.map(path => realpath(path)))).map(pathKey));
     if (['result.json', 'index.html', 'receipt.json'].some(name => protectedPaths.has(pathKey(join(canonicalOutput, name))))) {
-      throw new CliError('输出文件会覆盖输入或评分配置；请选择另一个输出目录。');
+      throw new CliError('输出文件会覆盖输入、评分配置或发现记录；请选择另一个输出目录。');
     }
     const baseReceipt = {
       schema_version: 1, kind: 'offline_trial_execution', run_id: randomUUID(), started_at: startedAt,
       node_version: process.version, profile_revision: profile.value.revision,
       inputs: { batch: { name: basename(batchPath), sha256: sha256(batch.bytes), bytes: batch.bytes.length },
-        profile: { name: basename(profilePath), sha256: sha256(profile.bytes), bytes: profile.bytes.length } },
+        profile: { name: basename(profilePath), sha256: sha256(profile.bytes), bytes: profile.bytes.length },
+        ...(discovery ? { discovery: { name: basename(discoveryPath), sha256: sha256(discovery.bytes), bytes: discovery.bytes.length } } : {}) },
       summary: result.summary, provider_requests: 0, model_requests: 0, network_requests: 0,
     };
     await writeOutputs(canonicalOutput, resultBytes, htmlBytes, baseReceipt, start, stages);

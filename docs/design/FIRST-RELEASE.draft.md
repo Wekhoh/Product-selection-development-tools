@@ -2,7 +2,7 @@
 
 ## Proposed word-to-form flow for owner discussion — 2026-11-15
 
-Status: proposed next-step behavior, not executed or adopted automation. The owner requests alignment before processing the saved larger pool. Existing eligibility, 21 scores, 100 points, modest-volume acceptance and owner-controlled portfolio choice remain unchanged. The ten-card target counts only passing, fully scored candidates.
+Status: approved for bounded implementation and trial after the owner explicitly accepts the word handling and directs execution on 2026-11-15. The following workflow is not yet accepted unattended automation. Existing eligibility, 21 scores, 100 points, modest-volume acceptance and owner-controlled portfolio choice remain unchanged. The ten-card target counts only passing, fully scored candidates. The earlier request to review before execution below preserves chronology and is superseded by this direction.
 
 Owner staging clarification later in this discussion: prepare the proposal and repository records while the owner is away; review it together before implementation and another live trial. First validate one complete passing card, then a small batch, then ten passing cards. The first-card target means an intact, inspectable workflow, not proven commercial success or a guarantee of future profitability.
 

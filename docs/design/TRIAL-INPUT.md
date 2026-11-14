@@ -8,6 +8,20 @@ This is the input/output contract for `src/scoring.mjs`. It implements the bound
 
 ## Evidence and observations
 
+### Optional discovery bundle
+
+`src/discovery.mjs` exports `prepareDiscovery(pool, decisions)` and `attachDiscovery(batch, manifest)`. The CLI accepts `--discovery <bundle.json>` containing `{ pool, decisions }`, demonstrated by the synthetic discovery fixture. The existing batch-only command remains supported. All supplied files are protected from output-name collisions; the execution receipt hashes the optional bundle as well as batch and profile.
+
+`pool.keywords[]` keeps `keyword`, `normalized_key` and nonempty `provenance[]`. Each provenance row needs `source_id`, `source_path` and a nonnegative integer `row_index`; original period, metrics and other source metadata remain unchanged. Exact keys normalize Unicode NFKC, surrounding/repeated whitespace and case. Synonyms are not silently merged; no overlapping search or sales metric is summed. Conflicting identities require reconciliation.
+
+`decisions.assessments[]` contains a sourced keyword, explicit `disposition` and reason. Supported dispositions are `product`, `context`, `brand_specific`, `promotion_only`, `delivery_only`, `seasonal_deferred` and `needs_context`. Missing assessments remain `unreviewed`; they are not products or exclusions by default. These are accountable agent interpretations, not a deterministic language classifier, a new score or a legal finding. Ordinary activities and broad product searches are not blanket exclusions.
+
+`decisions.forms[]` contains `id`, `candidate_id`, `label`, `description`, `lead_keywords` and `offer_evidence`. Every form needs reviewed product/context leads and actual candidate evidence IDs with a source, observation date and inspectable path or HTTP(S) URL. One lead may support several different forms; several leads may support one form. Candidate/form identities must be unambiguous. Binding checks metadata and references, not source truth or local file contents; the researcher still checks actual relevance and source paths. Bound source trails and the full manifest remain available in the report/result without changing any of the 21 scores.
+
+Counts distinguish raw records, unique words, supported/pending/excluded dispositions and bound forms. These are workflow counts, not independent products, demand totals or passing-card counts. Private source pools, decisions and native payloads remain in ignored local storage; only synthetic fixtures belong in the repository.
+
+Each replacement manifest rebuilds generated trails, so omitted forms cannot keep obsolete current-source labels. Older freeform origins that would be replaced are preserved in `discovery_context`; conflicting legacy contexts require reconciliation. Offer observation dates use the same valid ISO calendar-date/timezone-timestamp rule as scoring evidence. The caller retains original input files and the receipt hashes across revisions.
+
 A candidate has a stable `id`, a nonempty concrete `form`, optional `label`, and an `evidence` array. Each evidence entry has a unique `id`, nonempty `source`, and ISO `observed_at`; it may retain a local path/URL, scope and limitations. Real inputs and generated cards belong in ignored local directories. Public examples must be synthetic.
 
 When combining research packets, normalize local evidence paths to the project root and verify they resolve; a child packet's `raw/...` path cannot be copied without its original directory context. Preserve source IDs, original files and hashes. The runner validates declared evidence metadata, not file existence or source truth.

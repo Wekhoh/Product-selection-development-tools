@@ -231,6 +231,17 @@ function bibliography(registry, prefix) {
   return `<ol class="bibliography">${registry.map((entry, index) => `<li id="${prefix}-e${index}"><strong>${sourceLink(string(entry?.source, '未命名来源'), entry?.url ?? entry?.source)}</strong> · ${escape(entry?.observed_at ?? '日期未知')}<p>${escape(string(entry?.scope))}</p>${entry?.path ? `<p class="source">本地记录：${escape(readable(entry.path))}</p>` : ''}${entry?.limitations ? `<p class="muted">限制：${escape(readable(entry.limitations))}</p>` : ''}<span class="source">引用标识：${escape(entry?.id ?? '未知')}</span></li>`).join('')}</ol>`;
 }
 
+function discoveryDetails(discovery, registry, prefix) {
+  if (!discovery || !array(discovery.leads).length) return '';
+  return `<details class="card-details discovery-details"><summary>如何发现这款 · ${escape(array(discovery.leads).length)} 个来源词</summary><div class="details-body"><p><strong>${escape(discovery.label)}</strong>：${escape(discovery.description)}</p><p class="source">款式实物依据：${evidenceLinks(discovery.offer_evidence, registry, prefix)}</p><ul>${array(discovery.leads).map(lead => `<li><strong>${escape(lead?.keyword)}</strong>${typeof lead?.reason === 'string' ? `<p>${escape(lead.reason)}</p>` : ''}<ul>${array(lead?.provenance).map(source => `<li class="source">${escape(source?.source_label ?? source?.source_id)} · ${escape(source?.source_period ?? '期间未返回')}；原始记录：${escape(source?.source_path)}，行索引 ${escape(source?.row_index)}${finite(source?.searches) ? `；搜索量 ${escape(numberText(source.searches))}${typeof source.search_units === 'string' ? `（${escape(source.search_units === 'provider_monthly_search_estimate' ? '来源月估算' : source.search_units)}）` : ''}` : '；搜索量未返回'}。</li>`).join('')}</ul></li>`).join('')}</ul><p class="muted">不同来源的搜索量不相加；这些是发现线索，具体得分仍看下方21项证据。</p></div></details>`;
+}
+
+function discoverySummary(summary) {
+  if (!summary || !finite(summary.unique_keywords)) return '';
+  const seasonal = summary.dispositions?.seasonal_deferred ?? 0;
+  return `<p class="batch-counts">来源词 ${escape(numberText(summary.unique_keywords))} 个；已核对 ${escape(numberText(summary.reviewed_keywords))} 个，待核 ${escape(numberText(summary.pending_keywords - seasonal))} 个，暂缓 ${escape(numberText(seasonal))} 个，搁置专属或无关搜索 ${escape(numberText(summary.excluded_keywords))} 个；已绑定实物候选 ${escape(numberText(summary.bound_candidates))} 个。词数不等于产品数，绑定不代表评分通过。</p>`;
+}
+
 function candidateCard(result, original, index) {
   const presentation = object(original?.presentation);
   const registry = array(result.evidence);
@@ -244,17 +255,19 @@ function candidateCard(result, original, index) {
   const complete = queue === 'comparable' && Array.isArray(result.total_range);
   const incompleteLabel = queue === 'excluded' ? '当前规格已排除，不列完整总分' : queue === 'deferred' ? '本期暂缓，不列完整总分' : '完整总分待补证';
   return `<article class="candidate" id="${prefix}" data-queue="${queue}"><div class="card-top">${image ? `<figure class="product-image"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="320" height="320" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}<div class="card-intro"><div class="card-title"><h2>${escape(result.label ?? result.candidate_id)}</h2><span class="status ${queue}">${QUEUES[queue]}</span></div><p class="form">${escape(result.form ?? '具体可售规格尚待明确')}</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<div class="score-summary">${complete ? `<p class="total">完整总分 <strong>${escape(rangeText(result.total_range))} / 100</strong></p>` : `<p class="total incomplete">${escape(incompleteLabel)}</p>`}<p><strong>已支持分数 ${escape(rangeText(result.supported_range))}</strong>；证据覆盖权重 ${escape(numberText(result.covered_weight))} / 100；未评分权重 ${escape(numberText(result.unscored_weight))}。</p>${result.conditional_total_range ? `<p class="muted">满足准入后可能范围 ${escape(rangeText(result.conditional_total_range))}。这是数学界限，不是已获得总分或预测。</p>` : ''}${result.may_exceed_comparable_leader ? '<p class="priority-note">有效可能上界高于当前完整队列首项的保守端点，值得补证；这不代表已经胜出。</p>' : ''}</div></div></div>
+    ${discoveryDetails(original?.discovery, registry, prefix)}
     ${mainGaps.length ? `<section class="next-evidence"><h3>需要解决的缺口</h3><ul>${mainGaps.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}
     ${screenGaps.length ? `<p class="screen-note">筛选状态：${screenGaps.map(condition => `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : '<p class="screen-note">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}
     <details class="card-details"><summary>查看21项评分与证据 · 8组</summary><div class="details-body">${scoreRows(result, registry, prefix)}${economicDetails(result)}${presentationRows('费用明细补充', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${newcomerDetails(result)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
 }
 
 function batchContext(presentation) {
+  const linkedSummary = discoverySummary(presentation.discovery_summary);
   const discovery = array(presentation.discovery);
   const timings = array(presentation.timings);
   const limitations = array(presentation.limitations);
-  if (!discovery.length && !timings.length && !limitations.length) return '';
-  return `<details class="batch-context"><summary>查看发现路径、耗时与本轮限制</summary><div class="details-body">${discovery.length ? `<h2>发现与覆盖记录</h2><ul>${discovery.map(value => {
+  if (!discovery.length && !timings.length && !limitations.length) return linkedSummary;
+  return `${linkedSummary}<details class="batch-context"><summary>查看发现路径、耗时与本轮限制</summary><div class="details-body">${discovery.length ? `<h2>发现与覆盖记录</h2><ul>${discovery.map(value => {
     if (typeof value === 'string') return `<li>${escape(value)}</li>`;
     const row = object(value);
     return `<li><strong>${escape(string(row.label, '发现记录'))}</strong>${typeof row.detail === 'string' ? `：${escape(row.detail)}` : ''}${typeof row.status === 'string' ? `（${escape(row.status)}）` : ''}${row.source || safeHttpUrl(row.url) ? `<p class="source">${sourceLink(string(row.source, '查看来源'), row.url)}${typeof row.observed_at === 'string' ? ` · ${escape(row.observed_at)}` : ''}</p>` : ''}</li>`;
@@ -272,7 +285,7 @@ const CSS = `
 `;
 
 export function renderReport(result, batch = {}) {
-  const presentation = object(batch?.presentation);
+  const presentation = { ...object(batch?.presentation), discovery_summary: batch?.discovery_summary };
   const candidates = array(result?.candidates);
   const originals = new Map(array(batch?.candidates).map(candidate => [candidate?.id, candidate]));
   const title = string(presentation.title, '选品试评记录');

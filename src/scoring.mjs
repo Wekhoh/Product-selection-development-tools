@@ -1,4 +1,5 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
+import { validEvidenceDate as validDate } from './observations.mjs';
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -16,12 +17,6 @@ const EXPECTED_GROUPS = ['profit', 'suggested_bid_pressure', 'niche_demand', 'ma
 
 const text = value => typeof value === 'string' && value.trim().length > 0;
 const number = value => typeof value === 'number' && Number.isFinite(value);
-function validDate(value) {
-  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}(?:T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d{1,9})?)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d))?$/.test(value)) return false;
-  const day = value.slice(0, 10);
-  const parsedDay = Date.parse(`${day}T00:00:00Z`);
-  return Number.isFinite(Date.parse(value)) && Number.isFinite(parsedDay) && new Date(parsedDay).toISOString().slice(0, 10) === day;
-}
 const addRanges = (a, b) => [a[0] + b[0], a[1] + b[1]];
 const span = values => [Math.min(...values), Math.max(...values)];
 const point = range => range[0] === range[1] ? range[0] : null;

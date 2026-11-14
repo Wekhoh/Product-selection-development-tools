@@ -2,6 +2,8 @@
 
 ## Product words, additional discovery angles and discussion boundary — 2026-11-15
 
+Later explicit acceptance: after clarifying delivery-only words, the owner approves handling them, brand-specific and pure promotion terms as discussed, authorizes trying the source-to-form flow and delegates routine implementation choices. Resume bounded execution; the earlier pause in this section is historical. The owner permits relevant SellerSprite/SIF cross-checks and Amazon buyer-front verification of missing/uncertain ratings. Explicit source/displayed zeros are valid; missing fields or sign-in-only views are not converted to zero. This does not change the 21-item scoring package or authorize store-account changes.
+
 The owner asks to align how a large sourced word pool becomes concrete products before executing that step. Pause dependent interpretation/research, preserve saved responses and continue read-only fault attribution and records. The proposal lives in FIRST-RELEASE and remains unadopted pending that alignment; this is not a new scoring interview.
 
 Broad generic product terms and long-tail product terms are both acceptable starting points. Prefer them over brand-specific searches, and distinguish pure shopping-promotion or delivery/navigation phrases from ordinary use/activity vocabulary. Social pain and emotional value can reveal buying reasons but are not mandatory or exclusive criteria. Growth, stable demand and supply gaps remain core hypotheses, without restricting discovery to three labels, sustained-growth lists or potential-market lists. Additional angles extend source-led investigation, not the 100-point score budget.
