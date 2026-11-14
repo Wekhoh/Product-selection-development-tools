@@ -1,5 +1,13 @@
 # Design decisions and open questions
 
+## Batch discovery breadth and staged delivery target — 2026-11-15
+
+The owner asks for substantially more source-backed words using different native lists and screening directions, rather than restricting discovery to sustained growth and potential-market modes. Batch acquisition, relevance assessment and shared research should support useful throughput; raw word count is not a product or card count. Existing five routes and growth/stable/gap hypotheses remain, without mandatory route quotas or a new score bonus.
+
+The owner describes ten cards per later delivery, then explicitly corrects the implementer's misunderstanding: the ten must be passing, fully scored candidate cards. Rejected forms are a separate review list and cannot count toward the ten; pending cards cannot count either. The initial interpretation that ten could include rejections is withdrawn. This adopts no new overall-score passing line and does not establish commercial viability. The present milestone remains first to make discovery, scoring and card correctness work across categories; ten is the later measured target, not a current throughput promise. Do not hold concrete blockers until ten cards exist. No new cadence, scheduler, score curve or automatic spending path is adopted.
+
+The owner reaffirms early rejection when even the highest supported gross-margin scenario is below 30%. The current scorer already implements this boundary; there is no formula change. Applicable coherent initial-scope costs must support the interval. Do not reject a whole market from one failed supply form, replace missing costs with zero, or use a category average price/margin as the chosen form's economics. A range crossing 30% keeps the existing pending-evidence treatment. Preserve the rejected form's calculated amounts, source and reason so failures can inform later calibration.
+
 ## Implemented trial package under simplification delegation — revision 51
 
 The owner delegates simplifying the initial workflow and directs real replay on 2026-11-15. The implementer selects the coherent package documented in Q31: retain 21 weights/100 points, use current relevant-category examples and an independent all-age sales median, rescale the actual-rating component to four points, retire the relative-rating median, and permit guarded single/observed-zero cases. The native 3/2 ratios, best-capped-example preference, fixed-example natural-share curve, price/margin gates and ordering remain. These are explicit trial implementation choices under delegation, not new numerical answers attributed to the owner. Independent review and real replay precede calibration; original revision50 files/results remain available.
