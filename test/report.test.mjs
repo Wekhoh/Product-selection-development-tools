@@ -27,6 +27,20 @@ test('Chinese cards distinguish complete point/range totals from supported parti
   assert.match(html, /原始精确竞价/);
 });
 
+test('cards display a supported demand interval and its basis rather than an unknown or midpoint input', () => {
+  const batch = structuredClone(fixture);
+  Object.assign(batch.candidates[0].metrics.purchase_demand_scale, {
+    value: null, value_range: [100, 500], coherent: true,
+    range_basis: '同一合成样本的有据范围 <bound>',
+  });
+  const html = renderReport(scoreBatch(batch, profile), batch);
+  const row = html.match(/data-item-id="purchase_demand_scale"[\s\S]*?<p class="source">/)?.[0];
+  assert.match(row, /1–2 \/ 4 分/);
+  assert.match(row, /100–500 件/);
+  assert.match(row, /同一合成样本的有据范围 &lt;bound&gt;/);
+  assert.doesNotMatch(row, /输入：未知|输入：300/);
+});
+
 test('untrusted copy is escaped, source URLs are limited to HTTP(S), and SVG or remote images are omitted', () => {
   const batch = structuredClone(fixture);
   const attack = '<img src=x onerror="alert(1)"><script>alert(2)</script>';
@@ -38,6 +52,7 @@ test('untrusted copy is escaped, source URLs are limited to HTTP(S), and SVG or 
   batch.candidates[0].presentation.image_data_uri = 'data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=';
   batch.candidates[0].presentation.blockers = [{ problem: attack, next_step: attack }];
   batch.candidates[0].presentation.procurement = [{ label: attack, value: attack, source: attack, url: 'file:///private-record' }];
+  batch.candidates[0].presentation.market_references = [{ label: attack, value: attack, note: attack, url: 'javascript:alert(1)' }];
   batch.candidates[0].evidence[0].url = 'data:text/html,<script>alert(3)</script>';
   const html = renderReport(scoreBatch(batch, profile), batch);
   assert.ok(html.includes('&lt;img src=x onerror=&quot;alert(1)&quot;&gt;'));

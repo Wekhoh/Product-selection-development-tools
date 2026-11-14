@@ -71,6 +71,22 @@ function completeCandidate(id = 'synthetic-complete') {
   };
 }
 
+test('supported demand intervals preserve score and total ranges without inventing a point', () => {
+  const candidate = completeCandidate();
+  Object.assign(candidate.metrics.purchase_demand_scale, {
+    value: null, value_range: [100, 500], coherent: true,
+    range_basis: 'Synthetic bounds for the same observed niche, period and family population.',
+  });
+  const result = scoreCandidate(candidate, profile);
+  const demand = item(result, 'purchase_demand_scale');
+  assert.equal(demand.status, 'scored');
+  assert.equal(demand.score, null);
+  assert.deepEqual(demand.score_range, [1, 2]);
+  assert.equal(result.covered_weight, 100);
+  assert.equal(result.total, null);
+  assert.deepEqual(result.total_range, [97, 98]);
+});
+
 test('a candidate with unknown evidence retains all 21 gaps without creating a total', () => {
   const result = scoreCandidate({ id: 'synthetic-unknown', form: 'Synthetic saleable form', evidence: [] }, profile);
   assert.equal(result.items.length, 21);
@@ -82,6 +98,28 @@ test('a candidate with unknown evidence retains all 21 gaps without creating a t
   assert.equal(result.unscored_weight, 100);
   assert.deepEqual(result.conditional_total_range, [0, 100]);
   assert.equal(result.queue, 'pending');
+});
+
+test('unsupported or contradictory demand ranges remain evidence gaps and capped ranges can have one score', () => {
+  const candidate = completeCandidate();
+  const metric = candidate.metrics.purchase_demand_scale;
+  Object.assign(metric, { value: null, value_range: [5000, 7000], coherent: true, range_basis: 'Synthetic same-population bounds.' });
+  const capped = scoreCandidate(candidate, profile);
+  assert.equal(item(capped, 'purchase_demand_scale').score, 4);
+  assert.equal(capped.total, 100);
+  for (const patch of [
+    { value_range: [500, 100] }, { value_range: [-1, 500] }, { value_range: [100, null] },
+    { value_range: [100, '500'] }, { value_range: [100, Infinity] }, { value_range: [100] },
+    { value: 500 }, { coherent: false }, { range_basis: '' }, { unit: 'USD' },
+    { evidence: [] }, { supported: false }, { material_conflict: true }, { coverage_supported: false },
+  ]) {
+    const invalid = structuredClone(candidate);
+    Object.assign(invalid.metrics.purchase_demand_scale, patch);
+    const result = scoreCandidate(invalid, profile);
+    assert.equal(item(result, 'purchase_demand_scale').status, 'needs_evidence', JSON.stringify(patch));
+    assert.equal(result.total_range, null);
+    assert.equal(result.covered_weight, 96);
+  }
 });
 
 test('supported demand, return proxy and rubric anchors retain their original points and gaps', () => {

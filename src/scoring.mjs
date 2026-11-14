@@ -173,6 +173,18 @@ function scoreMetric(item, input, ctx) {
     validScope = input?.applicable === true && text(input.category) && text(input.period);
   }
   if (!validScope) return missing(item, input?.reason ?? 'Required metric scope, period or applicability is unsupported.', input);
+  if (item.id === 'purchase_demand_scale' && Object.hasOwn(input, 'value_range')) {
+    const range = input.value_range;
+    if (input.value != null || input.coherent !== true || !text(input.range_basis) ||
+      !Array.isArray(range) || range.length !== 2 || !range.every(number) || range[0] > range[1]) {
+      return missing(item, 'Demand bounds need one supported coherent population and an explained range, without a competing point.', input);
+    }
+    const readings = range.map(value => readNumber({ ...input, value }, 'units', ctx));
+    const invalid = readings.find(reading => reading.value === null);
+    if (invalid) return missing(item, invalid.reason, input);
+    const scoreRange = range.map(value => numericScore(item, value));
+    return scored(item, point(scoreRange), input, { score_range: scoreRange });
+  }
   const reading = readNumber(input, item.id === 'purchase_demand_scale' ? 'units' : 'fraction', ctx,
     { max: item.id === 'purchase_demand_scale' ? Infinity : 1 });
   return reading.value === null ? missing(item, reading.reason, input) : scored(item, numericScore(item, reading.value), input);

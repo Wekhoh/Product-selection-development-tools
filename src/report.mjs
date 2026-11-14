@@ -36,6 +36,7 @@ const REASONS = new Map([
   ['Observation has unresolved support or conflict.', '这项观察尚未得到支持，或仍有实质冲突。'],
   ['Observation needs valid source/date evidence references and a concrete form.', '缺少有效来源、日期或具体可售规格。'],
   ['Required metric scope, period or applicability is unsupported.', '指标的市场范围、观察期间或适用性尚不明确。'],
+  ['Demand bounds need one supported coherent population and an explained range, without a competing point.', '需求范围须对应同一有据样本，并说明上下限依据；不能同时混填单点或倒序区间。'],
   ['A bounded judgment needs a reason and valid evidence references.', '该判断需要具体理由和有效证据。'],
   ['A common saleable unit and nonempty supported economic scenario set are required.', '尚缺统一可售单位下的费用情景。'],
   ['Economic scenarios need unique IDs, the same saleable unit, coherent inputs and explicit assumptions.', '费用情景的规格、可售单位、假设或编号存在未解决的问题。'],
@@ -197,6 +198,10 @@ function inputSummary(item) {
   if (item.id === 'natural_visibility_development') return '固定使用少评价销售表现选定的同一对示例，不因自然占比或数据更容易获得而换例。';
   if (['refund_adjusted_pre_ad_margin', 'unit_contribution'].includes(item.id)) return '完整情景尚待补证，已有金额和缺口见费用情景。';
   if (Object.hasOwn(input, 'anchor')) return input.anchor === null ? '判断档位：待补证' : `采用有据档位 ${readable(input.anchor)} / ${item.weight}`;
+  if (item.id === 'purchase_demand_scale' && Array.isArray(input.value_range)) {
+    const scope = ['niche', 'period'].map(key => string(input[key])).filter(Boolean).join('；');
+    return `输入范围：${rangeText(input.value_range)}${input.unit === 'units' ? ' 件' : ''}；${string(input.range_basis, '范围依据待补证')}${scope ? `；${scope}` : ''}`;
+  }
   if (Object.hasOwn(input, 'value')) {
     const scope = ['niche', 'category', 'period'].map(key => string(input[key])).filter(Boolean).join('；');
     return `输入：${observed(input)}${scope ? `；${scope}` : ''}`;
@@ -234,7 +239,7 @@ function candidateCard(result, original, index) {
   return `<article class="candidate" id="${prefix}" data-queue="${queue}"><div class="card-top">${image ? `<figure class="product-image"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="320" height="320" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}<div class="card-intro"><div class="card-title"><h2>${escape(result.label ?? result.candidate_id)}</h2><span class="status ${queue}">${QUEUES[queue]}</span></div><p class="form">${escape(result.form ?? '具体可售规格尚待明确')}</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<div class="score-summary">${complete ? `<p class="total">完整总分 <strong>${escape(rangeText(result.total_range))} / 100</strong></p>` : `<p class="total incomplete">${escape(incompleteLabel)}</p>`}<p><strong>已支持分数 ${escape(rangeText(result.supported_range))}</strong>；证据覆盖权重 ${escape(numberText(result.covered_weight))} / 100；未评分权重 ${escape(numberText(result.unscored_weight))}。</p>${result.conditional_total_range ? `<p class="muted">满足准入后可能范围 ${escape(rangeText(result.conditional_total_range))}。这是数学界限，不是已获得总分或预测。</p>` : ''}${result.may_exceed_comparable_leader ? '<p class="priority-note">有效可能上界高于当前完整队列首项的保守端点，值得补证；这不代表已经胜出。</p>' : ''}</div></div></div>
     ${mainGaps.length ? `<section class="next-evidence"><h3>需要解决的缺口</h3><ul>${mainGaps.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}
     ${screenGaps.length ? `<p class="screen-note">筛选状态：${screenGaps.map(condition => `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : '<p class="screen-note">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}
-    <details class="card-details"><summary>查看21项评分与证据 · 8组</summary><div class="details-body">${scoreRows(result, registry, prefix)}${economicDetails(result)}${presentationRows('费用明细补充', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${newcomerDetails(result)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
+    <details class="card-details"><summary>查看21项评分与证据 · 8组</summary><div class="details-body">${scoreRows(result, registry, prefix)}${economicDetails(result)}${presentationRows('费用明细补充', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${newcomerDetails(result)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
 }
 
 function batchContext(presentation) {
