@@ -6,6 +6,8 @@ Current reading rule (2026-11-13): the discussion sequence below preserves earli
 
 ## Outcome
 
+Current marketplace scope, clarified 2026-11-14: support the United States. Other countries' freight and marketplace adaptation are outside the current work; retaining their tabs in a source workbook does not require implementing them.
+
 Proactively discover multiple promising physical product forms from real demand evidence, investigate them, apply the agreed multidimensional scoring rules, and deliver ranked, inspectable selection cards for the owner's review. The owner reaffirmed daily automatic discovery and card delivery on 2026-11-11: the first release must not require a daily owner prompt, a supplied category or keyword, or a manually selected candidate before discovery and evaluation can proceed. Support configurable preferences and comparison across genuinely substitutable niches. The reference profile is one trial profile, not a universal commercial standard.
 
 Daily operation is a product requirement, not a claim of an implemented scheduler or an authorization to activate one now. Subscription-backed Codex execution, runtime availability, request recovery, usage and delivery must be demonstrated for the selected arrangement. A manual-only category research assistant does not satisfy this outcome. The owner can still make additional focused requests and discuss the delivered cards.
