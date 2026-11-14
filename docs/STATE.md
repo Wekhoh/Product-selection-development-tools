@@ -1,5 +1,13 @@
 # Project state
 
+## Initial-estimate implementation guidance — 2026-11-14
+
+Reinspect retained source material before labeling evidence unavailable. Initial assessments may use the already agreed comparable-package proxy and supported, explicitly stated cost scenarios. Future realized turnover, recovery and account settlement are later reconciliation inputs, not prerequisites for making an initial estimate. A starting tariff does not establish a complete cost bound; retain its scope and unresolved conditions.
+
+Bounded rights and requirements checks are separate from exhaustive clearance and final supplier certification. Preserve concrete unresolved issues rather than silently changing scoring weights or substituting a score for missing evidence. Published scoring rules remain unchanged.
+
+Detailed execution findings, candidate-level corrections, figures, quotations and recovery artifacts stay in the ignored local trial records under `.local/trials/`; they are not public release material. Check those existing records when resuming the active follow-up. Publish only reusable methods, implementation and synthetic fixtures.
+
 ## Active discovery-to-card implementation trial — 2026-11-14
 
 Current owner outcome supersedes the definition-only checkpoint below: execute the full path from sourced proactive discovery through research, all 21 revision-50 scoring items and readable cards. Reuse the saved real cohort and resolved request records; add a bounded fresh discovery path rather than presenting a selected-product replay as discovery. Measure collection/research/calculation elapsed time and coverage, expose concrete blockers, and calibrate after the owner sees the results. SellerSprite/SIF retrieval and ordinary agent-browser/Playwright access to domestic 1688 are explicitly authorized. Preserve supplier-message, purchase, store-write and scheduler boundaries.
