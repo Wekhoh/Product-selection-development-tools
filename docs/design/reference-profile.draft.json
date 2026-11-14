@@ -768,6 +768,14 @@
     "packaging": "Use a coherent matched-spec packed dimension/weight tuple; show actual and dimensional weight with the applicable freight and fulfillment rules separately.",
     "fee_fx_and_return_inputs": "Retain source, applicable period, units and uncertainty; no invented current rates or zero-filled missing data.",
     "initial_margin_estimate": {
+      "owner_scope_20261114": {
+        "basis": "Normal-operation initial estimate; revision-50 numerical score curves remain unchanged.",
+        "deferred_return_outcomes": ["unsupported removal/disposal incidence", "resale/refurbishment and recovered-inventory value", "additional unrecoverable-loss proportions"],
+        "accounting": "Keep originally shipped goods costs once, with no speculative recovery credit or duplicate goods loss. Defer disposition expense and recovery credit together, preserving null underlying amounts and explicit scope. Known platform refund/fulfillment fees remain included; the category return rate remains a labeled full-refund proxy.",
+        "conditional_events": "Record triggers and supported event costs for unobserved operational exceptions without inventing incidence. Their unknown frequency does not block normal-operation margin; fees known to apply to the selected base scenario still belong in it.",
+        "stock_planning": "Three months is total mature supply across FBA, in-transit and domestic stock after validation, not first-batch quantity or average FBA inventory.",
+        "fee_category": "Keep BSR/browse market and Amazon fee category separate; label actual fee-report assignment versus supported guideline-based estimate. Apply current effective dates and avoid adding calculator-included surcharges twice."
+      },
       "presentation": "A supported margin interval, narrowed where practical; not a falsely exact realized margin.",
       "price_and_procurement": "Use matched-spec competitor price evidence and comparable supplier price tiers; retain plausible variation without mixing different products, quantities or unsupported high prices.",
       "packaging_estimate": "For initial 1688 ready-stock estimates, use the matched-spec quoted purchase price directly for the combined procurement-and-packaging amount, treating carton and labor as included. Do not add a separate carton, foam, corner-protector, insert or packaging/assembly-labor estimate, or require separate carton-price research first. Preserve CNY source prices and dated FX. Other applicable freight, platform and return costs remain in the margin calculation. Later actual costs may replace or adjust this initial estimate. This is the owner's selected initial accounting convention, not verified realized margin or a universal statement about supplier quotes.",

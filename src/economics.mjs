@@ -40,23 +40,33 @@ export function calculateEconomics(input) {
   const map = new Map();
   for (const line of lines) {
     if (!REQUIRED_COSTS.includes(line.id) || map.has(line.id)) throw new TypeError(`Unknown or duplicate cost: ${line.id}`);
-    if (!['sourced', 'estimated', 'not_applicable', 'pending'].includes(line.status) ||
+    if (!['sourced', 'estimated', 'not_applicable', 'pending', 'deferred'].includes(line.status) ||
       typeof line.basis !== 'string' || !line.basis.trim()) throw new TypeError(`Cost status and basis required: ${line.id}`);
     if (line.amount_usd !== null && (!finite(line.amount_usd) || line.amount_usd < 0)) throw new TypeError(`Invalid amount: ${line.id}`);
     if (line.status === 'not_applicable' && line.amount_usd !== 0) throw new TypeError(`Not-applicable cost must be explicit zero: ${line.id}`);
     map.set(line.id, line);
   }
-  const pending = REQUIRED_COSTS.filter(k => !map.has(k) || map.get(k).amount_usd === null || map.get(k).status === 'pending');
+  const deferred = REQUIRED_COSTS.filter(k => map.get(k)?.status === 'deferred');
+  if (deferred.length) {
+    if (deferred.length !== 2 || !deferred.includes('returns_disposal') || !deferred.includes('recovery_credit')) {
+      throw new TypeError('Only paired return disposition and recovery may be deferred from the initial estimate');
+    }
+    if (deferred.some(k => map.get(k).amount_usd !== null)) {
+      throw new TypeError('Deferred outcomes must retain null amounts, not asserted zeros');
+    }
+  }
+  const pending = REQUIRED_COSTS.filter(k => !deferred.includes(k) &&
+    (!map.has(k) || map.get(k).amount_usd === null || map.get(k).status === 'pending'));
   let known = 0;
   for (const [key, line] of map) {
-    if (!pending.includes(key)) known += (key === 'recovery_credit' ? -1 : 1) * line.amount_usd;
+    if (!pending.includes(key) && !deferred.includes(key)) known += (key === 'recovery_credit' ? -1 : 1) * line.amount_usd;
   }
   const net = p * (1 - r), complete = pending.length === 0;
   const cost = complete ? known : null, contribution = complete ? net - cost : null;
   const supported = complete && input.sensitivity_only !== true;
   return { id, saleable_unit, assumptions, lines, price_usd: p, refund_fraction: r,
     expected_refund_usd: round(p * r), net_revenue_usd: round(net),
-    known_cost_usd: round(known), pending_lines: pending,
+    known_cost_usd: round(known), pending_lines: pending, deferred_lines: deferred,
     net_cost_usd: complete ? round(cost) : null,
     contribution_usd: complete ? round(contribution) : null,
     margin: complete ? contribution / net : null,
@@ -66,6 +76,7 @@ export function calculateEconomics(input) {
     // This cap holds the supplied recovery credit fixed; it is not a procurement quote.
     procurement_cap_at_30pct_usd: complete ? round(net * 0.7 - (cost - map.get('procurement').amount_usd)) : null,
     scoring_supported: supported,
-    status: !complete ? 'pending_costs' : supported ? 'conditional_estimate' : 'sensitivity_only',
+    status: !complete ? 'pending_costs' : !supported ? 'sensitivity_only' :
+      deferred.length ? 'initial_estimate_with_deferred_returns' : 'conditional_estimate',
   };
 }

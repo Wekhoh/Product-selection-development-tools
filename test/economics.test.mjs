@@ -36,6 +36,49 @@ test('a missing applicable cost blocks complete margin, while evidenced zero rem
   assert.equal(out.procurement_cap_at_30pct_usd, null);
 });
 
+test('an explicit paired return deferral produces a labeled initial estimate without claiming zero outcomes', () => {
+  const input = fixture();
+  for (const id of ['returns_disposal', 'recovery_credit']) {
+    Object.assign(input.lines.find(x => x.id === id), {
+      amount_usd: null, status: 'deferred', basis: 'Owner defers unsupported return outcomes from initial estimate',
+    });
+  }
+  const out = calculateEconomics(input);
+  assert.equal(out.margin, 0.375);
+  assert.equal(out.net_cost_usd, 30);
+  assert.equal(out.scoring_supported, true);
+  assert.equal(out.status, 'initial_estimate_with_deferred_returns');
+  assert.deepEqual(out.deferred_lines, ['returns_disposal', 'recovery_credit']);
+  assert.deepEqual(out.pending_lines, []);
+  assert.equal(out.lines.find(x => x.id === 'returns_disposal').amount_usd, null);
+  assert.equal(out.lines.find(x => x.id === 'recovery_credit').amount_usd, null);
+});
+
+test('initial return scope cannot hide a required cost or retain a one-sided recovery benefit', () => {
+  const missingFreight = fixture();
+  for (const id of ['returns_disposal', 'recovery_credit']) {
+    Object.assign(missingFreight.lines.find(x => x.id === id), { amount_usd: null, status: 'deferred' });
+  }
+  Object.assign(missingFreight.lines.find(x => x.id === 'headhaul'), { amount_usd: null, status: 'pending' });
+  const out = calculateEconomics(missingFreight);
+  assert.equal(out.margin, null);
+  assert.equal(out.scoring_supported, false);
+  assert.deepEqual(out.pending_lines, ['headhaul']);
+  assert.deepEqual(out.deferred_lines, ['returns_disposal', 'recovery_credit']);
+
+  const unauthorized = fixture();
+  Object.assign(unauthorized.lines.find(x => x.id === 'procurement'), { amount_usd: null, status: 'deferred' });
+  assert.throws(() => calculateEconomics(unauthorized), /paired return disposition/);
+  const oneSided = fixture();
+  Object.assign(oneSided.lines.find(x => x.id === 'returns_disposal'), { amount_usd: null, status: 'deferred' });
+  assert.throws(() => calculateEconomics(oneSided), /paired return disposition/);
+  const withAmount = fixture();
+  for (const id of ['returns_disposal', 'recovery_credit']) {
+    Object.assign(withAmount.lines.find(x => x.id === id), { amount_usd: 0, status: 'deferred' });
+  }
+  assert.throws(() => calculateEconomics(withAmount), /null amounts/);
+});
+
 test('refund commission credits and administration are netted once', () => {
   assert.deepEqual(netReferral({ price_usd: 50, refund_fraction: 0.08, referral_fraction: 0.15,
     refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 }),
