@@ -2,6 +2,8 @@
 
 ## Initial-estimate implementation guidance — 2026-11-14
 
+Current narrow follow-up: resolve one blocker at a time, starting with the freight input to the profit group. A retained carrier workbook supplies explicit chargeable-weight and surcharge rules; its current price validity is not yet verified. Keep the calculation method, dated tariff example and current executable quote distinct. Do not transfer sea-express minimum-carton rules to a sea-truck channel, or confuse the saleable package with a shipping master carton. Detailed readback and the pending current-tariff input remain in the existing ignored follow-up record. No scoring input or mapping changed at this step.
+
 Reinspect retained source material before labeling evidence unavailable. Initial assessments may use the already agreed comparable-package proxy and supported, explicitly stated cost scenarios. Future realized turnover, recovery and account settlement are later reconciliation inputs, not prerequisites for making an initial estimate. A starting tariff does not establish a complete cost bound; retain its scope and unresolved conditions.
 
 Bounded rights and requirements checks are separate from exhaustive clearance and final supplier certification. Preserve concrete unresolved issues rather than silently changing scoring weights or substituting a score for missing evidence. Published scoring rules remain unchanged.
