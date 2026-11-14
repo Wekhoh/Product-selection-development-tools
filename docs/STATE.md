@@ -1,6 +1,6 @@
 # Project state
 
-Updated: 2026-11-14. API worktree checkpoint: reviewed evidence-review handoff prepared; no implementation or live invocation.
+Updated: 2026-11-14. API worktree checkpoint: two reviewed documents adopted in the selection working tree; optional enhancement remains inactive and no implementation is commissioned.
 
 ## Current API-seat recovery checkpoint
 
@@ -12,9 +12,13 @@ The integration checkout's `docs/STATE.md` remains the maintained project-wide r
 
 Current evidence: all 23 preserved API source/test/dependency/reference files still match their migration manifest and original files. The known canonical local ledger and saved receipt records were inspected read-only; no pending hold was observed within that scope, but account-wide reconciliation, posted billing, promotional balance and model eligibility remain unverified. One historical native rejection has only its embedded ledger receipt verified. Detailed private observations and recovery pointers are in `.local/api-integration/preparation/openai-enhancement-recovery.2026-11-14.json`; do not publish that file. Source inspection is targeted, not an end-to-end semantic audit or runtime acceptance.
 
-Reviewed delivery: [optional evidence-review contract](api/EVIDENCE-REVIEW-CONTRACT.draft.md) and [current official options/reuse investigation](api/OFFICIAL-OPENAI-OPTIONS.2026-11-14.md). The single recommendation is a bounded Responses review of comparison membership and evidence consistency using the maintained official SDK, retaining caller-owned scores and the subscription-backed main flow. Independent review accepted the documentation candidate with no material finding; its fixed hashes and limits are recorded in `.local/api-integration/preparation/evidence-review-independent-review.2026-11-14.md`. Relative-link, whitespace and bounded privacy-pattern checks passed. No runtime tests, provider requests, credential moves or ledger mutations were performed. The private delivery receipt records the eventual fixed commit and dispatch.
+Reviewed delivery: [optional evidence-review contract](api/EVIDENCE-REVIEW-CONTRACT.draft.md) and [current official options/reuse investigation](api/OFFICIAL-OPENAI-OPTIONS.2026-11-14.md), fixed at `dca8349989fde2bc34f2edaf849cbd5e2b97a33c`. The single recommendation is a bounded Responses review of comparison membership and evidence consistency using a maintained official SDK, retaining caller-owned scores and the subscription-backed main flow. Independent review accepted the documentation candidate with no material finding; its fixed hashes and limits are recorded in `.local/api-integration/preparation/evidence-review-independent-review.2026-11-14.md`. Relative-link, whitespace and bounded privacy-pattern checks passed. No runtime tests, provider requests, credential moves or ledger mutations were performed. The private delivery receipt records the fixed commit, dispatch and subsequent adoption readback.
 
-Next ownership boundary: deliver the reviewed branch documents and private receipt pointer to selection development, which decides adoption against the real trial bottleneck. A future commissioned offline adapter/caller slice and separately authorized bounded live acceptance remain unimplemented. Live policy still needs verified account/model/funding, disclosed packet/retention, current cost bounds and canonical-state reconciliation; the reported credit is not a verified allowance. This checkpoint does not ask the owner to repeat prior approvals or choose hypothetical infrastructure.
+Adoption readback: selection development reported local adoption on `codex/full-score-trial-r50`. A read-only check confirmed both working-tree files normalize to the delivered Git blobs; they were untracked at that observation, so this is local document adoption, not a committed or published release. This worktree's `STATE.md` was not transferred. Preserve the reviewed candidate files and the integration seat's own state.
+
+Current ownership boundary: selection development reports that semantic comparison review is useful, while matched procurement/fees and newcomer-reference coverage are the immediate trial gaps. It retains this enhancement as researched but inactive and commissions no module or live call. Its current implementation is reported as a Node 24 built-in-module offline scoring/Chinese-card CLI with native Codex tools for research. Any future API caller must fit that runtime; this handoff does not add another language stack. Selection development will supply a fixed anonymous packet and acceptance criteria if a concrete caller is needed.
+
+A future commissioned offline adapter/caller slice and separately authorized bounded live acceptance remain unimplemented. Live policy still needs verified account/model/funding, disclosed packet/retention, current cost bounds and canonical-state reconciliation; the reported credit is not a verified allowance. Existing credentials and ledgers remain in place. No acknowledgement message or new investigation is required by the adoption receipt.
 
 ## Objective and settled scope
 
@@ -51,7 +55,7 @@ Use this record as the single project task/recovery entry. Coordinate assignment
 
 ## Next work
 
-1. Deliver the reviewed optional evidence-review investigation at a fixed branch commit; adoption and the next concrete implementation assignment belong to selection development.
+1. Retain the fixed reviewed documents and private delivery/recovery evidence. Selection development owns the current trial and the next concrete API implementation assignment; none is queued here.
 2. Keep the API worktree separate. Use the integration checkout's current state for product decisions; the historical migration table is not the current application status.
 3. Reuse relevant invariants and focused regression scenarios from the inactive reference material in `API-MIGRATION.md`; do not install the former workflow wholesale.
 4. Only a later commissioned implementation may adapt code. A bounded offline caller and independent review precede separately authorized live acceptance with reconciled shared spending and original request identities.
