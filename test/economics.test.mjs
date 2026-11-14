@@ -85,6 +85,29 @@ test('refund commission credits and administration are netted once', () => {
   { gross_usd: 7.5, refund_credit_usd: 0.6, administration_usd: 0.12, net_usd: 7.02 });
 });
 
+test('an explicitly deferred domestic delivery cost stays unknown while the initial estimate can be scored', () => {
+  const input = fixture();
+  Object.assign(input.lines.find(x => x.id === 'domestic_freight'), {
+    amount_usd: null, status: 'deferred', basis: 'Owner excludes domestic delivery from the initial screen; verify after retention',
+  });
+  const out = calculateEconomics(input);
+  assert.equal(out.net_cost_usd, 30);
+  assert.equal(out.margin, 0.375);
+  assert.equal(out.scoring_supported, true);
+  assert.equal(out.status, 'initial_estimate_with_deferred_costs');
+  assert.deepEqual(out.deferred_lines, ['domestic_freight']);
+  assert.equal(out.lines.find(x => x.id === 'domestic_freight').amount_usd, null);
+
+  for (const id of ['returns_disposal', 'recovery_credit']) {
+    Object.assign(input.lines.find(x => x.id === id), { amount_usd: null, status: 'deferred' });
+  }
+  assert.equal(calculateEconomics(input).margin, 0.375);
+  Object.assign(input.lines.find(x => x.id === 'procurement'), { amount_usd: null, status: 'pending' });
+  assert.equal(calculateEconomics(input).scoring_supported, false);
+  input.lines.find(x => x.id === 'domestic_freight').amount_usd = 0;
+  assert.throws(() => calculateEconomics(input), /null amounts/);
+});
+
 test('collection uses the Amazon payout estimate, not selling price or product profit', () => {
   const result = collectionFromDisbursement({ net_revenue_usd: 48, amazon_deductions_usd: [7.2, 5, 1, 0.5, 0.3], rate: 0.006 });
   assert.equal(result.estimated_disbursement_usd, 34);

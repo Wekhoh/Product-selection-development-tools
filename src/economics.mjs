@@ -48,8 +48,10 @@ export function calculateEconomics(input) {
   }
   const deferred = REQUIRED_COSTS.filter(k => map.get(k)?.status === 'deferred');
   if (deferred.length) {
-    if (deferred.length !== 2 || !deferred.includes('returns_disposal') || !deferred.includes('recovery_credit')) {
-      throw new TypeError('Only paired return disposition and recovery may be deferred from the initial estimate');
+    const returns = deferred.filter(k => k === 'returns_disposal' || k === 'recovery_credit');
+    if (deferred.some(k => !['domestic_freight', 'returns_disposal', 'recovery_credit'].includes(k)) ||
+      (returns.length !== 0 && returns.length !== 2)) {
+      throw new TypeError('Only domestic freight or paired return disposition and recovery may be deferred from the initial estimate');
     }
     if (deferred.some(k => map.get(k).amount_usd !== null)) {
       throw new TypeError('Deferred outcomes must retain null amounts, not asserted zeros');
@@ -77,6 +79,7 @@ export function calculateEconomics(input) {
     procurement_cap_at_30pct_usd: complete ? round(net * 0.7 - (cost - map.get('procurement').amount_usd)) : null,
     scoring_supported: supported,
     status: !complete ? 'pending_costs' : !supported ? 'sensitivity_only' :
-      deferred.length ? 'initial_estimate_with_deferred_returns' : 'conditional_estimate',
+      deferred.includes('domestic_freight') ? 'initial_estimate_with_deferred_costs' :
+        deferred.length ? 'initial_estimate_with_deferred_returns' : 'conditional_estimate',
   };
 }

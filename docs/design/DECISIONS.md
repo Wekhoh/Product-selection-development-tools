@@ -1,5 +1,23 @@
 # Design decisions and open questions
 
+## Initial-flow simplification and retrieval accountability — 2026-11-14
+
+The owner now directs implementation of the discussed simplification: initial research uses the current relevant category/BSR population, with New Releases as a separate supplementary source. Historical entrants/exits and fine-grained niche reconstruction are no longer mandatory before an initial card. Detailed strategy, patent analysis and supplier verification move after retention. Available written reviews, review dates, listing dates and Keepa observations remain basic checks; a supported old-review/recent-launch conflict excludes that example from a normal-from-zero reference. Nonlinear review growth alone does not identify a manipulation method.
+
+Keep the 100-point framework and adapt only the affected scoring dependencies/items with a documented trial version and real replay. The owner delegates this practical adjustment, not a particular replacement allocation. Existing useful weights and research should not be deleted merely to reduce the number of rows. Matched-form economics, the 30% margin floor, concrete rights conflicts and the five discovery routes/three opportunity hypotheses remain.
+
+Completeness means completion of the declared provider query: consume supported pagination/fields and inspect the returned status and limits. A natural pagination end without truncation or unresolved errors is **tool-query complete**. Report an uncalled relevant interface, unfinished page or unread payload as implementer work. Only evidenced source caps, missing fields/history or explicit errors are provider limitations. Provider-complete observations are usable for the declared initial assessment without an independent market census. State actual counts and query scope rather than vague guarantees. This does not make different native populations interchangeable or convert a missing value into zero.
+
+Owner domestic-freight decision, 2026-11-14: omit supplier-to-domestic-forwarder delivery from this initial scoring estimate and verify it after retention. Keep its amount null and status explicitly deferred, display that exclusion beside margin, and show remaining per-unit cost capacity before crossing the 30% floor. This does not assert free delivery, adopt the page starting tariff as a complete quote, or permit omission of procurement, first-leg transport or Amazon cash fees. The economic ledger now supports this explicit independent deferral as well as the existing paired return disposition/recovery deferral; ordinary missing in-scope costs still block a complete scoped estimate.
+
+Owner follow-up, 2026-11-14 — initial-screen proportionality and source coverage:
+
+- Accepted freight quote includes tax/customs for the trial; estimate from a comparable packaged unit. Detailed carton/shipment and clearance choices are later work, not initial-score gates. Do not add included charges twice. Domestic inland freight follows the later explicit initial-scope deferral above.
+- Close comparable supply specifications are sufficient for initial procurement estimates; exact dimensions are not mandatory. Preserve functional/electrical compatibility and disclose differences.
+- Rights and requirements use a bounded public initial check, not completed supplier inquiry/certification or exhaustive legal clearance. Material unresolved evidence stays explicit; do not invent a suspicion score.
+- Use actual source-returned parent sales where available/preferred; preserve native windows and family composition. Reviews and related BSR100 entry/exit histories are best effort: report observed coverage, missing fields and tool limits without requiring a complete historical census.
+- Broaden source-led keyword opportunities and scene-specific recurring social pain. High attention is a competition concern to verify, not a confirmed numeric exclusion. No new heat threshold, score curve or missing-data imputation was approved.
+
 Status: preserved design direction, not a completed scoring implementation. Updated 2026-11-14.
 
 The numerical trial budgets and conditions have one machine-readable source: [reference-profile.draft.json](reference-profile.draft.json). This document preserves the reasons, exceptions, and question lineage that numbers alone cannot represent.
