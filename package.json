@@ -1,0 +1,14 @@
+{
+  "name": "product-selection-development-tools",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Bounded offline revision-50 product-selection scoring trial",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test",
+    "trial": "node src/cli.mjs"
+  }
+}
