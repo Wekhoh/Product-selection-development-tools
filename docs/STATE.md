@@ -1,14 +1,20 @@
 # Project state
 
-Updated: 2026-11-12. API worktree checkpoint: ownership narrowed; no new implementation assignment.
+Updated: 2026-11-14. API worktree checkpoint: reviewed evidence-review handoff prepared; no implementation or live invocation.
 
 ## Current API-seat recovery checkpoint
 
 The owner's 2026-11-12 clarification supersedes earlier broad provider ownership: the selection development seat owns SIF, SellerSprite and other selection-data MCP calls, data validation and workflow integration. This API seat owns OpenAI API tool development and compatibility, including OpenAI-specific input/output, error, cost and recovery contracts when commissioned. The clarification was received from the selection seat and checked against its current project working agreement and state record.
 
-The selection seat completed its own bounded native SIF probe. No selection-data query, probe reconciliation or duplicate call is assigned here. The earlier API-seat Q31 capability investigation remains historical design evidence; it does not retain ownership of selection-data integration. This record update grants no new spending, access or development authority.
+The selection seat is running its revision-50 discovery-to-card trial and commissioned a bounded OpenAI enhancement investigation. This seat checks reusable Responses/native Agents/Decisions references, current official contracts and existing local request/cost recovery evidence, then proposes one optional closed-evidence review seam. Selection-data collection, 1688, scoring, product integration and final acceptance remain with selection development.
 
-The integration checkout's `docs/STATE.md` remains the maintained project-wide recovery record. The migration baseline below is retained in this separate API worktree and does not mirror the latest business definitions. Before accepting a concrete OpenAI assignment, reconcile its scope with the current integration record and agreed first-release workflow. No OpenAI implementation task is currently queued here; no provider activation is implied.
+The integration checkout's `docs/STATE.md` remains the maintained project-wide recovery record. Its published `d67ab89085e246c23a126b25ae2390e529dcdd05` / revision-50 baseline and ongoing trial supersede the historical product-definition snapshot below. This investigation does not import that business state into the API branch, activate a provider, move credentials, reset ledgers, submit model requests or authorize an automatic paid fallback.
+
+Current evidence: all 23 preserved API source/test/dependency/reference files still match their migration manifest and original files. The known canonical local ledger and saved receipt records were inspected read-only; no pending hold was observed within that scope, but account-wide reconciliation, posted billing, promotional balance and model eligibility remain unverified. One historical native rejection has only its embedded ledger receipt verified. Detailed private observations and recovery pointers are in `.local/api-integration/preparation/openai-enhancement-recovery.2026-11-14.json`; do not publish that file. Source inspection is targeted, not an end-to-end semantic audit or runtime acceptance.
+
+Reviewed delivery: [optional evidence-review contract](api/EVIDENCE-REVIEW-CONTRACT.draft.md) and [current official options/reuse investigation](api/OFFICIAL-OPENAI-OPTIONS.2026-11-14.md). The single recommendation is a bounded Responses review of comparison membership and evidence consistency using the maintained official SDK, retaining caller-owned scores and the subscription-backed main flow. Independent review accepted the documentation candidate with no material finding; its fixed hashes and limits are recorded in `.local/api-integration/preparation/evidence-review-independent-review.2026-11-14.md`. Relative-link, whitespace and bounded privacy-pattern checks passed. No runtime tests, provider requests, credential moves or ledger mutations were performed. The private delivery receipt records the eventual fixed commit and dispatch.
+
+Next ownership boundary: deliver the reviewed branch documents and private receipt pointer to selection development, which decides adoption against the real trial bottleneck. A future commissioned offline adapter/caller slice and separately authorized bounded live acceptance remain unimplemented. Live policy still needs verified account/model/funding, disclosed packet/retention, current cost bounds and canonical-state reconciliation; the reported credit is not a verified allowance. This checkpoint does not ask the owner to repeat prior approvals or choose hypothetical infrastructure.
 
 ## Objective and settled scope
 
@@ -29,7 +35,7 @@ The former coordinator and former Radar chat become historical handoff sources a
 
 Use this record as the single project task/recovery entry. Coordinate assignments, actionable interface or cost changes, blockers and deliveries; batch routine progress. Reusable API modules may serve other projects when concrete callers exist. This handoff does not commission a central hosted service, another repository, a new allowance or provider activation.
 
-## Progress and remaining work
+## Historical migration progress
 
 | Item | State | Acceptance evidence / next step |
 | --- | --- | --- |
@@ -45,20 +51,20 @@ Use this record as the single project task/recovery entry. Coordinate assignment
 
 ## Next work
 
-1. Await a concrete OpenAI API development or compatibility assignment tied to the agreed product workflow; this ownership correction is not such an assignment.
-2. Read the current integration checkout's project state and applicable working agreement before resuming implementation. Keep this API worktree separate and preserve other writers' changes.
-3. Reuse existing OpenAI technical research and the inactive reference material in `API-MIGRATION.md` where relevant. Earlier SIF/SellerSprite findings are historical evidence, not pending API-seat queries or integration tasks.
-4. Adopt or rewrite an OpenAI module only when it serves the agreed assignment. Verify a bounded offline path before separately authorized live integration, preserving shared-account, cost and request-recovery constraints.
+1. Deliver the reviewed optional evidence-review investigation at a fixed branch commit; adoption and the next concrete implementation assignment belong to selection development.
+2. Keep the API worktree separate. Use the integration checkout's current state for product decisions; the historical migration table is not the current application status.
+3. Reuse relevant invariants and focused regression scenarios from the inactive reference material in `API-MIGRATION.md`; do not install the former workflow wholesale.
+4. Only a later commissioned implementation may adapt code. A bounded offline caller and independent review precede separately authorized live acceptance with reconciled shared spending and original request identities.
 
-No numerical mapping, current provider fee, or complete scoring algorithm has been approved merely by transferring these files. Live scans and paid research remain inactive.
+The historical file transfer did not approve scoring mappings, current fees or activation. The later revision-50 business definitions and current selection trial belong to the integration checkout. This API investigation enabled no scan or paid request.
 
 ## New-chat recovery
 
-Read this file, then `PRODUCT.md`, `design/DECISIONS.md`, and the draft profile. State what is implemented versus proposed before choosing work. For an ambiguity that requires original evidence, the owner machine has an ignored `.local/migration/README.md` handoff index, reviewed per-question records, and selected original evidence copies; it is not required to understand the public design or run future software. Do not import private paths into code.
+Read this file's current checkpoint, the [evidence-review candidate](api/EVIDENCE-REVIEW-CONTRACT.draft.md), its linked official investigation and the private recovery receipt when resuming this assignment. For product dependencies, read the integration checkout's current `STATE.md`, `PRODUCT.md` and `design/DECISIONS.md`; this API branch's business files retain the migration baseline. State what is implemented versus proposed before choosing work. Original migration evidence is indexed by the integration checkout's ignored `.local/migration/README.md`, not a duplicate directory in this worktree. Do not import private paths or the old repository into new runtime code.
 
 Historical question IDs Q1–Q32 refer to the selection design. Migration Q1/Q2 refer only to publicity and usage scope. They are separate decisions.
 
-## Transfer versus implementation
+## Historical transfer versus implementation
 
 The reviewed public design, selected local source references, decision evidence and API handoff have been transferred. Wider historical evidence remains indexed at its original locations where a local copy was not selected. Credentials, live budget/request ledgers and operation locks intentionally remain at their canonical private locations; copying a folder cannot create a second allowance or independent run authority.
 
