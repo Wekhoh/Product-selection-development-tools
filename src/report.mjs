@@ -1,17 +1,17 @@
 // Self-contained, script-free Chinese cards for an already scored local batch.
 
 const GROUP_LABELS = {
-  profit: '盈利能力', suggested_bid_pressure: '建议竞价压力', niche_demand: '细分需求',
+  profit: '盈利能力', suggested_bid_pressure: '建议竞价压力', niche_demand: '需求依据',
   market_entry: '竞争分散程度', normal_newcomer: '正常起步新品', need_fit: '需求满足与轻改进',
   product_risk_and_operations: '产品风险与日常工作', rights_and_requirements: '权利与准入',
 };
 const ITEM_LABELS = {
   refund_adjusted_pre_ad_margin: '退款调整后广告前毛利率', unit_contribution: '单件贡献金额',
-  relevant_purchase_entry_bid: '主要购买入口建议竞价', purchase_demand_scale: '可比细分市场购买规模',
+  relevant_purchase_entry_bid: '主要购买入口建议竞价', purchase_demand_scale: '相关市场购买规模',
   supported_opportunity: '有依据的需求机会', purchase_entry_match: '购买入口匹配',
   product_dispersion: '产品分散程度', brand_dispersion: '品牌分散程度', seller_dispersion: '可观察卖家分散程度',
   new_product_count_share: '原生市场新品数量占比', new_product_sales_share: '原生市场新品销量占比',
-  low_rating_sales_performance: '少评价销售表现', natural_visibility_development: '同一对示例自然曝光',
+  low_rating_sales_performance: '少评价销售表现', natural_visibility_development: '固定示例自然曝光',
   existing_solution_fit: '现成方案满足需求', feasible_light_differentiation: '可行轻改进',
   low_return_preference: '低退货偏好', storage_tolerance: '储存耐受', transport_tolerance: '运输耐受',
   routine_complexity: '日常工作简洁度', specific_design_rights: '具体款式权利初查', applicable_public_requirements: '适用公开准入要求',
@@ -29,6 +29,12 @@ const QUALIFIERS = {
   applicable_public_requirements: '这里评价已知准入路径负担，不代表未来供应产品已经检测或合规。',
 };
 const REASONS = new Map([
+  ['A completed current-category query and aligned all-age sales reference are required.', '需要完成当前相关类目查询，并提供同口径的全龄商品销量参照。'],
+  ['All-age reference families need unique identities and supported sales, including real zeros.', '销量参照须按家族去重并补齐数据；真实零保留，未知不填零。'],
+  ['An unresolved observed newcomer could change the selected examples.', '仍有已发现新品可能改变固定示例，需要完成它的评价数、销量或起步核查。'],
+  ['The fixed current-category examples lack supported SIF overall shares.', '固定示例仍缺SIF整体自然曝光占比，不能换一款有数据的来顶替。'],
+  ['A positive category sales reference is required for positive sales.', '销量为正，但类目销量参照尚不能支持比较。'],
+  ['A qualified current example needs matching rank 1-100 and a supported launch within three calendar months.', '新品需要对应当前榜单前100名，并有近三个月起步证据；当前记录不满足或待核。'],
   ['The rubric judgment is unavailable and needs evidence.', '该判断尚缺证据。'],
   ['Judgment does not name an adopted rubric anchor.', '提供的判断档位不属于本项已确认档位。'],
   ['Observation is missing.', '尚未取得这项数据。'],
@@ -170,17 +176,18 @@ function newcomerDetails(result) {
   const examples = array(diagnostics.examples);
   const members = array(diagnostics.members);
   const refs = object(diagnostics.references);
+  const current = diagnostics.reference_mode === 'current_category_r51';
   const pairKeys = new Set(pair.map(entry => `${entry.family_id}\0${entry.asin}`));
-  return `<section class="support-section"><h3>正常新品：同一对示例</h3>
-    <p>评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。</p>
-    <p>${pair.length === 2 ? `固定示例对：${pair.map(entry => escape(`${entry.family_id} / ${entry.asin}`)).join('；')}。` : '尚未形成两个完整、独立且合格的示例；保留已有单例和未知记录。'}</p>
+  return `<section class="support-section"><h3>正常新品：${current ? '固定示例' : '同一对示例'}</h3>
+    <p>${current ? diagnostics.no_qualifying_examples ? '当前相关榜单的完整查询中，没有合格近三个月新品；少评价与自然曝光各记0支持分，不代表无法进入此市场。' : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 ${escape(numberText(refs.sales_median))} 件。参照包含新老商品；不再计算评价数中位数。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算，不是父体合计' : '声明的家族销量'}。` : `评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。`}</p>
+    <p>${pair.length ? `固定${pair.length}个示例：${pair.map(entry => escape(`${entry.family_id} / ${entry.asin}`)).join('；')}。${pair.length === 1 ? '这是单例支持，不能理解为普遍成功。' : ''}` : diagnostics.no_qualifying_examples ? '保留源样本及排除理由。' : '示例尚待核实；缺数据不填零。'}</p>
     ${examples.length ? `<dl class="reference-rows">${examples.map(example => {
       const raw = members.find(member => member?.family_id === example.family_id && member?.asin === example.asin) ?? {};
       const natural = object(example.natural);
-      return `<div><dt>${escape(example.family_id)}${pairKeys.has(`${example.family_id}\0${example.asin}`) ? ' · 已选示例' : ' · 参照样本'}</dt><dd>评分数量 ${escape(observed(raw.ratings))}；近30天销量 ${escape(observed(raw.units_30d))}；少评价示例得分 ${escape(numberText(example.score))} / 4。<p class="muted">实际数量分 ${escape(numberText(example.actual_score))}；相对数量分 ${escape(numberText(example.relative_score))}；销量／参照中位数 ${escape(numberText(example.sales_ratio))}；销量封顶 ${escape(numberText(example.sales_ceiling))}。</p>${typeof raw.reason === 'string' ? `<p class="muted">纳入理由：${escape(raw.reason)}</p>` : ''}<p>自然曝光 ${escape(observed(natural.input))}；${natural.source_label === 'sif_with_sellersprite_corroboration' ? 'SIF占比，附SellerSprite关键词旁证' : 'SIF单来源占比'}。${natural.score === null || natural.score === undefined ? escape(reasonText(natural.reason)) : `自然示例得分 ${escape(numberText(natural.score))} / 1。`}${natural.input?.period ? `观察期：${escape(readable(natural.input.period))}。` : ''}</p>${natural.keyword_counts ? `<p class="muted">自然／广告关键词数：SellerSprite ${escape(numberText(natural.keyword_counts.sellersprite?.organic))} / ${escape(numberText(natural.keyword_counts.sellersprite?.ad))}；SIF ${escape(numberText(natural.keyword_counts.sif?.organic))} / ${escape(numberText(natural.keyword_counts.sif?.ad))}。</p>` : ''}</dd></div>`;
+      return `<div><dt>${escape(example.family_id)}${pairKeys.has(`${example.family_id}\0${example.asin}`) ? ' · 已选示例' : ' · 参照样本'}</dt><dd>评分数量 ${escape(observed(raw.ratings))}；近30天销量 ${escape(observed(raw.units_30d))}；少评价示例得分 ${escape(numberText(example.score))} / 4。<p class="muted">实际数量分 ${escape(numberText(example.actual_score))}；${current ? '' : `相对数量分 ${escape(numberText(example.relative_score))}；`}销量／参照中位数 ${escape(numberText(example.sales_ratio))}；销量封顶 ${escape(numberText(example.sales_ceiling))}。</p>${typeof raw.reason === 'string' ? `<p class="muted">纳入理由：${escape(raw.reason)}</p>` : ''}<p>自然曝光 ${escape(observed(natural.input))}；${natural.source_label === 'sif_with_sellersprite_corroboration' ? 'SIF占比，附SellerSprite关键词旁证' : 'SIF单来源占比'}。${natural.score === null || natural.score === undefined ? escape(reasonText(natural.reason)) : `自然示例得分 ${escape(numberText(natural.score))} / 1。`}${natural.input?.period ? `观察期：${escape(readable(natural.input.period))}。` : ''}</p>${natural.keyword_counts ? `<p class="muted">自然／广告关键词数：SellerSprite ${escape(numberText(natural.keyword_counts.sellersprite?.organic))} / ${escape(numberText(natural.keyword_counts.sellersprite?.ad))}；SIF ${escape(numberText(natural.keyword_counts.sif?.organic))} / ${escape(numberText(natural.keyword_counts.sif?.ad))}。</p>` : ''}</dd></div>`;
     }).join('')}</dl>` : ''}
     ${members.some(member => member?.effective_status && member.effective_status !== 'qualified') ? `<ul>${members.filter(member => member?.effective_status && member.effective_status !== 'qualified').map(member => `<li>${escape(member.family_id ?? member.asin ?? '未命名记录')}：${escape(MEMBER_STATES[member.effective_status] ?? member.effective_status)}；${escape(reasonText(member.reason))}</li>`).join('')}</ul>` : ''}
-    <p class="muted">自然占比是来源建模的曝光构成，不是自然订单或利润。关键词数仅作旁证，不换算曝光占比，也不额外加分。原生市场新品3／2分与上述合格细分参照4／1分保持分开。</p></section>`;
+    <p class="muted">自然占比是来源建模的曝光构成，不是自然订单或利润。关键词数仅作旁证，不换算曝光占比，也不额外加分。原生市场新品3／2分与上述合格示例4／1分保持分开。</p></section>`;
 }
 
 function economicDetails(result) {
@@ -194,9 +201,9 @@ function inputSummary(item) {
   const input = object(item.input);
   if (Array.isArray(item.scenario_scores)) return item.scenario_scores.map(row => `${row.id}：${item.id === 'refund_adjusted_pre_ad_margin' ? `${numberText(row.value * 100)}%` : `US$ ${numberText(row.value)}`}`).join('；');
   if (item.id === 'relevant_purchase_entry_bid') return '主购买入口先取两源可用精确竞价点，再按同周期月搜索量加权；原始区间另列。';
-  if (item.id === 'low_rating_sales_performance') return '全体合格参照计算中位数，再取完整示例的前两名；具体样本见下方。';
-  if (item.id === 'natural_visibility_development') return '固定使用少评价销售表现选定的同一对示例，不因自然占比或数据更容易获得而换例。';
-  if (['refund_adjusted_pre_ad_margin', 'unit_contribution'].includes(item.id)) return '完整情景尚待补证，已有金额和缺口见费用情景。';
+  if (item.id === 'low_rating_sales_performance') return input.scope === 'current_relevant_bsr_top100' ? '评价数量得分受独立类目销量参照限制，再取至多两个最佳完整示例；具体依据见下方。' : '全体合格参照计算中位数，再取完整示例的前两名；具体样本见下方。';
+  if (item.id === 'natural_visibility_development') return '固定使用少评价销售表现选定的示例，不因自然占比或数据更容易获得而换例。';
+  if (['refund_adjusted_pre_ad_margin', 'unit_contribution'].includes(item.id)) return item.status === 'ineligible' ? '费用已算出，但该方案不满足毛利条件；具体金额见费用情景。' : '完整情景尚待补证，已有金额和缺口见费用情景。';
   if (Object.hasOwn(input, 'anchor')) return input.anchor === null ? '判断档位：待补证' : `采用有据档位 ${readable(input.anchor)} / ${item.weight}`;
   if (item.id === 'purchase_demand_scale' && Array.isArray(input.value_range)) {
     const scope = ['niche', 'period'].map(key => string(input[key])).filter(Boolean).join('；');
@@ -230,7 +237,7 @@ function candidateCard(result, original, index) {
   const prefix = `candidate-${index + 1}`;
   const image = imageUri(presentation.image_data_uri);
   const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
-  const gaps = array(result.items).filter(item => item.status !== 'scored');
+  const gaps = array(result.items).filter(item => item.status === 'needs_evidence');
   const mainGaps = blockers.length ? blockers : gaps.slice(0, 3).map(item => ({ problem: `${ITEM_LABELS[item.id] ?? item.id}：${reasonText(item.reason)}`, next_step: '补齐对应来源和适用口径后重新计算。' }));
   const screenGaps = array(result.screening?.conditions).filter(condition => condition.status !== 'pass');
   const queue = Object.hasOwn(QUEUES, result.queue) ? result.queue : 'pending';

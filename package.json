@@ -2,7 +2,7 @@
   "name": "product-selection-development-tools",
   "version": "0.0.0",
   "private": true,
-  "description": "Bounded offline revision-50 product-selection scoring trial",
+  "description": "Bounded offline product-selection scoring and local-card trial",
   "type": "module",
   "engines": {
     "node": ">=24"

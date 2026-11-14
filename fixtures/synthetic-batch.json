@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_revision": 50,
+  "profile_revision": 51,
   "presentation": {
     "title": "离线选品试评演示",
     "summary": "本页全部为合成教学数据。三个样本分别演示完整点值、完整情景区间和费用待补证；不构成任何市场或采购结论。",
@@ -357,7 +357,10 @@
                   }
                 }
               }
-            }
+            },
+            "launch_date": "2026-10-01",
+            "current_bsr_node": "synthetic-node",
+            "current_bsr_rank": 20
           },
           {
             "family_id": "synthetic-family-b",
@@ -426,9 +429,57 @@
                   }
                 }
               }
-            }
+            },
+            "launch_date": "2026-10-01",
+            "current_bsr_node": "synthetic-node",
+            "current_bsr_rank": 20
           }
-        ]
+        ],
+        "scope": "current_relevant_bsr_top100",
+        "query_complete": true,
+        "market_reference": {
+          "scope": "current_relevant_bsr_top100_all_ages",
+          "node": "synthetic-node",
+          "period": "2026-10-15/2026-11-13",
+          "grain": "family",
+          "deduplicated": true,
+          "coverage_supported": true,
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "families": [
+            {
+              "family_id": "synthetic-old-a",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            },
+            {
+              "family_id": "synthetic-old-b",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            },
+            {
+              "family_id": "synthetic-old-c",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            }
+          ]
+        }
       },
       "economics": {
         "saleable_unit": "一套合成双件收纳架",
@@ -805,7 +856,10 @@
                   }
                 }
               }
-            }
+            },
+            "launch_date": "2026-10-01",
+            "current_bsr_node": "synthetic-node",
+            "current_bsr_rank": 20
           },
           {
             "family_id": "synthetic-family-b",
@@ -874,9 +928,57 @@
                   }
                 }
               }
-            }
+            },
+            "launch_date": "2026-10-01",
+            "current_bsr_node": "synthetic-node",
+            "current_bsr_rank": 20
           }
-        ]
+        ],
+        "scope": "current_relevant_bsr_top100",
+        "query_complete": true,
+        "market_reference": {
+          "scope": "current_relevant_bsr_top100_all_ages",
+          "node": "synthetic-node",
+          "period": "2026-10-15/2026-11-13",
+          "grain": "family",
+          "deduplicated": true,
+          "coverage_supported": true,
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "families": [
+            {
+              "family_id": "synthetic-old-a",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            },
+            {
+              "family_id": "synthetic-old-b",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            },
+            {
+              "family_id": "synthetic-old-c",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            }
+          ]
+        }
       },
       "economics": {
         "saleable_unit": "一套合成双件收纳架",
@@ -1275,7 +1377,10 @@
                   }
                 }
               }
-            }
+            },
+            "launch_date": "2026-10-01",
+            "current_bsr_node": "synthetic-node",
+            "current_bsr_rank": 20
           },
           {
             "family_id": "synthetic-family-b",
@@ -1344,9 +1449,57 @@
                   }
                 }
               }
-            }
+            },
+            "launch_date": "2026-10-01",
+            "current_bsr_node": "synthetic-node",
+            "current_bsr_rank": 20
           }
-        ]
+        ],
+        "scope": "current_relevant_bsr_top100",
+        "query_complete": true,
+        "market_reference": {
+          "scope": "current_relevant_bsr_top100_all_ages",
+          "node": "synthetic-node",
+          "period": "2026-10-15/2026-11-13",
+          "grain": "family",
+          "deduplicated": true,
+          "coverage_supported": true,
+          "evidence": [
+            "synthetic-evidence"
+          ],
+          "families": [
+            {
+              "family_id": "synthetic-old-a",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            },
+            {
+              "family_id": "synthetic-old-b",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            },
+            {
+              "family_id": "synthetic-old-c",
+              "units_30d": {
+                "value": 100,
+                "unit": "units",
+                "evidence": [
+                  "synthetic-evidence"
+                ]
+              }
+            }
+          ]
+        }
       },
       "economics": {
         "saleable_unit": "一套合成双件收纳架",

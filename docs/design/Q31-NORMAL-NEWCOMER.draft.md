@@ -2,7 +2,21 @@
 
 建立：2026-11-11；更新：2026-11-13。状态：3／2／4／1 分配与四项完整试评规则均已确认，具体真实样本、取数可得性、判断准确度和跨类目校准仍待验证。本稿不是正式算法实现或运行配置。原 2／2／3／3 未获采用。
 
-Current numerical source: [reference-profile.draft.json](reference-profile.draft.json), revision 50. All 21 item mappings and the shared total/missingness/order package are accepted for trial. The owner also accepts the reference changes below and requests continuation from saved real products. Older dated sections preserve history; the single recovery entry is [STATE.md](../STATE.md). No production or real scoring acceptance follows merely from recording the rules.
+Current numerical source: [reference-profile.draft.json](reference-profile.draft.json), revision 51. The following package implements the owner's delegated initial-flow simplification; its new reference and curve remain trial choices to calibrate, not separately confirmed owner numbers or production acceptance. Older dated sections preserve revision-50 history and replay. The single recovery entry is [STATE.md](../STATE.md).
+
+## Current-category simplification for trial (revision 51)
+
+Keep the four weights at 3/2/4/1 and the entire 100-point budget. Native count/sales ratios and their existing curves remain unchanged and source-labeled. The 4/1 reference now uses current relevant BSR-top-100 normal-start newcomers within three calendar months; supplementary New Releases and historical exits do not become required initial-card members. Basic functional relevance excludes obvious spare parts/unrelated uses without forcing every material, shape or accessory into a separate market. Retain available launch/review checks and contrary evidence.
+
+For each eligible example, convert actual current rating count R to at most four points: R<=10 gives 4; 10<R<=40 gives `4-(R-10)/15`; above 40 gives `80/R`. This rescales the prior actual-count curve and removes the separate relative-rating median component. No arbitrary zero-median rating substitution remains.
+
+Cap that score using sales S relative to independent reference T: the median of supported recent-30-day sales across the declared relevant current category's all-age deduplicated families. Prefer parent totals; if the source only supplies ASIN estimates, freeze one representative per family, use the same basis for examples/reference and disclose that proxy rather than summing children. Preserve true zero values and unknowns. The benchmark must not be just the successful newcomers or the selected two examples. At S/T=0.5 the cap is 3, at 0.8 it is 4, with continuous linear segments from zero and between these anchors. Supported S=0 caps at zero; positive S with nonpositive/missing T stays unresolved.
+
+Select the two highest complete capped example scores, breaking ties by family then ASIN ascending, and average them. This preserves the prior best-example opportunity signal, not a highest-sales or typical-outcome statistic. One example can supply a labeled single-case score only if no unresolved observed example could change the selection. Missing values or pending eligibility cannot be silently dropped. A weaker unresolved example need not trigger deep research when its supported maximum cannot displace either selected example. Preserve such records in diagnostics.
+
+The identical selected examples supply natural visibility: the existing SIF overall-share/0.70 curve, capped at one, with both tools' keyword counts as corroboration. Do not substitute another example for easier traffic data or derive shares from word counts. If the completed declared query has no qualified examples and no unresolved possible member, record zero observed support for 4/1, without requiring an unused sales median or claiming market impossibility. Unknown query coverage or membership is never observed absence.
+
+Real replay must verify identities, time windows, current rank, broad functional relevance, basic launch support and source fields. This package reduces dependencies; it does not make third-party estimates actual orders. Sparse examples, representativeness and resulting scores require owner calibration after seeing cards.
 
 ## Accepted reference adjustment (revision 50)
 

@@ -1,4 +1,4 @@
-// Offline revision-50 trial calculations. Importing this module performs no I/O.
+// Offline trial calculations, with revision-50 replay. Importing performs no I/O.
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -35,11 +35,11 @@ const median = values => {
 };
 
 function definitions(profile) {
-  if (profile?.revision !== 50 || profile.total_budget !== 100 || profile.production_eligible !== false ||
+  if (![50, 51].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
     profile.activate_by_import !== false || !Array.isArray(profile.group_budgets) ||
     profile.group_budgets.length !== EXPECTED_GROUPS.length || profile.group_budgets.some((group, index) =>
       group?.id !== EXPECTED_GROUPS[index] || !Array.isArray(group.items))) {
-    throw new TypeError('The frozen revision-50, 100-point trial profile is required.');
+    throw new TypeError('A supported frozen 100-point trial profile is required.');
   }
   const items = profile.group_budgets.flatMap(group => (group.items ?? []).map(item => ({ ...item, group: group.id })));
   if (items.length !== EXPECTED_ITEMS.length || items.some((item, i) =>
@@ -53,8 +53,15 @@ function definitions(profile) {
   if (!number(margin.eligible_margin_floor) || !number(margin.full_score_at) ||
     margin.full_score_at <= margin.eligible_margin_floor || !number(margin.score_at_floor) ||
     margin.eligible_margin_floor !== profile.reference_screening?.margin?.minimum || !profile.measurement ||
-    profile.workflow?.scoring_and_ordering?.revision !== 50) {
-    throw new TypeError('The profile needs valid adopted margin and shared revision-50 mappings.');
+    profile.workflow?.scoring_and_ordering?.revision !== profile.revision) {
+    throw new TypeError('The profile needs valid margin and matching shared mappings.');
+  }
+  if (profile.revision === 51) {
+    const { actual_rating_points: a, sales_cap: s } = profile.measurement.current_category_newcomers ?? {};
+    if (!a || !s || !Object.values(a).every(number) || !Object.values(s).every(number) ||
+      a.max_points !== 4 || s.max_points !== 4 || a.full_points_through < 0 || a.linear_end_rating <= a.full_points_through ||
+      a.linear_end_points < 0 || a.linear_end_points > 4 || s.lower_ratio <= 0 || s.upper_ratio <= s.lower_ratio ||
+      s.lower_points < 0 || s.lower_points > 4) throw new TypeError('Revision-51 newcomer curves need valid ordered anchors.');
   }
   return items;
 }
@@ -303,7 +310,8 @@ function scoreNatural(member, ctx, profile) {
 function scoreNewcomers(cohort, ctx, profile, defs) {
   const lowDef = defs.find(item => item.id === 'low_rating_sales_performance');
   const naturalDef = defs.find(item => item.id === 'natural_visibility_development');
-  const diagnostics = { members: [], examples: [], selected_pair: [], references: { rating_median: null, sales_median: null } };
+  const diagnostics = { members: [], examples: [], selected_pair: [], references: { rating_median: null, sales_median: null },
+    reference_mode: profile.revision === 51 ? 'current_category_r51' : 'qualified_cohort_r50' };
   const pending = reason => ({
     low: missing(lowDef, reason, cohort), natural: missing(naturalDef, reason, cohort), diagnostics,
   });
@@ -317,6 +325,7 @@ function scoreNewcomers(cohort, ctx, profile, defs) {
   const qualified = [];
   for (const member of cohort.members) {
     const record = { ...member, effective_status: member?.status ?? 'pending' };
+    if (profile.revision === 51 && record.effective_status === 'duplicate') record.effective_status = 'pending';
     diagnostics.members.push(record);
     if (member?.old_reviews_predate_launch === true) {
       record.effective_status = hasEvidence(member.evidence, ctx) ? 'excluded' : 'pending';
@@ -329,6 +338,19 @@ function scoreNewcomers(cohort, ctx, profile, defs) {
       record.effective_status = 'pending';
       record.reason = 'A qualified member needs frozen family/listing identity and qualification evidence.';
       continue;
+    }
+    if (profile.revision === 51) {
+      const observed = new Date(cohort.observation_date.slice(0, 10));
+      const earliest = new Date(Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth() - 3,
+        Math.min(observed.getUTCDate(), new Date(Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth() - 2, 0)).getUTCDate())));
+      if (!validDate(member.launch_date) || Date.parse(member.launch_date) < earliest.getTime() ||
+        member.launch_date.slice(0, 10) > cohort.observation_date.slice(0, 10) ||
+        member.current_bsr_node !== cohort.relevant_bsr_node || !Number.isInteger(member.current_bsr_rank) ||
+        member.current_bsr_rank < 1 || member.current_bsr_rank > 100) {
+        record.effective_status = 'pending';
+        record.reason = 'A qualified current example needs matching rank 1-100 and a supported launch within three calendar months.';
+        continue;
+      }
     }
     qualified.push(record);
   }
@@ -364,6 +386,7 @@ function scoreNewcomers(cohort, ctx, profile, defs) {
   diagnostics.observed_count = cohort.members.length;
   diagnostics.qualified_deduplicated_count = unique.length;
   if (invalidReference) return pending('Qualified identity, grouping or duplicate observations remain unresolved.');
+  if (profile.revision === 51) return scoreCurrentNewcomers(cohort, unique, ctx, profile, lowDef, naturalDef, diagnostics, pending);
   if (unique.length === 0) return pending('No supported qualified normal-newcomer reference member is available.');
   const readings = unique.map(member => ({ member,
     ratings: readNumber(member.ratings, 'count', ctx, { integer: true }),
@@ -413,6 +436,82 @@ function scoreNewcomers(cohort, ctx, profile, defs) {
       { selected_pair: diagnostics.selected_pair, evidence: naturalEvidence,
         conditional_range: known.length === 1 ? [known[0] / 2, (known[0] + 1) / 2] : null });
   }
+  return { low, natural, diagnostics };
+}
+
+function scoreCurrentNewcomers(cohort, unique, ctx, profile, lowDef, naturalDef, diagnostics, pending) {
+  diagnostics.reference_mode = 'current_category_r51';
+  if (cohort.scope !== 'current_relevant_bsr_top100' || cohort.query_complete !== true) {
+    return pending('A completed current-category query and aligned all-age sales reference are required.');
+  }
+  const unresolvedMembers = diagnostics.members.filter(row => !['qualified', 'duplicate'].includes(row.effective_status) &&
+    !(row.effective_status === 'excluded' && text(row.reason) && hasEvidence(row.evidence, ctx)));
+  if (!unique.length && !unresolvedMembers.length) {
+    diagnostics.no_qualifying_examples = true;
+    const evidence = mergeRefs(cohort.evidence, ...diagnostics.members.map(row => row.evidence));
+    return { low: scored(lowDef, 0, cohort, { evidence }), natural: scored(naturalDef, 0, cohort, { evidence }), diagnostics };
+  }
+  const reference = cohort.market_reference;
+  if (reference?.scope !== 'current_relevant_bsr_top100_all_ages' || reference.node !== cohort.relevant_bsr_node ||
+    reference.period !== cohort.period || reference.grain !== cohort.grain || reference.deduplicated !== true ||
+    reference.coverage_supported !== true || !hasEvidence(reference.evidence, ctx) ||
+    !Array.isArray(reference.families) || reference.families.length === 0) {
+    return pending('A completed current-category query and aligned all-age sales reference are required.');
+  }
+  const ids = reference.families.map(row => row?.family_id);
+  const sales = reference.families.map(row => readNumber(row?.units_30d, 'units', ctx));
+  if (ids.some(id => !text(id)) || new Set(ids).size !== ids.length || sales.some(row => row.value === null)) {
+    return pending('All-age reference families need unique identities and supported sales, including real zeros.');
+  }
+  const benchmark = median(sales.map(row => row.value));
+  diagnostics.references = { sales_median: benchmark, family_count: ids.length, grain: reference.grain,
+    scope: reference.scope, sales_units: sales.map(row => row.value) };
+  const calculate = member => {
+    const ratings = readNumber(member.ratings, 'count', ctx, { integer: true });
+    const units = readNumber(member.units_30d, 'units', ctx);
+    const r = ratings.value;
+    const { actual_rating_points: a, sales_cap: s } = profile.measurement.current_category_newcomers;
+    const actualScore = r === null ? null : r <= a.full_points_through ? a.max_points : r <= a.linear_end_rating ?
+      a.max_points - (r - a.full_points_through) * (a.max_points - a.linear_end_points) / (a.linear_end_rating - a.full_points_through) :
+      a.linear_end_points * a.linear_end_rating / r;
+    const ratio = units.value !== null && benchmark > 0 ? units.value / benchmark : null;
+    const ceiling = units.value === 0 ? 0 : ratio === null ? null : ratio <= s.lower_ratio ? s.lower_points * ratio / s.lower_ratio :
+      ratio < s.upper_ratio ? s.lower_points + (s.max_points - s.lower_points) * (ratio - s.lower_ratio) / (s.upper_ratio - s.lower_ratio) : s.max_points;
+    return { family_id: member.family_id, asin: member.asin, actual_score: actualScore, sales_ratio: ratio,
+      sales_ceiling: ceiling, natural: scoreNatural(member, ctx, profile),
+      score: actualScore !== null && ceiling !== null ? Math.min(actualScore, ceiling) : null,
+      possible_upper: Math.min(actualScore ?? 4, ceiling ?? 4),
+      reason: ratings.reason ?? units.reason ?? (ceiling === null ? 'A positive category sales reference is required for positive sales.' : null) };
+  };
+  diagnostics.examples = unique.map(calculate);
+  const complete = diagnostics.examples.filter(row => row.score !== null)
+    .sort((a, b) => b.score - a.score || compareIdentity(a, b));
+  const pair = complete.slice(0, 2);
+  const unresolved = [
+    ...diagnostics.examples.filter(row => row.score === null),
+    ...unresolvedMembers.map(calculate),
+  ];
+  diagnostics.unresolved_possible_examples = unresolved.map(row => ({ family_id: row.family_id, asin: row.asin, possible_upper: row.possible_upper }));
+  if (unresolved.some(row => pair.length < 2 || row.possible_upper > pair[1].score ||
+    (row.possible_upper === pair[1].score && (!text(row.family_id) || !text(row.asin) || compareIdentity(row, pair[1]) < 0)))) {
+    return pending('An unresolved observed newcomer could change the selected examples.');
+  }
+  diagnostics.selected_pair = pair.map(({ family_id, asin }) => ({ family_id, asin }));
+  diagnostics.no_qualifying_examples = pair.length === 0;
+  const evidence = mergeRefs(cohort.evidence, reference.evidence, ...reference.families.map(row => row.units_30d?.evidence),
+    ...unique.flatMap(member => [member.evidence, member.ratings?.evidence, member.units_30d?.evidence]));
+  const low = pair.length ? scored(lowDef, pair.reduce((sum, row) => sum + row.score / pair.length, 0), cohort,
+    { selected_pair: diagnostics.selected_pair, evidence }) : scored(lowDef, 0, cohort, { evidence });
+  const naturalScores = pair.map(row => row.natural.score);
+  const knownNatural = naturalScores.filter(value => value !== null);
+  const knownTotal = knownNatural.reduce((sum, value) => sum + value, 0);
+  const naturalEvidence = mergeRefs(evidence, ...pair.flatMap(row => [row.natural.input?.evidence, row.natural.input?.relevant_entries_evidence]));
+  const natural = naturalScores.every(value => value !== null) ? scored(naturalDef,
+    pair.length ? naturalScores.reduce((sum, value) => sum + value / pair.length, 0) : 0, cohort,
+    { selected_pair: diagnostics.selected_pair, evidence: naturalEvidence }) :
+    missing(naturalDef, 'The fixed current-category examples lack supported SIF overall shares.', cohort,
+      { selected_pair: diagnostics.selected_pair, evidence: naturalEvidence,
+        conditional_range: knownNatural.length ? [knownTotal / pair.length, (knownTotal + pair.length - knownNatural.length) / pair.length] : null });
   return { low, natural, diagnostics };
 }
 
@@ -570,8 +669,8 @@ export function scoreCandidate(candidate, profile) {
 
 export function scoreBatch(batch, profile) {
   definitions(profile);
-  if (batch?.schema_version !== 1 || batch.profile_revision !== 50 || !Array.isArray(batch.candidates)) {
-    throw new TypeError('A version-1 batch with profile_revision 50 and a candidates array is required.');
+  if (batch?.schema_version !== 1 || batch.profile_revision !== profile.revision || !Array.isArray(batch.candidates)) {
+    throw new TypeError('A version-1 batch with matching profile_revision and a candidates array is required.');
   }
   const ids = new Set();
   const results = batch.candidates.map(candidate => {
@@ -591,7 +690,7 @@ export function scoreBatch(batch, profile) {
   }
   const queues = { comparable, pending, deferred, excluded };
   return {
-    schema_version: 1, profile_revision: 50, total_budget: 100,
+    schema_version: 1, profile_revision: profile.revision, total_budget: 100,
     candidates: Object.values(queues).flat(),
     order: Object.fromEntries(Object.entries(queues).map(([key, values]) => [key, values.map(result => result.candidate_id)])),
     comparable_leader: leader ? { candidate_id: leader.candidate_id, total_range: leader.total_range, conservative_score: leader.total_range[0] } : null,

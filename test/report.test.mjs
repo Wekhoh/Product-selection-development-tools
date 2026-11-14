@@ -23,7 +23,9 @@ test('Chinese cards distinguish complete point/range totals from supported parti
   assert.match(html, /89\.75[–—-]90\.5/);
   assert.equal((html.match(/data-item-id=/g) ?? []).length, 63);
   assert.equal((html.match(/data-group-id=/g) ?? []).length, 24);
-  assert.match(html, /同一对示例/);
+  assert.match(html, /正常新品：固定示例/);
+  assert.match(html, /独立类目参照/);
+  assert.doesNotMatch(html, /相对数量分|包含弱表现与仍合格的退出样本/);
   assert.match(html, /原始精确竞价/);
 });
 
@@ -105,6 +107,16 @@ test('known exclusions and deferrals are not mislabeled as missing score evidenc
   assert.ok(deferred?.includes('本期暂缓，不列完整总分'));
   assert.doesNotMatch(excluded, /完整总分待补证/);
   assert.doesNotMatch(deferred, /完整总分待补证/);
+
+  const belowFloor = structuredClone(fixture);
+  belowFloor.candidates = [belowFloor.candidates[0]];
+  for (const scenario of belowFloor.candidates[0].economics.scenarios) {
+    scenario.margin.value = 0.20;
+    scenario.contribution_usd.value = 8;
+  }
+  const failedMargin = renderReport(scoreBatch(belowFloor, profile), belowFloor);
+  assert.match(failedMargin, /费用已算出，但该方案不满足毛利条件/);
+  assert.doesNotMatch(failedMargin, /需要解决的缺口|完整情景尚待补证/);
 });
 
 test('unsupported economic records never display a margin pass, including stale eligibility-only diagnostics', () => {

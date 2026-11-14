@@ -2,7 +2,7 @@
 
 An independent, open-source product-selection tool for personal use and optional self-hosting.
 
-**Current stage: bounded discovery-to-card implementation and real-data trials.** The offline runner applies the 21 adopted revision-50 mappings to explicit local evidence and produces Chinese cards. Native research still runs through the authorized Codex tools; daily scheduling and full application acceptance remain open. Importing modules or the profile never starts requests.
+**Current stage: bounded discovery-to-card implementation and real-data trials.** The offline runner applies the 21 revision-51 trial mappings to explicit local evidence and produces Chinese cards; frozen revision-50 inputs remain replayable with their matching profile. The current trial simplifies newcomer references under the owner's delegation, with calibration still pending. Native research runs through authorized Codex tools; daily scheduling and full application acceptance remain open. Importing modules or the profile never starts requests.
 
 ## Run the offline example
 
@@ -20,7 +20,7 @@ Open `outputs/example/index.html`. These cards are explicitly synthetic. For gen
 - [Project state and next steps](docs/STATE.md) — the single task and recovery record.
 - [Product requirements](docs/PRODUCT.md) — intended workflow and acceptance.
 - [Decisions and unresolved questions](docs/design/DECISIONS.md) — confirmed preferences, exceptions, and superseded proposals.
-- [Reference profile](docs/design/reference-profile.draft.json) — 21 adopted trial item mappings and revision-50 shared scoring rules; real-world validation and calibration remain open.
+- [Reference profile](docs/design/reference-profile.draft.json) — 21 trial items, unchanged 100-point budget and current-category newcomer simplification; real-world calibration remains open.
 - [Migration boundaries](docs/MIGRATION.md) — what is retained and what needs redesign.
 - [Provider integration handoff](docs/API-MIGRATION.md) — preserved API behavior, unresolved compatibility, and cost continuity.
 

@@ -101,7 +101,7 @@ The source-reported count of written reviews for an identified product scope and
 _Avoid_: Rating count
 
 **Comparable-newcomer rating-count median (可比新品评价数中位数)**:
-The median accumulated rating count of the eligible comparable-newcomer reference cohort at aligned observation points, adopted for trial as the reference for relative rating accumulation. It describes the cohort's middle rating-count level, not a rating requirement for sales success or a substitute for missing launch history.
+The median accumulated rating count of the eligible comparable-newcomer reference cohort at aligned observation points. This is a historical revision-50 scoring reference; revision 51 removes the relative-rating component. It describes the cohort's middle rating-count level, not a rating requirement for sales success or a substitute for missing launch history.
 _Avoid_: Whole-category review average, required reviews to launch, provider-native reference field
 
 **Star rating (星级)**:
@@ -125,12 +125,16 @@ The observed newcomers that meet the declared substitutable-niche, relevant BSR 
 _Avoid_: A fixed six-product sample, only the best-performing examples, whole-category membership
 
 **Selected newcomer exemplars (选定新品案例)**:
-The qualifying examples selected from an observed reference cohort to summarize a supported opportunity. They remain distinct from the larger cohort that supplies the market references and contrary evidence; the current two-example aggregation does not redefine market size.
+The qualifying examples selected from an observed reference cohort to summarize a supported opportunity. Revision 51 selects up to two best capped scores from the current relevant category; the independent all-age sales reference and contrary evidence remain separate. Frozen revision 50 requires two and uses its older cohort references. Selection never redefines market size.
 _Avoid_: The full niche, a census, a success-probability sample
 
 **Single-case selection evidence (单例选品线索)**:
-Supported evidence from one eligible observed launch, which can retain its own justified example score and prompt further investigation. It does not by itself establish a complete direction-level score, typical newcomer performance or a market success rate; other observed outcomes and uncertainty remain relevant.
-_Avoid_: A second independent example, complete market score, candidate failure
+Supported evidence from one eligible observed launch. Revision 51 permits a labeled single-case trial score only after no unresolved observed example could change selection; frozen revision 50 retains it without a direction-level score. It does not establish typical newcomer performance or a market success rate. Other observed outcomes and uncertainty remain relevant.
+_Avoid_: A second independent example, proof of broad opportunity, candidate failure
+
+**Independent current-category sales reference (独立的当前类目销量参照)**:
+The median of aligned recent-30-day units for the declared relevant current category's deduplicated all-age families. When only representative-ASIN estimates are supported, disclose that consistent proxy rather than inventing parent totals. Revision 51 uses this reference to cap few-rating example scores; selected newcomers do not define their own benchmark.
+_Avoid_: Success-only median, own-sales forecast, missing sales as zero
 
 **Newcomer sales-unit share (新品销量件数占比)**:
 The estimated units attributed to source-defined eligible newcomers divided by estimated units for the same declared sample and sales period, with consistent family scope. The native market sample used for the count/sales shares is distinct from the genuinely comparable normal-start cohort used for few-rating sales evidence. Q31 uses the latest 30 days as the primary sales window and three months as the newcomer age definition. Its trial mapping and selected population are recorded in the reference profile; actual coverage and calibration remain to verify.
@@ -157,7 +161,7 @@ The bounds of a possible item score under stated valid sample and known-input as
 _Avoid_: Earned lower-bound points, midpoint score, cross-source observed range
 
 **Unscored true-zero reference (真实零基准未评分)**:
-The trial evaluation state in which a verified comparable-newcomer rating-count median is zero and the relative-rating component has no numerical score. The underlying observations remain valid; independently supported points are a partial result, not a complete item score.
+The historical revision-50 state in which a verified comparable-newcomer rating-count median is zero and the relative-rating component has no numerical score. Revision 51 no longer has that component. The original observations and historical result remain valid for replay.
 _Avoid_: Missing observations, zero score, full score
 
 **Recorded selection decision (已记录选品判断)**:

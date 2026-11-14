@@ -4,6 +4,9 @@ import { readFileSync } from 'node:fs';
 import { scoreBatch, scoreCandidate, scoreNumericValue } from '../src/scoring.mjs';
 
 const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+// Preserve the already accepted revision-50 behavior while the current profile evolves.
+profile.revision = 50;
+profile.workflow.scoring_and_ordering.revision = 50;
 const evidence = [{ id: 'synthetic-source', source: 'Synthetic test evidence', observed_at: '2026-11-13' }];
 const observation = (value, unit, extra = {}) => ({ value, unit, evidence: ['synthetic-source'], ...extra });
 const judgment = (anchor, extra = {}) => ({ anchor, reason: 'Synthetic bounded judgment.', evidence: ['synthetic-source'], ...extra });
