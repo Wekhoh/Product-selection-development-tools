@@ -1,5 +1,11 @@
 # Design decisions and open questions
 
+## Calculator fee-version choice and owner trial feedback — 2026-11-15
+
+The owner independently checked the researched form's main cost calculation, accepts the method and confirms rejection for inadequate margin. The owner then explicitly selects the calculator's 2027-02-01 version for subsequent estimates. Apply this to each available affected fee selector; a storage selection is not a page-wide version switch. Record applicable earlier-effective fee selections under their true dates, and keep unrelated quote/policy dates intact. These are preview estimates until their effective date. Preserve the old economics and show the adopted-version recalculation separately. No weight, mapping, minimum margin or permission boundary changes.
+
+The same owner review challenges why a market with weak newcomer representation and deep incumbent review histories was prioritized. Preserve this as useful selection calibration: established purchase demand does not establish accessible entry, and moderate concentration does not rule out competition from many established listings. The existing workflow already requires economic feasibility before expensive research; apply that ordering rather than explain a rejected form as a successful passing-card delivery. Keep the demand, concentration and newcomer signals distinct, without adding duplicate deductions, a universal review-count exclusion or a whole-category ban from one failed form. Exact owner observations, saved sample comparisons and the investigation trail remain private. No new calibrated screening cutoff is approved by this feedback.
+
 ## Product words, additional discovery angles and discussion boundary — 2026-11-15
 
 Later explicit acceptance: after clarifying delivery-only words, the owner approves handling them, brand-specific and pure promotion terms as discussed, authorizes trying the source-to-form flow and delegates routine implementation choices. Resume bounded execution; the earlier pause in this section is historical. The owner permits relevant SellerSprite/SIF cross-checks and Amazon buyer-front verification of missing/uncertain ratings. Explicit source/displayed zeros are valid; missing fields or sign-in-only views are not converted to zero. This does not change the 21-item scoring package or authorize store-account changes.
