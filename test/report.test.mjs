@@ -114,9 +114,18 @@ test('known exclusions and deferrals are not mislabeled as missing score evidenc
     scenario.margin.value = 0.20;
     scenario.contribution_usd.value = 8;
   }
+  belowFloor.candidates[0].presentation.blockers = [{ problem: '有据毛利低于硬线', next_step: '排除当前规格。' }];
   const failedMargin = renderReport(scoreBatch(belowFloor, profile), belowFloor);
   assert.match(failedMargin, /费用已算出，但该方案不满足毛利条件/);
+  assert.match(failedMargin, /已计分权重 70 \/ 100/);
+  assert.match(failedMargin, /不满足合格评分条件 2 项；待补证 0 项/);
+  assert.match(failedMargin, /排除原因与后续处理/);
   assert.doesNotMatch(failedMargin, /需要解决的缺口|完整情景尚待补证/);
+
+  belowFloor.candidates[0].metrics.purchase_demand_scale.value = null;
+  const excludedWithGap = renderReport(scoreBatch(belowFloor, profile), belowFloor);
+  assert.match(excludedWithGap, /不满足合格评分条件 2 项；待补证 1 项/);
+  assert.match(excludedWithGap, /需要解决的缺口/);
 });
 
 test('unsupported economic records never display a margin pass, including stale eligibility-only diagnostics', () => {
