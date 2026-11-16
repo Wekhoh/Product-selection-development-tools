@@ -162,3 +162,19 @@ test('a complete off-peak plan survives an unknown holiday rate, and the card ex
   assert.equal(malformed.operating_periods[1].queue, 'pending');
   assert.doesNotThrow(() => renderReport({ profile_revision:54, candidates:[malformed], queues:{} }, { candidates:[candidate] }));
 });
+
+test('a sensitivity-only ledger is shown as an unscored conditional estimate, not a missing fee date', () => {
+  const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url)));
+  const candidate = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url))).candidates[0];
+  for (const scenario of candidate.economics.scenarios) scenario.cost_ledger.sensitivity_only = true;
+  const result = scoreCandidate(candidate, profile);
+  const calculations = result.diagnostics.economics.scenarios.map(scenario => scenario.input.calculation);
+  assert.ok(calculations.every(calc => calc.status === 'sensitivity_only' && calc.fee_validation.status === 'validated'));
+  assert.equal(result.diagnostics.economics.margin_range, null);
+  assert.equal(result.total, null);
+  const html = renderReport({ profile_revision:54, candidates:[result], queues:{} }, { candidates:[candidate] });
+  assert.match(html, /条件试算毛利率/);
+  assert.match(html, /不授予经济分/);
+  assert.doesNotMatch(html, /完整费用尚待补证：费率适用日期或来源/);
+  assert.doesNotMatch(html, /该情景满足毛利条件/);
+});

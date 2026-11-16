@@ -47,7 +47,7 @@ const REASONS = new Map([
   ['A common saleable unit and nonempty supported economic scenario set are required.', '尚缺统一可售单位下的费用情景。'],
   ['Economic scenarios need unique IDs, the same saleable unit, coherent inputs and explicit assumptions.', '费用情景的规格、可售单位、假设或编号存在未解决的问题。'],
   ['Supported margin and contribution have contradictory signs or zero under the required positive net revenue.', '同一费用记录中的毛利率与贡献金额正负号或零值矛盾，不能作为完整利润证据。'],
-  ['One or more economic scenarios lacks a supported complete margin; missing costs are not zero.', '至少一个费用情景仍不完整；缺失费用不能按零计算。'],
+  ['One or more economic scenarios lacks a supported complete margin; missing costs are not zero.', '至少一个情景尚不能支持完整毛利；请核对未决费用或情景假设，缺失项不当零。'],
   ['The supported margin upper bound is below the existing 30% floor.', '有据毛利率上界仍低于30%，当前规格不满足毛利条件。'],
   ['The supported scenario margin is below the existing 30% floor.', '该有据情景的毛利率低于30%，不满足毛利条件。'],
   ['All supported coherent scenarios meet the margin condition.', '所有有据且一致的情景均满足毛利条件。'],
@@ -231,7 +231,17 @@ function economicDetails(result) {
   const diagnostics = object(result.diagnostics?.economics);
   const scenarios = array(diagnostics.scenarios);
   if (!scenarios.length) return '';
-  return `<section class="support-section"><h3>费用情景与假设</h3><p>统一可售单位：${escape(diagnostics.saleable_unit ?? '未知')}。毛利率与单件贡献来自同一情景，不能拼接不同情景的有利端点。</p><dl class="reference-rows">${scenarios.map(scenario => `<div><dt>${escape(scenario.id ?? '未命名情景')}</dt><dd>广告前毛利率 ${escape(observed(scenario.input?.margin))}；单件贡献 ${escape(observed(scenario.input?.contribution_usd))}。<p>${scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' : escape(scenario.input?.calculation && !scenario.input.calculation.scoring_supported ? `完整费用尚待补证：${array(scenario.input.calculation.pending_lines).map(id => COST_LABELS[id] ?? id).join('、') || '费率适用日期或来源'}。见下方核对。` : reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。'))}</p>${feeLedgerDetails(scenario)}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}</dd></div>`).join('')}</dl><p class="muted">缺失费用仍为未知。费用测算、初步路径判断、实际供应验证与后续经营结果分别核验。</p></section>`;
+  return `<section class="support-section"><h3>费用情景与假设</h3><p>统一可售单位：${escape(diagnostics.saleable_unit ?? '未知')}。毛利率与单件贡献来自同一情景，不能拼接不同情景的有利端点。</p><dl class="reference-rows">${scenarios.map(scenario => {
+    const calculation = scenario.input?.calculation;
+    const conditional = calculation?.status === 'sensitivity_only';
+    const margin = conditional ? { value: calculation.margin, unit: 'fraction' } : scenario.input?.margin;
+    const contribution = conditional ? { value: calculation.contribution_usd, unit: 'USD' } : scenario.input?.contribution_usd;
+    const explanation = conditional ? '费用已算出，但售价或其他情景假设尚未确认；不授予经济分。' :
+      scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' :
+        calculation && !calculation.scoring_supported ? `完整费用尚待补证：${array(calculation.pending_lines).map(id => COST_LABELS[id] ?? id).join('、') || '费率适用日期或来源'}。见下方核对。` :
+          reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。');
+    return `<div><dt>${escape(scenario.id ?? '未命名情景')}</dt><dd>${conditional ? '条件试算毛利率' : '广告前毛利率'} ${escape(observed(margin))}；单件贡献 ${escape(observed(contribution))}。<p>${escape(explanation)}</p>${feeLedgerDetails(scenario)}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}</dd></div>`;
+  }).join('')}</dl><p class="muted">缺失费用仍为未知。费用测算、初步路径判断、实际供应验证与后续经营结果分别核验。</p></section>`;
 }
 
 function inputSummary(item) {
