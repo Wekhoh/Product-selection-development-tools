@@ -1,5 +1,11 @@
 # Design decisions and open questions
 
+## Complete-evidence preference for tied newcomer examples — 2026-11-16
+
+The owner explicitly accepts preferring complete evidence when unresolved newcomer examples can only tie two already supported examples. Adopt this in revision52: preserve unknown ratings/sales and eligibility records with their supported upper bounds; when two complete capped four-point scores exist, an unresolved upper bound equal to or below the second complete score cannot displace them. A strictly greater upper bound still requires evidence before fixing the pair. Fewer than two complete examples with an unresolved additional example remains pending.
+
+This changes the prior stable-identity rule only at the boundary between a complete four-point example score and an unresolved equal upper bound. Canonical family/ASIN order remains for exact ties among complete scores. Natural share, traffic-data availability or the resulting combined total cannot be used to cherry-pick a different pair; the one-point natural item retains the same selected examples and its own missingness. All 21 weights, numerical curves, normal-start eligibility, query/reference/grouping checks and hard exclusions remain unchanged. Preserve revision50/51 replays and raw evidence. This is a trial rule adoption, not acceptance of the pending forms, a new data request or a production release.
+
 ## Calculator fee-version choice and owner trial feedback — 2026-11-15
 
 The owner independently checked the researched form's main cost calculation, accepts the method and confirms rejection for inadequate margin. The owner then explicitly selects the calculator's 2027-02-01 version for subsequent estimates. Apply this to each available affected fee selector; a storage selection is not a page-wide version switch. Record applicable earlier-effective fee selections under their true dates, and keep unrelated quote/policy dates intact. These are preview estimates until their effective date. Preserve the old economics and show the adopted-version recalculation separately. No weight, mapping, minimum margin or permission boundary changes.

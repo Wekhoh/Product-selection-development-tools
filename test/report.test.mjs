@@ -24,6 +24,7 @@ test('Chinese cards distinguish complete point/range totals from supported parti
   assert.equal((html.match(/data-item-id=/g) ?? []).length, 63);
   assert.equal((html.match(/data-group-id=/g) ?? []).length, 24);
   assert.match(html, /正常新品：固定示例/);
+  assert.match(html, /最多只能同分的缺数样本不再阻断选例/);
   assert.match(html, /独立类目参照/);
   assert.doesNotMatch(html, /相对数量分|包含弱表现与仍合格的退出样本/);
   assert.match(html, /原始精确竞价/);

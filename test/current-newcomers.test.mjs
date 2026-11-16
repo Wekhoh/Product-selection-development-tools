@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { scoreCandidate } from '../src/scoring.mjs';
 
 const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const currentProfile = structuredClone(profile);
 profile.revision = 51;
 profile.workflow.scoring_and_ordering.revision = 51;
 const obs = (value, unit) => ({ value, unit, evidence: ['source'] });
@@ -29,6 +30,48 @@ function candidate(members = [member('new', 0, 1)]) {
   };
 }
 const get = (result, id) => result.items.find(item => item.id === id);
+
+test('complete four-point examples take precedence over unresolved examples that can only tie', () => {
+  const input = candidate([member('a-unknown', null, 100), member('b-unknown', null, 100),
+    member('y-complete', 5, 100, 0.35), member('z-complete', 10, 100, 0.7)]);
+  const result = scoreCandidate(input, currentProfile);
+  assert.equal(get(result, 'low_rating_sales_performance').score, 4);
+  assert.equal(get(result, 'natural_visibility_development').score, 0.75);
+  assert.deepEqual(result.diagnostics.newcomers.selected_pair.map(row => row.family_id), ['y-complete', 'z-complete']);
+  assert.deepEqual(result.diagnostics.newcomers.unresolved_possible_examples.map(row => row.possible_upper), [4, 4]);
+  assert.equal(result.diagnostics.newcomers.examples[0].score, null);
+  assert.equal(input.newcomer_cohort.members[0].ratings.value, null);
+});
+
+test('equal-bound precedence also applies below four points and preserves revision-51 replay', () => {
+  const input = candidate([member('a-unknown', null, 50), member('y-complete', 25, 100), member('z-complete', 25, 100)]);
+  const current = scoreCandidate(input, currentProfile);
+  assert.equal(get(current, 'low_rating_sales_performance').score, 3);
+  assert.equal(current.diagnostics.newcomers.unresolved_possible_examples[0].selection_blocking, false);
+  const previous = scoreCandidate(input, profile);
+  assert.equal(get(previous, 'low_rating_sales_performance').score, null);
+  assert.equal(previous.diagnostics.newcomers.unresolved_possible_examples[0].selection_blocking, true);
+});
+
+test('a possibly stronger unknown or an unresolved second example still blocks scoring', () => {
+  for (const rows of [
+    [member('a-unknown', null, 100), member('y-complete', 5, 100), member('z-complete', 25, 100)],
+    [member('a-unknown', null, 100), member('y-complete', 5, 100)],
+  ]) {
+    const result = scoreCandidate(candidate(rows), currentProfile);
+    assert.equal(get(result, 'low_rating_sales_performance').score, null);
+    assert.equal(get(result, 'natural_visibility_development').score, null);
+    assert.equal(result.diagnostics.newcomers.unresolved_possible_examples[0].selection_blocking, true);
+  }
+});
+
+test('ties among complete scores keep canonical identity without choosing easier or higher natural evidence', () => {
+  const result = scoreCandidate(candidate([member('c', 5, 100, 0.7), member('b', 5, 100, 0.35), member('a', 5, 100, null)]), currentProfile);
+  assert.equal(get(result, 'low_rating_sales_performance').score, 4);
+  assert.deepEqual(result.diagnostics.newcomers.selected_pair.map(row => row.family_id), ['a', 'b']);
+  assert.equal(get(result, 'natural_visibility_development').score, null);
+  assert.deepEqual(get(result, 'natural_visibility_development').conditional_range, [0.25, 0.75]);
+});
 
 test('one verified newcomer uses the independent all-age market, not its own one-unit median', () => {
   const result = scoreCandidate(candidate(), profile);

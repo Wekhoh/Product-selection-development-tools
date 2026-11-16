@@ -1,5 +1,7 @@
 # 第一版需求与验收草案：承接原雷达的主动发现流程
 
+Current scoring amendment, 2026-11-16: revision52 adopts the owner-approved preference for complete newcomer evidence over unresolved equal upper bounds once two complete examples exist. [Q31](Q31-NORMAL-NEWCOMER.draft.md) owns the exact boundary and frozen revision50/51 replay. The 21 weights, curves, eligibility and same-pair natural scoring remain unchanged; earlier revision51 implementation statements below are historical base evidence rather than an override of this amendment.
+
 ## Proposed word-to-form flow for owner discussion — 2026-11-15
 
 Status: approved for bounded implementation and trial after the owner explicitly accepts the word handling and directs execution on 2026-11-15. The following workflow is not yet accepted unattended automation. Existing eligibility, 21 scores, 100 points, modest-volume acceptance and owner-controlled portfolio choice remain unchanged. The ten-card target counts only passing, fully scored candidates. The earlier request to review before execution below preserves chronology and is superseded by this direction.

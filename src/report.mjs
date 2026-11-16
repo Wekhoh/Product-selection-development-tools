@@ -176,11 +176,12 @@ function newcomerDetails(result) {
   const examples = array(diagnostics.examples);
   const members = array(diagnostics.members);
   const refs = object(diagnostics.references);
-  const current = diagnostics.reference_mode === 'current_category_r51';
+  const current = ['current_category_r51', 'current_category_r52'].includes(diagnostics.reference_mode);
   const pairKeys = new Set(pair.map(entry => `${entry.family_id}\0${entry.asin}`));
   return `<section class="support-section"><h3>正常新品：${current ? '固定示例' : '同一对示例'}</h3>
     <p>${current ? diagnostics.no_qualifying_examples ? '当前相关榜单的完整查询中，没有合格近三个月新品；少评价与自然曝光各记0支持分，不代表无法进入此市场。' : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 ${escape(numberText(refs.sales_median))} 件。参照包含新老商品；不再计算评价数中位数。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算，不是父体合计' : '声明的家族销量'}。` : `评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。`}</p>
     <p>${pair.length ? `固定${pair.length}个示例：${pair.map(entry => escape(`${entry.family_id} / ${entry.asin}`)).join('；')}。${pair.length === 1 ? '这是单例支持，不能理解为普遍成功。' : ''}` : diagnostics.no_qualifying_examples ? '保留源样本及排除理由。' : '示例尚待核实；缺数据不填零。'}</p>
+    ${diagnostics.selection_tie_policy === 'complete_score_before_unresolved_equal_bound' ? '<p class="muted">已有两款完整少评价得分时，最多只能同分的缺数样本不再阻断选例；缺数仍是未知。可能超过所选样本的仍需补证。自然可见度继续使用同一组示例。</p>' : ''}
     ${examples.length ? `<dl class="reference-rows">${examples.map(example => {
       const raw = members.find(member => member?.family_id === example.family_id && member?.asin === example.asin) ?? {};
       const natural = object(example.natural);

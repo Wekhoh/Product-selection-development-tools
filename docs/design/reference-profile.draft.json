@@ -1008,7 +1008,7 @@
       "evidence_boundary": "The shared per-example curve requires supported normal-start scope, period and relevant-query evidence. Source sufficiency/conflicts follow newcomer_natural_visibility_synthesis. Revision51 selection, single/zero examples and missingness follow current_category_newcomers; only frozen revision50 uses newcomer_natural_visibility_example_aggregation.",
       "score_meaning": "A trial indicator of observed natural exposure composition, not natural orders, profit, proven growth or a requirement to stop advertising.",
       "complete_item_mapping": true,
-      "multi_example_aggregation": "Revision51: current_category_newcomers fixes up to two selected low-rating examples. Frozen revision50 only: newcomer_natural_visibility_example_aggregation fixes two. Both retain missing shares without replacements or normalization.",
+      "multi_example_aggregation": "Revisions51/52: current_category_newcomers fixes up to two selected low-rating examples. Revision52 prefers complete scores over unresolved equal upper bounds. Frozen revision50 only: newcomer_natural_visibility_example_aggregation fixes two. All retain missing selected shares without replacements or normalization.",
       "calibration_status": "Pending real samples across niches, including overly strict/lenient anchors, sparse observations and potential newcomers still building visibility."
     },
     "newcomer_natural_visibility_example_aggregation": {
@@ -1137,9 +1137,9 @@
         "upper_ratio": 0.8,
         "max_points": 4
       },
-      "selection": "Mean of up to two highest supported capped scores; stable family then ASIN tie. Single example only when no unresolved extra example could change selection.",
+      "selection": "Revision52: mean of up to two highest supported capped scores. Once two complete scores exist, unresolved examples with upper bounds equal to or below the second complete score do not displace them. Exact ties among complete scores retain family then ASIN ascending; natural-data availability or score never selects a different pair. A single complete example with an unresolved second example remains pending. Frozen revision51 retains stable identity ties against unresolved equal upper bounds.",
       "no_examples": "Zero support points only after the declared query is complete and no unresolved observed member could qualify. This is not proof of market impossibility.",
-      "missingness": "Pending qualification or missing R/S that could displace selected examples blocks the 4/1. Do not discard unknowns to create a pair. Missing selected SIF shares remain unknown.",
+      "missingness": "Keep pending qualification and missing R/S as unknown records with supported upper bounds. They block 4/1 if fewer than two complete examples exist or the upper bound strictly exceeds the second complete score. This removes only equal-bound blocking in revision52, not missing-query, identity/grouping or reference checks. Missing selected SIF shares remain unknown; never substitute a different complete example merely for easier traffic data.",
       "natural": "Same selected examples, share/0.70 capped at one. Both tools keyword counts corroborate; never substitute word-count ratios.",
       "reference_boundary": "Initial category relevance removes obvious parts/unrelated uses, without mandatory fine niche reconstruction or off-list history. Source-complete query is sufficient; no Amazon-wide census.",
       "interpretation": "Observed opportunity support, not a typical outcome, success probability or own-sales forecast."
@@ -1185,7 +1185,7 @@
     },
     "scoring_and_ordering": {
       "status": "confirmed_for_trial",
-      "revision": 51,
+      "revision": 52,
       "scale": 100,
       "complete_total": "Sum all fully supported item scores at original weights. Do not add AI impression adjustments or duplicate penalties.",
       "supported_intervals": "Evaluate coherent supported scenarios with shared price/cost/refund inputs consistent across dependent items; keep the full resulting interval, not a midpoint or incompatible independent endpoints. Item-specific input rules still apply.",
@@ -1228,5 +1228,5 @@
     "Complete end-to-end product design and real-card acceptance.",
     "Suggested-bid revision 47 is confirmed for trial: equal native source points per query, labeled single-source fallback, consistent SellerSprite monthly-search importance across relevant main entries, and USD 0.50 full / USD 3.00 zero. Keep source points/ranges, approximate strategy/time limitations and missingness visible. This is not actual CPC, evidence of better accuracy, acceptance of a fixed collection size or activation of research. Later calibrated field/coverage/runtime acceptance remains pending."
   ],
-  "revision": 51
+  "revision": 52
 }
