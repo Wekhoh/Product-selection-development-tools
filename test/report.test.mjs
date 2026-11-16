@@ -114,6 +114,7 @@ test('known exclusions and deferrals are not mislabeled as missing score evidenc
   for (const scenario of belowFloor.candidates[0].economics.scenarios) {
     scenario.margin.value = 0.20;
     scenario.contribution_usd.value = 8;
+    scenario.cost_ledger.lines.find(line => line.id === 'procurement').amount_usd += 12;
   }
   belowFloor.candidates[0].presentation.blockers = [{ problem: '有据毛利低于硬线', next_step: '排除当前规格。' }];
   const failedMargin = renderReport(scoreBatch(belowFloor, profile), belowFloor);

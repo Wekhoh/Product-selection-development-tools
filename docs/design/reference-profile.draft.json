@@ -1193,7 +1193,7 @@
     },
     "scoring_and_ordering": {
       "status": "confirmed_for_trial",
-      "revision": 53,
+      "revision": 54,
       "scale": 100,
       "complete_total": "Sum all fully supported item scores at original weights. Do not add AI impression adjustments or duplicate penalties.",
       "supported_intervals": "Evaluate coherent supported scenarios with shared price/cost/refund inputs consistent across dependent items; keep the full resulting interval, not a midpoint or incompatible independent endpoints. Item-specific input rules still apply.",
@@ -1230,7 +1230,14 @@
       },
       "screening": "Existing specific-form exclusions, date-dependent deferrals and matched-price conditions remain. A credible margin upper bound below 30% excludes; a range spanning 30% remains pending. Never extend the eligible margin curve into failed scenarios or use a high total to clear a pending condition.",
       "gap_resolution": "Record required input, evidence, blocker, remedy and score/screening effect. Recover existing requests before new submission, then recompute/version after evidence or an adopted rule correction. Recurring unscorable important dimensions do not pass workflow acceptance.",
-      "validation": "Synthetic rule checks and the authorized saved-product trial do not establish production, calibration or business outcomes."
+      "validation": "Synthetic rule checks and the authorized saved-product trial do not establish production, calibration or business outcomes.",
+      "dated_economics": {
+        "status": "required_for_revision54",
+        "contract": "Every scenario supplies a same-ID, same-saleable-unit cost_ledger. The scorer recomputes refund-adjusted economics; cached margins never establish support. Registered sources, per-fee effective dates, separate sales/storage/inbound windows and included-charge components are validated before scoring.",
+        "legacy": "Frozen revisions50-53 remain arithmetic-only historical replay, not fee-policy acceptance.",
+        "unavailable": "An unavailable or out-of-period rate withholds that period margin and dependent collection; no cross-season or cross-year fill.",
+        "domestic_delivery": "The current 100-purchased-unit quote is required. Legacy deferred domestic delivery is not accepted in revision54."
+      }
     }
   },
   "pending_design": [
@@ -1242,5 +1249,5 @@
     "Complete end-to-end product design and real-card acceptance.",
     "Suggested-bid revision 47 is confirmed for trial: equal native source points per query, labeled single-source fallback, consistent SellerSprite monthly-search importance across relevant main entries, and USD 0.50 full / USD 3.00 zero. Keep source points/ranges, approximate strategy/time limitations and missingness visible. This is not actual CPC, evidence of better accuracy, acceptance of a fixed collection size or activation of research. Later calibrated field/coverage/runtime acceptance remains pending."
   ],
-  "revision": 53
+  "revision": 54
 }

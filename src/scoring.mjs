@@ -1,5 +1,6 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
 import { validEvidenceDate as validDate } from './observations.mjs';
+import { calculateEconomics } from './economics.mjs';
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -30,7 +31,7 @@ const median = values => {
 };
 
 function definitions(profile) {
-  if (![50, 51, 52, 53].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
+  if (![50, 51, 52, 53, 54].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
     profile.activate_by_import !== false || !Array.isArray(profile.group_budgets) ||
     profile.group_budgets.length !== EXPECTED_GROUPS.length || profile.group_budgets.some((group, index) =>
       group?.id !== EXPECTED_GROUPS[index] || !Array.isArray(group.items))) {
@@ -514,6 +515,30 @@ function scoreCurrentNewcomers(cohort, unique, ctx, profile, lowDef, naturalDef,
   return { low, natural, diagnostics };
 }
 
+function datedScenario(scenario, economics, ctx) {
+  let calculation = null, reason = null;
+  try {
+    const ledger = scenario?.cost_ledger;
+    if (!ledger || ledger.id !== scenario.id || ledger.saleable_unit !== economics.saleable_unit) {
+      throw new TypeError('Revision54 requires a cost_ledger with the same scenario ID and saleable unit.');
+    }
+    calculation = calculateEconomics(ledger, { requireFeeBasis: true,
+      evidenceIds: [...ctx.evidence.keys()], operatingMonths: economics.operating_months });
+    if (!calculation.scoring_supported) {
+      reason = calculation.fee_validation.issues.map(issue => `${issue.line}: ${issue.reason}`).join(' ') ||
+        `Unconfirmed costs: ${calculation.pending_lines.join(', ')}; sensitivity-only results cannot be scored.`;
+    }
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    reason = error.message;
+  }
+  const refs = mergeRefs(...(Array.isArray(scenario?.cost_ledger?.lines) ? scenario.cost_ledger.lines : []).map(line => line?.evidence));
+  return { ...scenario, calculation,
+    supplied_observations: { margin: scenario?.margin ?? null, contribution_usd: scenario?.contribution_usd ?? null },
+    margin: { value: reason ? null : calculation.margin, unit: 'fraction', evidence: refs, reason },
+    contribution_usd: { value: reason ? null : calculation.contribution_usd, unit: 'USD', evidence: refs, reason } };
+}
+
 function scoreEconomics(economics, ctx, profile, defs) {
   const marginDef = defs.find(item => item.id === 'refund_adjusted_pre_ad_margin');
   const contributionDef = defs.find(item => item.id === 'unit_contribution');
@@ -527,7 +552,8 @@ function scoreEconomics(economics, ctx, profile, defs) {
     for (const scenario of economics.scenarios) {
       if (text(scenario?.id)) idCounts.set(scenario.id, (idCounts.get(scenario.id) ?? 0) + 1);
     }
-    for (const scenario of economics.scenarios) {
+    for (const original of economics.scenarios) {
+      const scenario = profile.revision >= 54 ? datedScenario(original, economics, ctx) : original;
       const validRecord = text(scenario?.id) && idCounts.get(scenario.id) === 1 && scenario.saleable_unit === economics.saleable_unit &&
         scenario.coherent === true && Array.isArray(scenario.assumptions) && scenario.assumptions.length > 0 && scenario.assumptions.every(text);
       let eligibilityReason = validRecord ? null : 'Economic scenarios need unique IDs, the same saleable unit, coherent inputs and explicit assumptions.';
@@ -677,7 +703,7 @@ export function scoreCandidate(candidate, profile) {
       candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
       profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [],
       operating_periods: periods.map(period => ({
-        ...scoreCandidate({ ...candidate, economics: { ...economics, scenarios: period.scenarios } }, profile),
+        ...scoreCandidate({ ...candidate, economics: { ...economics, scenarios: period.scenarios, operating_months: period.months } }, profile),
         id: period.id, label: period.label, months: period.months })),
       total: null, total_range: null, conditional_total_range: null, supported_score: null, supported_range: null,
       covered_weight: null, unscored_weight: null, scoring_complete: null, queue: 'seasonal_review',

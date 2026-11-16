@@ -2,7 +2,7 @@
 
 An independent, open-source product-selection tool for personal use and optional self-hosting.
 
-**Current stage: bounded discovery-to-card implementation and real-data trials.** The offline runner applies the 21 revision-53 trial mappings to explicit local evidence and produces Chinese cards; frozen revision-50–52 inputs remain replayable with their matching profile. Revision53 adds separate operating-season economics on one form, retaining the complete-newcomer tie rule and all 100-point weights/curves. Off-peak eligibility can remain available beside a peak failure; there is no automatic annual average or season choice. Calibration remains pending. Native research runs through authorized Codex tools; daily scheduling and full application acceptance remain open. Importing modules or the profile never starts requests.
+**Current stage: bounded discovery-to-card implementation and real-data trials.** The offline runner applies 21 trial mappings to explicit local evidence and produces Chinese cards. Revision54 calculates economics from dated, evidenced cost ledgers before scoring, rejects mismatched/unpublished fee periods and detects declared duplicate charges. Frozen revisions50–53 remain replayable with their matching profiles, without retroactive fee-policy acceptance. All 100-point weights/curves and separate operating-season results remain unchanged. Off-peak eligibility can remain available beside a peak gap or failure; there is no automatic annual average or season choice. Calibration remains pending. Native research runs through authorized Codex tools; daily scheduling and full application acceptance remain open. Importing modules or the profile never starts requests.
 
 ## Run the offline example
 

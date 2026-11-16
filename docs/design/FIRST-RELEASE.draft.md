@@ -1,5 +1,11 @@
 # 第一版需求与验收草案：承接原雷达的主动发现流程
 
+## Dated economics correction — bounded implementation, 2026-11-16
+
+The owner authorizes enforcing fee-year/season rules and rechecking the two saved forms. Revision54 preserves all 21 scoring mappings and adds mandatory cost-ledger calculation before economics can support a score. The source-research responsibility remains with Codex; deterministic code validates the declared applicability and performs the arithmetic. [TRIAL-INPUT](TRIAL-INPUT.md) defines the interface, and STATE owns progress and actual acceptance evidence.
+
+Acceptance for this slice: the real CLI recomputes same-unit costs instead of trusting cached margins; wrong-year/season/source/package fees cannot produce a confirmed margin; independent sales/storage/inbound date windows permit genuinely different effective dates; unavailable 2027 holiday fulfillment remains null and withholds dependent collection; a complete independent period is preserved; refund administration, original outbound fulfillment, domestic delivery and bond are not charged twice. A missing current domestic quote cannot use the superseded blanket deferral. Invalid fee metadata must remain an actionable period gap without preventing the remaining cards/report from rendering. Verify the public synthetic checks, frozen historical replay, actual saved two-card output, independent review and expanded desktop/mobile report. This is not renewed discovery or acceptance of a new passing product.
+
 Current scoring amendment, 2026-11-16: revision52 adopts the owner-approved preference for complete newcomer evidence over unresolved equal upper bounds once two complete examples exist. [Q31](Q31-NORMAL-NEWCOMER.draft.md) owns the exact boundary and frozen revision50/51 replay. The 21 weights, curves, eligibility and same-pair natural scoring remain unchanged; earlier revision51 implementation statements below are historical base evidence rather than an override of this amendment.
 
 ## Proposed word-to-form flow for owner discussion — 2026-11-15

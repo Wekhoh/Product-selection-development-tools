@@ -176,7 +176,7 @@ function newcomerDetails(result) {
   const examples = array(diagnostics.examples);
   const members = array(diagnostics.members);
   const refs = object(diagnostics.references);
-  const current = ['current_category_r51', 'current_category_r52', 'current_category_r53'].includes(diagnostics.reference_mode);
+  const current = ['current_category_r51', 'current_category_r52', 'current_category_r53', 'current_category_r54'].includes(diagnostics.reference_mode);
   const pairKeys = new Set(pair.map(entry => `${entry.family_id}\0${entry.asin}`));
   return `<section class="support-section"><h3>正常新品：${current ? '固定示例' : '同一对示例'}</h3>
     <p>${current ? diagnostics.no_qualifying_examples ? '当前相关榜单的完整查询中，没有合格近三个月新品；少评价与自然曝光各记0支持分，不代表无法进入此市场。' : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 ${escape(numberText(refs.sales_median))} 件。参照包含新老商品；不再计算评价数中位数。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算，不是父体合计' : '声明的家族销量'}。` : `评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。`}</p>
@@ -191,11 +191,47 @@ function newcomerDetails(result) {
     <p class="muted">自然占比是来源建模的曝光构成，不是自然订单或利润。关键词数仅作旁证，不换算曝光占比，也不额外加分。原生市场新品3／2分与上述合格示例4／1分保持分开。</p></section>`;
 }
 
+const COST_LABELS = { procurement: '采购（含约定普通包装）', domestic_freight: '国内运费分摊', headhaul: '头程（含适用 bond）',
+  referral: '退款调整后净佣金', fulfillment: 'FBA原出库配送', placement: '入库配置', storage: '仓储分摊',
+  returns_processing: '额外退货处理', returns_disposal: '退货损失／处置', collection: '收款手续费',
+  other_applicable: '其他适用费用', recovery_credit: '回收抵扣' };
+
+const FEE_ISSUES = {
+  missing_fee_context: '缺少有效的美国站、美元、包装参照或销售／仓储／入库日期。',
+  operating_period_mismatch: '销售日期超出了卡片列出的经营月份。',
+  missing_cost_evidence: '缺少已登记的成本来源。',
+  domestic_quote_required: '需要100采购单位的国内运费报价，不能沿用旧暂缓规则。',
+  missing_components: '尚未说明这笔费用已包含哪些收费项目。',
+  duplicate_component: '与其他成本行重复包含同一收费项目，须核对后再算。',
+  unpublished_fee: '没有可用的已发布适用费率；不拿其他年份或季节的费率代替。',
+  invalid_fee_basis: '费率版本、来源或生效日期不完整。',
+  fee_scope_mismatch: '费率的站点、币种或包装参照不一致。',
+  fee_outside_dates: '该费率没有覆盖完整目标日期，请核对下方版本。',
+  fee_season_mismatch: '该费率没有覆盖目标月份，或月份输入无效。',
+};
+
+function feeLedgerDetails(scenario) {
+  const ledger = scenario.input?.calculation;
+  if (!ledger) return '';
+  const validation = object(ledger.fee_validation), context = object(validation.context);
+  const windowText = window => window ? `${window.from} 至 ${window.through}` : '待补证';
+  const pending = array(ledger.pending_lines), deferred = array(ledger.deferred_lines);
+  const rows = array(ledger.lines).map(line => {
+    const unknown = pending.includes(line.id) || line.amount_usd === null;
+    const basis = line.fee_basis;
+    const dateText = basis ? `${basis.version ?? '正式费率待补'}；${basis.effective_from ?? '未知'} 至 ${basis.effective_through ?? '未声明截止日'}${basis.months !== undefined ? `；适用月份 ${Array.isArray(basis.months) ? basis.months.join('、') : '无效，待补证'}` : ''}` : '按所列成本来源与情景';
+    return { label: COST_LABELS[line.id] ?? line.id,
+      value: deferred.includes(line.id) ? (pending.includes(line.id) ? '旧暂缓规则不再适用，待补证' : '按已批准范围暂缓，金额未知') : unknown ? '待补证' : line.amount_usd,
+      unit: !unknown && !deferred.includes(line.id) ? 'USD/销售单位' : '', note: `${line.basis}；${dateText}` };
+  });
+  return `<section class="support-section fee-validation"><h4>费率适用性：${validation.status === 'validated' ? '所声明日期与来源通过检查' : '存在待补证项'}</h4><p>销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。</p><p>净收入 US$ ${escape(numberText(ledger.net_revenue_usd))}；完整费用 ${ledger.net_cost_usd === null ? '未知' : `US$ ${escape(numberText(ledger.net_cost_usd))}`}；完整贡献 ${ledger.contribution_usd === null ? '未知' : `US$ ${escape(numberText(ledger.contribution_usd))}`}。</p>${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(FEE_ISSUES[issue.code] ?? issue.reason)}</li>`).join('')}</ul>` : ''}${presentationRows('由本次计算账本生成的费用明细', rows)}<p class="muted">费用按本销售单位计入一次。净佣金已含退款管理费；原出库配送不因退款再扣一次。收款从本情景的Amazon打款估算；待补费用不按零计。日期检查验证已声明的来源范围，不代替源页面核验。</p></section>`;
+}
+
 function economicDetails(result) {
   const diagnostics = object(result.diagnostics?.economics);
   const scenarios = array(diagnostics.scenarios);
   if (!scenarios.length) return '';
-  return `<section class="support-section"><h3>费用情景与假设</h3><p>统一可售单位：${escape(diagnostics.saleable_unit ?? '未知')}。毛利率与单件贡献来自同一情景，不能拼接不同情景的有利端点。</p><dl class="reference-rows">${scenarios.map(scenario => `<div><dt>${escape(scenario.id ?? '未命名情景')}</dt><dd>广告前毛利率 ${escape(observed(scenario.input?.margin))}；单件贡献 ${escape(observed(scenario.input?.contribution_usd))}。<p>${scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' : escape(reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。'))}</p>${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}</dd></div>`).join('')}</dl><p class="muted">缺失费用仍为未知。费用测算、初步路径判断、实际供应验证与后续经营结果分别核验。</p></section>`;
+  return `<section class="support-section"><h3>费用情景与假设</h3><p>统一可售单位：${escape(diagnostics.saleable_unit ?? '未知')}。毛利率与单件贡献来自同一情景，不能拼接不同情景的有利端点。</p><dl class="reference-rows">${scenarios.map(scenario => `<div><dt>${escape(scenario.id ?? '未命名情景')}</dt><dd>广告前毛利率 ${escape(observed(scenario.input?.margin))}；单件贡献 ${escape(observed(scenario.input?.contribution_usd))}。<p>${scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' : escape(scenario.input?.calculation && !scenario.input.calculation.scoring_supported ? `完整费用尚待补证：${array(scenario.input.calculation.pending_lines).map(id => COST_LABELS[id] ?? id).join('、') || '费率适用日期或来源'}。见下方核对。` : reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。'))}</p>${feeLedgerDetails(scenario)}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}</dd></div>`).join('')}</dl><p class="muted">缺失费用仍为未知。费用测算、初步路径判断、实际供应验证与后续经营结果分别核验。</p></section>`;
 }
 
 function inputSummary(item) {
@@ -255,7 +291,7 @@ function periodPanel(period, presentation, registry, prefix) {
   const label = { excluded: '本时段排除', deferred: '本时段暂缓' }[period.queue] ?? QUEUES[period.queue] ?? '待补证';
   const incomplete = period.queue === 'excluded' ? '本经营时段不满足筛选条件，不列完整总分' :
     period.queue === 'deferred' ? '本经营时段暂缓，不列完整总分' : '本经营时段完整总分待补证';
-  return `<section class="operating-period" data-operating-period="${escape(period.id)}" data-queue="${escape(period.queue)}"><div class="card-title"><h3>${escape(period.label)}</h3><span class="status ${escape(period.queue)}">${label}</span></div><p class="muted">适用月份：${escape(array(period.months).join('、'))}月；本时段独立适用30%毛利条件。</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<div class="score-summary"><p><strong>退款调整后广告前毛利率 ${margin ? `${escape(rangeText(margin))}%` : '未知'}</strong>；单件贡献 ${contribution ? `US$ ${escape(rangeText(contribution))}` : '未知'}。</p>${complete ? `<p class="total">本经营时段完整总分 <strong>${escape(rangeText(period.total_range))} / 100</strong></p>` : `<p class="total incomplete">${incomplete}</p>`}<p>已支持分数 ${escape(rangeText(period.supported_range))}；已计分权重 ${escape(numberText(period.covered_weight))} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。</p>${period.conditional_total_range ? `<p class="muted">满足本时段准入后可能范围 ${escape(rangeText(period.conditional_total_range))}；这是数学界限，不是已获得总分或预测。</p>` : ''}</div>${presentationRows('本时段核算依据', presentation.facts)}${conditions.length ? `<p class="screen-note">本时段筛选：${conditions.map(condition => `${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : ''}<details class="card-details period-details"><summary>查看${escape(period.label)}的21项评分、费用与证据 · 8组</summary><div class="details-body">${economicDetails(period)}${presentationRows('本时段费用明细', presentation.costs)}${scoreRows(period, registry, prefix)}${newcomerDetails(period)}</div></details></section>`;
+  return `<section class="operating-period" data-operating-period="${escape(period.id)}" data-queue="${escape(period.queue)}"><div class="card-title"><h3>${escape(period.label)}</h3><span class="status ${escape(period.queue)}">${label}</span></div><p class="muted">适用月份：${escape(array(period.months).join('、'))}月；本时段独立适用30%毛利条件。</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<div class="score-summary"><p><strong>退款调整后广告前毛利率 ${margin ? `${escape(rangeText(margin))}%` : '未知'}</strong>；单件贡献 ${contribution ? `US$ ${escape(rangeText(contribution))}` : '未知'}。</p>${complete ? `<p class="total">本经营时段完整总分 <strong>${escape(rangeText(period.total_range))} / 100</strong></p>` : `<p class="total incomplete">${incomplete}</p>`}<p>已支持分数 ${escape(rangeText(period.supported_range))}；已计分权重 ${escape(numberText(period.covered_weight))} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。</p>${period.conditional_total_range ? `<p class="muted">满足本时段准入后可能范围 ${escape(rangeText(period.conditional_total_range))}；这是数学界限，不是已获得总分或预测。</p>` : ''}</div>${presentationRows('本时段核算依据', presentation.facts)}${conditions.length ? `<p class="screen-note">本时段筛选：${conditions.map(condition => `${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : ''}<details class="card-details period-details"><summary>查看${escape(period.label)}的21项评分、费用与证据 · 8组</summary><div class="details-body">${economicDetails(period)}${period.profile_revision >= 54 ? '' : presentationRows('本时段费用明细', presentation.costs)}${scoreRows(period, registry, prefix)}${newcomerDetails(period)}</div></details></section>`;
 }
 
 function seasonalCard(result, original, index) {
@@ -265,7 +301,7 @@ function seasonalCard(result, original, index) {
   const image = imageUri(presentation.image_data_uri);
   const displays = array(presentation.operating_periods);
   const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
-  return `<article class="candidate" id="${prefix}" data-queue="seasonal_review"><div class="card-top">${image ? `<figure class="product-image"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="320" height="320" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}<div class="card-intro"><div class="card-title"><h2>${escape(result.label ?? result.candidate_id)}</h2><span class="status seasonal_review">分季评估</span></div><p class="form">${escape(result.form ?? '具体可售规格尚待明确')}</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<p class="screen-note">同一款式的经营时段分别评估，由主人选择经营季节。各时段的费用、毛利与21项得分分别阅读，不合并全年总分或按最佳时段排序。</p></div></div>${presentationRows('款式事实与共同依据', presentation.facts)}${discoveryDetails(original?.discovery, registry, prefix)}${blockers.length ? `<section class="next-evidence"><h3>共同问题与后续处理</h3><ul>${blockers.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}${array(result.operating_periods).map(period => periodPanel(period, object(displays.find(display => display?.id === period.id)), registry, prefix)).join('')}<details class="card-details"><summary>查看共同采购资料与来源限制</summary><div class="details-body">${presentationRows('共同费用资料', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
+  return `<article class="candidate" id="${prefix}" data-queue="seasonal_review"><div class="card-top">${image ? `<figure class="product-image"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="320" height="320" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}<div class="card-intro"><div class="card-title"><h2>${escape(result.label ?? result.candidate_id)}</h2><span class="status seasonal_review">分季评估</span></div><p class="form">${escape(result.form ?? '具体可售规格尚待明确')}</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<p class="screen-note">同一款式的经营时段分别评估，由主人选择经营季节。各时段的费用、毛利与21项得分分别阅读，不合并全年总分或按最佳时段排序。</p></div></div>${presentationRows('款式事实与共同依据', presentation.facts)}${discoveryDetails(original?.discovery, registry, prefix)}${blockers.length ? `<section class="next-evidence"><h3>共同问题与后续处理</h3><ul>${blockers.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}${array(result.operating_periods).map(period => periodPanel(period, object(displays.find(display => display?.id === period.id)), registry, prefix)).join('')}<details class="card-details"><summary>查看共同采购资料与来源限制</summary><div class="details-body">${result.profile_revision >= 54 ? '' : presentationRows('共同费用资料', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
 }
 
 function candidateCard(result, original, index) {
@@ -289,7 +325,7 @@ function candidateCard(result, original, index) {
     ${discoveryDetails(original?.discovery, registry, prefix)}
     ${mainGaps.length ? `<section class="next-evidence"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul>${mainGaps.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}
     ${screenGaps.length ? `<p class="screen-note">筛选状态：${screenGaps.map(condition => `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : '<p class="screen-note">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}
-    <details class="card-details"><summary>查看21项评分与证据 · 8组</summary><div class="details-body">${scoreRows(result, registry, prefix)}${economicDetails(result)}${presentationRows('费用明细补充', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${newcomerDetails(result)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
+    <details class="card-details"><summary>查看21项评分与证据 · 8组</summary><div class="details-body">${scoreRows(result, registry, prefix)}${economicDetails(result)}${result.profile_revision >= 54 ? '' : presentationRows('费用明细补充', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${newcomerDetails(result)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
 }
 
 function batchContext(presentation) {

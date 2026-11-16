@@ -11,7 +11,7 @@ Status: development process, updated 2026-11-14. The first-release specification
 | [Design decisions](design/DECISIONS.md) | Confirmed choices, their conditions, superseded proposals and open questions |
 | [Domain glossary](../GLOSSARY.md) | Domain meanings, without implementation instructions or a second task list |
 | [First-release draft](design/FIRST-RELEASE.draft.md) | Automatic discovery/scoring workflow; the explicitly bounded trial slice is ready for implementation, with broader product acceptance still open |
-| [Draft reference profile](design/reference-profile.draft.json) | The 21 item mappings, 100-point budget and revision-53 trial rules, with revision-50–52 replay retained; not production configuration |
+| [Draft reference profile](design/reference-profile.draft.json) | The 21 item mappings, 100-point budget and revision-54 dated-ledger trial rules, with revision-50–53 replay retained; not production configuration |
 | [API migration](API-MIGRATION.md) | Historical capability and request/cost continuity constraints; not an adopted interface |
 | `docs/research/` | Dated primary-source investigations and reuse comparisons |
 | [STATE.md](STATE.md) | The single current task, evidence, blocker and recovery record |

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_revision": 53,
+  "profile_revision": 54,
   "presentation": {
     "title": "离线选品试评演示",
     "summary": "本页全部为合成教学数据。三个样本分别演示完整点值、完整情景区间和费用待补证；不构成任何市场或采购结论。",
@@ -504,6 +504,256 @@
               "evidence": [
                 "synthetic-evidence"
               ]
+            },
+            "cost_ledger": {
+              "id": "synthetic-base",
+              "saleable_unit": "一套合成双件收纳架",
+              "price_usd": 40,
+              "refund_fraction": 0,
+              "assumptions": [
+                "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+              ],
+              "referral_terms": {
+                "referral_fraction": 0.15,
+                "refund_admin_fraction": 0.2,
+                "refund_admin_cap_usd": 5
+              },
+              "collection_rate": 0.006,
+              "fee_context": {
+                "marketplace": "US",
+                "currency": "USD",
+                "package_ref": "synthetic-pack",
+                "sales": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "storage": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "inbound": {
+                  "from": "2027-02-01",
+                  "through": "2027-02-01"
+                }
+              },
+              "lines": [
+                {
+                  "id": "procurement",
+                  "amount_usd": 8.317,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "procurement"
+                  ]
+                },
+                {
+                  "id": "domestic_freight",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "domestic_freight"
+                  ]
+                },
+                {
+                  "id": "headhaul",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "headhaul"
+                  ]
+                },
+                {
+                  "id": "referral",
+                  "amount_usd": 6,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "referral"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "fulfillment",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "fulfillment"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "placement",
+                  "amount_usd": 1,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "placement"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "storage",
+                  "amount_usd": 0.5,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "storage"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_processing",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_processing"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_disposal",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_disposal"
+                  ]
+                },
+                {
+                  "id": "collection",
+                  "amount_usd": 0.183,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "collection"
+                  ]
+                },
+                {
+                  "id": "other_applicable",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "other_applicable"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "recovery_credit",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "recovery_credit"
+                  ]
+                }
+              ]
             }
           }
         ]
@@ -1003,6 +1253,256 @@
               "evidence": [
                 "synthetic-evidence"
               ]
+            },
+            "cost_ledger": {
+              "id": "synthetic-higher-margin",
+              "saleable_unit": "一套合成双件收纳架",
+              "price_usd": 25,
+              "refund_fraction": 0,
+              "assumptions": [
+                "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+              ],
+              "referral_terms": {
+                "referral_fraction": 0.15,
+                "refund_admin_fraction": 0.2,
+                "refund_admin_cap_usd": 5
+              },
+              "collection_rate": 0.006,
+              "fee_context": {
+                "marketplace": "US",
+                "currency": "USD",
+                "package_ref": "synthetic-pack",
+                "sales": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "storage": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "inbound": {
+                  "from": "2027-02-01",
+                  "through": "2027-02-01"
+                }
+              },
+              "lines": [
+                {
+                  "id": "procurement",
+                  "amount_usd": 5.6435,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "procurement"
+                  ]
+                },
+                {
+                  "id": "domestic_freight",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "domestic_freight"
+                  ]
+                },
+                {
+                  "id": "headhaul",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "headhaul"
+                  ]
+                },
+                {
+                  "id": "referral",
+                  "amount_usd": 3.75,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "referral"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "fulfillment",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "fulfillment"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "placement",
+                  "amount_usd": 1,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "placement"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "storage",
+                  "amount_usd": 0.5,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "storage"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_processing",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_processing"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_disposal",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_disposal"
+                  ]
+                },
+                {
+                  "id": "collection",
+                  "amount_usd": 0.1065,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "collection"
+                  ]
+                },
+                {
+                  "id": "other_applicable",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "other_applicable"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "recovery_credit",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "recovery_credit"
+                  ]
+                }
+              ]
             }
           },
           {
@@ -1024,6 +1524,256 @@
               "unit": "USD",
               "evidence": [
                 "synthetic-evidence"
+              ]
+            },
+            "cost_ledger": {
+              "id": "synthetic-higher-contribution",
+              "saleable_unit": "一套合成双件收纳架",
+              "price_usd": 42.85714285714286,
+              "refund_fraction": 0,
+              "assumptions": [
+                "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+              ],
+              "referral_terms": {
+                "referral_fraction": 0.15,
+                "refund_admin_fraction": 0.2,
+                "refund_admin_cap_usd": 5
+              },
+              "collection_rate": 0.006,
+              "fee_context": {
+                "marketplace": "US",
+                "currency": "USD",
+                "package_ref": "synthetic-pack",
+                "sales": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "storage": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "inbound": {
+                  "from": "2027-02-01",
+                  "through": "2027-02-01"
+                }
+              },
+              "lines": [
+                {
+                  "id": "procurement",
+                  "amount_usd": 15.731000000000002,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "procurement"
+                  ]
+                },
+                {
+                  "id": "domestic_freight",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "domestic_freight"
+                  ]
+                },
+                {
+                  "id": "headhaul",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "headhaul"
+                  ]
+                },
+                {
+                  "id": "referral",
+                  "amount_usd": 6.428571428571429,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "referral"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "fulfillment",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "fulfillment"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "placement",
+                  "amount_usd": 1,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "placement"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "storage",
+                  "amount_usd": 0.5,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "storage"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_processing",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_processing"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_disposal",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_disposal"
+                  ]
+                },
+                {
+                  "id": "collection",
+                  "amount_usd": 0.1975714285714286,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "collection"
+                  ]
+                },
+                {
+                  "id": "other_applicable",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "other_applicable"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "recovery_credit",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "recovery_credit"
+                  ]
+                }
               ]
             }
           }
@@ -1526,6 +2276,256 @@
                 "synthetic-evidence"
               ],
               "reason": "合成缺口：贡献金额取决于尚缺的费用。"
+            },
+            "cost_ledger": {
+              "id": "synthetic-unknown",
+              "saleable_unit": "一套合成双件收纳架",
+              "price_usd": 40,
+              "refund_fraction": 0,
+              "assumptions": [
+                "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
+              ],
+              "referral_terms": {
+                "referral_fraction": 0.15,
+                "refund_admin_fraction": 0.2,
+                "refund_admin_cap_usd": 5
+              },
+              "collection_rate": 0.006,
+              "fee_context": {
+                "marketplace": "US",
+                "currency": "USD",
+                "package_ref": "synthetic-pack",
+                "sales": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "storage": {
+                  "from": "2027-02-01",
+                  "through": "2027-09-30"
+                },
+                "inbound": {
+                  "from": "2027-02-01",
+                  "through": "2027-02-01"
+                }
+              },
+              "lines": [
+                {
+                  "id": "procurement",
+                  "amount_usd": null,
+                  "status": "pending",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "procurement"
+                  ]
+                },
+                {
+                  "id": "domestic_freight",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "domestic_freight"
+                  ]
+                },
+                {
+                  "id": "headhaul",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "headhaul"
+                  ]
+                },
+                {
+                  "id": "referral",
+                  "amount_usd": 6,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "referral"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "fulfillment",
+                  "amount_usd": 2,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "fulfillment"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "placement",
+                  "amount_usd": 1,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "placement"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "storage",
+                  "amount_usd": 0.5,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "storage"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_processing",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_processing"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "returns_disposal",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "returns_disposal"
+                  ]
+                },
+                {
+                  "id": "collection",
+                  "amount_usd": 0.183,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "collection"
+                  ]
+                },
+                {
+                  "id": "other_applicable",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "other_applicable"
+                  ],
+                  "fee_basis": {
+                    "status": "published",
+                    "version": "SYNTHETIC-2027-nonpeak",
+                    "marketplace": "US",
+                    "currency": "USD",
+                    "package_ref": "synthetic-pack",
+                    "effective_from": "2027-02-01",
+                    "effective_through": "2027-09-30",
+                    "evidence": [
+                      "synthetic-evidence"
+                    ]
+                  }
+                },
+                {
+                  "id": "recovery_credit",
+                  "amount_usd": 0,
+                  "status": "estimated",
+                  "basis": "Synthetic classroom amount; not a business quote",
+                  "evidence": [
+                    "synthetic-evidence"
+                  ],
+                  "components": [
+                    "recovery_credit"
+                  ]
+                }
+              ]
             }
           }
         ]
