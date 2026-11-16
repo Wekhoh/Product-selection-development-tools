@@ -2,9 +2,19 @@
 
 ## Active reading order and resumed trial — 2026-11-16
 
-Read STATE for current authorization and progress, the revision54 profile plus its owning design documents for current rules, and the dated sections below for provenance. Later explicit decisions supersede only their stated scope. The owner now resumes the saved-lead trial and adopts early economic/entry checks before expensive research; the preceding wider pause is historical. Keep 100 points, 21 items, all weights and curves. Ten qualifying cards means ten fully scored forms satisfying the established margin and initial-rights conditions, without a new total-score cutoff; exclusions and unresolved forms are additional, not part of ten. Preserve price, interval, season and source-evidence boundaries.
+Read STATE for current authorization and progress, the revision55 profile plus its owning design documents for current rules, and the dated sections below for provenance. Later explicit decisions supersede only their stated scope. The owner now resumes the saved-lead trial and adopts early economic/entry checks before expensive research; the preceding wider pause is historical. Keep 100 points, 21 items, all weights and curves. Ten qualifying cards means ten fully scored forms satisfying the established margin and initial-rights conditions, without a new total-score cutoff; exclusions and unresolved forms are additional, not part of ten. Preserve price, interval, season and source-evidence boundaries.
 
 The five entry routes share one provenance-preserving candidate pool. They need not share a keyword, run for every card, or produce equal numbers. Social observations can originate a direction. Merge repeated observations of the same form while retaining distinct material forms in the same market. Use observed trial times and qualifying yield before estimating ten-card delivery.
+
+## Single genuine main purchase entry — 2026-11-17
+
+The owner explicitly approves using a genuine sole main purchase query's usable exact bid directly, while multiple entries keep monthly-search weighting. Revision55 adopts B=b_1 for one entry and the unchanged weighted formula for several. Preserve both-source averaging, single-source labeling, original ranges, US/USD/exact scope and the 15-point curve. Missing monthly volume remains unknown and does not block this one-entry bid item; it is not demand evidence. Do not shrink a known multi-entry or unresolved set to the one returned point. Missing exact points still withhold scoring. Revisions50–54 retain their old behavior.
+
+Implement in the existing scorer and report, then rerun the saved candidate with its existing sourcing and dated fees. Complete scores and separate supported operating periods remain required; a future unpublished holiday fee stays unknown. No new supplier, advertising or order action is authorized.
+
+Later source-review clarification, same date: the saved candidate has consequential additional relevant main-query candidates without usable points/volumes. It is not established as a genuine sole-entry case. The owner explicitly chooses to obtain the main-query data before awarding the bid item and declines scoring from only the available query. This does not withdraw the genuine-sole-entry rule or authorize a partial-source fallback. Keep the real total pending and preserve the original source-selection correction.
+
+Supplier browsing: reuse the saved authenticated session and evidence, serialize necessary page navigation and avoid duplicate searches/refresh loops. If a challenge appears, stop that browsing path for the owner. This reduces unnecessary site activity; it neither guarantees no challenge nor authorizes bypass, identity rotation or hidden endpoints.
 
 ## Decision chronology
 

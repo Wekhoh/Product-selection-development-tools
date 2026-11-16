@@ -54,7 +54,7 @@
           "weight_status": "confirmed_for_trial",
           "mapping": {
             "status": "confirmed_for_trial",
-            "method": "source_mean_then_main_entry_search_weighted_capped_linear",
+            "method": "source_mean_then_single_entry_or_search_weighted_capped_linear",
             "input_currency": "USD",
             "match_type": "exact",
             "source_points": {
@@ -77,16 +77,17 @@
             },
             "entry_aggregation": {
               "selection": "Use supported main purchase entries relevant to the specific form, including meaningful longtail queries. Deduplicate exact queries; keep cheap peripheral opportunities separate. No fixed word count, core/longtail 9/6 split or full-market claim.",
-              "weight_source": "SellerSprite monthly search volumes for a compatible common period and the selected main-entry set; do not mix SIF weekly volumes.",
+              "weight_source": "For multiple main entries, use SellerSprite monthly search volumes for a compatible common period; do not mix SIF weekly volumes.",
               "weight_formula": "a_i = v_i / sum(v_j for j in M)",
-              "reference_formula": "B = sum(a_i * b_i for i in M)",
-              "requires": "A supported main-entry set, valid nonnegative supported points/volumes, positive total volume, and consistent marketplace/currency/metric scope. Missing or placeholder data are not zero.",
-              "interpretation": "Research importance, not actual orders, candidate traffic shares or ad-budget allocation."
+              "reference_formula": "B = b_1 when |M| = 1; otherwise B = sum(a_i * b_i for i in M)",
+              "requires": "A researched main-entry set and usable exact point per entry, consistent US/USD/exact scope and registered evidence. For multiple entries, require supported nonnegative monthly volumes and positive total volume. Single-entry scoring does not establish demand size.",
+              "interpretation": "Research importance, not actual orders, candidate traffic shares or ad-budget allocation.",
+              "single_entry": "Exactly one evidenced genuine main purchase entry: B=b_1, with the unchanged two-source mean or labeled single-source point. Monthly volume and period are not required; missing volume remains unknown. Do not drop unresolved additional entries to invoke this rule."
             },
             "full_score_at_or_below": 0.5,
             "zero_score_at_or_above": 3,
             "formula": "item_weight * min(1, max(0, (3.00 - B) / 2.50))",
-            "missingness": "If a required main-entry point is missing from both sources or required weighting volume is unavailable, leave the item unscored; do not omit that entry and renormalize the rest. Keep supported observations and gaps.",
+            "missingness": "A required native exact point missing from both sources leaves the item unscored. For multiple entries, unavailable required weighting volume also leaves it unscored; never drop an entry and renormalize or pretend a partial set is the sole genuine entry. Single-entry monthly volume remains visible as unknown without blocking this item.",
             "range_handling": "Retain each source range as source-labeled scenario evidence; no invented native midpoint, automatic range-width/conflict penalty, confidence claim or actual CPC forecast.",
             "candidate_exclusion": false,
             "rounding": "Keep computational precision until display.",
@@ -1193,7 +1194,7 @@
     },
     "scoring_and_ordering": {
       "status": "confirmed_for_trial",
-      "revision": 54,
+      "revision": 55,
       "scale": 100,
       "complete_total": "Sum all fully supported item scores at original weights. Do not add AI impression adjustments or duplicate penalties.",
       "supported_intervals": "Evaluate coherent supported scenarios with shared price/cost/refund inputs consistent across dependent items; keep the full resulting interval, not a midpoint or incompatible independent endpoints. Item-specific input rules still apply.",
@@ -1247,7 +1248,8 @@
     "All 21 item mappings and the shared complete-total, supported-interval, missingness and card-ordering trial package are recorded at revision 50. Actual source validation, calibrated judgment, throughput, product implementation and useful real-card acceptance remain outstanding.",
     "The owner confirms retiring the independent initial-goods 6-point score and transferring six points to niche demand at 4/6/6 for trial in revision 37, then separately accepts the complete demand proposal in revision 38. All three trial mappings are recorded; see DEMAND.draft.md. Actual niche coverage, source-field acquisition, economical and consistent opportunity/entry judgments and real-sample calibration remain unverified. First-batch units remain the owner's capital decision, with compatible procurement-tier, packaging and freight evidence still required for per-unit economics.",
     "Complete end-to-end product design and real-card acceptance.",
-    "Suggested-bid revision 47 is confirmed for trial: equal native source points per query, labeled single-source fallback, consistent SellerSprite monthly-search importance across relevant main entries, and USD 0.50 full / USD 3.00 zero. Keep source points/ranges, approximate strategy/time limitations and missingness visible. This is not actual CPC, evidence of better accuracy, acceptance of a fixed collection size or activation of research. Later calibrated field/coverage/runtime acceptance remains pending."
+    "Suggested-bid revision 47 is confirmed for trial: equal native source points per query, labeled single-source fallback, consistent SellerSprite monthly-search importance across relevant main entries, and USD 0.50 full / USD 3.00 zero. Keep source points/ranges, approximate strategy/time limitations and missingness visible. This is not actual CPC, evidence of better accuracy, acceptance of a fixed collection size or activation of research. Later calibrated field/coverage/runtime acceptance remains pending.",
+    "Revision55 adopts one evidenced genuine main-entry direct point on 2026-11-17; multiple-entry monthly weighting, source fusion, all21 weights/curves and economics remain unchanged. Source-set relevance and useful-card calibration remain evidence responsibilities."
   ],
-  "revision": 54
+  "revision": 55
 }

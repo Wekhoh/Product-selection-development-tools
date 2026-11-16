@@ -57,7 +57,7 @@ A provider-returned suggested bidding amount for a keyword under a stated market
 _Avoid_: Actual CPC, inferred native midpoint, predicted customer-acquisition cost
 
 **Entry-weighted bid reference (主入口竞价参考值)**:
-A project-derived comparison amount combining supported native suggested points according to declared research importance across selected main purchase entries. It remains distinct from any provider-native point, actual paid cost or proposed account bidding instruction.
+A project-derived comparison amount combining supported native suggested points according to declared research importance across selected main purchase entries. For exactly one evidenced genuine main entry, the current trial uses that entry's usable exact point without a monthly weight; multiple entries retain monthly weighting. It remains distinct from any provider-native aggregate, actual paid cost or proposed account bidding instruction.
 _Avoid_: Provider-native aggregate, future ad-budget split, break-even CPC
 
 **Observed seller account (可观察卖家账号)**:

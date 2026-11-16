@@ -1,4 +1,4 @@
-# Offline trial input (revision 54, with revision-50–53 replay)
+# Offline trial input (revision 55, with revision-50–54 replay)
 
 ## Dated cost-ledger calculation (revision54)
 
@@ -40,7 +40,7 @@ Historical domestic-freight decision, 2026-11-14: the owner allowed an explicitl
 
 This is the input/output contract for `src/scoring.mjs`. It implements the bounded trial in [FIRST-RELEASE](FIRST-RELEASE.draft.md), using the [maintained profile](reference-profile.draft.json). It does no I/O and makes no provider or model calls. Importing the profile does not activate a production workflow.
 
-`scoreCandidate(candidate, profile)` scores one concrete form. `scoreBatch(batch, profile)` scores and orders `{ schema_version: 1, profile_revision: 54, candidates: [...] }`. The caller loads the matching frozen profile. Unsupported profile revision/activation flags, invalid group/item budgets or required margin mappings, malformed batches, missing candidate IDs and duplicate candidate IDs throw `TypeError`. This is a bounded scorer for the maintained profile, not a general profile-schema validator. Missing or invalid item evidence produces a null item and an explicit reason instead of throwing or filling a zero.
+`scoreCandidate(candidate, profile)` scores one concrete form. `scoreBatch(batch, profile)` scores and orders `{ schema_version: 1, profile_revision: 55, candidates: [...] }`. The caller loads the matching frozen profile. Unsupported profile revision/activation flags, invalid group/item budgets or required margin mappings, malformed batches, missing candidate IDs and duplicate candidate IDs throw `TypeError`. This is a bounded scorer for the maintained profile, not a general profile-schema validator. Missing or invalid item evidence produces a null item and an explicit reason instead of throwing or filling a zero.
 
 ## Evidence and observations
 
@@ -82,11 +82,11 @@ Units are `fraction`, `USD`, `count`, `units`, `searches_per_month`, or `boolean
 
 ### Exact bid points and separate ranges
 
-`bids` has `marketplace: "US"`, `currency: "USD"`, `match_type: "exact"`, a common `volume_period`, `selection_reason`, `evidence`, and nonempty `entries` for the supported main purchase-entry set. Other marketplaces remain unscored even if labeled USD. Each entry has a unique normalized `query`, `volume` (`searches_per_month` observation from SellerSprite), and optional `sellersprite` / `sif` observations. A source observation has `value`, `unit: "USD"`, `evidence`, `match_type: "exact"`, `strategy`, and optional nonnegative `low` / `high` with `low <= high`.
+`bids` has `marketplace: "US"`, `currency: "USD"`, `match_type: "exact"`, a `selection_reason`, `evidence`, and nonempty `entries` for the supported main purchase-entry set. Other marketplaces remain unscored even if labeled USD. For two or more entries, a common `volume_period` is required. Each entry has a unique normalized `query`, optional `volume` (`searches_per_month` observation from SellerSprite, required for multi-entry weighting), and optional `sellersprite` / `sif` observations. A source observation has `value`, `unit: "USD"`, `evidence`, `match_type: "exact"`, `strategy`, and optional nonnegative `low` / `high` with `low <= high`.
 
-SIF strategy must be `"fixed"`. SellerSprite `"fixed"` or `"unspecified"` is usable; the latter retains the adopted strategy limitation. Known incompatible strategies are not averaged. Optional per-source `marketplace`/`currency` must match the batch. One usable native point is labeled single-source; two usable points receive equal weight within that entry. Every selected entry needs a usable point and usable volume; missing entries are not dropped and reweighted. Total volume must be positive. Duplicated exact queries invalidate the item until deduplicated.
+SIF strategy must be `"fixed"`. SellerSprite `"fixed"` or `"unspecified"` is usable; the latter retains the adopted strategy limitation. Known incompatible strategies are not averaged. Optional per-source `marketplace`/`currency` must match the batch. One usable native point is labeled single-source; two usable points receive equal weight within that entry. Every selected entry needs a usable point. Revision55 directly uses the single entry's combined point when source research establishes exactly one genuine main entry; monthly volume/period are not required and missing volume stays null. Multiple entries still need every usable monthly volume and a positive total; entries cannot be dropped and reweighted or trimmed into a single-entry exception. The caller's existing selection reason and evidence must justify the full main-entry set. Revisions50–54 retain their prior volume requirement. Duplicated exact queries invalidate the item until deduplicated.
 
-The main bid score uses only original native points, then monthly-search weighting. Each provider's complete low/high ranges are separately weighted and displayed as source-labeled bid/score scenarios. Ranges never supply an invented native midpoint, main-score penalty or automatic CPC forecast. Incomplete or invalid ranges do not invalidate an otherwise usable point.
+The main bid score uses original native points, directly for a genuine sole entry and monthly-search weighted for multiple entries. The revision55 result records `aggregation_method` as `single_main_entry` or `monthly_search_weighted`. Each provider's complete low/high range is retained directly for the sole entry or separately weighted for multiple entries, and displayed as a source-labeled bid/score scenario. Ranges never supply an invented native midpoint, main-score penalty or automatic CPC forecast. Incomplete or invalid ranges do not invalidate an otherwise usable point.
 
 ### Current-category normal-newcomer reference (revision 51)
 

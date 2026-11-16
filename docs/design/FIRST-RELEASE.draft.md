@@ -6,6 +6,10 @@ The owner adopts the existing source-to-form sequence with early economics and e
 
 Acceptance proceeds from one newly completed qualifying card to a small batch and then ten. Qualifying means supported existing eligibility and initial-rights conditions with complete scores, not a new total-score threshold. Keep exclusions separately inspectable. Reuse evidence, report stage timing and actual yield, and do not promise a ten-card date from offline rendering speed. A candidate pool combines leads and provenance from the five routes; it is not a single search term or a requirement to visit every route for every form.
 
+## Sole main-entry bid amendment — 2026-11-17
+
+Revision55 implements the owner-approved direct exact point for exactly one researched genuine main purchase entry, preserving source averaging/labeling and the original15-point curve. Multiple entries still require all compatible monthly weights and cannot omit an unknown entry. The existing scorer, CLI and Chinese report must agree; unknown single-entry search volume remains unknown, and source ranges never substitute for a missing point. Preserve revisions50–54 replay and separate-season dated economics. Implementation checks include the affected public regression/CLI checks and source-correct saved-input replay. The requested real-card outcome still requires all21 supported non-peak scores, inspected fee detail and explicit future peak gaps. The owner's later refusal of partial-query scoring leaves that outcome pending where the main-query set is incomplete; passing implementation checks does not complete it.
+
 ## Dated economics correction — bounded implementation, 2026-11-16
 
 The owner authorizes enforcing fee-year/season rules and rechecking the two saved forms. Revision54 preserves all 21 scoring mappings and adds mandatory cost-ledger calculation before economics can support a score. The source-research responsibility remains with Codex; deterministic code validates the declared applicability and performs the arithmetic. [TRIAL-INPUT](TRIAL-INPUT.md) defines the interface, and STATE owns progress and actual acceptance evidence.

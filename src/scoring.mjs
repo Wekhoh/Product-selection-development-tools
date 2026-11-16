@@ -31,7 +31,7 @@ const median = values => {
 };
 
 function definitions(profile) {
-  if (![50, 51, 52, 53, 54].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
+  if (![50, 51, 52, 53, 54, 55].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
     profile.activate_by_import !== false || !Array.isArray(profile.group_budgets) ||
     profile.group_budgets.length !== EXPECTED_GROUPS.length || profile.group_budgets.some((group, index) =>
       group?.id !== EXPECTED_GROUPS[index] || !Array.isArray(group.items))) {
@@ -245,9 +245,10 @@ function bidSource(input, source, bids, ctx) {
     limitation: source === 'sellersprite' && strategy === 'unspecified' ? 'SellerSprite strategy is unspecified; this is an approximate trial input.' : null };
 }
 
-function scoreBids(item, bids, ctx) {
+function scoreBids(item, bids, ctx, profile) {
+  const singleEntry = profile.revision >= 55 && bids?.entries?.length === 1;
   if (!bids || bids.marketplace !== 'US' || bids.currency !== 'USD' || bids.match_type !== 'exact' ||
-    !text(bids.volume_period) || !text(bids.selection_reason) || !hasEvidence(bids.evidence, ctx) ||
+    (!singleEntry && !text(bids.volume_period)) || !text(bids.selection_reason) || !hasEvidence(bids.evidence, ctx) ||
     !Array.isArray(bids.entries) || bids.entries.length === 0) {
     return missing(item, bids?.reason ?? 'A supported main-entry set with common monthly volume and US/exact/USD scope is required.', bids);
   }
@@ -271,17 +272,20 @@ function scoreBids(item, bids, ctx) {
   const totalVolume = entries.reduce((sum, entry) => sum + (entry.volume ?? 0), 0);
   const validVolumes = entries.every(entry => entry.volume !== null) && number(totalVolume) && totalVolume > 0;
   const rangeScenarios = Object.fromEntries(['sellersprite', 'sif'].map(source => {
-    if (duplicate || !validVolumes || entries.some(entry => !entry.sources[source].range)) return [source, null];
-    const range = [0, 1].map(i => entries.reduce((sum, entry) => sum + entry.volume / totalVolume * entry.sources[source].range[i], 0));
+    if (duplicate || (!singleEntry && !validVolumes) || entries.some(entry => !entry.sources[source].range)) return [source, null];
+    const range = singleEntry ? [...entries[0].sources[source].range]
+      : [0, 1].map(i => entries.reduce((sum, entry) => sum + entry.volume / totalVolume * entry.sources[source].range[i], 0));
     return [source, { source, bid_range_usd: range,
       score_range: [numericScore(item, range[1]), numericScore(item, range[0])], interpretation: 'Source-labeled range scenario; not the main score or actual CPC.' }];
   }));
   const extra = { entries, range_scenarios: rangeScenarios, reference_bid_usd: null,
+    ...(profile.revision >= 55 ? { aggregation_method: singleEntry ? 'single_main_entry' : 'monthly_search_weighted' } : {}),
     evidence: mergeRefs(bids.evidence, ...bids.entries.flatMap(entry => [entry?.volume?.evidence, entry?.sellersprite?.evidence, entry?.sif?.evidence])) };
   if (duplicate) return missing(item, 'Main-entry queries must be nonempty and deduplicated before scoring.', bids, extra);
-  if (!validVolumes) return missing(item, 'Every selected entry needs supported monthly volume and the total must be positive.', bids, extra);
+  if (!singleEntry && !validVolumes) return missing(item, 'Every selected entry needs supported monthly volume and the total must be positive.', bids, extra);
   if (entries.some(entry => entry.combined_point === null)) return missing(item, 'A required main-entry native exact point is missing from both usable sources.', bids, extra);
-  const reference = entries.reduce((sum, entry) => sum + entry.volume / totalVolume * entry.combined_point, 0);
+  const reference = singleEntry ? entries[0].combined_point
+    : entries.reduce((sum, entry) => sum + entry.volume / totalVolume * entry.combined_point, 0);
   if (!number(reference)) return missing(item, 'The weighted bid reference is not finite.', bids, extra);
   return scored(item, numericScore(item, reference), bids, { ...extra, reference_bid_usd: reference });
 }
@@ -716,7 +720,7 @@ export function scoreCandidate(candidate, profile) {
     if (item.id === 'unit_contribution') return profit.contribution;
     if (item.id === 'low_rating_sales_performance') return newcomers.low;
     if (item.id === 'natural_visibility_development') return newcomers.natural;
-    if (item.id === 'relevant_purchase_entry_bid') return scoreBids(item, candidate.bids, ctx);
+    if (item.id === 'relevant_purchase_entry_bid') return scoreBids(item, candidate.bids, ctx, profile);
     if (['purchase_demand_scale', 'low_return_preference'].includes(item.id)) return scoreMetric(item, candidate.metrics?.[item.id], ctx);
     if (item.mapping.anchors?.some(anchor => !Array.isArray(anchor))) return scoreJudgment(item, candidate.judgments?.[item.id], ctx);
     if (['market_entry', 'normal_newcomer'].includes(item.group) &&

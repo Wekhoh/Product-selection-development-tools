@@ -161,13 +161,15 @@ function evidenceLinks(refs, registry, prefix) {
 
 function bidDetails(item) {
   if (!array(item.entries).length) return '';
-  return `<div class="item-support"><p><strong>原始精确竞价</strong>：${item.reference_bid_usd === null ? '点值参考待补证' : `主入口加权参考 US$ ${escape(numberText(item.reference_bid_usd))}`}</p>
+  const single = item.aggregation_method === 'single_main_entry';
+  return `<div class="item-support"><p><strong>原始精确竞价</strong>：${item.reference_bid_usd === null ? '点值参考待补证' : `${single ? '单个主购买词直接参考' : '主入口加权参考'} US$ ${escape(numberText(item.reference_bid_usd))}`}</p>
+    ${single ? '<p class="muted">输入研究记录声明只有一个真实主购买词；本项不需要月搜索量，缺失时保留未知，也不据此推断市场规模。</p>' : ''}
     ${item.entries.map(entry => `<div class="bid-entry"><p><strong>${escape(entry.query)}</strong> · 月搜索量 ${escape(numberText(entry.volume))} · 两源可用点均值 ${entry.combined_point === null ? '未知' : `US$ ${escape(numberText(entry.combined_point))}`}</p><ul>${['sellersprite', 'sif'].map(source => {
       const reading = object(entry.sources?.[source]);
       const label = source === 'sif' ? 'SIF 固定／精确' : 'SellerSprite 精确';
       return `<li>${label}：${reading.point === null || reading.point === undefined ? '点值未知' : `US$ ${escape(numberText(reading.point))}`}；原始区间 ${reading.range ? `US$ ${escape(rangeText(reading.range))}` : '未提供可用区间'}${reading.strategy === 'unspecified' ? '；策略未说明，作为近似试评输入' : ''}${reading.point === null && reading.reason ? `；${escape(reasonText(reading.reason))}` : ''}</li>`;
     }).join('')}</ul></div>`).join('')}
-    ${Object.entries(object(item.range_scenarios)).filter(([, scenario]) => scenario).map(([source, scenario]) => `<p class="muted">${source === 'sif' ? 'SIF' : 'SellerSprite'}来源区间情景：加权建议竞价 US$ ${escape(rangeText(scenario.bid_range_usd))}，对应评分 ${escape(rangeText(scenario.score_range))}。此区间不替代主点值，不是实际CPC预测。</p>`).join('')}</div>`;
+    ${Object.entries(object(item.range_scenarios)).filter(([, scenario]) => scenario).map(([source, scenario]) => `<p class="muted">${source === 'sif' ? 'SIF' : 'SellerSprite'}来源区间情景：${single ? '原始建议竞价' : '加权建议竞价'} US$ ${escape(rangeText(scenario.bid_range_usd))}，对应评分 ${escape(rangeText(scenario.score_range))}。此区间不替代主点值，不是实际CPC预测。</p>`).join('')}</div>`;
 }
 
 function newcomerDetails(result) {
@@ -176,7 +178,7 @@ function newcomerDetails(result) {
   const examples = array(diagnostics.examples);
   const members = array(diagnostics.members);
   const refs = object(diagnostics.references);
-  const current = ['current_category_r51', 'current_category_r52', 'current_category_r53', 'current_category_r54'].includes(diagnostics.reference_mode);
+  const current = ['current_category_r51', 'current_category_r52', 'current_category_r53', 'current_category_r54', 'current_category_r55'].includes(diagnostics.reference_mode);
   const pairKeys = new Set(pair.map(entry => `${entry.family_id}\0${entry.asin}`));
   return `<section class="support-section"><h3>正常新品：${current ? '固定示例' : '同一对示例'}</h3>
     <p>${current ? diagnostics.no_qualifying_examples ? '当前相关榜单的完整查询中，没有合格近三个月新品；少评价与自然曝光各记0支持分，不代表无法进入此市场。' : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 ${escape(numberText(refs.sales_median))} 件。参照包含新老商品；不再计算评价数中位数。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算，不是父体合计' : '声明的家族销量'}。` : `评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。`}</p>
@@ -247,7 +249,9 @@ function economicDetails(result) {
 function inputSummary(item) {
   const input = object(item.input);
   if (Array.isArray(item.scenario_scores)) return item.scenario_scores.map(row => `${row.id}：${item.id === 'refund_adjusted_pre_ad_margin' ? `${numberText(row.value * 100)}%` : `US$ ${numberText(row.value)}`}`).join('；');
-  if (item.id === 'relevant_purchase_entry_bid') return '主购买入口先取两源可用精确竞价点，再按同周期月搜索量加权；原始区间另列。';
+  if (item.id === 'relevant_purchase_entry_bid') return item.aggregation_method === 'single_main_entry'
+    ? '一个真实主购买词：直接使用该词的可用精确竞价点；两源都有时先取均值，原始区间另列。'
+    : '主购买入口先取两源可用精确竞价点，再按同周期月搜索量加权；原始区间另列。';
   if (item.id === 'low_rating_sales_performance') return input.scope === 'current_relevant_bsr_top100' ? '评价数量得分受独立类目销量参照限制，再取至多两个最佳完整示例；具体依据见下方。' : '全体合格参照计算中位数，再取完整示例的前两名；具体样本见下方。';
   if (item.id === 'natural_visibility_development') return '固定使用少评价销售表现选定的示例，不因自然占比或数据更容易获得而换例。';
   if (['refund_adjusted_pre_ad_margin', 'unit_contribution'].includes(item.id)) return item.status === 'ineligible' ? '费用已算出，但该方案不满足毛利条件；具体金额见费用情景。' : '完整情景尚待补证，已有金额和缺口见费用情景。';

@@ -1,6 +1,6 @@
 # Suggested-bid pressure: confirmed 15-point trial
 
-Updated: 2026-11-13. The owner explicitly accepts the complete trial package. Profile revision 47 records the mapping for relevant_purchase_entry_bid. Seventeen of 21 item mappings are now recorded; four remain incomplete. This is a design approval, not implemented production scoring, calibration or an advertising instruction.
+Updated: 2026-11-17. Revision55 adopts direct scoring for exactly one evidenced genuine main purchase entry; multiple entries retain the revision47 monthly-weighted convention and unchanged 15-point curve. All 21 mappings are maintained in the current profile. This is trial-rule adoption, not production calibration or an advertising instruction. Earlier revisions remain available for matching historical replay.
 
 ## Accepted inputs and source treatment
 
@@ -19,14 +19,16 @@ Equal source weights are a transparent trial convention, not measured accuracy o
 
 Identify supported main purchase entries relevant to the candidate's actual use and specification before choosing terms by bid. Important longtails can be main entries. Keep cheaper peripheral opportunities visible separately; their count must not dilute the main pressure. No fixed core/longtail 9/6 allocation or keyword quota is introduced.
 
-Use compatible SellerSprite monthly search volumes for one common period. Do not mix in SIF weekly counts or scale them into invented monthly values. For the chosen main-entry set M:
+For exactly one genuine main purchase entry, use its usable exact point directly: B = b_1. The same two-source mean or labeled single-source treatment above still applies. Monthly search volume and its period are not prerequisites for this case; retain unavailable volume as unknown. This does not infer demand scale or permit calling the only returned point the only genuine entry. Source research must support the selected entry set and retain consequential unresolved additional entries.
+
+For two or more main entries, use compatible SellerSprite monthly search volumes for one common period. Do not mix in SIF weekly counts or scale them into invented monthly values. For the chosen main-entry set M:
 
 a_i = v_i / sum(v_j for j in M)
 B = sum(a_i * b_i for i in M)
 
 These are research-importance weights, not orders, actual candidate traffic or future ad allocation. Keep computation precision until display. Calculate B first, then apply the capped curve.
 
-If required main-entry bid evidence or weighting volume is missing, retain that entry and leave the item pending; do not drop it and renormalize the remaining set to produce a complete score. Supported zeros require their source meaning to be valid; placeholders are not observed zeros.
+If required main-entry bid evidence is missing, leave the item pending in both cases. In a multi-entry set, missing weighting volume also keeps the item pending; do not drop an entry to invoke the single-entry rule or renormalize the remaining set. Supported zeros require their source meaning to be valid; placeholders are not observed zeros. Frozen revisions50–54 keep their former volume requirement, including single-entry replay.
 
 ## Accepted curve
 
