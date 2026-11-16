@@ -1,5 +1,11 @@
 # Design decisions and open questions
 
+## Quantity-specific domestic delivery in initial economics — 2026-11-16
+
+The owner replaces the blanket domestic-delivery omission with a 100-purchased-unit quotation scenario. Read the compatible SKU's goods total and actual quantity-specific freight for the displayed destination, allocate each per purchased unit, and convert to the retail bundle without charging the same delivery twice. Preserve destination, quantity, time, material/size differences and quote evidence; a starting tariff is insufficient. A quoted non-warehouse destination may support a disclosed initial proxy, not a claim of confirmed warehouse delivery. This is an estimate convention, not an order, first-batch commitment or sea-freight tier selection.
+
+[PROFITABILITY](PROFITABILITY.draft.md) owns the detailed method and missing-quote behavior. The existing cost ledger can already include the amount; keep the 21 mappings, 100-point budget, 30% floor and independent operating seasons unchanged. Recalculate affected current cards and eligibility while retaining frozen results under their earlier scope. Unavailable required quotes remain pending, not free or silently deferred. Paired return disposition/recovery deferral remains in force. Business quotations and conclusions stay local.
+
 ## Separate operating-season economics — 2026-11-16
 
 The owner requires separate off-peak and peak costs and margins. A form whose off-peak margin passes 30% but whose peak margin does not must remain visible for the owner's operating-season decision. Revision53 applies the existing floor and profit curves independently to explicit operating periods, normally January–September and October–December for storage. It does not average seasons, choose the best season automatically, or reject the whole form solely because another period fails. Price and procurement uncertainty remain within each period; a same-period interval crossing 30% still stays pending. All 21 weights, mappings and other screening rules remain unchanged.
