@@ -142,7 +142,8 @@ export async function runCli(args = process.argv.slice(2), streams = { stdout: p
       summary: result.summary, provider_requests: 0, model_requests: 0, network_requests: 0,
     };
     await writeOutputs(canonicalOutput, resultBytes, htmlBytes, baseReceipt, start, stages);
-    streams.stdout.write(`已生成离线试评：${result.summary.candidates}个候选，完整可比${result.summary.complete}个，待补证${result.summary.pending}个。\n结果目录：${output}\n`);
+    const seasonalSummary = result.summary.seasonal_review ? `，分季评估${result.summary.seasonal_review}个款式，至少一季完整可比${result.summary.seasonal_eligible}个款式` : '';
+    streams.stdout.write(`已生成离线试评：${result.summary.candidates}个候选，完整可比${result.summary.complete}个，待补证${result.summary.pending}个${seasonalSummary}。\n结果目录：${output}\n`);
     return 0;
   } catch (error) {
     const reason = error instanceof CliError || error instanceof TypeError ? error.message : `本地处理失败（${ioCode(error)}）。`;

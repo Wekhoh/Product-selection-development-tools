@@ -2,6 +2,10 @@
 
 Domain terms for evidence-based discovery and evaluation of physical product forms. These definitions preserve the current product requirements; they do not resolve pending scoring or market-reference choices.
 
+## Operating period
+
+An explicit set of calendar months with its own coherent economic scenarios and applicable fee schedules. Revision53 separates off-peak and peak storage estimates, normally January–September and October–December. A period is an estimate for owner review, not an adopted selling plan or seasonal-demand forecast. One physical form can have separate complete, pending or excluded period results without an annual score or duplicate card count.
+
 ## Language
 
 **Discovery signal (发现线索)**:

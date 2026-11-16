@@ -1,5 +1,11 @@
 # Design decisions and open questions
 
+## Separate operating-season economics — 2026-11-16
+
+The owner requires separate off-peak and peak costs and margins. A form whose off-peak margin passes 30% but whose peak margin does not must remain visible for the owner's operating-season decision. Revision53 applies the existing floor and profit curves independently to explicit operating periods, normally January–September and October–December for storage. It does not average seasons, choose the best season automatically, or reject the whole form solely because another period fails. Price and procurement uncertainty remain within each period; a same-period interval crossing 30% still stays pending. All 21 weights, mappings and other screening rules remain unchanged.
+
+Implementation choice under this instruction: one physical form/card has independent period cost ledgers, screening results and 21-item panels in a stable seasonal-review queue, without an annual score or cross-period best-score ranking. Count a form with at least one complete eligible period once and label that count separately from ordinary complete cards. Keep excluded/pending periods visible, applicable fee effective dates and the accepted inventory basis. Storage seasons do not automatically determine fulfillment peak charges. Shared evidence is reusable only where applicable; no seasonal-demand forecast or operating permission is inferred. The owner selects any selling strategy. Preserve old combined-season records and frozen revision50–52 replays; acceptance evidence remains in STATE's owning run.
+
 ## Complete-evidence preference for tied newcomer examples — 2026-11-16
 
 The owner explicitly accepts preferring complete evidence when unresolved newcomer examples can only tie two already supported examples. Adopt this in revision52: preserve unknown ratings/sales and eligibility records with their supported upper bounds; when two complete capped four-point scores exist, an unresolved upper bound equal to or below the second complete score cannot displace them. A strictly greater upper bound still requires evidence before fixing the pair. Fewer than two complete examples with an unresolved additional example remains pending.

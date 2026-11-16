@@ -727,6 +727,14 @@
     "total_score_cutoff": null
   },
   "economics": {
+    "operating_periods": {
+      "status": "confirmed_for_trial",
+      "revision": 53,
+      "basis": "Separate explicit off-peak and peak cost estimates on one form. Apply existing margin screening and profit curves independently within each period; preserve all supported price/cost scenarios within it.",
+      "screening": "An eligible off-peak result remains available when peak fails. A same-period interval crossing 30% or missing required input remains pending. No automatic selling-season selection, annual average or best-season total.",
+      "display": "One form, independent period cost ledgers, screening outcomes and 21-item score panels. Keep applicable fee dates and the accepted inventory basis; storage seasons do not automatically determine fulfillment peak charges.",
+      "ownership": "The owner chooses any eventual operating season; estimates do not establish seasonal sales, replenishment or realized profit."
+    },
     "recurring_or_expected_unit_cost_inputs": [
       "procurement",
       "packaging",
@@ -1185,11 +1193,17 @@
     },
     "scoring_and_ordering": {
       "status": "confirmed_for_trial",
-      "revision": 52,
+      "revision": 53,
       "scale": 100,
       "complete_total": "Sum all fully supported item scores at original weights. Do not add AI impression adjustments or duplicate penalties.",
       "supported_intervals": "Evaluate coherent supported scenarios with shared price/cost/refund inputs consistent across dependent items; keep the full resulting interval, not a midpoint or incompatible independent endpoints. Item-specific input rules still apply.",
       "missing_total": null,
+      "seasonal_review": {
+        "total": null,
+        "order": "Stable form order; no cross-period best-score rank.",
+        "count": "Count a unique form with at least one fully supported eligible period once, separately from ordinary complete cards. Pending and excluded periods remain visible.",
+        "contract": "Optional economics.operating_periods uses unique ids, explicit nonoverlapping calendar months and coherent same-unit scenarios; it cannot coexist with root economics.scenarios."
+      },
       "missing_display": [
         "supported_scored_portion",
         "scored_weight_coverage",
@@ -1228,5 +1242,5 @@
     "Complete end-to-end product design and real-card acceptance.",
     "Suggested-bid revision 47 is confirmed for trial: equal native source points per query, labeled single-source fallback, consistent SellerSprite monthly-search importance across relevant main entries, and USD 0.50 full / USD 3.00 zero. Keep source points/ranges, approximate strategy/time limitations and missingness visible. This is not actual CPC, evidence of better accuracy, acceptance of a fixed collection size or activation of research. Later calibrated field/coverage/runtime acceptance remains pending."
   ],
-  "revision": 52
+  "revision": 53
 }

@@ -30,7 +30,7 @@ const median = values => {
 };
 
 function definitions(profile) {
-  if (![50, 51, 52].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
+  if (![50, 51, 52, 53].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
     profile.activate_by_import !== false || !Array.isArray(profile.group_budgets) ||
     profile.group_budgets.length !== EXPECTED_GROUPS.length || profile.group_budgets.some((group, index) =>
       group?.id !== EXPECTED_GROUPS[index] || !Array.isArray(group.items))) {
@@ -436,7 +436,7 @@ function scoreNewcomers(cohort, ctx, profile, defs) {
 
 function scoreCurrentNewcomers(cohort, unique, ctx, profile, lowDef, naturalDef, diagnostics, pending) {
   diagnostics.reference_mode = `current_category_r${profile.revision}`;
-  diagnostics.selection_tie_policy = profile.revision === 52 ? 'complete_score_before_unresolved_equal_bound' : 'stable_identity';
+  diagnostics.selection_tie_policy = profile.revision >= 52 ? 'complete_score_before_unresolved_equal_bound' : 'stable_identity';
   if (cohort.scope !== 'current_relevant_bsr_top100' || cohort.query_complete !== true) {
     return pending('A completed current-category query and aligned all-age sales reference are required.');
   }
@@ -633,9 +633,56 @@ function aggregate(items, definitionsByGroup, profit) {
   };
 }
 
+function validateOperatingPeriods(economics) {
+  const periods = economics.operating_periods;
+  if (Object.hasOwn(economics, 'scenarios')) {
+    throw new TypeError('Operating-period economics cannot also contain root scenarios; put every scenario in its period.');
+  }
+  if (!text(economics.saleable_unit) || !Array.isArray(periods) || periods.length === 0) {
+    throw new TypeError('Operating-period economics require one common saleable unit and a nonempty operating_periods array.');
+  }
+  const ids = new Set();
+  const months = new Set();
+  for (const period of periods) {
+    if (!text(period?.id) || ids.has(period.id) || !text(period.label) || !Array.isArray(period.months) ||
+      period.months.length === 0 || !Array.isArray(period.scenarios) || period.scenarios.length === 0) {
+      throw new TypeError('Every operating period needs a unique nonempty id, label, explicit months and a nonempty scenarios array.');
+    }
+    ids.add(period.id);
+    for (const month of period.months) {
+      if (!Number.isInteger(month) || month < 1 || month > 12 || months.has(month)) {
+        throw new TypeError('Operating-period months must be unique integers from 1 to 12, without overlap within or between periods.');
+      }
+      months.add(month);
+    }
+    const scenarioIds = new Set();
+    for (const scenario of period.scenarios) {
+      if (!text(scenario?.id) || scenarioIds.has(scenario.id) || scenario.saleable_unit !== economics.saleable_unit ||
+        !Array.isArray(scenario.assumptions) || !scenario.assumptions.length || !scenario.assumptions.every(text)) {
+        throw new TypeError('Operating-period scenarios need unique ids, the common saleable unit and explicit assumptions.');
+      }
+      // The ordinary scorer retains incomplete costs and unsupported coherence as period-level evidence gaps.
+      scenarioIds.add(scenario.id);
+    }
+  }
+}
+
 export function scoreCandidate(candidate, profile) {
   const defs = definitions(profile);
   const ctx = context(candidate);
+  if (candidate.economics && Object.hasOwn(candidate.economics, 'operating_periods')) {
+    validateOperatingPeriods(candidate.economics);
+    const { operating_periods: periods, ...economics } = candidate.economics;
+    return {
+      candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
+      profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [],
+      operating_periods: periods.map(period => ({
+        ...scoreCandidate({ ...candidate, economics: { ...economics, scenarios: period.scenarios } }, profile),
+        id: period.id, label: period.label, months: period.months })),
+      total: null, total_range: null, conditional_total_range: null, supported_score: null, supported_range: null,
+      covered_weight: null, unscored_weight: null, scoring_complete: null, queue: 'seasonal_review',
+    };
+  }
   const newcomers = scoreNewcomers(candidate.newcomer_cohort, ctx, profile, defs);
   const profit = scoreEconomics(candidate.economics, ctx, profile, defs);
   const items = defs.map(item => {
@@ -683,11 +730,12 @@ export function scoreBatch(batch, profile) {
     .sort((a, b) => b.supported_range[0] - a.supported_range[0] || b.covered_weight - a.covered_weight);
   const deferred = results.filter(result => result.queue === 'deferred');
   const excluded = results.filter(result => result.queue === 'excluded');
+  const seasonalReview = results.filter(result => result.queue === 'seasonal_review');
   const leader = comparable[0];
   for (const result of pending) {
     result.may_exceed_comparable_leader = leader && result.conditional_total_range ? result.conditional_total_range[1] > leader.total_range[0] : null;
   }
-  const queues = { comparable, pending, deferred, excluded };
+  const queues = { comparable, pending, deferred, excluded, ...(seasonalReview.length ? { seasonal_review: seasonalReview } : {}) };
   return {
     schema_version: 1, profile_revision: profile.revision, total_budget: 100,
     candidates: Object.values(queues).flat(),
@@ -698,8 +746,10 @@ export function scoreBatch(batch, profile) {
       complete_points: comparable.filter(result => result.total !== null).length,
       complete_ranges: comparable.filter(result => result.total === null).length,
       all_items_supported: results.filter(result => result.scoring_complete).length,
-      partial: results.filter(result => !result.scoring_complete).length,
+      partial: results.filter(result => result.queue !== 'seasonal_review' && !result.scoring_complete).length,
       pending: pending.length, deferred: deferred.length, excluded: excluded.length,
+      ...(seasonalReview.length ? { seasonal_review: seasonalReview.length,
+        seasonal_eligible: seasonalReview.filter(result => result.operating_periods.some(period => period.queue === 'comparable')).length } : {}),
     },
   };
 }
