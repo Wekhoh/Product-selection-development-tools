@@ -1,5 +1,7 @@
 # Profitability: confirmed 30-point trial mappings
 
+Current execution reading rule, 2026-11-16: the owner has resumed discovery and workflow development after the dated-fee correction. Current [STATE](../STATE.md) owns execution scope; the paused-discovery sentence in the historical audit below is superseded. All adopted economic requirements in this document remain active unless a later explicit decision replaces them.
+
 Owner clarification, 2026-11-16: use ordinary **non-SIPP FBA fulfillment** as the initial-estimate basis, even if the owner has registered for SIPP or a competitor may receive a program benefit. Do not spend initial-card work resolving that eligibility or deduct an assumed SIPP discount. Apply the dated non-SIPP fee for the declared price/size/package, including any applicable non-SIPP charge already inside the total exactly once. This does not waive ordinary packaging-related charges or override independent seasonal dates. A saved native total with undisclosed components remains a bounded estimate, not proof of a program breakdown. No score weight or mapping changes.
 
 For a requested cost comparison, bind the estimate to the owner's exact ASIN and saleable-unit count before reuse. A one-unit mold must not inherit a two-unit bundle's price, procurement, package measurements or fee. The current owner correction returns to the saved single-unit screenshot scenario; a bundle review is not an answer to that comparison. Preserve the two alternatives as separate records.

@@ -8,6 +8,14 @@ An explicit set of calendar months with its own coherent economic scenarios and 
 
 ## Language
 
+**Candidate pool (候选池)**:
+The combined set of sourced discovery leads and their identified product forms, retaining where each observation came from and its research disposition. Different routes may originate different leads; several observations may refer to one form.
+_Avoid_: One shared keyword, five mandatory searches per card, raw keyword count as candidate count
+
+**Qualifying complete card (合格完整卡)**:
+A concrete form with supported existing screening eligibility, a bounded preliminary rights assessment and all required item scores for a declared operating period. This is eligibility for owner review, not a new total-score threshold or proof of commercial success.
+_Avoid_: Rejected/pending card counted toward the ten-card target, guaranteed profitable product
+
 **Discovery signal (发现线索)**:
 A sourced market observation, product record or recurring use need that gives a reason to investigate a direction. It is neither proof of an attractive opportunity nor a keyword invented without supporting evidence.
 _Avoid_: Proven opportunity, arbitrary seed word

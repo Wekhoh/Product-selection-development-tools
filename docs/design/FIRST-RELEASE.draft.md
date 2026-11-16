@@ -1,5 +1,11 @@
 # 第一版需求与验收草案：承接原雷达的主动发现流程
 
+## Current execution scope — 2026-11-16 resumption
+
+The owner adopts the existing source-to-form sequence with early economics and entry checks, authorizes continuing from saved leads, and retains 100 points and all 21 mappings. STATE is the sole active progress/recovery record. The revision54 fee correction below is verified; its earlier no-discovery boundary is superseded only by this explicit resumption. Historical proposed/pause wording below records the discussion sequence and does not reopen settled definitions.
+
+Acceptance proceeds from one newly completed qualifying card to a small batch and then ten. Qualifying means supported existing eligibility and initial-rights conditions with complete scores, not a new total-score threshold. Keep exclusions separately inspectable. Reuse evidence, report stage timing and actual yield, and do not promise a ten-card date from offline rendering speed. A candidate pool combines leads and provenance from the five routes; it is not a single search term or a requirement to visit every route for every form.
+
 ## Dated economics correction — bounded implementation, 2026-11-16
 
 The owner authorizes enforcing fee-year/season rules and rechecking the two saved forms. Revision54 preserves all 21 scoring mappings and adds mandatory cost-ledger calculation before economics can support a score. The source-research responsibility remains with Codex; deterministic code validates the declared applicability and performs the arithmetic. [TRIAL-INPUT](TRIAL-INPUT.md) defines the interface, and STATE owns progress and actual acceptance evidence.
@@ -8,7 +14,7 @@ Acceptance for this slice: the real CLI recomputes same-unit costs instead of tr
 
 Current scoring amendment, 2026-11-16: revision52 adopts the owner-approved preference for complete newcomer evidence over unresolved equal upper bounds once two complete examples exist. [Q31](Q31-NORMAL-NEWCOMER.draft.md) owns the exact boundary and frozen revision50/51 replay. The 21 weights, curves, eligibility and same-pair natural scoring remain unchanged; earlier revision51 implementation statements below are historical base evidence rather than an override of this amendment.
 
-## Proposed word-to-form flow for owner discussion — 2026-11-15
+## Adopted word-to-form flow — 2026-11-15; resumed 2026-11-16
 
 Status: approved for bounded implementation and trial after the owner explicitly accepts the word handling and directs execution on 2026-11-15. The following workflow is not yet accepted unattended automation. Existing eligibility, 21 scores, 100 points, modest-volume acceptance and owner-controlled portfolio choice remain unchanged. The ten-card target counts only passing, fully scored candidates. The earlier request to review before execution below preserves chronology and is superseded by this direction.
 
@@ -25,7 +31,7 @@ Code can retain/deduplicate records, validate inputs and calculate scores. The a
 
 Before adoption, apply the [discovery-change impact review](../reviews/20261113-scoring-overlap.md). A changed main-entry set affects bid and match inputs; a changed form affects economics and risks; grouping research must preserve native report denominators. The current three-route opportunity rubric and optional light-change anchor require explicit treatment of any genuinely uncovered buying reason, without duplicate bonuses or silent coercion into a route. Any later adopted scoring change must be versioned and replayed against affected saved candidates. The discussion does not assume either that all definitions must change or that every new angle fits unchanged.
 
-### Recommended first implementation scope after owner review
+### Adopted bounded implementation scope
 
 Reuse the current local scoring, economics, HTML report and saved evidence. Connect a bounded source-led research pass to those existing inputs, using subscription-backed Codex for semantic interpretation and ordinary code for record validation, deduplication, calculations and replay. Do not select a new platform, paid model, agent hierarchy, deployment or daily scheduler to answer this feasibility question. The current private pool builder proves source retention and exact-word deduplication; it is not yet a production discovery runner.
 
@@ -288,7 +294,7 @@ Scoring-feasibility acceptance clarification (2026-11-13; applies to V1-03, V1-0
 
 The table below defines product-wide acceptance, not an assertion that every component is still untested. Dated bounded-trial evidence is tracked in STATE; historical "not executed" wording does not override later verified work or imply acceptance of the whole application. These criteria do not authorize new account actions.
 
-Bounded real-trial evidence, 2026-11-16: a newly sourced related form now exercises source-to-form binding, compatible domestic quotation, individually selected fee schedules, all 21 revision51 inputs, deterministic scoring and saved desktop/mobile cards. Independent calculation and source review support this narrow completion claim. Other forms remain explicitly pending or economically excluded. This supplies additional evidence for V1-02 through V1-05 and read-only portions of V1-08/V1-10; it does not pass daily triggering, unattended recovery, owner-decision writeback, stable useful-card throughput or business outcomes. See the current STATE checkpoint and its private acceptance receipt for exact artifacts and limitations.
+Frozen revision51 trial evidence, 2026-11-16: a newly sourced related form exercised source-to-form binding, compatible domestic quotation, individually selected fee schedules, all 21 revision51 inputs, deterministic scoring and saved desktop/mobile cards. The independent calculation and source review supported that historical, bounded result. The later revision54 fee/source audit supersedes its economic eligibility: one reviewed form is excluded and the other remains pending, as recorded in current STATE. Neither counts as a new qualifying card. The frozen evidence remains useful for V1-02 through V1-05 and read-only portions of V1-08/V1-10; it does not pass daily triggering, unattended recovery, owner-decision writeback, stable useful-card throughput or business outcomes.
 
 Two source-handling checks exposed by this trial should remain part of that acceptance: verify each calculator component's selected effective date and inventory/season controls after product changes, and distinguish an observed supplier label from an inferred price-eligibility restriction. Correct unsupported interpretations before changing economic status. Preserve the original evidence and numerical before/after result; a corrected description need not alter a valid quoted amount or the scoring rules.
 

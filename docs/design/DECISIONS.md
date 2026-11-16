@@ -1,5 +1,15 @@
 # Design decisions and open questions
 
+## Active reading order and resumed trial — 2026-11-16
+
+Read STATE for current authorization and progress, the revision54 profile plus its owning design documents for current rules, and the dated sections below for provenance. Later explicit decisions supersede only their stated scope. The owner now resumes the saved-lead trial and adopts early economic/entry checks before expensive research; the preceding wider pause is historical. Keep 100 points, 21 items, all weights and curves. Ten qualifying cards means ten fully scored forms satisfying the established margin and initial-rights conditions, without a new total-score cutoff; exclusions and unresolved forms are additional, not part of ten. Preserve price, interval, season and source-evidence boundaries.
+
+The five entry routes share one provenance-preserving candidate pool. They need not share a keyword, run for every card, or produce equal numbers. Social observations can originate a direction. Merge repeated observations of the same form while retaining distinct material forms in the same market. Use observed trial times and qualifying yield before estimating ten-card delivery.
+
+## Decision chronology
+
+The following dated entries preserve adoption and correction history. Earlier pause or proposed-status wording applies only to its historical checkpoint when a later explicit instruction supersedes it.
+
 ## Use non-SIPP initial fulfillment estimates and preserve requested unit grain — 2026-11-16
 
 The owner chooses ordinary non-SIPP FBA fulfillment for initial estimates; SIPP registration and possible program benefits need no further eligibility investigation in this phase. Do not include a presumed discount or omit an otherwise applicable non-SIPP charge. Keep fee dates, seasons and included components explicit, without adding an already-inclusive charge twice. This changes the source-estimation convention, not the 21 weights or fee-validation schema.
