@@ -1,5 +1,11 @@
 # Design decisions and open questions
 
+## Use non-SIPP initial fulfillment estimates and preserve requested unit grain — 2026-11-16
+
+The owner chooses ordinary non-SIPP FBA fulfillment for initial estimates; SIPP registration and possible program benefits need no further eligibility investigation in this phase. Do not include a presumed discount or omit an otherwise applicable non-SIPP charge. Keep fee dates, seasons and included components explicit, without adding an already-inclusive charge twice. This changes the source-estimation convention, not the 21 weights or fee-validation schema.
+
+The owner also corrects the active comparison: calculate the saved one-unit competitor and screenshot inputs, not either two-unit form. Reuse the independent single-unit fee audit, verify it through the current dated ledger, and present the owner's freight allowance separately from the carrier-reference estimate. Keep the broader discovery pause and preserve prior evidence.
+
 ## Enforce dated economics in the scoring workflow — 2026-11-16
 
 The owner explicitly resumes implementing the fee-year/season checks, rechecking the two saved cards, testing omitted/duplicated costs and updating the records. Revision54 requires a source-referenced cost ledger per scenario and recomputes economics before scoring. Fee components retain independent sales/storage/inbound windows and their own effective dates; a missing published future holiday rate withholds that period's margin instead of reusing a different season or year. Preserve all 21 mappings, the 100-point budget, the 30% floor, source snapshots and frozen revision50–53 replay.
