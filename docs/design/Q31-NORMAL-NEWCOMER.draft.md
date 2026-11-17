@@ -24,6 +24,12 @@ The identical selected examples supply natural visibility: the existing SIF over
 
 Real replay must verify identities, time windows, current rank, broad functional relevance, basic launch support and source fields. This package reduces dependencies; it does not make third-party estimates actual orders. Sparse examples, representativeness and resulting scores require owner calibration after seeing cards.
 
+### Acquisition readback: current-category product research (2026-11-17)
+
+The [official SellerSprite product-research contract](https://open.sellersprite.com/api/2) requires `filterSub=Y` for subcategory-rank limits and declares the category list as `nodeIdPaths`. Use the intended category with that supported plural field, explicit rank bounds and completed pagination. In the bounded trial, a request without the prerequisite returned out-of-range records; a legacy singular category field combined with the switch returned unrelated global records. Those responses are retained as failed-scope evidence, not scored populations. A successful status or echoed request does not prove the returned scope.
+
+Validate each returned node/rank and the final page count, then deduplicate families. Child rows can repeat parent sales and a recent child can belong to an older observed family. Do not sum repeated family totals or treat a recently added variant as a normal new launch. Keep the native market-report ratios separate from this source-complete declared query. Functional relevance still excludes different tasks; shared material or a shared category label alone does not make a drilling-only jig evidence for a routing guide. This is source acquisition and interpretation guidance, not a new narrow-niche requirement, scoring curve or exhaustive historical-list reconstruction.
+
 ## Accepted reference adjustment (revision 50)
 
 Owner clarification, 2026-11-14: old reviews clearly predating a purported recent launch are sufficient to exclude that listing from the normal-from-zero reference. Do not spend further effort identifying the precise refurbishment/merge/seed-listing mechanism as a prerequisite to this exclusion. Preserve the observed history and exclusion reason as market evidence. This is distinct from missing dates, ordinary seller age or an unsupported accusation of a particular technique. The accepted native-report 3/2 inputs remain native labeled observations; do not silently replace their source population with the qualified 4/1 cohort. No weights or curves change.
