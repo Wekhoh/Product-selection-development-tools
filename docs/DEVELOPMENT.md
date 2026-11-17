@@ -1,6 +1,6 @@
 # Development workflow
 
-Status: development process, updated 2026-11-14. The first-release specification now admits a bounded native-research and offline-card implementation slice. This does not select the full product deployment or activate scheduled or paid-model integrations.
+Status: development process, updated 2026-11-17. The bounded native-research and offline-card slice is implemented and has scoped real-data acceptance; STATE records current cards and gaps. Full deployment, unattended operation and paid-model integrations remain separate. For another agent's review or a refactor, follow [CONTEXT-ROUTER](CONTEXT-ROUTER.md) without restarting settled design questions.
 
 ## Canonical records
 
@@ -10,17 +10,18 @@ Status: development process, updated 2026-11-14. The first-release specification
 | [PRODUCT.md](PRODUCT.md) | Product purpose, owner experience and requirements |
 | [Design decisions](design/DECISIONS.md) | Confirmed choices, their conditions, superseded proposals and open questions |
 | [Domain glossary](../GLOSSARY.md) | Domain meanings, without implementation instructions or a second task list |
-| [First-release draft](design/FIRST-RELEASE.draft.md) | Automatic discovery/scoring workflow; the explicitly bounded trial slice is ready for implementation, with broader product acceptance still open |
+| [First-release draft](design/FIRST-RELEASE.draft.md) | Intended automatic workflow and implemented bounded-trial specification; current acceptance is in STATE, with broader product acceptance open |
 | [Draft reference profile](design/reference-profile.draft.json) | The 21 item mappings, 100-point budget and revision-56 missing-volume equal-entry bid and dated-ledger trial rules, with revision-50–55 replay retained; not production configuration |
 | [API migration](API-MIGRATION.md) | Historical capability and request/cost continuity constraints; not an adopted interface |
 | `docs/research/` | Dated primary-source investigations and reuse comparisons |
 | [STATE.md](STATE.md) | The single current task, evidence, blocker and recovery record |
+| [CONTEXT-ROUTER.md](CONTEXT-ROUTER.md) | Causal background and topic-triggered routes to planning, rules, code, tests and original evidence; not a second task board |
 
 Create an interface contract, design brief, architecture decision or acceptance specification when its concrete subject exists. Link it from the owning record. Keep proposals visibly separate from adopted decisions. Do not create duplicate task boards or fill architectural documents with assumed answers.
 
 ## Collaboration and document progression
 
-The owner supplies needs, experience, preferences and final usefulness judgments. The selection seat actively investigates facts, surfaces overlooked cases, proposes alternatives, explains tradeoffs in plain language, and owns implementation, coordination and complete verification. Use Matt Pocock's `grill-with-docs` combination of grilling and domain modeling during the current clarification phase. Ask one material unresolved question at a time, with a concrete example and a recommendation; routine technical choices and facts are not homework for the owner. New evidence may refine a decision, with its reason and prior status preserved.
+The owner supplies needs, experience, preferences and final usefulness judgments. The selection seat actively investigates facts, surfaces overlooked cases, proposes alternatives, explains tradeoffs in plain language, and owns implementation, coordination and complete verification. Use Matt Pocock's `grill-with-docs` combination of grilling and domain modeling when a consequential design clarification is needed. Ask one material unresolved question at a time, with a concrete example and a recommendation; routine technical choices and facts are not homework for the owner. New evidence may refine a decision, with its reason and prior status preserved.
 
 Record conclusions, rationale, limitations, corrections and open decisions in their owning files. Keep original conversation evidence private. The document chain is: requirements and decisions -> one first-release specification -> executable work -> acceptance evidence. Each later stage must point back to the decision or requirement it implements. Preserve existing identifiers such as Q31 and V1-01; add an identifier only when it enables a concrete reference or verification need.
 
@@ -98,7 +99,7 @@ The installed v1.3.1 package was checked directly. Its user-invoked main flow in
 | `code-review` / `pr` | Fixed-scope standards/spec review, resolved findings and relevant acceptance evidence | Code adoption, offline operation, native integration, real-card usefulness and visual acceptance stay distinct |
 | `retro` | Evidence-based improvements to checks, navigation or engineering conventions | Improvements address observed problems; they do not automatically install tooling or create more process |
 
-Keep STATE as the single maintained task/recovery record. Use existing repository documents and issue conventions; do not mechanically reproduce a skill's sample tracker structure. Write a real spec once its scope is understandable, rather than creating a complete-looking document from unsettled assumptions. The owner-authorized bounded discovery-to-card slice in FIRST-RELEASE is now being implemented and tested; broader application interaction and deployment remain open. Historical clarification-only checkpoints do not block this adopted slice.
+Keep STATE as the single maintained task/recovery record. Use existing repository documents and issue conventions; do not mechanically reproduce a skill's sample tracker structure. Write a real spec once its scope is understandable, rather than creating a complete-looking document from unsettled assumptions. The owner-authorized bounded discovery-to-card slice in FIRST-RELEASE is implemented and undergoing real-data trials; broader application interaction and deployment remain open. Historical clarification-only checkpoints do not block this adopted slice.
 
 | Skill | Applicable work |
 | --- | --- |

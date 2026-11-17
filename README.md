@@ -26,6 +26,7 @@ This keeps original source rows and their separate metrics, validates explicit r
 ## Start here
 
 - [Project state and next steps](docs/STATE.md) — the single task and recovery record.
+- [Review and takeover context](docs/CONTEXT-ROUTER.md) — causal history, planning/decision/source routes, code and verification entry points; use with STATE when another coding agent reviews or refactors the project.
 - [Product requirements](docs/PRODUCT.md) — intended workflow and acceptance.
 - [Decisions and unresolved questions](docs/design/DECISIONS.md) — confirmed preferences, exceptions, and superseded proposals.
 - [Reference profile](docs/design/reference-profile.draft.json) — 21 trial items, unchanged 100-point budget and current-category newcomer simplification; real-world calibration remains open.
@@ -50,6 +51,8 @@ The project has adopted trial definitions and a bounded implementation. Its docu
 | [Development workflow](docs/DEVELOPMENT.md) | Matt Pocock skill usage, specification, task breakdown, review and recovery |
 
 Use this checkout as a separate project's primary folder. Start new chats here and read `AGENTS.md` and `docs/STATE.md`. Do not attach the retired operations repository as a prerequisite. Additional contributors should use separate branches/worktrees with explicit file ownership.
+
+The current owner handoff prepares review and possible continuation in AntiGravity/Gemini; it does not establish that platform's tool access or completed adoption. On this owner's machine, existing ignored evidence enables the real-card replay in STATE. A GitHub-only clone has source, specifications and synthetic examples; it does not contain genuine cards, supplier quotations or live request ledgers. Preserve that boundary when transferring work.
 
 In the Codex app, add this folder as a local project; existing chat membership and folder access are separate from cloning. Use the offline example above to verify the calculation and reading path without any external account.
 

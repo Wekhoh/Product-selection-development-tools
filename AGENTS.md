@@ -2,9 +2,11 @@
 
 This is an independent product-selection project. Start each task with `docs/STATE.md` and the files relevant to the requested outcome.
 
+For takeover, project-wide review or a proposed refactor, read [docs/CONTEXT-ROUTER.md](docs/CONTEXT-ROUTER.md) after STATE. It routes the owner outcome, causal decision history, retained planning/research, implementation checks and private source evidence. STATE remains the sole current task record; verify affected original evidence before changing a settled rule.
+
 ## Product decisions
 
-For discovery, economics, scoring, or product-flow changes, read `docs/PRODUCT.md` and `docs/design/DECISIONS.md`. The reference profile under `docs/design/` is incomplete design material, not runtime configuration. Confirmed trial weights do not approve mapping functions, live execution, or an overall product design.
+For discovery, economics, scoring, or product-flow changes, read `docs/PRODUCT.md` and `docs/design/DECISIONS.md`. The reference profile under `docs/design/` is trial design material, not automatically active runtime configuration. Accepted mappings are recorded in the current version and owning decisions; weights alone do not approve an otherwise unaccepted mapping, live execution or the overall product design.
 
 For project-design clarification, use Matt Pocock's Grill with Docs approach: combine grilling with domain modeling and maintain the existing records as decisions become clear. Ask one consequential unresolved question at a time after checking existing answers. Explain the impact and recommend a choice; factual investigation and routine engineering remain the implementer's responsibility. Keep question namespaces explicit so migration questions do not overwrite historical design questions.
 
