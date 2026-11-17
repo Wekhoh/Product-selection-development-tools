@@ -31,7 +31,7 @@ const median = values => {
 };
 
 function definitions(profile) {
-  if (![50, 51, 52, 53, 54, 55].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
+  if (![50, 51, 52, 53, 54, 55, 56].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
     profile.activate_by_import !== false || !Array.isArray(profile.group_budgets) ||
     profile.group_budgets.length !== EXPECTED_GROUPS.length || profile.group_budgets.some((group, index) =>
       group?.id !== EXPECTED_GROUPS[index] || !Array.isArray(group.items))) {
@@ -247,10 +247,13 @@ function bidSource(input, source, bids, ctx) {
 
 function scoreBids(item, bids, ctx, profile) {
   const singleEntry = profile.revision >= 55 && bids?.entries?.length === 1;
+  const allowEqualEntries = profile.revision >= 56;
   if (!bids || bids.marketplace !== 'US' || bids.currency !== 'USD' || bids.match_type !== 'exact' ||
-    (!singleEntry && !text(bids.volume_period)) || !text(bids.selection_reason) || !hasEvidence(bids.evidence, ctx) ||
+    (!singleEntry && !allowEqualEntries && !text(bids.volume_period)) || !text(bids.selection_reason) || !hasEvidence(bids.evidence, ctx) ||
     !Array.isArray(bids.entries) || bids.entries.length === 0) {
-    return missing(item, bids?.reason ?? 'A supported main-entry set with common monthly volume and US/exact/USD scope is required.', bids);
+    return missing(item, bids?.reason ?? (allowEqualEntries
+      ? 'A supported main-entry set with US/exact/USD scope is required.'
+      : 'A supported main-entry set with common monthly volume and US/exact/USD scope is required.'), bids);
   }
   const queries = new Set();
   let duplicate = false;
@@ -263,6 +266,10 @@ function scoreBids(item, bids, ctx, profile) {
       volume.value = null;
       volume.reason = 'Entry volume does not use the declared common period.';
     }
+    if (allowEqualEntries && !singleEntry && entry?.volume?.value != null && !text(bids.volume_period)) {
+      volume.value = null;
+      volume.reason = 'Supplied monthly volumes need a declared common period.';
+    }
     const sources = Object.fromEntries(['sellersprite', 'sif'].map(source => [source, bidSource(entry?.[source], source, bids, ctx)]));
     const usable = Object.entries(sources).filter(([, value]) => value.point !== null);
     const combined = usable.length ? usable.reduce((sum, [, value]) => sum + value.point / usable.length, 0) : null;
@@ -271,21 +278,34 @@ function scoreBids(item, bids, ctx, profile) {
   });
   const totalVolume = entries.reduce((sum, entry) => sum + (entry.volume ?? 0), 0);
   const validVolumes = entries.every(entry => entry.volume !== null) && number(totalVolume) && totalVolume > 0;
+  const allPoints = entries.every(entry => entry.combined_point !== null);
+  const absentVolumes = bids.entries.map(entry => (entry?.volume == null ||
+    (typeof entry.volume === 'object' && !Array.isArray(entry.volume) && entry.volume.value == null)) &&
+    entry?.volume?.supported !== false && entry?.volume?.material_conflict !== true);
+  const equalEntries = allowEqualEntries && !singleEntry && !duplicate && allPoints && absentVolumes.some(Boolean) &&
+    entries.every((entry, index) => entry.volume !== null || absentVolumes[index]);
   const rangeScenarios = Object.fromEntries(['sellersprite', 'sif'].map(source => {
-    if (duplicate || (!singleEntry && !validVolumes) || entries.some(entry => !entry.sources[source].range)) return [source, null];
+    if (duplicate || (!singleEntry && !validVolumes && !equalEntries) || entries.some(entry => !entry.sources[source].range)) return [source, null];
     const range = singleEntry ? [...entries[0].sources[source].range]
-      : [0, 1].map(i => entries.reduce((sum, entry) => sum + entry.volume / totalVolume * entry.sources[source].range[i], 0));
+      : [0, 1].map(i => entries.reduce((sum, entry) => sum +
+        (equalEntries ? 1 / entries.length : entry.volume / totalVolume) * entry.sources[source].range[i], 0));
     return [source, { source, bid_range_usd: range,
       score_range: [numericScore(item, range[1]), numericScore(item, range[0])], interpretation: 'Source-labeled range scenario; not the main score or actual CPC.' }];
   }));
   const extra = { entries, range_scenarios: rangeScenarios, reference_bid_usd: null,
-    ...(profile.revision >= 55 ? { aggregation_method: singleEntry ? 'single_main_entry' : 'monthly_search_weighted' } : {}),
+    ...(profile.revision >= 55 ? { aggregation_method: allowEqualEntries && duplicate ? null : singleEntry ? 'single_main_entry' : equalEntries
+      ? 'equal_main_entries' : allowEqualEntries && !validVolumes ? null : 'monthly_search_weighted' } : {}),
+    ...(equalEntries ? { aggregation_reason: 'Monthly search volume is missing; every main entry has a usable exact point. Equal entry weights do not establish equal demand.' } : {}),
     evidence: mergeRefs(bids.evidence, ...bids.entries.flatMap(entry => [entry?.volume?.evidence, entry?.sellersprite?.evidence, entry?.sif?.evidence])) };
   if (duplicate) return missing(item, 'Main-entry queries must be nonempty and deduplicated before scoring.', bids, extra);
-  if (!singleEntry && !validVolumes) return missing(item, 'Every selected entry needs supported monthly volume and the total must be positive.', bids, extra);
-  if (entries.some(entry => entry.combined_point === null)) return missing(item, 'A required main-entry native exact point is missing from both usable sources.', bids, extra);
+  if (allowEqualEntries && !allPoints) return missing(item, 'A required main-entry native exact point is missing from both usable sources.', bids, extra);
+  if (!singleEntry && !validVolumes && !equalEntries) return missing(item, allowEqualEntries
+    ? 'Supplied monthly volumes need valid compatible evidence and a positive total; equal weighting only resolves missing volume.'
+    : 'Every selected entry needs supported monthly volume and the total must be positive.', bids, extra);
+  if (!allPoints) return missing(item, 'A required main-entry native exact point is missing from both usable sources.', bids, extra);
   const reference = singleEntry ? entries[0].combined_point
-    : entries.reduce((sum, entry) => sum + entry.volume / totalVolume * entry.combined_point, 0);
+    : entries.reduce((sum, entry) => sum +
+      (equalEntries ? 1 / entries.length : entry.volume / totalVolume) * entry.combined_point, 0);
   if (!number(reference)) return missing(item, 'The weighted bid reference is not finite.', bids, extra);
   return scored(item, numericScore(item, reference), bids, { ...extra, reference_bid_usd: reference });
 }

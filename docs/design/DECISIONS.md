@@ -2,9 +2,15 @@
 
 ## Active reading order and resumed trial — 2026-11-16
 
-Read STATE for current authorization and progress, the revision55 profile plus its owning design documents for current rules, and the dated sections below for provenance. Later explicit decisions supersede only their stated scope. The owner now resumes the saved-lead trial and adopts early economic/entry checks before expensive research; the preceding wider pause is historical. Keep 100 points, 21 items, all weights and curves. Ten qualifying cards means ten fully scored forms satisfying the established margin and initial-rights conditions, without a new total-score cutoff; exclusions and unresolved forms are additional, not part of ten. Preserve price, interval, season and source-evidence boundaries.
+Read STATE for current authorization and progress, the revision56 profile plus its owning design documents for current rules, and the dated sections below for provenance. Later explicit decisions supersede only their stated scope. The owner now resumes the saved-lead trial and adopts early economic/entry checks before expensive research; the preceding wider pause is historical. Keep 100 points, 21 items, all weights and curves. Ten qualifying cards means ten fully scored forms satisfying the established margin and initial-rights conditions, without a new total-score cutoff; exclusions and unresolved forms are additional, not part of ten. Preserve price, interval, season and source-evidence boundaries.
 
 The five entry routes share one provenance-preserving candidate pool. They need not share a keyword, run for every card, or produce equal numbers. Social observations can originate a direction. Merge repeated observations of the same form while retaining distinct material forms in the same market. Use observed trial times and qualifying yield before estimating ten-card delivery.
+
+## Equal main-entry weighting for missing monthly volume — 2026-11-17
+
+The owner approves an equal mean only when every selected main purchase entry has a usable native exact quote and only monthly search volume is missing. Revision56 adopts this exception after the existing within-query source fusion, then applies the unchanged 15-point curve. Prefer complete compatible monthly weights when available. Keep unknown volumes null and disclose the equal basis; it is not evidence of equal demand. Do not average a subset of available quotes, invent a point from a range, or relabel the only returned quote as the only genuine entry.
+
+This supersedes revision55's missing-volume block for multiple entries only. Invalid/conflicting supplied observations still need correction, and an observed all-zero total is not missing data. Preserve the genuine sole-entry rule, 100 points, all21 item weights, existing economic rules and frozen revisions50–55 replay. [SUGGESTED-BID](SUGGESTED-BID.draft.md) owns the formulas; [TRIAL-INPUT](TRIAL-INPUT.md) owns the input/output contract. No additional provider request, paid-model activation or supplier action is needed to implement this deterministic change. A real candidate still missing main-entry exact points remains pending.
 
 ## Single genuine main purchase entry — 2026-11-17
 

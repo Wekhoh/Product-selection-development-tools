@@ -1,6 +1,6 @@
 # Suggested-bid pressure: confirmed 15-point trial
 
-Updated: 2026-11-17. Revision55 adopts direct scoring for exactly one evidenced genuine main purchase entry; multiple entries retain the revision47 monthly-weighted convention and unchanged 15-point curve. All 21 mappings are maintained in the current profile. This is trial-rule adoption, not production calibration or an advertising instruction. Earlier revisions remain available for matching historical replay.
+Updated: 2026-11-17. Revision56 adds the owner-approved equal-entry mean when every main entry has a usable exact point and only monthly search volume is missing. Complete compatible monthly weights remain preferred; revision55's genuine sole-entry rule and the 15-point curve remain unchanged. All 21 mappings are maintained in the current profile. This is trial-rule adoption, not production calibration or an advertising instruction. Earlier revisions remain available for matching historical replay.
 
 ## Accepted inputs and source treatment
 
@@ -28,7 +28,11 @@ B = sum(a_i * b_i for i in M)
 
 These are research-importance weights, not orders, actual candidate traffic or future ad allocation. Keep computation precision until display. Calculate B first, then apply the capped curve.
 
-If required main-entry bid evidence is missing, leave the item pending in both cases. In a multi-entry set, missing weighting volume also keeps the item pending; do not drop an entry to invoke the single-entry rule or renormalize the remaining set. Supported zeros require their source meaning to be valid; placeholders are not observed zeros. Frozen revisions50–54 keep their former volume requirement, including single-entry replay.
+If every selected main entry has a usable exact point but at least one monthly search volume is missing, revision56 uses equal weights across the entire selected set: a_i = 1 / |M| and B = sum(b_i) / |M|. First combine the sources within each query as above, then average entries. Do not average all provider rows together, overweight the entries with returned volumes or drop the unweighted entries. Keep observed volumes and unknowns visible and label the result as equal-entry trial weighting, not measured demand shares.
+
+For example, three main-entry combined points of USD 1, 1.50 and 2 with unavailable monthly weights give B = 1.50 and 9/15 points. Two entries of USD 2 and 1 with complete monthly weights of 100 and 300 still give B = 1.25 and 10.5/15. If either entry instead lacks a usable exact point, neither example qualifies for equal-entry scoring.
+
+Missing any required main-entry exact point leaves the item pending. Supplied invalid numbers, incompatible units/periods, unresolved conflicts or unsupported evidence require correction; they are not a missing-volume exception. An observed all-zero volume set still has no usable positive weighting total. A common volume period is unnecessary when all volumes are absent; supplied numeric volumes still need compatible common-period evidence. Supported zeros require valid source meaning; placeholders are not observed zeros. Never trim a multi-entry set to invoke the sole-entry rule. Frozen revisions50–54 retain their original volume requirement, and revision55 retains its multi-entry volume requirement.
 
 ## Accepted curve
 
