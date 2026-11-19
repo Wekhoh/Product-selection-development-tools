@@ -2,18 +2,18 @@
 
 An independent, open-source product-selection tool for personal use and optional self-hosting.
 
-**Current stage: bounded discovery-to-card implementation and real-data trials.** The offline runner applies 21 trial mappings to explicit local evidence and produces Chinese cards. Revision56 uses equal main-entry means when every entry has a usable exact quote and only monthly search volume is missing. Complete compatible monthly weights remain preferred, and the genuine sole-entry rule remains. Dated economics introduced in revision54 calculates economics from dated, evidenced cost ledgers before scoring, rejects mismatched/unpublished fee periods and detects declared duplicate charges. Frozen revisions50–55 remain replayable with their matching profiles, without retroactive fee-policy acceptance. All 100-point weights/curves and separate operating-season results remain unchanged. Off-peak eligibility can remain available beside a peak gap or failure; there is no automatic annual average or season choice. Calibration remains pending. Native research runs through authorized Codex tools; daily scheduling and full application acceptance remain open. Importing modules or the profile never starts requests.
+**Current stage: Revision 58 offline scoring/economics engine and Phase 2A local SQLite operations chassis complete; bounded Phase 2B live acceptance next.** The offline runner applies 21 trial mappings (8 groups, 100 points) to explicit local evidence and produces self-contained Chinese cards. Revision 58 unifies authoritative card `qualification` (`comparable` flat 12-month annual or non-holiday-dependent `seasonal_eligible`), enforces pre-declared `expected_primary_scenarios` and isolated `stress_scenarios[]`, aligns `r_refund` vs `r_physical` excess returns processing, adds deterministic 2027 US common Standard-size FBA rate lookups (`src/fba-rates-2027.mjs`) with Gate 1A landed-domestic caps (`>= USD 29.99`, `order_units >= 100`, non-promo `sku_lines[]`), and adopts exact-rational `4 + 1` Q31 newcomer scoring with deterministic 5-quintile stratification. Phase 2A adds an offline built-in `node:sqlite` WAL store (`src/store.mjs`, `src/contracts.mjs`, `src/history-import.mjs`, `src/pipeline.mjs`, `src/phase2-cli.mjs`) for idempotent request/quota ledgers, permanent request locking, PII/token redaction, structured short-context validators, immutable evaluations, and non-blocking Gate 1A -> Gate 1B (`CAPTCHA_PAUSED`) -> Gate 2/3 orchestration. Frozen revisions 50–57 remain replayable with their matching profiles without retroactive fee-policy acceptance. Calibration, daily scheduling, and live Phase 2B acceptance remain open. Importing modules or the profile never starts external requests.
 
-## Run the offline example
+## Run the offline examples
 
-Use Node.js 24 or newer; this slice has no package dependencies or credentials.
+Use Node.js 24 or newer; this repository has zero third-party npm dependencies and no embedded credentials.
 
 ```sh
 node --test
 node src/cli.mjs --input fixtures/synthetic-batch.json --profile docs/design/reference-profile.draft.json --output outputs/example
 ```
 
-Open `outputs/example/index.html`. These cards are explicitly synthetic. For genuine research use the [input contract](docs/design/TRIAL-INPUT.md), keep the batch and outputs in ignored local directories, and retain original evidence. A missing total stays unknown; supported points are not scaled to 100. The CLI only reads supplied files and does not collect fresh data, spend credits, contact suppliers or change stores.
+Open `outputs/example/index.html`. These cards are explicitly synthetic. For genuine research use the [input contract](docs/design/TRIAL-INPUT.md), keep batches, databases, ledgers, and outputs in ignored local directories (`.local/`, `data/`, `outputs/`), and retain original evidence. A missing total stays unknown; supported points are not scaled to 100. The CLIs only read supplied local files and never collect fresh external data, spend credits, contact suppliers, or change stores.
 
 To include the reviewed source-word-to-form trail, add the optional discovery bundle:
 
@@ -21,7 +21,15 @@ To include the reviewed source-word-to-form trail, add the optional discovery bu
 node src/cli.mjs --input fixtures/synthetic-batch.json --profile docs/design/reference-profile.draft.json --discovery fixtures/synthetic-discovery.json --output outputs/example-linked
 ```
 
-This keeps original source rows and their separate metrics, validates explicit research dispositions and concrete-offer references, and shows the trail beside the existing scores. It does not classify words automatically or add discovery bonuses. The receipt hashes all supplied inputs. Actual research and supplier authentication still run through the authorized tools; a successful offline replay is not unattended discovery acceptance.
+To inspect the Phase 2A local SQLite store on synthetic fixtures (without touching live provider accounts):
+
+```sh
+node src/phase2-cli.mjs init --db outputs/example-phase2.sqlite
+node src/phase2-cli.mjs replay --db outputs/example-phase2.sqlite --batch fixtures/synthetic-batch.json --profile docs/design/reference-profile.draft.json --discovery fixtures/synthetic-discovery.json
+node src/phase2-cli.mjs status --db outputs/example-phase2.sqlite
+```
+
+This keeps original source rows and their separate metrics, validates explicit research dispositions and concrete-offer references, records immutable evaluation receipts, and shows the trail beside the existing scores. It does not classify words automatically or add discovery bonuses. Actual research and supplier authentication still run through authorized tools; a successful offline replay is not unattended discovery acceptance.
 
 ## Start here
 
