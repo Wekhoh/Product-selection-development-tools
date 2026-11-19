@@ -138,6 +138,7 @@ test('a complete off-peak plan survives an unknown holiday rate, and the card ex
   const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url)));
   const candidate = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url))).candidates[0];
   const off = candidate.economics.scenarios[0];
+  off.cost_ledger.fee_context.sales = off.cost_ledger.fee_context.storage = { from: '2027-02-01', through: '2027-09-30' };
   const peak = structuredClone(off); peak.id = peak.cost_ledger.id = 'peak';
   peak.cost_ledger.fee_context.sales = peak.cost_ledger.fee_context.storage = { from: '2027-10-01', through: '2027-12-31' };
   for (const line of peak.cost_ledger.lines.filter(l => l.fee_basis)) line.fee_basis.effective_through = '2027-12-31';

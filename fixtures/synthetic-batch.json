@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "profile_revision": 56,
+  "profile_revision": 58,
   "presentation": {
     "title": "离线选品试评演示",
     "summary": "本页全部为合成教学数据。三个样本分别演示完整点值、完整情景区间和费用待补证；不构成任何市场或采购结论。",
@@ -47,7 +47,10 @@
           "evidence": [
             "synthetic-evidence"
           ],
-          "matched_spec": true
+          "matched_spec": true,
+          "target_variant_asin": "SYNTHETIC-VAR-A",
+          "fulfillment_channel": "FBA",
+          "sales_history_supported": true
         },
         "strong_date_dependency": {
           "value": false,
@@ -66,7 +69,7 @@
           ],
           "niche": "合成可替代细分市场",
           "period": "2026-10-15/2026-11-13",
-          "grain": "family",
+          "grain": "parent_units",
           "coverage_supported": true,
           "deduplicated": true,
           "window_days": 30,
@@ -360,7 +363,8 @@
             },
             "launch_date": "2026-10-01",
             "current_bsr_node": "synthetic-node",
-            "current_bsr_rank": 20
+            "current_bsr_rank": 20,
+            "comparability_verdict": "comparable"
           },
           {
             "family_id": "synthetic-family-b",
@@ -432,7 +436,8 @@
             },
             "launch_date": "2026-10-01",
             "current_bsr_node": "synthetic-node",
-            "current_bsr_rank": 20
+            "current_bsr_rank": 20,
+            "comparability_verdict": "comparable"
           }
         ],
         "scope": "current_relevant_bsr_top100",
@@ -456,7 +461,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             },
             {
               "family_id": "synthetic-old-b",
@@ -466,7 +472,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             },
             {
               "family_id": "synthetic-old-c",
@@ -476,7 +483,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             }
           ]
         }
@@ -524,16 +532,16 @@
                 "currency": "USD",
                 "package_ref": "synthetic-pack",
                 "sales": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "storage": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "inbound": {
-                  "from": "2027-02-01",
-                  "through": "2027-02-01"
+                  "from": "2027-01-15",
+                  "through": "2027-01-15"
                 }
               },
               "lines": [
@@ -545,6 +553,8 @@
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "procurement"
                   ]
@@ -557,6 +567,8 @@
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "domestic_freight"
                   ]
@@ -586,12 +598,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -610,12 +622,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -634,12 +646,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -658,12 +670,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -682,16 +694,17 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
-                  }
+                  },
+                  "return_threshold": 0.05
                 },
                 {
                   "id": "returns_disposal",
@@ -730,12 +743,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -796,7 +809,14 @@
           "evidence": [
             "synthetic-evidence"
           ],
-          "matched_spec": true
+          "matched_spec": true,
+          "target_variant_asin": "SYNTHETIC-VAR-B",
+          "fulfillment_channel": "FBA",
+          "sales_history_supported": true,
+          "supported_price_range": [
+            31.25,
+            45
+          ]
         },
         "strong_date_dependency": {
           "value": false,
@@ -815,7 +835,7 @@
           ],
           "niche": "合成可替代细分市场",
           "period": "2026-10-15/2026-11-13",
-          "grain": "family",
+          "grain": "parent_units",
           "coverage_supported": true,
           "deduplicated": true,
           "window_days": 30,
@@ -1109,7 +1129,8 @@
             },
             "launch_date": "2026-10-01",
             "current_bsr_node": "synthetic-node",
-            "current_bsr_rank": 20
+            "current_bsr_rank": 20,
+            "comparability_verdict": "comparable"
           },
           {
             "family_id": "synthetic-family-b",
@@ -1181,7 +1202,8 @@
             },
             "launch_date": "2026-10-01",
             "current_bsr_node": "synthetic-node",
-            "current_bsr_rank": 20
+            "current_bsr_rank": 20,
+            "comparability_verdict": "comparable"
           }
         ],
         "scope": "current_relevant_bsr_top100",
@@ -1205,7 +1227,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             },
             {
               "family_id": "synthetic-old-b",
@@ -1215,7 +1238,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             },
             {
               "family_id": "synthetic-old-c",
@@ -1225,7 +1249,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             }
           ]
         }
@@ -1257,8 +1282,9 @@
             "cost_ledger": {
               "id": "synthetic-higher-margin",
               "saleable_unit": "一套合成双件收纳架",
-              "price_usd": 25,
-              "refund_fraction": 0,
+              "price_usd": 31.25,
+              "refund_fraction": 0.2,
+              "physical_return_fraction": 0.02,
               "assumptions": [
                 "全部金额与经营参数均为合成教学值，不是供应报价或业务结果。"
               ],
@@ -1273,27 +1299,29 @@
                 "currency": "USD",
                 "package_ref": "synthetic-pack",
                 "sales": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "storage": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "inbound": {
-                  "from": "2027-02-01",
-                  "through": "2027-02-01"
+                  "from": "2027-01-15",
+                  "through": "2027-01-15"
                 }
               },
               "lines": [
                 {
                   "id": "procurement",
-                  "amount_usd": 5.6435,
+                  "amount_usd": 5.457125,
                   "status": "estimated",
                   "basis": "Synthetic classroom amount; not a business quote",
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "procurement"
                   ]
@@ -1306,6 +1334,8 @@
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "domestic_freight"
                   ]
@@ -1324,7 +1354,7 @@
                 },
                 {
                   "id": "referral",
-                  "amount_usd": 3.75,
+                  "amount_usd": 3.9375,
                   "status": "estimated",
                   "basis": "Synthetic classroom amount; not a business quote",
                   "evidence": [
@@ -1335,12 +1365,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1359,12 +1389,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1383,12 +1413,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1407,12 +1437,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1431,16 +1461,17 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
-                  }
+                  },
+                  "return_threshold": 0.05
                 },
                 {
                   "id": "returns_disposal",
@@ -1456,7 +1487,7 @@
                 },
                 {
                   "id": "collection",
-                  "amount_usd": 0.1065,
+                  "amount_usd": 0.105375,
                   "status": "estimated",
                   "basis": "Synthetic classroom amount; not a business quote",
                   "evidence": [
@@ -1479,12 +1510,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1545,16 +1576,16 @@
                 "currency": "USD",
                 "package_ref": "synthetic-pack",
                 "sales": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "storage": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "inbound": {
-                  "from": "2027-02-01",
-                  "through": "2027-02-01"
+                  "from": "2027-01-15",
+                  "through": "2027-01-15"
                 }
               },
               "lines": [
@@ -1566,6 +1597,8 @@
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "procurement"
                   ]
@@ -1578,6 +1611,8 @@
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "domestic_freight"
                   ]
@@ -1607,12 +1642,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1631,12 +1666,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1655,12 +1690,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1679,12 +1714,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1703,16 +1738,17 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
-                  }
+                  },
+                  "return_threshold": 0.05
                 },
                 {
                   "id": "returns_disposal",
@@ -1751,12 +1787,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -1774,6 +1810,17 @@
                     "recovery_credit"
                   ]
                 }
+              ]
+            },
+            "price_anchor": {
+              "value": 42.85714285714286,
+              "unit": "USD",
+              "matched_spec": true,
+              "target_variant_asin": "SYNTHETIC-VAR-B-ALT",
+              "fulfillment_channel": "FBA",
+              "sales_history_supported": true,
+              "evidence": [
+                "synthetic-evidence"
               ]
             }
           }
@@ -1817,7 +1864,10 @@
           "evidence": [
             "synthetic-evidence"
           ],
-          "matched_spec": true
+          "matched_spec": true,
+          "target_variant_asin": "SYNTHETIC-VAR-C",
+          "fulfillment_channel": "FBA",
+          "sales_history_supported": true
         },
         "strong_date_dependency": {
           "value": false,
@@ -1836,7 +1886,7 @@
           ],
           "niche": "合成可替代细分市场",
           "period": "2026-10-15/2026-11-13",
-          "grain": "family",
+          "grain": "parent_units",
           "coverage_supported": true,
           "deduplicated": true,
           "window_days": 30,
@@ -2130,7 +2180,8 @@
             },
             "launch_date": "2026-10-01",
             "current_bsr_node": "synthetic-node",
-            "current_bsr_rank": 20
+            "current_bsr_rank": 20,
+            "comparability_verdict": "comparable"
           },
           {
             "family_id": "synthetic-family-b",
@@ -2202,7 +2253,8 @@
             },
             "launch_date": "2026-10-01",
             "current_bsr_node": "synthetic-node",
-            "current_bsr_rank": 20
+            "current_bsr_rank": 20,
+            "comparability_verdict": "comparable"
           }
         ],
         "scope": "current_relevant_bsr_top100",
@@ -2226,7 +2278,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             },
             {
               "family_id": "synthetic-old-b",
@@ -2236,7 +2289,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             },
             {
               "family_id": "synthetic-old-c",
@@ -2246,7 +2300,8 @@
                 "evidence": [
                   "synthetic-evidence"
                 ]
-              }
+              },
+              "comparability_verdict": "comparable"
             }
           ]
         }
@@ -2296,16 +2351,16 @@
                 "currency": "USD",
                 "package_ref": "synthetic-pack",
                 "sales": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "storage": {
-                  "from": "2027-02-01",
-                  "through": "2027-09-30"
+                  "from": "2027-01-01",
+                  "through": "2027-12-31"
                 },
                 "inbound": {
-                  "from": "2027-02-01",
-                  "through": "2027-02-01"
+                  "from": "2027-01-15",
+                  "through": "2027-01-15"
                 }
               },
               "lines": [
@@ -2317,6 +2372,8 @@
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "procurement"
                   ]
@@ -2329,6 +2386,8 @@
                   "evidence": [
                     "synthetic-evidence"
                   ],
+                  "order_units": 100,
+                  "first_order_promotion": false,
                   "components": [
                     "domestic_freight"
                   ]
@@ -2358,12 +2417,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -2382,12 +2441,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -2406,12 +2465,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -2430,12 +2489,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
@@ -2454,16 +2513,17 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]
-                  }
+                  },
+                  "return_threshold": 0.05
                 },
                 {
                   "id": "returns_disposal",
@@ -2502,12 +2562,12 @@
                   ],
                   "fee_basis": {
                     "status": "published",
-                    "version": "SYNTHETIC-2027-nonpeak",
+                    "version": "SYNTHETIC-2027-annual",
                     "marketplace": "US",
                     "currency": "USD",
                     "package_ref": "synthetic-pack",
-                    "effective_from": "2027-02-01",
-                    "effective_through": "2027-09-30",
+                    "effective_from": "2027-01-01",
+                    "effective_through": "2027-12-31",
                     "evidence": [
                       "synthetic-evidence"
                     ]

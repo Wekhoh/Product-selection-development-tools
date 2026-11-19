@@ -1,4 +1,8 @@
 // Self-contained, script-free Chinese cards for an already scored local batch.
+// Preserves exact byte-for-byte legacy HTML for frozen revisions < 57 while rendering
+// a monochrome, hairline-driven split-inspector workbench (revision 57+).
+
+import { ledgerMeetsMarginFloor } from './economics.mjs';
 
 const GROUP_LABELS = {
   profit: '盈利能力', suggested_bid_pressure: '建议竞价压力', niche_demand: '需求依据',
@@ -18,7 +22,10 @@ const ITEM_LABELS = {
 };
 const QUEUES = { comparable: '完整可比', pending: '待补证', deferred: '本期暂缓', excluded: '当前规格排除', seasonal_review: '分季评估' };
 const STATES = { pass: '通过此项', fail: '不满足', pending: '待补证', defer: '本期暂缓' };
-const MEMBER_STATES = { qualified: '纳入参照', excluded: '排除参照', pending: '待核实', auxiliary: '辅助观察', duplicate: '已去重' };
+const MEMBER_STATES = {
+  qualified: '纳入参照', excluded: '排除参照', pending: '待核实', auxiliary: '辅助观察', duplicate: '已去重',
+  unsampled_stratified: '分层未抽样', ramp_up_zero_sales: '未满30天零销量（起量前排除）',
+};
 const QUALIFIERS = {
   low_return_preference: '这是对应类目的退货率代理，不是本产品的实测退货率；损失金额只在费用中计算一次。',
   storage_tolerance: '这是当前材料、结构和储存证据支持的初步判断，不是储存试验保证。',
@@ -56,6 +63,8 @@ const REASONS = new Map([
   ['A supported positive matched-spec reference price is required.', '尚缺同规格、正数且有据的参考售价。'],
   ['Supported matched-spec reference price is above USD 30.', '有据同规格参考价高于30美元。'],
   ['Supported matched-spec reference price does not exceed USD 30.', '有据同规格参考价未超过30美元。'],
+  ['Supported matched-spec reference price is at least USD 29.99.', '有据同规格参考价不低于29.99美元。'],
+  ['Supported matched-spec reference price is below USD 29.99.', '有据同规格参考价低于29.99美元。'],
   ['Strong date dependency has not been assessed with supported evidence.', '尚未有据判断是否强依赖节日或特定日期。'],
   ['The supported strong holiday/date dependency is deferred in this reference profile.', '强依赖节日或日期，本期参考方案暂缓。'],
   ['No strong holiday/date dependency is identified in the supported initial check.', '有据初查未发现强节日或日期依赖。'],
@@ -86,13 +95,27 @@ const REASONS = new Map([
   ['Duplicated family/shared-launch records have incompatible current observations.', '同家族或共享起步记录的当前观察互不兼容。'],
   ['True-zero rating median leaves the relative component unscored.', '真实评分数量中位数为零，相对数量分保持未评分。'],
   ['True-zero sales median supplies no sales ratio.', '真实销量中位数为零，不能计算销量比值。'],
+  ['A verified non-empty all-age sales reference T is required; missing T cannot default to 10.', '需要有据且非空的全龄销量参照中位数 T；缺失 T 时保持待补证，不自动按 10 件保底。'],
+  ['All-age reference families need unique identities and supported sales, including real zeros; missing T stays pending.', '全龄销量参照家族须身份唯一且销量齐全（保留真实零）；缺失 T 保持待补证。'],
+  ['Unresolved or invalid newcomer observations remain pending and block Q31 scoring.', '仍有未决或无效的新品记录，阻断 Q31 计分。'],
+  ['Stratified sampling (unsampled_stratified) is only permitted when N_active > 5.', '仅在有效同任务新品池 N_active > 5 时才允许使用分层未抽样状态。'],
+  ['Qualified representatives do not match the deterministic 5-quintile stratified selection and replacement order.', '已核新品代表与确定性 5 分位分层抽样及替补顺序不符，阻断择优挑选。'],
+  ['unsampled_stratified requires reliable ratings and units_30d inputs; missing inputs remain blocking.', '分层未抽样候选必须具备可靠的评价数与 30 天销量字段；缺字段项仍阻断。'],
+  ['Only verified <30-day zero-sales listings may be pre-excluded as ramp_up_zero_sales.', '仅已核未满 30 天且零销量的记录可作为起量前零销量排除。'],
+  ['Flat annual mode requires every primary scenario to cover all 12 calendar months and all days of one target year (YYYY-01-01..YYYY-12-31).', '全年模式要求每个主情景覆盖同一目标年份完整 12 个自然月及全部日期（YYYY-01-01 至 YYYY-12-31）。'],
 ]);
 
 const array = value => Array.isArray(value) ? value : [];
 const object = value => value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 const string = (value, fallback = '') => typeof value === 'string' ? value : fallback;
 const finite = value => typeof value === 'number' && Number.isFinite(value);
-const escape = value => String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+const safeText = value => {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  try { return String(value); } catch { try { return JSON.stringify(value) ?? ''; } catch { return ''; } }
+};
+const escape = value => safeText(value).replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const numberText = value => finite(value) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value) : '未知';
 const rangeText = range => Array.isArray(range) && range.length === 2 && range.every(finite) ?
   range[0] === range[1] ? numberText(range[0]) : `${numberText(range[0])}–${numberText(range[1])}` : '未知';
@@ -106,6 +129,185 @@ function readable(value, depth = 0) {
   if (depth > 2) return '详见原始记录';
   if (Array.isArray(value)) return value.map(item => readable(item, depth + 1)).join('；');
   if (value && typeof value === 'object') return Object.entries(value).map(([key, item]) => `${key}：${readable(item, depth + 1)}`).join('；');
+  return '未知';
+}
+
+const isR57 = value => (value?.profile_revision ?? 0) >= 57;
+const isR58 = value => (value?.profile_revision ?? 0) >= 58;
+
+function sanitizeLocalPath(value) {
+  if (typeof value !== 'string' || !value.trim()) return '未知';
+  let normalized = value.trim();
+  if (/^file:\//i.test(normalized)) {
+    normalized = normalized.replace(/^file:\/\/(?!\/|localhost(?:\/|$))([^/]+)\//i, '//$1/')
+      .replace(/^file:\/+(?:localhost\/)?/i, '/');
+    try { normalized = decodeURIComponent(normalized); } catch {}
+  }
+  normalized = normalized.replace(/\\/g, '/');
+  normalized = normalized.replace(/^(?:\/+)?\?\/UNC\//i, '//').replace(/^(?:\/+)?[?.]\//, '');
+  normalized = normalized.startsWith('//') ? `//${normalized.slice(2).replace(/\/+/g, '/')}` : normalized.replace(/\/+/g, '/');
+  normalized = normalized.replace(/^\/+(?=[A-Za-z]:\/)/, '');
+  const marker = normalized.match(/(?:^|\/)(\.local\/.*|docs\/.*|fixtures\/.*|src\/.*|test\/.*|data\/.*|outputs\/.*)$/i);
+  if (marker) return marker[1];
+  return normalized
+    .replace(/(?:^[A-Za-z]:|^\/\/[^/]+(?:\/[^/]+)?|^\/mnt\/[a-z]|^)\/(?:Users|Documents and Settings|home)\/[^/]+(?=\/|$)/i, '~')
+    .replace(/\/(Users|Documents and Settings|home)\/[^/]+(?=\/|$)/gi, '/~');
+}
+
+function decodeRepeated(str, maxRounds = 4) {
+  let cur = str;
+  for (let i = 0; i < maxRounds; i++) {
+    let next;
+    try { next = decodeURIComponent(cur); } catch { break; }
+    if (next === cur) break;
+    cur = next;
+  }
+  return cur;
+}
+
+function sanitizeHttpUrlParams(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (!['http:', 'https:'].includes(u.protocol)) return urlStr;
+    let changed = false;
+    const entries = [...u.searchParams.entries()];
+    if (entries.length) {
+      const next = new URLSearchParams();
+      for (const [k, v] of entries) {
+        const dk = decodeRepeated(k);
+        const dv = decodeRepeated(v);
+        const sk = sanitizeTextPaths(dk);
+        const sv = sanitizeTextPaths(dv);
+        if (sk !== dk || sv !== dv) {
+          changed = true;
+          next.append(sk !== dk ? sk : k, sv !== dv ? sv : v);
+        } else {
+          next.append(k, v);
+        }
+      }
+      if (changed) u.search = next.toString();
+    }
+    if (u.hash && u.hash.length > 1) {
+      const decodedHash = decodeRepeated(u.hash.slice(1));
+      const cleanHash = sanitizeTextPaths(decodedHash);
+      if (cleanHash !== decodedHash) {
+        u.hash = encodeURIComponent(cleanHash);
+        changed = true;
+      }
+    }
+    return changed ? u.href : urlStr;
+  } catch {
+    return urlStr;
+  }
+}
+
+function redactQuotedUserPaths(str) {
+  const userPrefixRe = /^(?:file:\/+(?:[^/\s\r\n"<>]+\/){0,5}|(?:(?:\\\\|\/\/)\?[\\/]UNC[\\/]+[^\\/\s:;\r\n"|?*<>]+[\\/]+(?:[^\\/\s:;\r\n"|?*<>]+[\\/]+)?|(?:(?:\\\\|\/\/)[?.][\\/]+)?[A-Za-z]:[\\/]+|(?:\\\\|\/\/)[^\\/\s:;\r\n"|?*<>]+[\\/]+(?:[^\\/\s:;\r\n"|?*<>]+[\\/]+)?)|\/(?:mnt\/[a-z]\/)?)(?:Users|Documents and Settings|home)[\\/]+/i;
+  const out = str.replace(/"([^"\r\n]+)"/g, (full, inner) => (
+    userPrefixRe.test(inner) ? `"${sanitizeLocalPath(inner)}"` : full
+  ));
+  let result = '';
+  let i = 0;
+  while (i < out.length) {
+    if (out[i] === "'") {
+      const rest = out.slice(i + 1);
+      if (userPrefixRe.test(rest)) {
+        let j = i + 1;
+        let closeIdx = -1;
+        while (j < out.length && out[j] !== '\r' && out[j] !== '\n') {
+          if (out[j] === "'") {
+            const nextCh = out[j + 1] ?? '';
+            if (nextCh && /[A-Za-z0-9_\\/-]/.test(nextCh)) {
+              j++;
+              continue;
+            }
+            if (nextCh === ' ') {
+              const rem = out.slice(j + 1);
+              const clauseEnd = rem.search(/[\r\n,;。)）\]]/);
+              const clause = clauseEnd >= 0 ? rem.slice(0, clauseEnd) : rem;
+              const nextQ = clause.indexOf("'");
+              const afterNextQ = clause[nextQ + 1] ?? '';
+              if (nextQ > 0 && !/\s/.test(clause[nextQ - 1]) && (!afterNextQ || !/[A-Za-z0-9_\\/-]/.test(afterNextQ))) {
+                j++;
+                continue;
+              }
+            }
+            closeIdx = j;
+            break;
+          }
+          j++;
+        }
+        if (closeIdx > i + 1) {
+          const inner = out.slice(i + 1, closeIdx);
+          result += `'${sanitizeLocalPath(inner)}'`;
+          i = closeIdx + 1;
+          continue;
+        }
+      }
+    }
+    result += out[i];
+    i++;
+  }
+  return result;
+}
+
+function sanitizeTextPaths(value) {
+  if (typeof value !== 'string' || !value) return '';
+  const trimmed = value.trim();
+  if (/^(?:file:\/|[A-Za-z]:[\\/]|\\\\|\/\/|\/(?:Users|Documents and Settings|home|mnt)\/)/i.test(trimmed) && !/\s/.test(trimmed)) {
+    return sanitizeLocalPath(trimmed);
+  }
+  const winUserRoot = String.raw`(?:(?:\\\\|\/\/)\?[\\/]UNC[\\/]+[^\\/\s:;\r\n"|?*<>]+[\\/]+(?:[^\\/\s:;\r\n"|?*<>]+[\\/]+)?|(?:(?:\\\\|\/\/)[?.][\\/]+)?[A-Za-z]:[\\/]+|(?:\\\\|\/\/)[^\\/\s:;\r\n"|?*<>]+[\\/]+(?:[^\\/\s:;\r\n"|?*<>]+[\\/]+)?)`;
+  const userSegBeforeSlash = String.raw`[^\\/:;\r\n"|?*<>]+`;
+  const userSegNoSlash = String.raw`(?:[^\\/\s:;\r\n"|?*<>)']|'(?=\S))+`;
+  const reFileUser = new RegExp(String.raw`file:\/+(?:[^/\s\r\n"<>]+\/){0,5}(?:Users|Documents and Settings|home)\/${userSegBeforeSlash}(?=\/)`, 'gi');
+  const reWinSlash = new RegExp(String.raw`${winUserRoot}(?:Users|Documents and Settings)[\\/]+${userSegBeforeSlash}(?=[\\/])`, 'gi');
+  const reUnixSlash = new RegExp(String.raw`(?<![A-Za-z0-9._-])\/(?:mnt\/[a-z]\/)?(?:Users|home)\/${userSegBeforeSlash}(?=\/)`, 'gi');
+  const reWinNoSlash = new RegExp(String.raw`${winUserRoot}(?:Users|Documents and Settings)[\\/]+${userSegNoSlash}`, 'gi');
+  const reUnixNoSlash = new RegExp(String.raw`(?<![A-Za-z0-9._-])\/(?:mnt\/[a-z]\/)?(?:Users|home)\/${userSegNoSlash}`, 'gi');
+  return redactQuotedUserPaths(
+    value.replace(/https?:\/\/[^\s"<>]+/gi, match => {
+      const m = match.match(/^(.*?)([',;。)）\]]*)$/);
+      return sanitizeHttpUrlParams(m[1]) + m[2];
+    }),
+  )
+    .replace(reFileUser, match => sanitizeLocalPath(match))
+    .replace(/file:\/\/(?:[^\s;)"<>']|'(?!\s|[，。；,;)）\]}]))+/gi, match => sanitizeLocalPath(match))
+    .replace(reWinSlash, match => sanitizeLocalPath(match))
+    .replace(reUnixSlash, match => sanitizeLocalPath(match))
+    .replace(reWinNoSlash, match => sanitizeLocalPath(match))
+    .replace(reUnixNoSlash, match => sanitizeLocalPath(match));
+}
+
+function sanitizeDisplayTree(value, keyName = '', allowRootImageUri = false) {
+  if (allowRootImageUri && keyName === 'image_data_uri' && imageUri(value) !== null) return value;
+  if (typeof value === 'string') {
+    if ((keyName === 'url' || keyName === 'href') && safeHttpUrl(value)) return sanitizeHttpUrlParams(value);
+    return sanitizeTextPaths(value);
+  }
+  if (Array.isArray(value)) return value.map(item => sanitizeDisplayTree(item, '', false));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [k, v] of Object.entries(value)) {
+      out[sanitizeTextPaths(k)] = sanitizeDisplayTree(v, k, allowRootImageUri && k === 'image_data_uri');
+    }
+    return out;
+  }
+  return value;
+}
+
+const isScoredSupportedR58 = sc => sc?.coherence_supported === true &&
+  sc?.input?.calculation?.scoring_supported === true &&
+  sc?.input?.calculation?.status !== 'sensitivity_only';
+
+function readableSanitized(value, depth = 0) {
+  if (value === null || value === undefined) return '未知';
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  if (typeof value === 'string') return sanitizeTextPaths(value);
+  if (finite(value)) return numberText(value);
+  if (depth > 2) return '详见原始记录';
+  if (Array.isArray(value)) return value.map(item => readableSanitized(item, depth + 1)).join('；');
+  if (value && typeof value === 'object') return Object.entries(value).map(([key, item]) => `${sanitizeTextPaths(key)}：${readableSanitized(item, depth + 1)}`).join('；');
   return '未知';
 }
 
@@ -141,63 +343,6 @@ function observed(input) {
   return readable(input.value);
 }
 
-function presentationRows(title, value) {
-  const rows = array(value).filter(row => row && typeof row === 'object' && !Array.isArray(row));
-  if (!rows.length) return '';
-  return `<section class="support-section"><h3>${escape(title)}</h3><dl class="reference-rows">${rows.map(row => {
-    const label = string(row.label, '补充记录');
-    const main = `${readable(row.value)}${typeof row.unit === 'string' ? ` ${row.unit}` : ''}`;
-    const note = string(row.note);
-    const source = string(row.source);
-    return `<div><dt>${escape(label)}</dt><dd>${escape(main)}${note ? `<p class="muted">${escape(note)}</p>` : ''}${source || safeHttpUrl(row.url) ? `<p class="source">来源：${sourceLink(source || '查看来源', row.url)}</p>` : ''}</dd></div>`;
-  }).join('')}</dl></section>`;
-}
-
-function evidenceLinks(refs, registry, prefix) {
-  if (!array(refs).length) return '<span class="muted">暂无可核验引用</span>';
-  return array(refs).map(ref => {
-    const index = registry.findIndex(entry => entry?.id === ref);
-    const label = index >= 0 ? string(registry[index].source, string(ref, '证据')) : readable(ref);
-    return index >= 0 ? `<a href="#${prefix}-e${index}">${escape(label)} [${index + 1}]</a>` : `<span>${escape(label)}（引用待核实）</span>`;
-  }).join(' · ');
-}
-
-function bidDetails(item) {
-  if (!array(item.entries).length) return '';
-  const single = item.aggregation_method === 'single_main_entry';
-  const equal = item.aggregation_method === 'equal_main_entries';
-  return `<div class="item-support"><p><strong>原始精确竞价</strong>：${item.reference_bid_usd === null ? '点值参考待补证' : `${single ? '单个主购买词直接参考' : equal ? '主购买词等权参考' : '主入口加权参考'} US$ ${escape(numberText(item.reference_bid_usd))}`}</p>
-    ${single ? '<p class="muted">输入研究记录声明只有一个真实主购买词；本项不需要月搜索量，缺失时保留未知，也不据此推断市场规模。</p>' : ''}
-    ${equal ? '<p class="muted">缺少月搜索量；每个主要购买词的可用精准报价均已齐全，因此先合并各词的来源报价，再对全部主购买词等权平均。缺失量保留未知，等权不代表各词需求相同。</p>' : ''}
-    ${item.entries.map(entry => `<div class="bid-entry"><p><strong>${escape(entry.query)}</strong> · 月搜索量 ${escape(numberText(entry.volume))} · 两源可用点均值 ${entry.combined_point === null ? '未知' : `US$ ${escape(numberText(entry.combined_point))}`}</p><ul>${['sellersprite', 'sif'].map(source => {
-      const reading = object(entry.sources?.[source]);
-      const label = source === 'sif' ? 'SIF 固定／精确' : 'SellerSprite 精确';
-      return `<li>${label}：${reading.point === null || reading.point === undefined ? '点值未知' : `US$ ${escape(numberText(reading.point))}`}；原始区间 ${reading.range ? `US$ ${escape(rangeText(reading.range))}` : '未提供可用区间'}${reading.strategy === 'unspecified' ? '；策略未说明，作为近似试评输入' : ''}${reading.point === null && reading.reason ? `；${escape(reasonText(reading.reason))}` : ''}</li>`;
-    }).join('')}</ul></div>`).join('')}
-    ${Object.entries(object(item.range_scenarios)).filter(([, scenario]) => scenario).map(([source, scenario]) => `<p class="muted">${source === 'sif' ? 'SIF' : 'SellerSprite'}来源区间情景：${single ? '原始建议竞价' : equal ? '等权建议竞价' : '加权建议竞价'} US$ ${escape(rangeText(scenario.bid_range_usd))}，对应评分 ${escape(rangeText(scenario.score_range))}。此区间不替代主点值，不是实际CPC预测。</p>`).join('')}</div>`;
-}
-
-function newcomerDetails(result) {
-  const diagnostics = object(result.diagnostics?.newcomers);
-  const pair = array(diagnostics.selected_pair);
-  const examples = array(diagnostics.examples);
-  const members = array(diagnostics.members);
-  const refs = object(diagnostics.references);
-  const current = ['current_category_r51', 'current_category_r52', 'current_category_r53', 'current_category_r54', 'current_category_r55', 'current_category_r56'].includes(diagnostics.reference_mode);
-  const pairKeys = new Set(pair.map(entry => `${entry.family_id}\0${entry.asin}`));
-  return `<section class="support-section"><h3>正常新品：${current ? '固定示例' : '同一对示例'}</h3>
-    <p>${current ? diagnostics.no_qualifying_examples ? '当前相关榜单的完整查询中，没有合格近三个月新品；少评价与自然曝光各记0支持分，不代表无法进入此市场。' : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 ${escape(numberText(refs.sales_median))} 件。参照包含新老商品；不再计算评价数中位数。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算，不是父体合计' : '声明的家族销量'}。` : `评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。`}</p>
-    <p>${pair.length ? `固定${pair.length}个示例：${pair.map(entry => escape(`${entry.family_id} / ${entry.asin}`)).join('；')}。${pair.length === 1 ? '这是单例支持，不能理解为普遍成功。' : ''}` : diagnostics.no_qualifying_examples ? '保留源样本及排除理由。' : '示例尚待核实；缺数据不填零。'}</p>
-    ${diagnostics.selection_tie_policy === 'complete_score_before_unresolved_equal_bound' ? '<p class="muted">已有两款完整少评价得分时，最多只能同分的缺数样本不再阻断选例；缺数仍是未知。可能超过所选样本的仍需补证。自然可见度继续使用同一组示例。</p>' : ''}
-    ${examples.length ? `<dl class="reference-rows">${examples.map(example => {
-      const raw = members.find(member => member?.family_id === example.family_id && member?.asin === example.asin) ?? {};
-      const natural = object(example.natural);
-      return `<div><dt>${escape(example.family_id)}${pairKeys.has(`${example.family_id}\0${example.asin}`) ? ' · 已选示例' : ' · 参照样本'}</dt><dd>评分数量 ${escape(observed(raw.ratings))}；近30天销量 ${escape(observed(raw.units_30d))}；少评价示例得分 ${escape(numberText(example.score))} / 4。<p class="muted">实际数量分 ${escape(numberText(example.actual_score))}；${current ? '' : `相对数量分 ${escape(numberText(example.relative_score))}；`}销量／参照中位数 ${escape(numberText(example.sales_ratio))}；销量封顶 ${escape(numberText(example.sales_ceiling))}。</p>${typeof raw.reason === 'string' ? `<p class="muted">纳入理由：${escape(raw.reason)}</p>` : ''}<p>自然曝光 ${escape(observed(natural.input))}；${natural.source_label === 'sif_with_sellersprite_corroboration' ? 'SIF占比，附SellerSprite关键词旁证' : 'SIF单来源占比'}。${natural.score === null || natural.score === undefined ? escape(reasonText(natural.reason)) : `自然示例得分 ${escape(numberText(natural.score))} / 1。`}${natural.input?.period ? `观察期：${escape(readable(natural.input.period))}。` : ''}</p>${natural.keyword_counts ? `<p class="muted">自然／广告关键词数：SellerSprite ${escape(numberText(natural.keyword_counts.sellersprite?.organic))} / ${escape(numberText(natural.keyword_counts.sellersprite?.ad))}；SIF ${escape(numberText(natural.keyword_counts.sif?.organic))} / ${escape(numberText(natural.keyword_counts.sif?.ad))}。</p>` : ''}</dd></div>`;
-    }).join('')}</dl>` : ''}
-    ${members.some(member => member?.effective_status && member.effective_status !== 'qualified') ? `<ul>${members.filter(member => member?.effective_status && member.effective_status !== 'qualified').map(member => `<li>${escape(member.family_id ?? member.asin ?? '未命名记录')}：${escape(MEMBER_STATES[member.effective_status] ?? member.effective_status)}；${escape(reasonText(member.reason))}</li>`).join('')}</ul>` : ''}
-    <p class="muted">自然占比是来源建模的曝光构成，不是自然订单或利润。关键词数仅作旁证，不换算曝光占比，也不额外加分。原生市场新品3／2分与上述合格示例4／1分保持分开。</p></section>`;
-}
-
 const COST_LABELS = { procurement: '采购（含约定普通包装）', domestic_freight: '国内运费分摊', headhaul: '头程（含适用 bond）',
   referral: '退款调整后净佣金', fulfillment: 'FBA原出库配送', placement: '入库配置', storage: '仓储分摊',
   returns_processing: '额外退货处理', returns_disposal: '退货损失／处置', collection: '收款手续费',
@@ -215,41 +360,9 @@ const FEE_ISSUES = {
   fee_scope_mismatch: '费率的站点、币种或包装参照不一致。',
   fee_outside_dates: '该费率没有覆盖完整目标日期，请核对下方版本。',
   fee_season_mismatch: '该费率没有覆盖目标月份，或月份输入无效。',
+  returns_processing_required: '实物退货率高于类目阈值且无官方豁免，必须计入额外退货处理费。',
+  invalid_return_rate: '实物退货率超出有效范围 [0, 1)。',
 };
-
-function feeLedgerDetails(scenario) {
-  const ledger = scenario.input?.calculation;
-  if (!ledger) return '';
-  const validation = object(ledger.fee_validation), context = object(validation.context);
-  const windowText = window => window ? `${window.from} 至 ${window.through}` : '待补证';
-  const pending = array(ledger.pending_lines), deferred = array(ledger.deferred_lines);
-  const rows = array(ledger.lines).map(line => {
-    const unknown = pending.includes(line.id) || line.amount_usd === null;
-    const basis = line.fee_basis;
-    const dateText = basis ? `${basis.version ?? '正式费率待补'}；${basis.effective_from ?? '未知'} 至 ${basis.effective_through ?? '未声明截止日'}${basis.months !== undefined ? `；适用月份 ${Array.isArray(basis.months) ? basis.months.join('、') : '无效，待补证'}` : ''}` : '按所列成本来源与情景';
-    return { label: COST_LABELS[line.id] ?? line.id,
-      value: deferred.includes(line.id) ? (pending.includes(line.id) ? '旧暂缓规则不再适用，待补证' : '按已批准范围暂缓，金额未知') : unknown ? '待补证' : line.amount_usd,
-      unit: !unknown && !deferred.includes(line.id) ? 'USD/销售单位' : '', note: `${line.basis}；${dateText}` };
-  });
-  return `<section class="support-section fee-validation"><h4>费率适用性：${validation.status === 'validated' ? '所声明日期与来源通过检查' : '存在待补证项'}</h4><p>销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。</p><p>净收入 US$ ${escape(numberText(ledger.net_revenue_usd))}；完整费用 ${ledger.net_cost_usd === null ? '未知' : `US$ ${escape(numberText(ledger.net_cost_usd))}`}；完整贡献 ${ledger.contribution_usd === null ? '未知' : `US$ ${escape(numberText(ledger.contribution_usd))}`}。</p>${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(FEE_ISSUES[issue.code] ?? issue.reason)}</li>`).join('')}</ul>` : ''}${presentationRows('由本次计算账本生成的费用明细', rows)}<p class="muted">费用按本销售单位计入一次。净佣金已含退款管理费；原出库配送不因退款再扣一次。收款从本情景的Amazon打款估算；待补费用不按零计。日期检查验证已声明的来源范围，不代替源页面核验。</p></section>`;
-}
-
-function economicDetails(result) {
-  const diagnostics = object(result.diagnostics?.economics);
-  const scenarios = array(diagnostics.scenarios);
-  if (!scenarios.length) return '';
-  return `<section class="support-section"><h3>费用情景与假设</h3><p>统一可售单位：${escape(diagnostics.saleable_unit ?? '未知')}。毛利率与单件贡献来自同一情景，不能拼接不同情景的有利端点。</p><dl class="reference-rows">${scenarios.map(scenario => {
-    const calculation = scenario.input?.calculation;
-    const conditional = calculation?.status === 'sensitivity_only';
-    const margin = conditional ? { value: calculation.margin, unit: 'fraction' } : scenario.input?.margin;
-    const contribution = conditional ? { value: calculation.contribution_usd, unit: 'USD' } : scenario.input?.contribution_usd;
-    const explanation = conditional ? '费用已算出，但售价或其他情景假设尚未确认；不授予经济分。' :
-      scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' :
-        calculation && !calculation.scoring_supported ? `完整费用尚待补证：${array(calculation.pending_lines).map(id => COST_LABELS[id] ?? id).join('、') || '费率适用日期或来源'}。见下方核对。` :
-          reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。');
-    return `<div><dt>${escape(scenario.id ?? '未命名情景')}</dt><dd>${conditional ? '条件试算毛利率' : '广告前毛利率'} ${escape(observed(margin))}；单件贡献 ${escape(observed(contribution))}。<p>${escape(explanation)}</p>${feeLedgerDetails(scenario)}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}</dd></div>`;
-  }).join('')}</dl><p class="muted">缺失费用仍为未知。费用测算、初步路径判断、实际供应验证与后续经营结果分别核验。</p></section>`;
-}
 
 function inputSummary(item) {
   const input = object(item.input);
@@ -276,33 +389,127 @@ function inputSummary(item) {
   return '该项输入尚未完整提供。';
 }
 
-function scoreRows(result, registry, prefix) {
+function evidenceLinks(refs, registry, prefix) {
+  if (!array(refs).length) return '<span class="muted">暂无可核验引用</span>';
+  return array(refs).map(ref => {
+    const index = registry.findIndex(entry => entry?.id === ref);
+    const label = index >= 0 ? string(registry[index].source, string(ref, '证据')) : readable(ref);
+    return index >= 0 ? `<a href="#${prefix}-e${index}">${escape(label)} [${index + 1}]</a>` : `<span>${escape(label)}（引用待核实）</span>`;
+  }).join(' · ');
+}
+
+// ============================================================================
+// Legacy Frozen Renderer (revisions < 57: byte-for-byte historical parity)
+// ============================================================================
+function legacyPresentationRows(title, value) {
+  const rows = array(value).filter(row => row && typeof row === 'object' && !Array.isArray(row));
+  if (!rows.length) return '';
+  return `<section class="support-section"><h3>${escape(title)}</h3><dl class="reference-rows">${rows.map(row => {
+    const label = string(row.label, '补充记录');
+    const main = `${readable(row.value)}${typeof row.unit === 'string' ? ` ${row.unit}` : ''}`;
+    const note = string(row.note);
+    const source = string(row.source);
+    return `<div><dt>${escape(label)}</dt><dd>${escape(main)}${note ? `<p class="muted">${escape(note)}</p>` : ''}${source || safeHttpUrl(row.url) ? `<p class="source">来源：${sourceLink(source || '查看来源', row.url)}</p>` : ''}</dd></div>`;
+  }).join('')}</dl></section>`;
+}
+
+function legacyBidDetails(item) {
+  if (!array(item.entries).length) return '';
+  const single = item.aggregation_method === 'single_main_entry';
+  const equal = item.aggregation_method === 'equal_main_entries';
+  return `<div class="item-support"><p><strong>原始精确竞价</strong>：${item.reference_bid_usd === null ? '点值参考待补证' : `${single ? '单个主购买词直接参考' : equal ? '主购买词等权参考' : '主入口加权参考'} US$ ${escape(numberText(item.reference_bid_usd))}`}</p>
+    ${single ? '<p class="muted">输入研究记录声明只有一个真实主购买词；本项不需要月搜索量，缺失时保留未知，也不据此推断市场规模。</p>' : ''}
+    ${equal ? '<p class="muted">缺少月搜索量；每个主要购买词的可用精准报价均已齐全，因此先合并各词的来源报价，再对全部主购买词等权平均。缺失量保留未知，等权不代表各词需求相同。</p>' : ''}
+    ${item.entries.map(entry => `<div class="bid-entry"><p><strong>${escape(entry.query)}</strong> · 月搜索量 ${escape(numberText(entry.volume))} · 两源可用点均值 ${entry.combined_point === null ? '未知' : `US$ ${escape(numberText(entry.combined_point))}`}</p><ul>${['sellersprite', 'sif'].map(source => {
+      const reading = object(entry.sources?.[source]);
+      const label = source === 'sif' ? 'SIF 固定／精确' : 'SellerSprite 精确';
+      return `<li>${label}：${reading.point === null || reading.point === undefined ? '点值未知' : `US$ ${escape(numberText(reading.point))}`}；原始区间 ${reading.range ? `US$ ${escape(rangeText(reading.range))}` : '未提供可用区间'}${reading.strategy === 'unspecified' ? '；策略未说明，作为近似试评输入' : ''}${reading.point === null && reading.reason ? `；${escape(reasonText(reading.reason))}` : ''}</li>`;
+    }).join('')}</ul></div>`).join('')}
+    ${Object.entries(object(item.range_scenarios)).filter(([, scenario]) => scenario).map(([source, scenario]) => `<p class="muted">${source === 'sif' ? 'SIF' : 'SellerSprite'}来源区间情景：${single ? '原始建议竞价' : equal ? '等权建议竞价' : '加权建议竞价'} US$ ${escape(rangeText(scenario.bid_range_usd))}，对应评分 ${escape(rangeText(scenario.score_range))}。此区间不替代主点值，不是实际CPC预测。</p>`).join('')}</div>`;
+}
+
+function legacyNewcomerDetails(result) {
+  const diagnostics = object(result.diagnostics?.newcomers);
+  const pair = array(diagnostics.selected_pair);
+  const examples = array(diagnostics.examples);
+  const members = array(diagnostics.members);
+  const refs = object(diagnostics.references);
+  const current = ['current_category_r51', 'current_category_r52', 'current_category_r53', 'current_category_r54', 'current_category_r55', 'current_category_r56'].includes(diagnostics.reference_mode);
+  const pairKeys = new Set(pair.map(entry => `${entry.family_id}\0${entry.asin}`));
+  return `<section class="support-section"><h3>正常新品：${current ? '固定示例' : '同一对示例'}</h3>
+    <p>${current ? diagnostics.no_qualifying_examples ? '当前相关榜单的完整查询中，没有合格近三个月新品；少评价与自然曝光各记0支持分，不代表无法进入此市场。' : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 ${escape(numberText(refs.sales_median))} 件。参照包含新老商品；不再计算评价数中位数。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算，不是父体合计' : '声明的家族销量'}。` : `评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。`}</p>
+    <p>${pair.length ? `固定${pair.length}个示例：${pair.map(entry => escape(`${entry.family_id} / ${entry.asin}`)).join('；')}。${pair.length === 1 ? '这是单例支持，不能理解为普遍成功。' : ''}` : diagnostics.no_qualifying_examples ? '保留源样本及排除理由。' : '示例尚待核实；缺数据不填零。'}</p>
+    ${diagnostics.selection_tie_policy === 'complete_score_before_unresolved_equal_bound' ? '<p class="muted">已有两款完整少评价得分时，最多只能同分的缺数样本不再阻断选例；缺数仍是未知。可能超过所选样本的仍需补证。自然可见度继续使用同一组示例。</p>' : ''}
+    ${examples.length ? `<dl class="reference-rows">${examples.map(example => {
+      const raw = members.find(member => member?.family_id === example.family_id && member?.asin === example.asin) ?? {};
+      const natural = object(example.natural);
+      return `<div><dt>${escape(example.family_id)}${pairKeys.has(`${example.family_id}\0${example.asin}`) ? ' · 已选示例' : ' · 参照样本'}</dt><dd>评分数量 ${escape(observed(raw.ratings))}；近30天销量 ${escape(observed(raw.units_30d))}；少评价示例得分 ${escape(numberText(example.score))} / 4。<p class="muted">实际数量分 ${escape(numberText(example.actual_score))}；${current ? '' : `相对数量分 ${escape(numberText(example.relative_score))}；`}销量／参照中位数 ${escape(numberText(example.sales_ratio))}；销量封顶 ${escape(numberText(example.sales_ceiling))}。</p>${typeof raw.reason === 'string' ? `<p class="muted">纳入理由：${escape(raw.reason)}</p>` : ''}<p>自然曝光 ${escape(observed(natural.input))}；${natural.source_label === 'sif_with_sellersprite_corroboration' ? 'SIF占比，附SellerSprite关键词旁证' : 'SIF单来源占比'}。${natural.score === null || natural.score === undefined ? escape(reasonText(natural.reason)) : `自然示例得分 ${escape(numberText(natural.score))} / 1。`}${natural.input?.period ? `观察期：${escape(readable(natural.input.period))}。` : ''}</p>${natural.keyword_counts ? `<p class="muted">自然／广告关键词数：SellerSprite ${escape(numberText(natural.keyword_counts.sellersprite?.organic))} / ${escape(numberText(natural.keyword_counts.sellersprite?.ad))}；SIF ${escape(numberText(natural.keyword_counts.sif?.organic))} / ${escape(numberText(natural.keyword_counts.sif?.ad))}。</p>` : ''}</dd></div>`;
+    }).join('')}</dl>` : ''}
+    ${members.some(member => member?.effective_status && member.effective_status !== 'qualified') ? `<ul>${members.filter(member => member?.effective_status && member.effective_status !== 'qualified').map(member => `<li>${escape(member.family_id ?? member.asin ?? '未命名记录')}：${escape(MEMBER_STATES[member.effective_status] ?? member.effective_status)}；${escape(reasonText(member.reason))}</li>`).join('')}</ul>` : ''}
+    <p class="muted">自然占比是来源建模的曝光构成，不是自然订单或利润。关键词数仅作旁证，不换算曝光占比，也不额外加分。原生市场新品3／2分与上述合格示例4／1分保持分开。</p></section>`;
+}
+
+function legacyFeeLedgerDetails(scenario) {
+  const ledger = scenario.input?.calculation;
+  if (!ledger) return '';
+  const validation = object(ledger.fee_validation), context = object(validation.context);
+  const windowText = window => window ? `${window.from} 至 ${window.through}` : '待补证';
+  const pending = array(ledger.pending_lines), deferred = array(ledger.deferred_lines);
+  const rows = array(ledger.lines).map(line => {
+    const unknown = pending.includes(line.id) || line.amount_usd === null;
+    const basis = line.fee_basis;
+    const dateText = basis ? `${basis.version ?? '正式费率待补'}；${basis.effective_from ?? '未知'} 至 ${basis.effective_through ?? '未声明截止日'}${basis.months !== undefined ? `；适用月份 ${Array.isArray(basis.months) ? basis.months.join('、') : '无效，待补证'}` : ''}` : '按所列成本来源与情景';
+    return { label: COST_LABELS[line.id] ?? line.id,
+      value: deferred.includes(line.id) ? (pending.includes(line.id) ? '旧暂缓规则不再适用，待补证' : '按已批准范围暂缓，金额未知') : unknown ? '待补证' : line.amount_usd,
+      unit: !unknown && !deferred.includes(line.id) ? 'USD/销售单位' : '', note: `${line.basis}；${dateText}` };
+  });
+  return `<section class="support-section fee-validation"><h4>费率适用性：${validation.status === 'validated' ? '所声明日期与来源通过检查' : '存在待补证项'}</h4><p>销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。</p><p>净收入 US$ ${escape(numberText(ledger.net_revenue_usd))}；完整费用 ${ledger.net_cost_usd === null ? '未知' : `US$ ${escape(numberText(ledger.net_cost_usd))}`}；完整贡献 ${ledger.net_cost_usd === null ? '未知' : `US$ ${escape(numberText(ledger.contribution_usd))}`}。</p>${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(FEE_ISSUES[issue.code] ?? issue.reason)}</li>`).join('')}</ul>` : ''}${legacyPresentationRows('由本次计算账本生成的费用明细', rows)}<p class="muted">费用按本销售单位计入一次。净佣金已含退款管理费；原出库配送不因退款再扣一次。收款从本情景的Amazon打款估算；待补费用不按零计。日期检查验证已声明的来源范围，不代替源页面核验。</p></section>`;
+}
+
+function legacyEconomicDetails(result) {
+  const diagnostics = object(result.diagnostics?.economics);
+  const scenarios = array(diagnostics.scenarios);
+  if (!scenarios.length) return '';
+  return `<section class="support-section"><h3>费用情景与假设</h3><p>统一可售单位：${escape(diagnostics.saleable_unit ?? '未知')}。毛利率与单件贡献来自同一情景，不能拼接不同情景的有利端点。</p><dl class="reference-rows">${scenarios.map(scenario => {
+    const calculation = scenario.input?.calculation;
+    const conditional = calculation?.status === 'sensitivity_only';
+    const margin = conditional ? { value: calculation.margin, unit: 'fraction' } : scenario.input?.margin;
+    const contribution = conditional ? { value: calculation.contribution_usd, unit: 'USD' } : scenario.input?.contribution_usd;
+    const explanation = conditional ? '费用已算出，但售价或其他情景假设尚未确认；不授予经济分。' :
+      scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' :
+        calculation && !calculation.scoring_supported ? `完整费用尚待补证：${array(calculation.pending_lines).map(id => COST_LABELS[id] ?? id).join('、') || '费率适用日期或来源'}。见下方核对。` :
+          reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。');
+    return `<div><dt>${escape(scenario.id ?? '未命名情景')}</dt><dd>${conditional ? '条件试算毛利率' : '广告前毛利率'} ${escape(observed(margin))}；单件贡献 ${escape(observed(contribution))}。<p>${escape(explanation)}</p>${legacyFeeLedgerDetails(scenario)}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}</dd></div>`;
+  }).join('')}</dl><p class="muted">缺失费用仍为未知。费用测算、初步路径判断、实际供应验证与后续经营结果分别核验。</p></section>`;
+}
+
+function legacyScoreRows(result, registry, prefix) {
   return array(result.groups).map(group => {
     const rows = array(result.items).filter(item => item.group === group.id);
     return `<section class="score-group" data-group-id="${escape(group.id)}"><h3>${escape(GROUP_LABELS[group.id] ?? group.id)}<span>${escape(rangeText(group.supported_range))} 已支持分 · 覆盖 ${escape(numberText(group.covered_weight))} / ${escape(numberText(group.weight))} 权重</span></h3>${rows.map(item => {
       const scored = item.status === 'scored' && Array.isArray(item.score_range);
-      return `<div class="item-row" data-item-id="${escape(item.id)}"><div class="item-heading"><h4>${escape(ITEM_LABELS[item.id] ?? item.id)}</h4><p class="item-score">${scored ? `${escape(rangeText(item.score_range))} / ${escape(numberText(item.weight))} 分` : item.status === 'ineligible' ? '当前情景不适用合格评分' : '待补证'}</p></div><p>${escape(inputSummary(item))}</p>${item.reason ? `<p>${escape(reasonText(item.reason))}</p>` : ''}${item.conditional_range ? `<p class="muted">固定前提下可能范围：${escape(rangeText(item.conditional_range))}；不是已获得分数。</p>` : ''}${item.id === 'relevant_purchase_entry_bid' ? bidDetails(item) : ''}${QUALIFIERS[item.id] ? `<p class="muted">${escape(QUALIFIERS[item.id])}</p>` : ''}<p class="source">依据：${evidenceLinks(item.evidence, registry, prefix)}</p></div>`;
+      return `<div class="item-row" data-item-id="${escape(item.id)}"><div class="item-heading"><h4>${escape(ITEM_LABELS[item.id] ?? item.id)}</h4><p class="item-score">${scored ? `${escape(rangeText(item.score_range))} / ${escape(numberText(item.weight))} 分` : item.status === 'ineligible' ? '当前情景不适用合格评分' : '待补证'}</p></div><p>${escape(inputSummary(item))}</p>${item.reason ? `<p>${escape(reasonText(item.reason))}</p>` : ''}${item.conditional_range ? `<p class="muted">固定前提下可能范围：${escape(rangeText(item.conditional_range))}；不是已获得分数。</p>` : ''}${item.id === 'relevant_purchase_entry_bid' ? legacyBidDetails(item) : ''}${QUALIFIERS[item.id] ? `<p class="muted">${escape(QUALIFIERS[item.id])}</p>` : ''}<p class="source">依据：${evidenceLinks(item.evidence, registry, prefix)}</p></div>`;
     }).join('')}</section>`;
   }).join('');
 }
 
-function bibliography(registry, prefix) {
+function legacyBibliography(registry, prefix) {
   if (!registry.length) return '<p>尚未提供可核验的来源记录。</p>';
   return `<ol class="bibliography">${registry.map((entry, index) => `<li id="${prefix}-e${index}"><strong>${sourceLink(string(entry?.source, '未命名来源'), entry?.url ?? entry?.source)}</strong> · ${escape(entry?.observed_at ?? '日期未知')}<p>${escape(string(entry?.scope))}</p>${entry?.path ? `<p class="source">本地记录：${escape(readable(entry.path))}</p>` : ''}${entry?.limitations ? `<p class="muted">限制：${escape(readable(entry.limitations))}</p>` : ''}<span class="source">引用标识：${escape(entry?.id ?? '未知')}</span></li>`).join('')}</ol>`;
 }
 
-function discoveryDetails(discovery, registry, prefix) {
+function legacyDiscoveryDetails(discovery, registry, prefix) {
   if (!discovery || !array(discovery.leads).length) return '';
   return `<details class="card-details discovery-details"><summary>如何发现这款 · ${escape(array(discovery.leads).length)} 个来源词</summary><div class="details-body"><p><strong>${escape(discovery.label)}</strong>：${escape(discovery.description)}</p><p class="source">款式实物依据：${evidenceLinks(discovery.offer_evidence, registry, prefix)}</p><ul>${array(discovery.leads).map(lead => `<li><strong>${escape(lead?.keyword)}</strong>${typeof lead?.reason === 'string' ? `<p>${escape(lead.reason)}</p>` : ''}<ul>${array(lead?.provenance).map(source => `<li class="source">${escape(source?.source_label ?? source?.source_id)} · ${escape(source?.source_period ?? '期间未返回')}；原始记录：${escape(source?.source_path)}，行索引 ${escape(source?.row_index)}${finite(source?.searches) ? `；搜索量 ${escape(numberText(source.searches))}${typeof source.search_units === 'string' ? `（${escape(source.search_units === 'provider_monthly_search_estimate' ? '来源月估算' : source.search_units)}）` : ''}` : '；搜索量未返回'}。</li>`).join('')}</ul></li>`).join('')}</ul><p class="muted">不同来源的搜索量不相加；这些是发现线索，具体得分仍看下方21项证据。</p></div></details>`;
 }
 
-function discoverySummary(summary) {
+function legacyDiscoverySummary(summary) {
   if (!summary || !finite(summary.unique_keywords)) return '';
   const seasonal = summary.dispositions?.seasonal_deferred ?? 0;
   return `<p class="batch-counts">来源词 ${escape(numberText(summary.unique_keywords))} 个；已核对 ${escape(numberText(summary.reviewed_keywords))} 个，待核 ${escape(numberText(summary.pending_keywords - seasonal))} 个，暂缓 ${escape(numberText(seasonal))} 个，搁置专属或无关搜索 ${escape(numberText(summary.excluded_keywords))} 个；已绑定实物候选 ${escape(numberText(summary.bound_candidates))} 个。词数不等于产品数，绑定不代表评分通过。</p>`;
 }
 
-function periodPanel(period, presentation, registry, prefix) {
+function legacyPeriodPanel(period, presentation, registry, prefix) {
   const complete = period.queue === 'comparable' && Array.isArray(period.total_range);
   const gaps = array(period.items).filter(item => item.status === 'needs_evidence');
   const ineligible = array(period.items).filter(item => item.status === 'ineligible');
@@ -314,21 +521,21 @@ function periodPanel(period, presentation, registry, prefix) {
   const label = { excluded: '本时段排除', deferred: '本时段暂缓' }[period.queue] ?? QUEUES[period.queue] ?? '待补证';
   const incomplete = period.queue === 'excluded' ? '本经营时段不满足筛选条件，不列完整总分' :
     period.queue === 'deferred' ? '本经营时段暂缓，不列完整总分' : '本经营时段完整总分待补证';
-  return `<section class="operating-period" data-operating-period="${escape(period.id)}" data-queue="${escape(period.queue)}"><div class="card-title"><h3>${escape(period.label)}</h3><span class="status ${escape(period.queue)}">${label}</span></div><p class="muted">适用月份：${escape(array(period.months).join('、'))}月；本时段独立适用30%毛利条件。</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<div class="score-summary"><p><strong>退款调整后广告前毛利率 ${margin ? `${escape(rangeText(margin))}%` : '未知'}</strong>；单件贡献 ${contribution ? `US$ ${escape(rangeText(contribution))}` : '未知'}。</p>${complete ? `<p class="total">本经营时段完整总分 <strong>${escape(rangeText(period.total_range))} / 100</strong></p>` : `<p class="total incomplete">${incomplete}</p>`}<p>已支持分数 ${escape(rangeText(period.supported_range))}；已计分权重 ${escape(numberText(period.covered_weight))} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。</p>${period.conditional_total_range ? `<p class="muted">满足本时段准入后可能范围 ${escape(rangeText(period.conditional_total_range))}；这是数学界限，不是已获得总分或预测。</p>` : ''}</div>${presentationRows('本时段核算依据', presentation.facts)}${conditions.length ? `<p class="screen-note">本时段筛选：${conditions.map(condition => `${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : ''}<details class="card-details period-details"><summary>查看${escape(period.label)}的21项评分、费用与证据 · 8组</summary><div class="details-body">${economicDetails(period)}${period.profile_revision >= 54 ? '' : presentationRows('本时段费用明细', presentation.costs)}${scoreRows(period, registry, prefix)}${newcomerDetails(period)}</div></details></section>`;
+  return `<section class="operating-period" data-operating-period="${escape(period.id)}" data-queue="${escape(period.queue)}"><div class="card-title"><h3>${escape(period.label)}</h3><span class="status ${escape(period.queue)}">${label}</span></div><p class="muted">适用月份：${escape(array(period.months).join('、'))}月；本时段独立适用30%毛利条件。</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<div class="score-summary"><p><strong>退款调整后广告前毛利率 ${margin ? `${escape(rangeText(margin))}%` : '未知'}</strong>；单件贡献 ${contribution ? `US$ ${escape(rangeText(contribution))}` : '未知'}。</p>${complete ? `<p class="total">本经营时段完整总分 <strong>${escape(rangeText(period.total_range))} / 100</strong></p>` : `<p class="total incomplete">${incomplete}</p>`}<p>已支持分数 ${escape(rangeText(period.supported_range))}；已计分权重 ${escape(numberText(period.covered_weight))} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。</p>${period.conditional_total_range ? `<p class="muted">满足本时段准入后可能范围 ${escape(rangeText(period.conditional_total_range))}；这是数学界限，不是已获得总分或预测。</p>` : ''}</div>${legacyPresentationRows('本时段核算依据', presentation.facts)}${conditions.length ? `<p class="screen-note">本时段筛选：${conditions.map(condition => `${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : ''}<details class="card-details period-details"><summary>查看${escape(period.label)}的21项评分、费用与证据 · 8组</summary><div class="details-body">${legacyEconomicDetails(period)}${period.profile_revision >= 54 ? '' : legacyPresentationRows('本时段费用明细', presentation.costs)}${legacyScoreRows(period, registry, prefix)}${legacyNewcomerDetails(period)}</div></details></section>`;
 }
 
-function seasonalCard(result, original, index) {
+function legacySeasonalCard(result, original, index) {
   const presentation = object(original?.presentation);
   const registry = array(result.evidence);
   const prefix = `candidate-${index + 1}`;
   const image = imageUri(presentation.image_data_uri);
   const displays = array(presentation.operating_periods);
   const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
-  return `<article class="candidate" id="${prefix}" data-queue="seasonal_review"><div class="card-top">${image ? `<figure class="product-image"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="320" height="320" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}<div class="card-intro"><div class="card-title"><h2>${escape(result.label ?? result.candidate_id)}</h2><span class="status seasonal_review">分季评估</span></div><p class="form">${escape(result.form ?? '具体可售规格尚待明确')}</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<p class="screen-note">同一款式的经营时段分别评估，由主人选择经营季节。各时段的费用、毛利与21项得分分别阅读，不合并全年总分或按最佳时段排序。</p></div></div>${presentationRows('款式事实与共同依据', presentation.facts)}${discoveryDetails(original?.discovery, registry, prefix)}${blockers.length ? `<section class="next-evidence"><h3>共同问题与后续处理</h3><ul>${blockers.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}${array(result.operating_periods).map(period => periodPanel(period, object(displays.find(display => display?.id === period.id)), registry, prefix)).join('')}<details class="card-details"><summary>查看共同采购资料与来源限制</summary><div class="details-body">${result.profile_revision >= 54 ? '' : presentationRows('共同费用资料', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
+  return `<article class="candidate" id="${prefix}" data-queue="seasonal_review"><div class="card-top">${image ? `<figure class="product-image"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="320" height="320" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}<div class="card-intro"><div class="card-title"><h2>${escape(result.label ?? result.candidate_id)}</h2><span class="status seasonal_review">分季评估</span></div><p class="form">${escape(result.form ?? '具体可售规格尚待明确')}</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<p class="screen-note">同一款式的经营时段分别评估，由主人选择经营季节。各时段的费用、毛利与21项得分分别阅读，不合并全年总分或按最佳时段排序。</p></div></div>${legacyPresentationRows('款式事实与共同依据', presentation.facts)}${legacyDiscoveryDetails(original?.discovery, registry, prefix)}${blockers.length ? `<section class="next-evidence"><h3>共同问题与后续处理</h3><ul>${blockers.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}${array(result.operating_periods).map(period => legacyPeriodPanel(period, object(displays.find(display => display?.id === period.id)), registry, prefix)).join('')}<details class="card-details"><summary>查看共同采购资料与来源限制</summary><div class="details-body">${result.profile_revision >= 54 ? '' : legacyPresentationRows('共同费用资料', presentation.economics_details)}${legacyPresentationRows('采购参考与规格核对', presentation.procurement)}${legacyPresentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${legacyBibliography(registry, prefix)}</section></div></details></article>`;
 }
 
-function candidateCard(result, original, index) {
-  if (result.queue === 'seasonal_review') return seasonalCard(result, original, index);
+function legacyCandidateCard(result, original, index) {
+  if (result.queue === 'seasonal_review') return legacySeasonalCard(result, original, index);
   const presentation = object(original?.presentation);
   const registry = array(result.evidence);
   const prefix = `candidate-${index + 1}`;
@@ -345,14 +552,14 @@ function candidateCard(result, original, index) {
     ? `已计分权重 ${numberText(result.covered_weight)} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。`
     : `证据覆盖权重 ${numberText(result.covered_weight)} / 100；未评分权重 ${numberText(result.unscored_weight)}。`;
   return `<article class="candidate" id="${prefix}" data-queue="${queue}"><div class="card-top">${image ? `<figure class="product-image"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="320" height="320" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}<div class="card-intro"><div class="card-title"><h2>${escape(result.label ?? result.candidate_id)}</h2><span class="status ${queue}">${QUEUES[queue]}</span></div><p class="form">${escape(result.form ?? '具体可售规格尚待明确')}</p>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<div class="score-summary">${complete ? `<p class="total">完整总分 <strong>${escape(rangeText(result.total_range))} / 100</strong></p>` : `<p class="total incomplete">${escape(incompleteLabel)}</p>`}<p><strong>已支持分数 ${escape(rangeText(result.supported_range))}</strong>；${escape(coverageText)}</p>${result.conditional_total_range ? `<p class="muted">满足准入后可能范围 ${escape(rangeText(result.conditional_total_range))}。这是数学界限，不是已获得总分或预测。</p>` : ''}${result.may_exceed_comparable_leader ? '<p class="priority-note">有效可能上界高于当前完整队列首项的保守端点，值得补证；这不代表已经胜出。</p>' : ''}</div></div></div>
-    ${discoveryDetails(original?.discovery, registry, prefix)}
+    ${legacyDiscoveryDetails(original?.discovery, registry, prefix)}
     ${mainGaps.length ? `<section class="next-evidence"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul>${mainGaps.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p>下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></section>` : ''}
     ${screenGaps.length ? `<p class="screen-note">筛选状态：${screenGaps.map(condition => `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : '<p class="screen-note">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}
-    <details class="card-details"><summary>查看21项评分与证据 · 8组</summary><div class="details-body">${scoreRows(result, registry, prefix)}${economicDetails(result)}${result.profile_revision >= 54 ? '' : presentationRows('费用明细补充', presentation.economics_details)}${presentationRows('采购参考与规格核对', presentation.procurement)}${newcomerDetails(result)}${presentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${bibliography(registry, prefix)}</section></div></details></article>`;
+    <details class="card-details"><summary>查看21项评分与证据 · 8组</summary><div class="details-body">${legacyScoreRows(result, registry, prefix)}${legacyEconomicDetails(result)}${result.profile_revision >= 54 ? '' : legacyPresentationRows('费用明细补充', presentation.economics_details)}${legacyPresentationRows('采购参考与规格核对', presentation.procurement)}${legacyNewcomerDetails(result)}${legacyPresentationRows('市场范围与新增观察', presentation.market_references)}<section class="support-section"><h3>来源与适用限制</h3>${legacyBibliography(registry, prefix)}</section></div></details></article>`;
 }
 
-function batchContext(presentation) {
-  const linkedSummary = discoverySummary(presentation.discovery_summary);
+function legacyBatchContext(presentation) {
+  const linkedSummary = legacyDiscoverySummary(presentation.discovery_summary);
   const discovery = array(presentation.discovery);
   const timings = array(presentation.timings);
   const limitations = array(presentation.limitations);
@@ -367,7 +574,7 @@ function batchContext(presentation) {
   }).join('')}</dl>` : ''}${limitations.length ? `<h2>本轮限制</h2><ul>${limitations.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}</div></details>`;
 }
 
-const CSS = `
+const LEGACY_CSS = `
 :root{color-scheme:light;--ink:#243238;--muted:#52626a;--paper:#fff;--ground:#f3f4ef;--line:#d5ddd6;--accent:#205f55;--accent-soft:#ecf5ef;--pending:#75501f;--pending-soft:#fff4df;--danger:#8c3040;--danger-soft:#fff0f2;--radius:14px;--space:24px}
 *{box-sizing:border-box}html{scroll-behavior:auto;scroll-padding-top:24px}body{margin:0;background:var(--ground);color:var(--ink);font:16px/1.7 "Segoe UI","Microsoft YaHei","PingFang SC",sans-serif;overflow-wrap:anywhere}::selection{background:#c5e5d8;color:#163c34}a{color:var(--accent);text-underline-offset:.2em;text-decoration-thickness:1px}a:hover{text-decoration-thickness:2px}a:focus-visible,summary:focus-visible{outline:3px solid #246b92;outline-offset:4px;border-radius:4px}main{width:min(1120px,100%);margin:0 auto;padding:40px 24px 64px}h1,h2,h3,h4,p,figure,dl{margin:0}h1{font-size:clamp(1.65rem,3vw,2.3rem);line-height:1.3;letter-spacing:-.025em;font-weight:700}h2{font-size:1.28rem;line-height:1.45}h3{font-size:1.05rem;line-height:1.5}h4{font-size:1rem;line-height:1.5}p+p{margin-top:8px}ul,ol{padding-inline-start:1.35em;margin:10px 0}li+li{margin-top:10px}header>p{max-width:74ch;margin-top:16px}.batch-counts{color:var(--muted)}.queue-nav{display:flex;gap:10px 22px;flex-wrap:wrap;margin:20px 0 0}.queue-nav a{padding:5px 0}.batch-context{border-block:1px solid var(--line);margin:24px 0 32px}summary{cursor:pointer;min-height:48px;padding:13px 0;font-weight:600;color:var(--accent)}summary::marker{font-size:.8em}summary:hover{color:#123f37}.candidate{background:var(--paper);border:1px solid var(--line);border-radius:var(--radius);margin-top:24px;padding:28px;min-width:0;scroll-margin-top:24px}.card-top{display:flex;gap:24px;align-items:flex-start}.card-intro{flex:1;min-width:0}.card-title{display:flex;flex-wrap:wrap;align-items:baseline;gap:10px 14px}.card-title h2{flex:1;min-width:min(230px,100%)}.status{font-size:.82rem;font-weight:650;border-radius:6px;padding:3px 9px;white-space:nowrap}.status.comparable{color:var(--accent);background:var(--accent-soft)}.status.pending,.status.deferred{color:var(--pending);background:var(--pending-soft)}.status.excluded{color:var(--danger);background:var(--danger-soft)}.form{font-weight:600;margin:10px 0 8px}.product-image{flex:0 0 158px;max-width:100%}.product-image img{display:block;width:158px;height:158px;max-width:100%;object-fit:contain;background:#fafbf7;border-radius:8px}.product-image figcaption{font-size:.76rem;line-height:1.5;color:var(--muted);margin-top:8px}.score-summary{margin-top:18px;padding-top:14px;border-top:1px solid var(--line);font-variant-numeric:tabular-nums}.total{font-size:1.05rem}.total strong{font-size:1.28rem;margin-inline-start:8px}.total.incomplete{font-weight:650;color:var(--pending)}.muted,.source{color:var(--muted)}.source{font-size:.86rem;line-height:1.65}.priority-note{color:var(--accent)}.next-evidence{margin-top:24px}.next-evidence li p{color:var(--muted);font-size:.94rem;margin-top:3px}.screen-note{font-size:.9rem;color:var(--muted);margin-top:20px}.card-details{border-top:1px solid var(--line);margin-top:20px}.details-body{padding:8px 0 20px;min-width:0}.score-group{margin-top:24px}.score-group:first-child{margin-top:8px}.score-group>h3{display:flex;justify-content:space-between;flex-wrap:wrap;gap:6px 20px;padding-bottom:10px;border-bottom:1px solid var(--line)}.score-group>h3 span{font-size:.83rem;color:var(--muted);font-weight:400}.item-row{padding:18px 0;border-bottom:1px solid #e9eee9;font-size:.94rem}.item-heading{display:flex;justify-content:space-between;gap:10px 20px;align-items:baseline;margin-bottom:7px}.item-score{font-size:.9rem;font-weight:600;flex-shrink:0;font-variant-numeric:tabular-nums}.item-row>.source{margin-top:10px}.item-support{margin:14px 0 8px}.bid-entry{padding:12px 0}.bid-entry+.bid-entry{border-top:1px dotted var(--line)}.support-section{margin-top:32px}.support-section>h3{margin-bottom:10px}.reference-rows>div{display:grid;grid-template-columns:minmax(110px,1fr) minmax(0,4fr);gap:16px;padding:13px 0;border-bottom:1px solid #e9eee9}.reference-rows dt{font-weight:600}.reference-rows dd{margin:0;min-width:0}.bibliography li{padding:8px 0;scroll-margin-top:24px}.batch-context h2{font-size:1.05rem;margin:20px 0 10px}.empty-state{padding:32px 0}.report-footer{font-size:.88rem;color:var(--muted);margin-top:32px;padding-top:20px;border-top:1px solid var(--line);max-width:74ch}.skip-link{position:absolute;top:-100px;left:12px;background:white;padding:10px;z-index:2}.skip-link:focus{top:8px}
 .operating-period{margin-top:28px;padding-top:24px;border-top:1px solid var(--line)}.status.seasonal_review{color:var(--accent);background:var(--accent-soft)}
@@ -375,7 +582,7 @@ const CSS = `
 @media print{body{background:#fff;color:#111;font-size:10pt}main{width:100%;padding:0}.queue-nav,.skip-link{display:none}.candidate{border-radius:0;padding:16pt 0;border-inline:0;break-inside:auto}.card-details,.batch-context{display:block}details::details-content{display:block;content-visibility:visible}details>*{display:block!important}summary{color:#111;padding:10pt 0}.item-row,.reference-rows>div,.bibliography li{break-inside:avoid}.product-image img{width:90pt;height:90pt}.product-image{flex-basis:100pt}.source,.muted{color:#333}a{color:#111}.report-footer{margin-top:16pt}}
 `;
 
-export function renderReport(result, batch = {}) {
+function renderLegacyReport(result, batch = {}) {
   const presentation = { ...object(batch?.presentation), discovery_summary: batch?.discovery_summary };
   const candidates = array(result?.candidates);
   const originals = new Map(array(batch?.candidates).map(candidate => [candidate?.id, candidate]));
@@ -386,5 +593,1560 @@ export function renderReport(result, batch = {}) {
     const index = candidates.findIndex(candidate => candidate?.queue === key);
     return index >= 0 ? `<a href="#candidate-${index + 1}">${label} ${escape(numberText(counts[key === 'comparable' ? 'complete' : key]))}</a>` : '';
   }).join('');
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"><meta name="referrer" content="no-referrer"><title>${escape(title)}</title><style>${CSS}</style></head><body><a class="skip-link" href="#cards">跳到候选卡</a><main><header><h1>${escape(title)}</h1>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<p class="batch-counts">本轮 ${escape(numberText(candidates.length))} 个候选；完整可比 ${escape(numberText(counts.complete))} 个，待补证 ${escape(numberText(counts.pending))} 个。${seasonalCounts}完整得分、证据覆盖和补证优先级分别阅读。</p>${queueLinks ? `<nav class="queue-nav" aria-label="跳转候选队列">${queueLinks}</nav>` : ''}</header>${batchContext(presentation)}<section id="cards" aria-label="候选产品卡">${candidates.length ? candidates.map((candidate, index) => candidateCard(object(candidate), originals.get(candidate?.candidate_id), index)).join('') : '<div class="empty-state"><h2>本轮没有候选卡</h2><p>保留发现与覆盖记录；没有候选不等于市场中没有机会。</p></div>'}</section><footer class="report-footer"><p>评分反映本轮证据与已确认试评规则。未知不按零计，不把已知部分折算为100分；初步评分、供应验证、主人决定与实际经营效果分别核验。</p><p>规则版本：修订 ${escape(result?.profile_revision ?? '未知')}。本页可离线展开和打印；查看与重新计算不会提交市场或模型请求。</p></footer></main></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"><meta name="referrer" content="no-referrer"><title>${escape(title)}</title><style>${LEGACY_CSS}</style></head><body><a class="skip-link" href="#cards">跳到候选卡</a><main><header><h1>${escape(title)}</h1>${typeof presentation.summary === 'string' ? `<p>${escape(presentation.summary)}</p>` : ''}<p class="batch-counts">本轮 ${escape(numberText(candidates.length))} 个候选；完整可比 ${escape(numberText(counts.complete))} 个，待补证 ${escape(numberText(counts.pending))} 个。${seasonalCounts}完整得分、证据覆盖和补证优先级分别阅读。</p>${queueLinks ? `<nav class="queue-nav" aria-label="跳转候选队列">${queueLinks}</nav>` : ''}</header>${legacyBatchContext(presentation)}<section id="cards" aria-label="候选产品卡">${candidates.length ? candidates.map((candidate, index) => legacyCandidateCard(object(candidate), originals.get(candidate?.candidate_id), index)).join('') : '<div class="empty-state"><h2>本轮没有候选卡</h2><p>保留发现与覆盖记录；没有候选不等于市场中没有机会。</p></div>'}</section><footer class="report-footer"><p>评分反映本轮证据与已确认试评规则。未知不按零计，不把已知部分折算为100分；初步评分、供应验证、主人决定与实际经营效果分别核验。</p><p>规则版本：修订 ${escape(result?.profile_revision ?? '未知')}。本页可离线展开和打印；查看与重新计算不会提交市场或模型请求。</p></footer></main></body></html>`;
+}
+
+// ============================================================================
+// Achromatic Split-Inspector Workbench (revision 57+)
+// ============================================================================
+function minMaxRange(values) {
+  const nums = values.filter(finite);
+  return nums.length ? [Math.min(...nums), Math.max(...nums)] : null;
+}
+
+function usdRangeText(range) {
+  return range ? `US$ ${escape(rangeText(range))}` : '待补证';
+}
+
+function pctRangeText(range) {
+  if (!range) return '待补证';
+  const [lo, hi] = range.map(v => v * 100);
+  if (Math.abs(hi - lo) <= 1e-9) return `${escape(numberText(lo))}%`;
+  if (lo < 0 || hi < 0) return `${escape(numberText(lo))}% 至 ${escape(numberText(hi))}%`;
+  return `${escape(rangeText([lo, hi]))}%`;
+}
+
+function isCandidateEligible(candidate, rev = candidate?.profile_revision ?? 0) {
+  if (rev >= 58) return candidate?.qualification?.counts_toward_target === true;
+  if (candidate?.queue === 'comparable') return true;
+  if (candidate?.queue === 'seasonal_review') {
+    const monthsReq = [2, 3, 4, 5, 6, 7, 8, 9];
+    const hasPeak = array(candidate.operating_periods).some(p => [10, 11, 12].every(m => array(p?.months).includes(m)));
+    return hasPeak && array(candidate.operating_periods).some(p =>
+      p?.queue === 'comparable' && monthsReq.every(m => array(p?.months).includes(m)));
+  }
+  return false;
+}
+
+function sInputs(scenarios, calc) {
+  const match = scenarios.find(s => s?.input?.calculation === calc);
+  return match?.input?.cost_ledger?.source_inputs ?? null;
+}
+
+function calcMeetsFloor30(calc, sc = null) {
+  if (sc?.coherence_supported === true && typeof sc.margin_eligible === 'boolean') return sc.margin_eligible;
+  if (calc && finite(calc.price_usd) && finite(calc.refund_fraction) && Array.isArray(calc.lines) && calc.margin !== null && calc.margin !== undefined) {
+    try { return ledgerMeetsMarginFloor(calc, 0.3); } catch {}
+  }
+  if (sc && typeof sc.margin_eligible === 'boolean') return sc.margin_eligible;
+  if (finite(calc?.margin)) return calc.margin >= 0.3;
+  if (finite(sc?.input?.margin?.value)) return sc.input.margin.value >= 0.3;
+  return null;
+}
+
+function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 0) {
+  const target = candidate?.queue === 'seasonal_review'
+    ? (rev >= 58
+      ? ((candidate?.qualification?.display_period_id
+        ? array(candidate.operating_periods).find(p => p?.id === candidate.qualification.display_period_id)
+        : null) ?? array(candidate.operating_periods)[0] ?? candidate)
+      : (array(candidate.operating_periods).find(p => p?.queue === 'comparable') ?? array(candidate.operating_periods)[0] ?? candidate))
+    : candidate;
+  const scenarios = array(target?.diagnostics?.economics?.scenarios);
+  const scoredLedgers = scenarios
+    .filter(s => rev < 58 || isScoredSupportedR58(s))
+    .map(s => s?.input?.calculation)
+    .filter(c => c && c.status !== 'sensitivity_only');
+  const sensitivityScenarios = rev >= 58
+    ? []
+    : scenarios.filter(s => s?.input?.calculation?.status === 'sensitivity_only');
+  const primarySensScenarios = sensitivityScenarios.filter(s => s?.input?.cost_ledger?.source_inputs?.matched_grade_primary === true);
+  const chosenSensLedgers = (primarySensScenarios.length ? primarySensScenarios : sensitivityScenarios).map(s => s.input.calculation);
+  const activeLedgers = scoredLedgers.some(c => finite(c?.margin)) ? scoredLedgers : (chosenSensLedgers.length ? chosenSensLedgers : scoredLedgers);
+  const isSensitivity = !scoredLedgers.some(c => finite(c?.margin)) && chosenSensLedgers.some(c => finite(c?.margin));
+
+  const validatedRefPrice = rev >= 58
+    ? (() => {
+      const rp = array(target?.screening?.conditions).find(c => c?.id === 'reference_price' && c?.status === 'pass');
+      return finite(rp?.input?.value) ? [rp.input.value, rp.input.value] : null;
+    })()
+    : null;
+  const prices = minMaxRange(activeLedgers.map(c => c?.price_usd)) ?? validatedRefPrice;
+  const domesticDelivered = minMaxRange(activeLedgers.map(c => {
+    const proc = array(c?.lines).find(l => l.id === 'procurement')?.amount_usd;
+    const dom = array(c?.lines).find(l => l.id === 'domestic_freight')?.amount_usd;
+    return finite(proc) && finite(dom) ? proc + dom : null;
+  }));
+  const margins = Array.isArray(target?.diagnostics?.economics?.margin_range) && target.diagnostics.economics.margin_range.length === 2
+    ? target.diagnostics.economics.margin_range
+    : minMaxRange(activeLedgers.map(c => c?.margin));
+  let marginFloorStatus = 'unknown';
+  if (rev >= 58) {
+    const ledgerVerdicts = activeLedgers
+      .map(c => calcMeetsFloor30(c, scenarios.find(s => s?.input?.calculation === c)))
+      .filter(v => typeof v === 'boolean');
+    if (ledgerVerdicts.length) {
+      marginFloorStatus = ledgerVerdicts.every(Boolean) ? 'pass' : ledgerVerdicts.every(v => !v) ? 'fail' : 'cross';
+    } else if (margins) {
+      marginFloorStatus = margins[0] >= 0.3 ? 'pass' : margins[1] < 0.3 ? 'fail' : 'cross';
+    }
+  } else if (margins) {
+    marginFloorStatus = margins[0] >= 0.3 ? 'pass' : margins[1] < 0.3 ? 'fail' : 'cross';
+  }
+  const adMargins = minMaxRange(activeLedgers.map(c => c?.advertising_scenario_margin));
+  const eligibleScenarios = rev >= 58 ? scenarios.filter(isScoredSupportedR58) : scenarios;
+  const contributions = minMaxRange(
+    eligibleScenarios.map(s => s?.contribution?.value).filter(finite).length
+      ? eligibleScenarios.map(s => s?.contribution?.value)
+      : activeLedgers.map(c => c?.contribution_usd),
+  );
+  const cnyTotals = minMaxRange(activeLedgers.map(c => {
+    const si = sInputs(scenarios, c);
+    return finite(si?.procurement_cny) && finite(si?.domestic_per_unit_cny) ? si.procurement_cny + si.domestic_per_unit_cny : null;
+  }));
+  const complete = target?.queue === 'comparable' && Array.isArray(target?.total_range);
+  return {
+    target,
+    prices,
+    domesticDelivered,
+    cnyTotals,
+    margins,
+    marginFloorStatus,
+    adMargins,
+    contributions,
+    isSensitivity,
+    complete,
+    totalRange: complete ? target.total_range : null,
+    supportedRange: target?.supported_range ?? candidate?.supported_range ?? null,
+    coveredWeight: target?.covered_weight ?? candidate?.covered_weight ?? 0,
+    periodLabel: candidate?.queue === 'seasonal_review' ? string(target?.label, '主营时段') : '全时段',
+  };
+}
+
+function statusDotInfo(candidate, snapshot, rev = candidate?.profile_revision ?? 0) {
+  const eligible = isCandidateEligible(candidate, rev);
+  if (eligible) {
+    return {
+      tone: 'pass',
+      text: candidate.queue === 'seasonal_review' ? '淡季达标 · 可推进' : '完整达标 · 可推进',
+    };
+  }
+  if (candidate.queue === 'excluded') return { tone: 'fail', text: '不满足条件 · 排除' };
+  if (candidate.queue === 'deferred') return { tone: 'pending', text: '强节日款 · 暂缓' };
+  if (snapshot.isSensitivity && snapshot.margins && (rev >= 58 ? snapshot.marginFloorStatus === 'fail' : snapshot.margins[1] < 0.3)) {
+    return { tone: 'fail', text: '同精度毛利不足 · 搁置' };
+  }
+  return { tone: 'pending', text: '待补齐证据' };
+}
+
+function renderDotStatus(candidate, snapshot, rev = candidate?.profile_revision ?? 0) {
+  const info = statusDotInfo(candidate, snapshot, rev);
+  return `<span class="state-inline state-${info.tone}"><i class="dot" aria-hidden="true"></i>${escape(info.text)}</span>`;
+}
+
+function starReferenceSection(original) {
+  const raw = original?.presentation?.niche_average_star_reference ?? original?.market?.average_star_rating;
+  if (raw === null || raw === undefined) return '';
+  const rating = finite(raw) ? raw : finite(raw?.value) ? raw.value : null;
+  if (rating === null || rating <= 0 || rating > 5) return '';
+  const scope = typeof raw === 'object' ? string(raw.scope || raw.population || original?.market?.population) : string(original?.market?.population);
+  const period = typeof raw === 'object' ? string(raw.period || original?.market?.period) : string(original?.market?.period);
+  const note = typeof raw === 'object' ? string(raw.note, '仅作细分市场口碑与预期参考，不纳入100分评分。') : '仅作细分市场口碑与预期参考，不纳入100分评分。';
+  return `<p class="star-ref">细分市场显示均星参考（不计分）：<strong>${escape(numberText(rating))} 星</strong>${scope ? ` · ${escape(scope)}` : ''}${period ? `（${escape(period)}）` : ''}。${escape(note)}</p>`;
+}
+
+function formatCleanBullet(text) {
+  const escaped = escape(text);
+  const bracket = escaped.match(/^【([^】]{1,20})】(.*)$/s);
+  if (bracket) return `<strong>${bracket[1]}</strong> — ${bracket[2]}`;
+  const colon = escaped.match(/^([^：:；。]{2,18})[：:](.*)$/s);
+  if (colon) return `<strong>${colon[1]}：</strong>${colon[2]}`;
+  return escaped;
+}
+
+function r57BriefList(title, value) {
+  const items = array(value).filter(item => (typeof item === 'string' && item.trim()) ||
+    (item && typeof item === 'object' && !Array.isArray(item) && (typeof item.label === 'string' || typeof item.problem === 'string' || item.value !== undefined)));
+  if (!items.length) return '';
+  return `<div class="brief-col"><h3>${escape(title)}</h3><ul class="brief-list">${items.map(item => {
+    if (typeof item === 'string') return `<li>${formatCleanBullet(item)}</li>`;
+    const head = string(item.label || item.problem, '提示');
+    const detail = item.value !== undefined ? `：${escape(readable(item.value))}${typeof item.unit === 'string' ? ` ${escape(item.unit)}` : ''}` : '';
+    const note = string(item.note || item.next_step);
+    const source = string(item.source);
+    return `<li><strong>${escape(head)}</strong>${detail}${note ? `<p class="muted">${escape(note)}</p>` : ''}${source || safeHttpUrl(item.url) ? `<p class="source">来源：${sourceLink(source || '查看来源', item.url)}</p>` : ''}</li>`;
+  }).join('')}</ul></div>`;
+}
+
+const SVG_UP = '<svg class="ico" viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9.5V2.5M2.75 5.75 6 2.5l3.25 3.25"/></svg>';
+const SVG_DOWN = '<svg class="ico" viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 2.5v7M2.75 6.25 6 9.5l3.25-3.25"/></svg>';
+const SVG_EXT = '<svg class="ico" viewBox="0 0 12 12" width="11" height="11" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 8.5 8.5 3.5M4.5 3.5h4v4"/></svg>';
+
+function r57KeyValueSection(title, value) {
+  const rows = array(value).filter(row => row && typeof row === 'object' && !Array.isArray(row));
+  if (!rows.length) return '';
+  return `<section class="ledger-section"><h3>${escape(title)}</h3><dl class="kv-rows">${rows.map(row => {
+    const label = string(row.label, '补充记录');
+    const main = `${readable(row.value)}${typeof row.unit === 'string' ? ` ${row.unit}` : ''}`;
+    const note = string(row.note);
+    const source = string(row.source);
+    const validUrl = safeHttpUrl(row.url);
+    return `<div class="kv-row"><dt>${escape(label)}</dt><dd><div class="kv-main">${escape(main)}${validUrl ? ` <a class="pill-link" href="${escape(validUrl)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">${escape(source || '查看来源')} ${SVG_EXT}</a>` : ''}</div>${note ? `<p class="muted">${escape(note)}</p>` : ''}${!validUrl && source ? `<p class="source">来源：${escape(source)}</p>` : ''}</dd></div>`;
+  }).join('')}</dl></section>`;
+}
+
+function r57BidDetails(item) {
+  if (!array(item.entries).length) return '';
+  const single = item.aggregation_method === 'single_main_entry';
+  const equal = item.aggregation_method === 'equal_main_entries';
+  return `<div class="bid-block"><p class="bid-summary-line"><strong>原始精确竞价</strong> · ${item.reference_bid_usd === null ? '点值参考待补证' : `${single ? '单个主购买词直接参考' : equal ? '主购买词等权参考' : '主入口加权参考'} <strong>US$ ${escape(numberText(item.reference_bid_usd))}</strong>`}</p>
+    ${single ? (item.entries[0]?.volume === null || item.entries[0]?.volume === undefined ? '<p class="muted">输入研究记录声明只有一个真实主购买词；本项不需要月搜索量，缺失时保留未知，也不据此推断市场规模。</p>' : '<p class="muted">输入研究记录声明只有一个真实主购买词；本项直接使用该词精确竞价，已记录的月搜索量仅作展示参考，不单独据此推断市场规模。</p>') : ''}
+    ${equal ? '<p class="muted">缺少月搜索量；每个主要购买词的可用精准报价均已齐全，因此先合并各词的来源报价，再对全部主购买词等权平均。缺失量保留未知，等权不代表各词需求相同。</p>' : ''}
+    <div class="bid-rows">${item.entries.map(entry => `<div class="bid-row"><div class="bid-row-head"><code class="mono-kw">${escape(entry.query)}</code><span class="bid-row-meta">月搜 ${escape(numberText(entry.volume))} · ${entry.source_label === 'sellersprite_only' ? 'SellerSprite 单源精确点' : entry.source_label === 'sif_only' ? 'SIF 单源精确点' : entry.source_label === 'two_source_mean' ? '两源精确点均值' : '可用精确点'} <strong>${entry.combined_point === null ? '未知' : `US$ ${escape(numberText(entry.combined_point))}`}</strong></span></div><p class="muted bid-sub">${['sellersprite', 'sif'].map(source => {
+      const reading = object(entry.sources?.[source]);
+      const label = source === 'sif' ? 'SIF 固定／精确' : 'SellerSprite 精确';
+      return `${label} ${reading.point === null || reading.point === undefined ? '未知' : `US$ ${escape(numberText(reading.point))}`}${reading.range ? `（区间 ${escape(rangeText(reading.range))}）` : ''}${reading.point === null && reading.reason ? ` · ${escape(reasonText(reading.reason))}` : ''}`;
+    }).join(' ／ ')}</p>${entry.low_exposure_baseline && entry.combined_point !== null ? `<p class="muted">低曝光提示：${escape(string(entry.low_exposure_note, '周曝光极低或无历史数据，采用原生工具返回的平台基准建议竞价。'))}</p>` : ''}</div>`).join('')}</div>
+    ${Object.entries(object(item.range_scenarios)).filter(([, scenario]) => scenario).map(([source, scenario]) => `<p class="muted">${source === 'sif' ? 'SIF' : 'SellerSprite'}来源区间情景：${single ? '原始建议竞价' : equal ? '等权建议竞价' : '加权建议竞价'} US$ ${escape(rangeText(scenario.bid_range_usd))}，对应评分 ${escape(rangeText(scenario.score_range))}。此区间不替代主点值，不是实际CPC预测。</p>`).join('')}</div>`;
+}
+
+function r57NewcomerDetails(result, rev = result?.profile_revision ?? 0) {
+  const diagnostics = object(result.diagnostics?.newcomers);
+  const pair = array(diagnostics.selected_pair);
+  const examples = array(diagnostics.examples);
+  const members = array(diagnostics.members);
+  const refs = object(diagnostics.references);
+  const current = typeof diagnostics.reference_mode === 'string' && /^current_category_r\d+$/.test(diagnostics.reference_mode);
+  const pairKeys = new Set(pair.map(entry => `${entry.family_id}\0${entry.asin}`));
+  if (rev >= 58) {
+    const strat = object(diagnostics.stratification);
+    const rampExcl = array(diagnostics.ramp_up_excluded);
+    const rampZero = array(diagnostics.ramp_up_zero_sales);
+    const denom = diagnostics.denominator;
+    const tLead = diagnostics.no_qualifying_examples
+      ? escape(string(diagnostics.absence_note, '所查范围内无同任务正常起步新品样板')) + '；少评价与自然曝光各记 0 支持分，不代表无法进入此市场。'
+      : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 T = ${escape(numberText(refs.sales_median))} 件${refs.floor_applied ? `（小类目 10 件保底生效，T_eff = ${escape(numberText(refs.effective_sales_median))} 件）` : ''}。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算' : refs.grain === 'parent_units' ? '去重父体月销量口径' : '声明的家族销量'}。`;
+    const selLead = pair.length
+      ? `最终入选样本 S*（${pair.length} 款，分母 D = ${escape(numberText(denom ?? Math.max(pair.length, 2)))}）：${pair.map(entry => escape(`${entry.family_id} / ${entry.asin}`)).join('；')}。`
+      : diagnostics.no_qualifying_examples
+        ? '保留源样本及排除理由。'
+        : '示例尚待核实；缺数据不填零。';
+    const policyLine = '<p class="muted">修订58规则：所有满30天同任务正常起步新品强制纳入，未满30天零销量起量前预先排除；未满30天有销新品按精确有理数贪心规则择优并入使 F(S) = sum(e) / max(|S|, 2) 严格提高（持平取最短前缀）；4分项与1分项共用同一 S* 与分母 D。</p>';
+    const strataList = array(strat.strata);
+    const stratHtml = strat.applied
+      ? `<p class="ink-muted"><strong>${escape(strat.disclosure)}</strong>（有效新品池 ${escape(numberText(strat.active_pool_size))} 款，抽检 ${escape(numberText(strat.sampled_count))} 款，分层未抽样 ${escape(numberText(strat.unsampled_count))} 款）；4 分项全集界限 <strong>${escape(rangeText(strat.stratified_bounds))} / 4</strong>。${escape(string(strat.natural_stratified_note))}</p>${strataList.length ? `<details class="quiet-fold"><summary>5 分位分层抽样与替补明细（${strataList.length} 层）</summary><ul>${strataList.map(st => `<li>第 ${escape(numberText((st.stratum ?? 0) + 1))} 层（共 ${escape(numberText(st.count))} 款）：代表 ${st.chosen ? `<span class="mono-id">${escape(st.chosen.family_id)} / ${escape(st.chosen.asin)}</span>` : '无'}${finite(st.borrowed_from_stratum) ? `（本层已空，按固定替补序借调自第 ${escape(numberText(st.borrowed_from_stratum + 1))} 层）` : ''}</li>`).join('')}</ul></details>` : ''}`
+      : '';
+    const loneHtml = diagnostics.lone_newcomer_alert && diagnostics.lone_newcomer_note
+      ? `<p class="ink-fail"><strong>预警：</strong>${escape(diagnostics.lone_newcomer_note)}</p>`
+      : '';
+    const rampNote = (rampExcl.length || rampZero.length)
+      ? `<p class="muted">${rampExcl.length ? `未并入的未满30天有销新品（${rampExcl.length} 款，避免稀释 F(S)）：${rampExcl.map(r => `${escape(r.family_id)}（${escape(numberText(r.age_days))}天，e=${escape(numberText(r.score))}）`).join('；')}。` : ''}${rampZero.length ? `起量前预排除的未满30天零销量新品（${rampZero.length} 款）：${rampZero.map(r => `${escape(r.family_id)}（${escape(numberText(r.age_days))}天）`).join('；')}。` : ''}</p>`
+      : '';
+    return `<section class="ledger-section"><h3>正常新品：固定示例</h3>
+      <p class="section-lead">${tLead}</p>
+      <p class="muted">${selLead}</p>
+      ${policyLine}
+      ${stratHtml}
+      ${loneHtml}
+      ${rampNote}
+      ${examples.length ? `<dl class="kv-rows">${examples.map(example => {
+        const raw = members.find(member => member?.family_id === example.family_id && member?.asin === example.asin) ?? {};
+        const natural = object(example.natural);
+        const ageTag = finite(example.age_days) ? ` · 上架 ${escape(numberText(example.age_days))} 天（${example.is_full_month ? '满30天强制' : '未满30天起量期'}）` : '';
+        return `<div class="kv-row"><dt><span class="mono-id">${escape(example.family_id)}</span>${pairKeys.has(`${example.family_id}\0${example.asin}`) ? ' · 已选示例 S*' : ' · 参照样本'}</dt><dd><div class="kv-main">评价数 ${escape(observed(raw.ratings))} · 近30天销量 ${escape(observed(raw.units_30d))} · 少评价得分 ${escape(numberText(example.score))} / 4${ageTag}</div><p class="muted">实际数量分 ${escape(numberText(example.actual_score))}；销量／参照中位数 ${escape(numberText(example.sales_ratio))}；销量封顶 ${escape(numberText(example.sales_ceiling))}。</p>${typeof raw.reason === 'string' ? `<p class="muted">纳入理由：${escape(raw.reason)}</p>` : ''}<p class="muted">自然曝光 ${escape(observed(natural.input))}（${natural.source_label === 'sif_with_sellersprite_corroboration' ? 'SIF占比＋SellerSprite旁证' : 'SIF单来源占比'}）· ${natural.score === null || natural.score === undefined ? escape(reasonText(natural.reason)) : `自然得分 ${escape(numberText(natural.score))} / 1`}${natural.input?.period ? ` · ${escape(readable(natural.input.period))}` : ''}</p>${natural.keyword_counts ? `<p class="muted">自然／广告词数：SellerSprite ${escape(numberText(natural.keyword_counts.sellersprite?.organic))} / ${escape(numberText(natural.keyword_counts.sellersprite?.ad))}；SIF ${escape(numberText(natural.keyword_counts.sif?.organic))} / ${escape(numberText(natural.keyword_counts.sif?.ad))}。</p>` : ''}</dd></div>`;
+      }).join('')}</dl>` : ''}
+      ${members.some(member => member?.effective_status && member.effective_status !== 'qualified') ? `<details class="quiet-fold"><summary>未纳入新品参照的其他榜单记录（${members.filter(m => m?.effective_status && m.effective_status !== 'qualified').length}）</summary><ul>${members.filter(member => member?.effective_status && member.effective_status !== 'qualified').map(member => `<li><span class="mono-id">${escape(member.family_id ?? member.asin ?? '未命名记录')}</span>（${escape(MEMBER_STATES[member.effective_status] ?? member.effective_status)}）：${escape(reasonText(member.reason))}</li>`).join('')}</ul></details>` : ''}
+    </section>`;
+  }
+  return `<section class="ledger-section"><h3>正常新品：${current ? '固定示例' : '同一对示例'}</h3>
+    <p class="section-lead">${current ? diagnostics.no_qualifying_examples ? '当前相关榜单的完整查询中，没有合格近三个月新品；少评价与自然曝光各记0支持分，不代表无法进入此市场。' : `独立类目参照：${escape(numberText(refs.family_count))}个去重家族，近30天销量中位数 ${escape(numberText(refs.sales_median))} 件。参照包含新老商品；不再计算评价数中位数。销量粒度：${refs.grain === 'family_representative' ? '每家族一个代表ASIN估算，不是父体合计' : refs.grain === 'parent_units' ? '去重父体月销量口径' : '声明的家族销量'}。` : `评分数量中位数 ${escape(numberText(refs.rating_median))}；近30天销量中位数 ${escape(numberText(refs.sales_median))}。中位数使用全体观察到的合格参照，包含弱表现与仍合格的退出样本。`}</p>
+    <p class="muted">${pair.length ? `固定${pair.length}个示例：${pair.map(entry => escape(`${entry.family_id} / ${entry.asin}`)).join('；')}。${pair.length === 1 ? '这是单例支持，不能理解为普遍成功。' : ''}` : diagnostics.no_qualifying_examples ? '保留源样本及排除理由。' : '示例尚待核实；缺数据不填零。'}</p>
+    ${diagnostics.selection_tie_policy === 'complete_score_before_unresolved_equal_bound' ? '<p class="muted">已有两款完整少评价得分时，最多只能同分的缺数样本不再阻断选例；缺数仍是未知。可能超过所选样本的仍需补证。自然可见度继续使用同一组示例。</p>' : ''}
+    ${examples.length ? `<dl class="kv-rows">${examples.map(example => {
+      const raw = members.find(member => member?.family_id === example.family_id && member?.asin === example.asin) ?? {};
+      const natural = object(example.natural);
+      return `<div class="kv-row"><dt><span class="mono-id">${escape(example.family_id)}</span>${pairKeys.has(`${example.family_id}\0${example.asin}`) ? ' · 已选示例' : ' · 参照样本'}</dt><dd><div class="kv-main">评价数 ${escape(observed(raw.ratings))} · 近30天销量 ${escape(observed(raw.units_30d))} · 少评价得分 ${escape(numberText(example.score))} / 4</div><p class="muted">实际数量分 ${escape(numberText(example.actual_score))}；${current ? '' : `相对数量分 ${escape(numberText(example.relative_score))}；`}销量／参照中位数 ${escape(numberText(example.sales_ratio))}；销量封顶 ${escape(numberText(example.sales_ceiling))}。</p>${typeof raw.reason === 'string' ? `<p class="muted">纳入理由：${escape(raw.reason)}</p>` : ''}<p class="muted">自然曝光 ${escape(observed(natural.input))}（${natural.source_label === 'sif_with_sellersprite_corroboration' ? 'SIF占比＋SellerSprite旁证' : 'SIF单来源占比'}）· ${natural.score === null || natural.score === undefined ? escape(reasonText(natural.reason)) : `自然得分 ${escape(numberText(natural.score))} / 1`}${natural.input?.period ? ` · ${escape(readable(natural.input.period))}` : ''}</p>${natural.keyword_counts ? `<p class="muted">自然／广告词数：SellerSprite ${escape(numberText(natural.keyword_counts.sellersprite?.organic))} / ${escape(numberText(natural.keyword_counts.sellersprite?.ad))}；SIF ${escape(numberText(natural.keyword_counts.sif?.organic))} / ${escape(numberText(natural.keyword_counts.sif?.ad))}。</p>` : ''}</dd></div>`;
+    }).join('')}</dl>` : ''}
+    ${members.some(member => member?.effective_status && member.effective_status !== 'qualified') ? `<details class="quiet-fold"><summary>未纳入新品参照的其他榜单记录（${members.filter(m => m?.effective_status && m.effective_status !== 'qualified').length}）</summary><ul>${members.filter(member => member?.effective_status && member.effective_status !== 'qualified').map(member => `<li><span class="mono-id">${escape(member.family_id ?? member.asin ?? '未命名记录')}</span>（${escape(MEMBER_STATES[member.effective_status] ?? member.effective_status)}）：${escape(reasonText(member.reason))}</li>`).join('')}</ul></details>` : ''}
+  </section>`;
+}
+
+function r57RevenueAllocationStrip(scenarios, rev = 57) {
+  const r58 = rev >= 58;
+  const valid = scenarios
+    .filter(sc => !r58 || isScoredSupportedR58(sc))
+    .map(sc => ({
+      label: r58 ? sanitizeTextPaths(string(sc?.input?.label, sc?.id ?? '当前情景')) : string(sc?.input?.label, sc?.id ?? '当前情景'),
+      calc: sc?.input?.calculation,
+      sc,
+    }))
+    .filter(row => row.calc && finite(row.calc.net_revenue_usd) && row.calc.net_revenue_usd > 0 && finite(row.calc.net_cost_usd));
+  if (!valid.length) return '';
+  valid.sort((a, b) => (a.calc.margin ?? -Infinity) - (b.calc.margin ?? -Infinity));
+  const { label, calc, sc } = valid[0];
+  const lines = array(calc.lines);
+  const amt = id => {
+    const found = lines.find(l => l.id === id);
+    return found && !array(calc.deferred_lines).includes(id) && finite(found.amount_usd) ? found.amount_usd : 0;
+  };
+  const supplyUsd = amt('procurement') + amt('domestic_freight') + amt('headhaul');
+  const platformUsd = Math.max(0, calc.net_cost_usd - supplyUsd);
+  const netRev = calc.net_revenue_usd;
+  const contribUsd = netRev - calc.net_cost_usd;
+  const posContrib = Math.max(0, contribUsd);
+  const denom = Math.max(netRev, calc.net_cost_usd);
+  const supplyPct = Math.min(100, Math.max(0, (supplyUsd / denom) * 100));
+  const platformPct = Math.min(100 - supplyPct, Math.max(0, (platformUsd / denom) * 100));
+  const marginPct = contribUsd > 0 ? Math.max(0, 100 - supplyPct - platformPct) : 0;
+  const pass = rev >= 58 ? calcMeetsFloor30(calc, sc) === true : (finite(calc.margin) && calc.margin >= 0.3);
+  const money = v => `US$ ${new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(v)}`;
+  return `<div class="alloc-strip" aria-label="退款后净收入去向构成">
+    <div class="alloc-head">
+      <span><strong>净收入去向构成</strong> · 保守基准：${escape(label)}（退款后净收入 ${money(netRev)}）</span>
+      <span class="muted">70% 成本上限<span class="sep-bar" aria-hidden="true"></span>30% 毛利红线</span>
+    </div>
+    <div class="alloc-track" aria-hidden="true">
+      <span class="alloc-seg alloc-supply" style="width:${supplyPct.toFixed(2)}%"></span>
+      <span class="alloc-seg alloc-platform" style="width:${platformPct.toFixed(2)}%"></span>
+      ${marginPct > 0 ? `<span class="alloc-seg ${pass ? 'alloc-margin-pass' : 'alloc-margin-fail'}" style="width:${marginPct.toFixed(2)}%"></span>` : ''}
+      <span class="alloc-tick" title="30% 广告前净毛利红线（净成本 ≤ 70%）"></span>
+    </div>
+    <div class="alloc-legend">
+      <span><i class="swatch swatch-supply" aria-hidden="true"></i>采购＋国内运＋头程 <strong>${money(supplyUsd)}</strong>（${escape(numberText((supplyUsd / netRev) * 100))}%）</span>
+      <span><i class="swatch swatch-platform" aria-hidden="true"></i>佣金＋FBA配送入仓仓储 <strong>${money(platformUsd)}</strong>（${escape(numberText((platformUsd / netRev) * 100))}%）</span>
+      <span><i class="swatch ${pass ? 'swatch-pass' : 'swatch-fail'}" aria-hidden="true"></i>广告前留存 <strong>${money(contribUsd)}</strong>（<strong class="${pass ? 'ink-pass' : 'ink-fail'}">${finite(calc.margin) ? `${escape(numberText(calc.margin * 100))}%` : `${escape(numberText((posContrib / netRev) * 100))}%`}</strong>）</span>
+    </div>
+  </div>`;
+}
+
+function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revision ?? 0) {
+  const diagnostics = object(result.diagnostics?.economics);
+  const scenarios = array(diagnostics.scenarios);
+  if (!scenarios.length) return '';
+
+  const money2 = val => finite(val) ? `US$ ${new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(val)}` : '未知';
+  const lineOrder = ['procurement', 'domestic_freight', 'headhaul', 'referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'collection', 'other_applicable', 'returns_disposal', 'recovery_credit'];
+  const r58 = rev >= 58;
+  const refBidUsd = r58 && finite(result?.diagnostics?.bids?.reference_bid_usd) && result.diagnostics.bids.reference_bid_usd > 0
+    ? result.diagnostics.bids.reference_bid_usd : null;
+  const stressScenarios = r58 ? array(diagnostics.stress_scenarios) : [];
+  const expectedPrimary = r58 && Array.isArray(diagnostics.expected_primary_scenarios) ? diagnostics.expected_primary_scenarios : [];
+
+  const cellAmount = (ledger, lineId) => {
+    if (!ledger) return '未知';
+    const pending = array(ledger.pending_lines);
+    const deferred = array(ledger.deferred_lines);
+    const line = array(ledger.lines).find(l => l.id === lineId);
+    if (!line) return '—';
+    if (deferred.includes(lineId)) return pending.includes(lineId) ? '待补证' : '成对暂缓';
+    if (pending.includes(lineId) || line.amount_usd === null) return '待补证';
+    return money2(line.amount_usd);
+  };
+
+  const r58ExtraRows = r58 ? `
+          <tr><th scope="row">保 30% 毛利对应到深含运采购上限<span class="th-note">含采购＋国内运；与上方裸货采购上限区分</span></th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            return finite(c?.landed_domestic_cap_at_30pct_usd)
+              ? `<td class="num-col">${money2(c.landed_domestic_cap_at_30pct_usd)}</td>`
+              : '<td class="num-col ink-muted">待补证</td>';
+          }).join('')}</tr>${refBidUsd !== null ? `
+          <tr><th scope="row">广告盈亏平衡所需点击转化率<span class="th-note">广告订单数 ÷ 广告点击数；仅可与点击转化率 clickConvRate 对照，严禁与搜索购买率 purchaseRate 混比</span></th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            const cond = c?.status === 'sensitivity_only';
+            const contrib = cond ? c?.contribution_usd : sc.input?.contribution_usd?.value;
+            return finite(contrib) && contrib > 0
+              ? `<td class="num-col">${escape(numberText((refBidUsd / contrib) * 100))}%</td>`
+              : '<td class="num-col ink-muted">待补证</td>';
+          }).join('')}</tr>` : ''}` : '';
+
+  const stressSection = stressScenarios.length ? `
+    <div class="quiet-surface" data-section="stress-scenarios">
+      <h3>独立压力情景（仅作敏感度观察，不计入 21 项主分与 30% 淘汰线）</h3>
+      <dl class="kv-rows">${stressScenarios.map(st => {
+        const mText = finite(st.margin) ? `${escape(numberText(st.margin * 100))}%` : '待补证';
+        const cText = finite(st.contribution_usd) ? money2(st.contribution_usd) : '待补证';
+        const adText = finite(st.advertising_scenario_margin) ? `${escape(numberText(st.advertising_scenario_margin * 100))}%` : '待补证';
+        const capText = finite(st.landed_domestic_cap_at_30pct_usd) ? `；保30%到深含运上限 ${money2(st.landed_domestic_cap_at_30pct_usd)}` : '';
+        return `<div class="kv-row"><dt>${escape(sanitizeTextPaths(string(st.label ?? st.id, '压力情景')))}</dt><dd><div class="kv-main">压力售价 ${money2(st.price_usd)} · 广告前毛利率 ${mText} · 单件贡献 ${cText} · 扣15%广告后 ${adText}${capText}</div>${array(st.assumptions).length ? `<p class="muted">${st.assumptions.map(a => escape(readableSanitized(a))).join('；')}</p>` : ''}</dd></div>`;
+      }).join('')}</dl>
+    </div>` : '';
+
+  const expectedPrimaryNote = expectedPrimary.length ? `<p class="muted">预声明主情景核验：${expectedPrimary.map(e => `${escape(e.id)}（${e.verdict === 'present' ? '已纳入' : e.verdict === 'evidenced_cancellation' ? `有据撤销：${escape(sanitizeTextPaths(string(e.reason)))}` : escape(e.verdict)}）`).join('；')}。</p>` : '';
+
+  return `<section class="ledger-section">
+    <div class="section-head"><h3>单件利润与费用拆解</h3><span class="muted">可售单位：${escape(diagnostics.saleable_unit ?? '未知')}</span></div>
+    ${r57RevenueAllocationStrip(scenarios, rev)}
+    <div tabindex="0" role="region" aria-labelledby="${escape(tableCaptionId)}" class="table-scroll">
+      <table class="hairline-table waterfall-table">
+        <caption id="${escape(tableCaptionId)}" class="sr-only">各情景单件收入、成本与毛利率对比</caption>
+        <thead>
+          <tr>
+            <th scope="col">核算项目</th>
+            ${scenarios.map(sc => {
+              const calc = sc.input?.calculation;
+              const cond = calc?.status === 'sensitivity_only';
+              const rawLabel = string(sc.input?.label, sc.id ?? '未命名情景');
+              const dispLabel = r58 ? sanitizeTextPaths(rawLabel) : rawLabel;
+              return `<th scope="col" class="num-col">${escape(dispLabel)}${cond ? '<span class="th-note">条件试算·不计分</span>' : ''}</th>`;
+            }).join('')}
+          </tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">美站销售定价</th>${scenarios.map(sc => `<td class="num-col"><strong>${money2(sc.input?.calculation?.price_usd)}</strong></td>`).join('')}</tr>
+          <tr><th scope="row">退货率代理 ／ 退款后净收入</th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            return `<td class="num-col">${finite(c?.refund_fraction) ? `${escape(numberText(c.refund_fraction * 100))}%` : '未知'} ／ ${money2(c?.net_revenue_usd)}</td>`;
+          }).join('')}</tr>
+          ${lineOrder.map(lineId => {
+            const allDeferred = scenarios.every(sc => array(sc.input?.calculation?.deferred_lines).includes(lineId) && !array(sc.input?.calculation?.pending_lines).includes(lineId));
+            const allZero = scenarios.every(sc => {
+              const l = array(sc.input?.calculation?.lines).find(x => x.id === lineId);
+              return l && l.amount_usd === 0 && !array(sc.input?.calculation?.pending_lines).includes(lineId);
+            });
+            return `<tr class="${allDeferred || allZero ? 'row-dim' : ''}"><th scope="row">${escape(COST_LABELS[lineId] ?? lineId)}</th>${scenarios.map(sc => `<td class="num-col">${cellAmount(sc.input?.calculation, lineId)}</td>`).join('')}</tr>`;
+          }).join('')}
+          <tr class="row-sum"><th scope="row">单件完整总费用</th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            return `<td class="num-col"><strong>${c?.net_cost_usd === null || c?.net_cost_usd === undefined ? '未知' : money2(c.net_cost_usd)}</strong></td>`;
+          }).join('')}</tr>
+          <tr class="row-sum"><th scope="row">广告前单件贡献</th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            const cond = c?.status === 'sensitivity_only';
+            const contrib = cond ? c?.contribution_usd : sc.input?.contribution_usd?.value;
+            return `<td class="num-col"><strong>${finite(contrib) ? money2(contrib) : '未知'}</strong></td>`;
+          }).join('')}</tr>
+          <tr class="row-sum"><th scope="row">退款调整后广告前毛利率（门槛 30%）</th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            const cond = c?.status === 'sensitivity_only';
+            const m = cond ? { value: c.margin, unit: 'fraction' } : sc.input?.margin;
+            const pass30 = r58
+              ? (isScoredSupportedR58(sc) && finite(m?.value) ? calcMeetsFloor30(c, sc) : null)
+              : (finite(m?.value) ? m.value >= 0.3 : null);
+            const tone = pass30 === true ? 'ink-pass' : pass30 === false ? 'ink-fail' : 'ink-muted';
+            return `<td class="num-col ${tone}"><strong>${escape(observed(m))}</strong></td>`;
+          }).join('')}</tr>
+          <tr><th scope="row">扣 15% 广告费后净毛利 ／ 贡献</th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            return finite(c?.advertising_scenario_margin) && finite(c?.advertising_scenario_contribution_usd)
+              ? `<td class="num-col">${escape(numberText(c.advertising_scenario_margin * 100))}%（${money2(c.advertising_scenario_contribution_usd)}）</td>`
+              : '<td class="num-col ink-muted">待补证</td>';
+          }).join('')}</tr>
+          <tr><th scope="row">保 30% 毛利对应采购单价上限</th>${scenarios.map(sc => {
+            const c = sc.input?.calculation;
+            return finite(c?.procurement_cap_at_30pct_usd)
+              ? `<td class="num-col">${money2(c.procurement_cap_at_30pct_usd)}</td>`
+              : '<td class="num-col ink-muted">待补证</td>';
+          }).join('')}</tr>${r58ExtraRows}
+        </tbody>
+      </table>
+    </div>${expectedPrimaryNote}${stressSection}
+    <div class="scenario-folds">${scenarios.map(scenario => {
+      const calculation = scenario.input?.calculation;
+      const conditional = calculation?.status === 'sensitivity_only';
+      const validation = object(calculation?.fee_validation);
+      const context = object(validation.context);
+      const windowText = window => window ? `${window.from} 至 ${window.through}` : '待补证';
+      const explanation = conditional ? '费用已算出，但售价或其他情景假设尚未确认；不授予经济分。' :
+        scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' :
+          calculation && !calculation.scoring_supported ? `完整费用尚待补证：${array(calculation.pending_lines).map(id => COST_LABELS[id] ?? id).join('、') || '费率适用日期或来源'}。见下方核对。` :
+            reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。');
+      const adNote = calculation && finite(calculation.advertising_scenario_margin) && finite(calculation.advertising_scenario_contribution_usd)
+        ? `售价15%广告敏感度参考（US$ ${escape(numberText(calculation.advertising_15pct_usd))}）：广告后单件贡献 US$ ${escape(numberText(calculation.advertising_scenario_contribution_usd))}，广告后毛利率 ${escape(numberText(calculation.advertising_scenario_margin * 100))}%${finite(calculation.procurement_cap_at_30pct_usd) ? `；30%广告前毛利对应采购单价上限 US$ ${escape(numberText(calculation.procurement_cap_at_30pct_usd))}` : ''}（仅作敏感度参考，不改变主毛利计分）。`
+        : '';
+      const retComp = r58 ? calculation?.returns_processing_components : null;
+      const retNote = retComp
+        ? `退货费口径：退款率 r_refund=${escape(numberText(retComp.r_refund * 100))}%，实物退货率 r_physical=${escape(numberText(retComp.r_physical * 100))}%${retComp.return_threshold !== null ? `，类目阈值 ${escape(numberText(retComp.return_threshold * 100))}%` : ''}，超阈费 US$ ${escape(numberText(retComp.expected_fee_per_shipped_unit_usd))}。`
+        : '';
+      const foldTitle = r58 ? sanitizeTextPaths(string(scenario.input?.label, scenario.id ?? '未命名情景')) : string(scenario.input?.label, scenario.id ?? '未命名情景');
+      return `<details class="quiet-fold"><summary>${escape(foldTitle)} · ${escape(explanation)}</summary><div class="fold-body">${calculation ? `<p class="muted">适用窗口 — 销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。费率核验：${validation.status === 'validated' ? '通过' : '存在待补证项'}。</p>` : ''}${adNote ? `<p class="muted">${adNote}</p>` : ''}${retNote ? `<p class="muted">${retNote}</p>` : ''}${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(issue.code === 'domestic_quote_required' ? (r58 ? '修订58要求提供整数 order_units >= 100 的非首单常规复购货款与国内运费报价（且须与 source_inputs/sku_lines 口径一致，first_order_promotion: false）。' : '需要100采购单位的非首单常规复购货款与国内运费报价（须明确order_units: 100及first_order_promotion: false），不能沿用旧暂缓规则或首单促销减免。') : (FEE_ISSUES[issue.code] ?? (r58 ? sanitizeTextPaths(string(issue.reason)) : issue.reason)))}</li>`).join('')}</ul>` : ''}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(r58 ? readableSanitized(value) : readable(value))}</li>`).join('')}</ul>` : ''}</div></details>`;
+    }).join('')}</div>
+  </section>`;
+}
+
+function r57ScoreRows(result, registry, prefix) {
+  return `<div class="score-columns">${array(result.groups).map(group => {
+    const rows = array(result.items).filter(item => item.group === group.id);
+    return `<section class="score-group" data-group-id="${escape(group.id)}">
+      <div class="group-bar">
+        <h3>${escape(GROUP_LABELS[group.id] ?? group.id)}</h3>
+        <span class="group-pts">${escape(rangeText(group.supported_range))} / ${escape(numberText(group.weight))} <span class="muted">（覆盖 ${escape(numberText(group.covered_weight))}）</span></span>
+      </div>
+      <div class="group-list">${rows.map(item => {
+        const scored = item.status === 'scored' && Array.isArray(item.score_range);
+        const scoreCls = scored ? '' : item.status === 'ineligible' ? 'ink-fail' : 'ink-muted';
+        return `<div class="item-row" data-item-id="${escape(item.id)}">
+          <div class="item-heading">
+            <h4>${escape(ITEM_LABELS[item.id] ?? item.id)}</h4>
+            <p class="item-score ${scoreCls}">${scored ? `${escape(rangeText(item.score_range))} / ${escape(numberText(item.weight))} 分` : item.status === 'ineligible' ? '当前情景不适用合格评分' : '待补证'}</p>
+          </div>
+          <p class="item-input">${escape(inputSummary(item))}</p>
+          ${item.reason ? `<p class="item-reason">${escape(reasonText(item.reason))}</p>` : ''}
+          ${item.conditional_range ? `<p class="muted">固定前提下可能范围：${escape(rangeText(item.conditional_range))}；不是已获得分数。</p>` : ''}
+          ${item.id === 'relevant_purchase_entry_bid' ? r57BidDetails(item) : ''}
+          ${QUALIFIERS[item.id] ? `<p class="muted item-qualifier">${escape(QUALIFIERS[item.id])}</p>` : ''}
+          ${array(item.evidence).length > 4 ? `<details class="cite-fold"><summary>原始依据（${array(item.evidence).length}）</summary><p class="source">依据：${evidenceLinks(item.evidence, registry, prefix)}</p></details>` : `<p class="source">依据：${evidenceLinks(item.evidence, registry, prefix)}</p>`}
+        </div>`;
+      }).join('')}</div>
+    </section>`;
+  }).join('')}</div>`;
+}
+
+function r57Bibliography(registry, prefix) {
+  if (!registry.length) return '<p class="muted">尚未提供可核验的来源记录。</p>';
+  return `<ol class="bibliography">${registry.map((entry, index) => `<li id="${prefix}-e${index}"><div class="bib-head"><strong>${sourceLink(string(entry?.source, '未命名来源'), entry?.url ?? entry?.source)}</strong><span class="bib-meta">${escape(typeof entry?.observed_at === 'string' && entry.observed_at.trim() ? entry.observed_at : '日期未知')} · <code class="mono-id">${escape(typeof entry?.id === 'string' ? entry.id : '未知')}</code></span></div>${entry?.scope ? `<p>${escape(sanitizeTextPaths(string(entry?.scope)))}</p>` : ''}${typeof (entry?.path ?? entry?.local_path) === 'string' && (entry?.path ?? entry?.local_path).trim() ? `<p class="source">本地记录：<code class="mono-id">${escape(sanitizeLocalPath(entry.path ?? entry.local_path))}</code></p>` : ''}${entry?.limitations ? `<p class="muted">限制：${escape(readableSanitized(entry.limitations))}</p>` : ''}</li>`).join('')}</ol>`;
+}
+
+function r57DiscoveryDetails(discovery, registry, prefix) {
+  if (!discovery || !array(discovery.leads).length) return '';
+  return `<section class="ledger-section"><h3>如何发现这款 · ${escape(array(discovery.leads).length)} 个来源词</h3><p><strong>${escape(discovery.label)}</strong>：${escape(discovery.description)}</p><p class="source">款式实物依据：${evidenceLinks(discovery.offer_evidence, registry, prefix)}</p><ul class="lead-list">${array(discovery.leads).map(lead => `<li><code class="mono-kw">${escape(lead?.keyword)}</code>${typeof lead?.reason === 'string' ? ` — ${escape(lead.reason)}` : ''}<ul>${array(lead?.provenance).map(source => `<li class="source">${escape(source?.source_label ?? source?.source_id)} · ${escape(source?.source_period ?? '期间未返回')}；原始记录：<code class="mono-id">${escape(sanitizeLocalPath(source?.source_path))}</code>，行索引 ${escape(source?.row_index)}${finite(source?.searches) ? `；搜索量 ${escape(numberText(source.searches))}${typeof source.search_units === 'string' ? `（${escape(source.search_units === 'provider_monthly_search_estimate' ? '来源月估算' : source.search_units)}）` : ''}` : '；搜索量未返回'}。</li>`).join('')}</ul></li>`).join('')}</ul><p class="muted">不同来源的搜索量不相加；这些是发现线索，具体得分仍看21项证据。</p></section>`;
+}
+
+function r57DiscoverySummary(summary) {
+  if (!summary || !finite(summary.unique_keywords)) return '';
+  const seasonal = summary.dispositions?.seasonal_deferred ?? 0;
+  return `<p class="batch-counts">来源词 ${escape(numberText(summary.unique_keywords))} 个；已核对 ${escape(numberText(summary.reviewed_keywords))} 个，待核 ${escape(numberText(summary.pending_keywords - seasonal))} 个，暂缓 ${escape(numberText(seasonal))} 个，搁置专属或无关搜索 ${escape(numberText(summary.excluded_keywords))} 个；已绑定实物候选 ${escape(numberText(summary.bound_candidates))} 个。词数不等于产品数，绑定不代表评分通过。</p>`;
+}
+
+function r57PeriodPanel(period, presentation, registry, prefix, panelIndex, rev = period?.profile_revision ?? 0) {
+  const complete = period.queue === 'comparable' && Array.isArray(period.total_range);
+  const gaps = array(period.items).filter(item => item.status === 'needs_evidence');
+  const ineligible = array(period.items).filter(item => item.status === 'ineligible');
+  const conditions = array(period.screening?.conditions).filter(condition => condition.status !== 'pass');
+  const economics = object(period.diagnostics?.economics);
+  const periodScenarios = array(economics.scenarios);
+  const contributions = periodScenarios.map(scenario => scenario?.contribution?.value);
+  const contribution = contributions.length && contributions.every(finite) && (rev < 58 || periodScenarios.every(isScoredSupportedR58))
+    ? [Math.min(...contributions), Math.max(...contributions)]
+    : null;
+  const margin = array(economics.margin_range).length === 2 ? economics.margin_range.map(value => value * 100) : null;
+  const label = { excluded: '本时段排除', deferred: '本时段暂缓' }[period.queue] ?? QUEUES[period.queue] ?? '待补证';
+  const incomplete = period.queue === 'excluded' ? '本经营时段不满足筛选条件，不列完整总分' :
+    period.queue === 'deferred' ? '本经营时段暂缓，不列完整总分' : '本经营时段完整总分待补证';
+  return `<section class="operating-period tab-panel tab-p${panelIndex}" data-operating-period="${escape(period.id)}" data-queue="${escape(period.queue)}">
+    <div class="period-meta-line">
+      <div>
+        <strong>${escape(period.label)}</strong> · <span class="muted">${label} · 适用 ${escape(array(period.months).join('、'))}月</span>
+        ${typeof presentation.summary === 'string' ? `<p class="period-note">${escape(presentation.summary)}</p>` : ''}
+      </div>
+      <div class="period-inline-nums">
+        <span>毛利 <strong>${margin ? `${escape(rangeText(margin))}%` : '未知'}</strong></span>
+        <span>贡献 <strong>${contribution ? `US$ ${escape(rangeText(contribution))}` : '未知'}</strong></span>
+        <span>总分 <strong>${complete ? `${escape(rangeText(period.total_range))} / 100` : incomplete}</strong></span>
+      </div>
+    </div>
+    <p class="muted coverage-line">已支持分数 ${escape(rangeText(period.supported_range))}；已计分权重 ${escape(numberText(period.covered_weight))} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。${period.conditional_total_range ? `满足本时段准入后可能范围 ${escape(rangeText(period.conditional_total_range))}（数学界限，非预测）。` : ''}</p>
+    ${conditions.length ? `<p class="muted coverage-line">本时段筛选：${conditions.map(condition => `${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : ''}
+    ${r57KeyValueSection('本时段核算参数', presentation.facts)}
+    ${r57EconomicWaterfall(period, `${prefix}-econ-${period.id}`, rev)}
+    <section class="ledger-section">
+      <div class="section-head"><h3>21 项评分明细</h3><span class="muted">8 大维度 · 点击编号直达原始证据</span></div>
+      ${r57ScoreRows(period, registry, prefix)}
+    </section>
+    ${r57NewcomerDetails(period, rev)}
+  </section>`;
+}
+
+function renderLeftSpecLedger(snapshot, queueLabel, rev = 57) {
+  const r58 = rev >= 58;
+  const marginCls = r58
+    ? (snapshot.marginFloorStatus === 'pass' ? 'ink-pass' : snapshot.marginFloorStatus === 'fail' ? 'ink-fail' : snapshot.marginFloorStatus === 'cross' ? '' : 'ink-muted')
+    : (snapshot.margins
+      ? (snapshot.margins[0] >= 0.3 ? 'ink-pass' : snapshot.margins[1] < 0.3 ? 'ink-fail' : '')
+      : 'ink-muted');
+  let deltaHtml = `<span class="muted">${snapshot.isSensitivity ? '同精度条件试算 · 红线 30%' : '广告前净毛利率 · 红线 30%'}</span>`;
+  if (snapshot.margins) {
+    if (r58 ? snapshot.marginFloorStatus === 'pass' : snapshot.margins[0] >= 0.3) {
+      const pts = r58 ? Math.max(0, (snapshot.margins[0] - 0.3) * 100) : (snapshot.margins[0] - 0.3) * 100;
+      deltaHtml = `<span class="ink-pass">${SVG_UP} +${escape(numberText(pts))} pts 高于红线</span> · <span class="muted">广告前净毛利</span>`;
+    } else if (r58 ? snapshot.marginFloorStatus === 'fail' : snapshot.margins[1] < 0.3) {
+      const pts = (snapshot.margins[1] - 0.3) * 100;
+      deltaHtml = `<span class="ink-fail">${SVG_DOWN} ${escape(numberText(pts))} pts 低于红线</span> · <span class="muted">${snapshot.isSensitivity ? '同精度试算' : '广告前净毛利'}</span>`;
+    }
+  }
+  const domesticMain = snapshot.cnyTotals
+    ? `${escape(rangeText(snapshot.cnyTotals))} 元`
+    : usdRangeText(snapshot.domesticDelivered);
+  const domesticSub = snapshot.cnyTotals && snapshot.domesticDelivered
+    ? `（${usdRangeText(snapshot.domesticDelivered)}）`
+    : '';
+  const scoreMain = snapshot.totalRange ? `${escape(rangeText(snapshot.totalRange))} / 100` : queueLabel;
+  return `<div class="hero-stat">
+    <p class="hero-stat-val ${marginCls}">${pctRangeText(snapshot.margins)}</p>
+    <p class="hero-stat-sub">${deltaHtml}</p>
+  </div>
+  <dl class="side-ledger">
+    <div><dt>美站参照价</dt><dd>${usdRangeText(snapshot.prices)}</dd></div>
+    <div><dt>1688百套含运</dt><dd>${domesticMain}${domesticSub}</dd></div>
+    <div><dt>扣15%广告毛利</dt><dd>${pctRangeText(snapshot.adMargins)}</dd></div>
+    <div><dt>广告前单件贡献</dt><dd>${usdRangeText(snapshot.contributions)}</dd></div>
+    <div><dt>21项综合评分</dt><dd><strong>${escape(scoreMain)}</strong></dd></div>
+    <div><dt>已支持 ／ 权重</dt><dd class="muted">${escape(rangeText(snapshot.supportedRange))} 分 ／ ${escape(numberText(snapshot.coveredWeight))}</dd></div>
+  </dl>`;
+}
+
+function r57SeasonalCard(result, original, index, rev = result?.profile_revision ?? 0) {
+  const presentation = object(original?.presentation);
+  const registry = array(result.evidence);
+  const prefix = `candidate-${index + 1}`;
+  const image = imageUri(presentation.image_data_uri);
+  const displays = array(presentation.operating_periods);
+  const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
+  const periods = array(result.operating_periods);
+  const eligible = isCandidateEligible(result, rev);
+  const snapshot = extractMetricsSnapshot(result, rev);
+  const defaultPeriodIdx = rev >= 58
+    ? Math.max(0, result.qualification?.display_period_id
+      ? periods.findIndex(p => p?.id === result.qualification.display_period_id)
+      : 0)
+    : Math.max(0, periods.findIndex(p => p?.queue === 'comparable'));
+
+  const supplyTabIdx = periods.length + 1;
+  const bibTabIdx = periods.length + 2;
+  const idxPad = String(index + 1).padStart(2, '0');
+  const hasBrief = array(presentation.risks).length || array(presentation.next_checks).length || blockers.length;
+
+  return `<article class="candidate" id="${prefix}" data-queue="seasonal_review" data-eligible="${eligible ? 'true' : 'false'}">
+    <div class="inspector-split">
+      <div class="inspector-rail">
+        ${image ? `<figure class="media-frame"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="248" height="248" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}
+        ${renderLeftSpecLedger(snapshot, '待补证', rev)}
+      </div>
+      <div class="inspector-main">
+        <div class="title-line">
+          <span class="mono-idx">${idxPad}</span>
+          <h2>${escape(result.label ?? result.candidate_id)}</h2>
+          ${renderDotStatus(result, snapshot, rev)}
+          <span class="muted queue-tag">分季评估</span>
+        </div>
+        ${typeof presentation.summary === 'string' ? `<p class="lead-copy">${escape(presentation.summary)}</p>` : ''}
+        <p class="spec-copy">${escape(result.form ?? '具体可售规格尚待明确')}</p>
+        ${starReferenceSection(original)}
+        ${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与核查清单">
+          ${r57BriefList('风险与边界提示', presentation.risks)}
+          ${r57BriefList('后续核查事项', presentation.next_checks)}
+          ${blockers.length ? `<div class="brief-col"><h3>共同问题与后续处理</h3><ul class="brief-list">${blockers.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
+        </section>` : ''}
+        <div class="card-tabs">
+          <div class="segmented-track" role="radiogroup" aria-label="${escape(result.label ?? result.candidate_id)} 视图切换">
+            ${periods.map((p, idx) => {
+              const pDot = p.queue === 'comparable' ? 'pass' : p.queue === 'excluded' ? 'fail' : 'pending';
+              return `<label class="seg-btn" for="${prefix}-t${idx + 1}"><input class="tab-radio" type="radio" name="tabs-${prefix}" id="${prefix}-t${idx + 1}" ${idx === defaultPeriodIdx ? 'checked' : ''}><i class="dot dot-${pDot}" aria-hidden="true"></i>${escape(p.label)}</label>`;
+            }).join('')}
+            <label class="seg-btn" for="${prefix}-t${supplyTabIdx}"><input class="tab-radio" type="radio" name="tabs-${prefix}" id="${prefix}-t${supplyTabIdx}">1688 货源与线索</label>
+            <label class="seg-btn" for="${prefix}-t${bibTabIdx}"><input class="tab-radio" type="radio" name="tabs-${prefix}" id="${prefix}-t${bibTabIdx}">证据回执 · ${registry.length}</label>
+          </div>
+          <div class="tab-panels">
+            ${periods.map((period, idx) => r57PeriodPanel(period, object(displays.find(display => display?.id === period.id)), registry, prefix, idx + 1, rev)).join('')}
+            <section class="tab-panel tab-p${supplyTabIdx} tab-panel-supply">
+              ${r57KeyValueSection('采购参考与 1688 规格核对', presentation.procurement)}
+              ${r57KeyValueSection('款式事实与共同依据', presentation.facts)}
+              ${r57KeyValueSection('市场范围与补充观察', presentation.market_references)}
+              ${r57DiscoveryDetails(original?.discovery, registry, prefix)}
+            </section>
+            <section class="tab-panel tab-p${bibTabIdx} tab-panel-bib">
+              <div class="section-head"><h3>来源与适用限制</h3><span class="muted">本地路径已统一脱敏</span></div>
+              ${r57Bibliography(registry, prefix)}
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+  </article>`;
+}
+
+function r57SingleCard(result, original, index, rev = result?.profile_revision ?? 0) {
+  const presentation = object(original?.presentation);
+  const registry = array(result.evidence);
+  const prefix = `candidate-${index + 1}`;
+  const image = imageUri(presentation.image_data_uri);
+  const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
+  const gaps = array(result.items).filter(item => item.status === 'needs_evidence');
+  const mainGaps = blockers.length ? blockers : gaps.slice(0, 3).map(item => ({ problem: `${ITEM_LABELS[item.id] ?? item.id}：${reasonText(item.reason)}`, next_step: '补齐对应来源和适用口径后重新计算。' }));
+  const screenGaps = array(result.screening?.conditions).filter(condition => condition.status !== 'pass');
+  const queue = Object.hasOwn(QUEUES, result.queue) ? result.queue : 'pending';
+  const complete = queue === 'comparable' && Array.isArray(result.total_range);
+  const incompleteLabel = queue === 'excluded' ? '当前规格已排除，不列完整总分' : queue === 'deferred' ? '本期暂缓，不列完整总分' : '完整总分待补证';
+  const ineligible = array(result.items).filter(item => item.status === 'ineligible');
+  const coverageText = ineligible.length
+    ? `已计分权重 ${numberText(result.covered_weight)} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。`
+    : `证据覆盖权重 ${numberText(result.covered_weight)} / 100；未评分权重 ${numberText(result.unscored_weight)}。`;
+  const eligible = isCandidateEligible(result, rev);
+  const snapshot = extractMetricsSnapshot(result, rev);
+  const idxPad = String(index + 1).padStart(2, '0');
+  const hasBrief = array(presentation.risks).length || array(presentation.next_checks).length || mainGaps.length;
+  const qualReasonNote = rev >= 58 && !eligible && queue === 'pending' && array(result.qualification?.reasons).length
+    ? `<p class="muted coverage-line">达标口径核验：${result.qualification.reasons.map(r => escape(sanitizeTextPaths(reasonText(r)))).join('；')}</p>`
+    : '';
+
+  return `<article class="candidate" id="${prefix}" data-queue="${queue}" data-eligible="${eligible ? 'true' : 'false'}">
+    <div class="inspector-split">
+      <div class="inspector-rail">
+        ${image ? `<figure class="media-frame"><img src="${escape(image)}" alt="${escape(string(presentation.image_alt, string(result.form, '候选产品参考图')))}" width="248" height="248" loading="lazy" decoding="async"><figcaption>${escape(string(presentation.image_caption, '所附参考图，供核对具体规格'))}</figcaption></figure>` : ''}
+        ${renderLeftSpecLedger(snapshot, incompleteLabel, rev)}
+      </div>
+      <div class="inspector-main">
+        <div class="title-line">
+          <span class="mono-idx">${idxPad}</span>
+          <h2>${escape(result.label ?? result.candidate_id)}</h2>
+          ${renderDotStatus(result, snapshot, rev)}
+          <span class="muted queue-tag">${QUEUES[queue]}</span>
+        </div>
+        ${typeof presentation.summary === 'string' ? `<p class="lead-copy">${escape(presentation.summary)}</p>` : ''}
+        <p class="spec-copy">${escape(result.form ?? '具体可售规格尚待明确')}</p>
+        ${starReferenceSection(original)}
+        <div class="inline-score-status">
+          ${complete ? `<p>完整总分 <strong>${escape(rangeText(result.total_range))} / 100</strong></p>` : `<p class="ink-muted"><strong>${escape(incompleteLabel)}</strong></p>`}
+          <p class="muted">已支持分数 ${escape(rangeText(result.supported_range))}；${escape(coverageText)}</p>
+          ${result.conditional_total_range ? `<p class="muted">满足准入后可能范围 ${escape(rangeText(result.conditional_total_range))}。这是数学界限，不是已获得总分或预测。</p>` : ''}
+          ${result.may_exceed_comparable_leader ? '<p class="ink-pass">有效可能上界高于当前完整队列首项的保守端点，值得补证；这不代表已经胜出。</p>' : ''}
+        </div>
+        ${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与缺口">
+          ${r57BriefList('风险与边界提示', presentation.risks)}
+          ${r57BriefList('后续核查事项', presentation.next_checks)}
+          ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
+        </section>` : ''}
+        ${screenGaps.length ? `<p class="muted coverage-line">筛选状态：${screenGaps.map(condition => `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : '<p class="muted coverage-line">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}${qualReasonNote}
+        <div class="card-tabs">
+          <div class="segmented-track" role="radiogroup" aria-label="${escape(result.label ?? result.candidate_id)} 视图切换">
+            <label class="seg-btn" for="${prefix}-t1"><input class="tab-radio" type="radio" name="tabs-${prefix}" id="${prefix}-t1" checked>费用拆解与 21 项评分</label>
+            <label class="seg-btn" for="${prefix}-t2"><input class="tab-radio" type="radio" name="tabs-${prefix}" id="${prefix}-t2">采购核对与线索</label>
+            <label class="seg-btn" for="${prefix}-t3"><input class="tab-radio" type="radio" name="tabs-${prefix}" id="${prefix}-t3">证据回执 · ${registry.length}</label>
+          </div>
+          <div class="tab-panels">
+            <section class="tab-panel tab-p1">
+              ${r57EconomicWaterfall(result, `${prefix}-econ-main`, rev)}
+              <section class="ledger-section">
+                <div class="section-head"><h3>21 项评分明细</h3><span class="muted">8 大维度 · 点击编号直达原始证据</span></div>
+                ${r57ScoreRows(result, registry, prefix)}
+              </section>
+              ${r57NewcomerDetails(result, rev)}
+            </section>
+            <section class="tab-panel tab-p2 tab-panel-supply">
+              ${r57KeyValueSection('采购参考与规格核对', presentation.procurement)}
+              ${r57KeyValueSection('市场范围与新增观察', presentation.market_references)}
+              ${r57DiscoveryDetails(original?.discovery, registry, prefix)}
+            </section>
+            <section class="tab-panel tab-p3 tab-panel-bib">
+              <div class="section-head"><h3>来源与适用限制</h3><span class="muted">本地路径已统一脱敏</span></div>
+              ${r57Bibliography(registry, prefix)}
+            </section>
+          </div>
+        </div>
+      </div>
+    </div>
+  </article>`;
+}
+
+function renderComparisonMatrix(candidates, originals, rev = 57) {
+  if (!candidates.length) return '';
+  return `<section id="overview" class="matrix-block" aria-labelledby="matrix-heading">
+    <div class="section-head">
+      <h2 id="matrix-heading">横向对比总览</h2>
+      <span class="muted">点击款式直达详情核账</span>
+    </div>
+    <div tabindex="0" role="region" aria-labelledby="matrix-heading" class="table-scroll">
+      <table class="hairline-table matrix-table">
+        <thead>
+          <tr>
+            <th scope="col">候选款式</th>
+            <th scope="col">结论</th>
+            <th scope="col" class="num-col">美站参照价</th>
+            <th scope="col" class="num-col">1688百套含运</th>
+            <th scope="col" class="num-col">广告前毛利</th>
+            <th scope="col" class="num-col">扣15%广告后</th>
+            <th scope="col" class="num-col">单件贡献</th>
+            <th scope="col" class="num-col">21项总分</th>
+            <th scope="col">采购前头号核查</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${candidates.map((cand, idx) => {
+            const orig = originals.get(cand?.candidate_id);
+            const pres = object(orig?.presentation);
+            const snap = extractMetricsSnapshot(cand, rev);
+            const eligible = isCandidateEligible(cand, rev);
+            const topCheck = array(pres.next_checks)[0] ?? array(pres.risks)[0] ?? array(pres.blockers)[0]?.problem ?? '核对下方评分明细';
+            const topCheckStr = typeof topCheck === 'string' ? topCheck : string(topCheck?.label || topCheck?.problem, '核对下方评分明细');
+            const leadMatch = topCheckStr.match(/^([^：:—]{4,26})[：:—]\s*(.*)$/s);
+            let clipped = topCheckStr;
+            if (leadMatch) {
+              const head = leadMatch[1].trim();
+              const firstClause = leadMatch[2].split(/[，；。]/)[0].trim();
+              clipped = head.length >= 6 ? head : `${head} · ${firstClause.length > 26 ? `${firstClause.slice(0, 25).replace(/[0-9a-zA-Z.%+$]+$/, '').trim()}…` : firstClause}`;
+            } else if (topCheckStr.length > 28) {
+              clipped = `${topCheckStr.slice(0, 27).replace(/[0-9a-zA-Z.%+$]+$/, '').trim()}…`;
+            }
+            const mCls = rev >= 58
+              ? (snap.marginFloorStatus === 'pass' ? 'ink-pass' : snap.marginFloorStatus === 'fail' ? 'ink-fail' : snap.marginFloorStatus === 'cross' ? '' : 'ink-muted')
+              : (snap.margins ? (snap.margins[0] >= 0.3 ? 'ink-pass' : snap.margins[1] < 0.3 ? 'ink-fail' : '') : 'ink-muted');
+            return `<tr data-eligible="${eligible ? 'true' : 'false'}">
+              <th scope="row"><a class="row-jump" href="#candidate-${idx + 1}"><span class="mono-idx">${String(idx + 1).padStart(2, '0')}</span>${escape(cand.label ?? cand.candidate_id)}</a></th>
+              <td>${renderDotStatus(cand, snap, rev)}</td>
+              <td class="num-col">${usdRangeText(snap.prices)}</td>
+              <td class="num-col">${snap.cnyTotals ? `${escape(rangeText(snap.cnyTotals))} 元` : usdRangeText(snap.domesticDelivered)}</td>
+              <td class="num-col ${mCls}"><strong>${pctRangeText(snap.margins)}</strong></td>
+              <td class="num-col">${pctRangeText(snap.adMargins)}</td>
+              <td class="num-col">${usdRangeText(snap.contributions)}</td>
+              <td class="num-col"><strong>${snap.totalRange ? `${escape(rangeText(snap.totalRange))}` : `已得 ${escape(rangeText(snap.supportedRange))}`}</strong></td>
+              <td class="matrix-check">${escape(clipped)}</td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>
+    </div>
+  </section>`;
+}
+
+function r57BatchContext(presentation) {
+  const linkedSummary = r57DiscoverySummary(presentation.discovery_summary);
+  const discovery = array(presentation.discovery);
+  const timings = array(presentation.timings);
+  const limitations = array(presentation.limitations);
+  if (!discovery.length && !timings.length && !limitations.length) return linkedSummary ? `<div class="footer-meta">${linkedSummary}</div>` : '';
+  return `<section class="method-section" aria-labelledby="method-heading"><h2 id="method-heading" class="sr-only">核算边界与发现路径</h2><details class="quiet-fold batch-context"><summary>核算边界、发现路径与耗时记录</summary><div class="fold-body">${linkedSummary}${limitations.length ? `<h3>核算与方法边界</h3><ul>${limitations.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}${discovery.length ? `<h3>发现与覆盖记录</h3><ul>${discovery.map(value => {
+    if (typeof value === 'string') return `<li>${escape(value)}</li>`;
+    const row = object(value);
+    return `<li><strong>${escape(string(row.label, '发现记录'))}</strong>${typeof row.detail === 'string' ? `：${escape(row.detail)}` : ''}${typeof row.status === 'string' ? `（${escape(row.status)}）` : ''}${row.source || safeHttpUrl(row.url) ? `<p class="source">${sourceLink(string(row.source, '查看来源'), row.url)}${typeof row.observed_at === 'string' ? ` · ${escape(row.observed_at)}` : ''}</p>` : ''}</li>`;
+  }).join('')}</ul>` : ''}${timings.length ? `<h3>记录耗时</h3><dl class="kv-rows">${timings.map(value => {
+    const row = object(value);
+    return `<div class="kv-row"><dt>${escape(string(row.label, '阶段'))}</dt><dd>${finite(row.seconds) && row.seconds >= 0 ? `${escape(numberText(row.seconds))} 秒` : '未测量'}${typeof row.note === 'string' ? `<p class="muted">${escape(row.note)}</p>` : ''}</dd></div>`;
+  }).join('')}</dl>` : ''}</div></details></section>`;
+}
+
+const R57_CSS = `
+:root{
+  color-scheme:light;
+  --canvas:oklch(100% 0 0);
+  --quiet:oklch(0% 0 0 / .026);
+  --frame:oklch(96.8% 0 0);
+  --pill-bg:oklch(0% 0 0 / .058);
+  --pill-hover:oklch(0% 0 0 / .092);
+  --ink:oklch(14% 0 0);
+  --ink-2:oklch(28% 0 0);
+  --muted:oklch(0% 0 0 / .56);
+  --hairline:oklch(0% 0 0 / .075);
+  --hairline-strong:oklch(0% 0 0 / .14);
+  --dot-pass:oklch(60% .17 150);
+  --dot-warn:oklch(68% .15 75);
+  --dot-fail:oklch(57% .21 25);
+  --ink-pass:#0b613d;
+  --ink-fail:#a61b29;
+}
+*{box-sizing:border-box}
+html{
+  font-size:16px;
+  scroll-behavior:smooth;
+  scroll-padding-top:76px;
+  scrollbar-width:thin;
+  scrollbar-color:oklch(0% 0 0 / .22) transparent;
+  -webkit-font-smoothing:antialiased;
+  -moz-osx-font-smoothing:grayscale;
+}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+body{
+  margin:0;
+  background:var(--canvas);
+  color:var(--ink);
+  font:400 .875rem/1.6 "Inter","PingFang SC","HarmonyOS Sans SC","Microsoft YaHei UI",ui-sans-serif,system-ui,sans-serif;
+  font-variant-numeric:tabular-nums;
+  overflow-wrap:anywhere;
+}
+::selection{background:#0000001c;color:var(--ink)}
+a{color:var(--ink);text-underline-offset:.24em;text-decoration-color:var(--hairline-strong);text-decoration-thickness:1px}
+a:hover{text-decoration-color:var(--ink)}
+a:focus-visible,summary:focus-visible,.table-scroll:focus-visible,.pill-btn:has(:focus-visible),.seg-btn:has(:focus-visible),.ring-btn:has(:focus-visible){
+  outline:2px solid var(--ink);
+  outline-offset:2px;
+  border-radius:7px;
+}
+.ico{display:inline-block;vertical-align:-.12em;flex-shrink:0}
+.sep-bar{display:inline-block;width:1px;height:10px;background:var(--hairline-strong);margin-inline:7px;vertical-align:-1px}
+h1,h2,h3,h4,p,figure,dl,dd{margin:0}
+h1{font-size:1.375rem;font-weight:600;line-height:1.32}
+h2{font-size:1.25rem;font-weight:600;line-height:1.34}
+h3{font-size:.9375rem;font-weight:600;line-height:1.42}
+h4{font-size:.875rem;font-weight:500;line-height:1.45}
+code,.mono-id,.mono-idx,.mono-kw{
+  font-family:"Departure Mono","JetBrains Mono",ui-monospace,"Cascadia Mono","SFMono-Regular",Consolas,monospace;
+  font-size:.8125rem;
+}
+.mono-id{color:var(--muted)}
+.mono-idx{color:var(--muted);font-size:.8125rem;margin-right:6px}
+.mono-kw{color:var(--ink);font-weight:500}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.skip-link{position:absolute;top:-100px;left:16px;background:var(--ink);color:#fff;padding:8px 14px;border-radius:9999px;z-index:60;text-decoration:none;font-size:.8125rem}
+.skip-link:focus{top:12px}
+
+.shell{
+  max-width:1640px;
+  margin-inline:auto;
+  padding:20px 24px 72px;
+  display:grid;
+  grid-template-columns:216px minmax(0,1fr);
+  gap:40px;
+  align-items:start;
+}
+@media(min-width:1712px){
+  .shell{border-inline:1px solid var(--hairline)}
+}
+
+.side-rail{
+  position:sticky;
+  top:20px;
+  display:flex;
+  flex-direction:column;
+  gap:28px;
+  padding-right:16px;
+}
+.rail-brand{
+  display:flex;
+  align-items:center;
+  gap:9px;
+  font-weight:600;
+  font-size:.875rem;
+  color:var(--ink);
+}
+.brand-mark{
+  width:18px;
+  height:18px;
+  border-radius:4px;
+  background:var(--ink);
+  display:inline-block;
+  flex-shrink:0;
+}
+.rail-group{display:flex;flex-direction:column;gap:4px}
+.rail-heading{
+  font-size:.8125rem;
+  font-weight:500;
+  color:var(--muted);
+  margin-bottom:4px;
+}
+.rail-link{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:8px;
+  min-height:28px;
+  padding:3px 8px;
+  margin-inline:-8px;
+  border-radius:6px;
+  text-decoration:none;
+  color:var(--ink-2);
+  font-size:.8125rem;
+  line-height:1.35;
+}
+.rail-link:hover{background:var(--frame);color:var(--ink)}
+.rail-link-text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rail-specs{display:flex;flex-direction:column;gap:6px;font-size:.8125rem}
+.rail-specs div{display:flex;justify-content:space-between;gap:8px}
+.rail-specs dt{color:var(--muted)}
+.rail-specs dd{color:var(--ink-2);font-weight:500}
+.rail-foot{font-size:.8125rem;color:var(--muted);padding-top:14px;border-top:1px solid var(--hairline)}
+
+.workspace{min-width:0}
+
+.banner-line{
+  display:flex;
+  flex-direction:column;
+  gap:6px;
+  padding-bottom:6px;
+}
+.banner-sub{color:var(--ink-2);font-size:.875rem;line-height:1.58;max-width:74ch}
+.batch-counts{color:var(--muted);font-size:.8125rem;max-width:82ch}
+
+.filter-radio,.tab-radio,.mode-check{position:absolute;width:1px;height:1px;margin:0;opacity:0;pointer-events:none}
+
+.sticky-bar{
+  position:sticky;
+  top:0;
+  z-index:20;
+  background:var(--canvas);
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:10px 16px;
+  padding:12px 14px;
+  margin-inline:-14px;
+  border-bottom:1px solid var(--hairline);
+}
+.pill-bar{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.pill-btn{
+  position:relative;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  height:28px;
+  padding-inline:12px;
+  border-radius:9999px;
+  background:var(--pill-bg);
+  color:var(--muted);
+  font-size:.8125rem;
+  font-weight:500;
+  line-height:1;
+  user-select:none;
+  transition:background-color .14s ease,color .14s ease,transform .12s cubic-bezier(.2,0,0,1);
+}
+.pill-btn:hover{background:var(--pill-hover);color:var(--ink)}
+@media(prefers-reduced-motion:no-preference){
+  .pill-btn:active,.seg-btn:active,.ring-btn:active,.pill-link:active{transform:scale(.97)}
+}
+.ring-btn{
+  position:relative;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  height:28px;
+  padding-inline:12px;
+  border-radius:9999px;
+  background:var(--canvas);
+  color:var(--ink-2);
+  font-size:.8125rem;
+  font-weight:500;
+  box-shadow:0 0 0 .5px oklch(0% 0 0 / .11),0 1px 2px oklch(0% 0 0 / .06);
+  user-select:none;
+  transition:background-color .14s ease,color .14s ease,transform .12s cubic-bezier(.2,0,0,1);
+}
+.ring-btn:hover{background:var(--frame);color:var(--ink)}
+
+.pill-btn:has(:checked),
+.ring-btn:has(:checked){
+  background:var(--ink);
+  color:#fff;
+  box-shadow:none;
+}
+.item-qualifier{display:none}
+.workspace:has(#expand-qualifiers:checked) .item-qualifier{display:block}
+
+.workspace:has(#filter-pass:checked) .candidate[data-eligible="false"],
+.workspace:has(#filter-pass:checked) .matrix-table tbody tr[data-eligible="false"],
+.workspace:has(#filter-hold:checked) .candidate[data-eligible="true"],
+.workspace:has(#filter-hold:checked) .matrix-table tbody tr[data-eligible="true"]{
+  display:none;
+}
+.filter-empty{display:none;padding:28px 0;border-bottom:1px solid var(--hairline);font-size:.875rem}
+.workspace:has(#filter-pass:checked):not(:has(.candidate[data-eligible="true"])) .filter-empty,
+.workspace:has(#filter-hold:checked):not(:has(.candidate[data-eligible="false"])) .filter-empty{display:block}
+.workspace:has(#filter-pass:checked):not(:has(.candidate[data-eligible="true"])) .matrix-block,
+.workspace:has(#filter-hold:checked):not(:has(.candidate[data-eligible="false"])) .matrix-block{display:none}
+
+.bar-right{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.queue-nav{display:flex;gap:10px;font-size:.8125rem}
+.queue-nav a{color:var(--ink-2);text-decoration:underline;text-decoration-color:var(--hairline-strong);text-underline-offset:.24em}
+.queue-nav a:hover{color:var(--ink);text-decoration-color:var(--ink)}
+
+.dot{
+  width:6px;
+  height:6px;
+  border-radius:9999px;
+  display:inline-block;
+  flex-shrink:0;
+  background:var(--muted);
+}
+.state-pass .dot,.dot-pass{background:var(--dot-pass)}
+.state-pending .dot,.dot-pending,.dot-warn{background:var(--dot-warn)}
+.state-fail .dot,.dot-fail{background:var(--dot-fail)}
+.state-inline{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-size:.8125rem;
+  font-weight:500;
+  color:var(--ink);
+  white-space:nowrap;
+}
+.ink-pass{color:var(--ink-pass)}
+.ink-fail{color:var(--ink-fail)}
+.ink-muted,.muted{color:var(--muted)}
+
+.matrix-block{margin-top:24px}
+.section-head{
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  flex-wrap:wrap;
+  gap:6px 16px;
+  margin-bottom:10px;
+}
+.table-scroll{
+  overflow:auto;
+  max-inline-size:100%;
+  container-type:inline-size;
+  scrollbar-width:thin;
+  scrollbar-color:oklch(0% 0 0 / .22) transparent;
+}
+.hairline-table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:.8125rem;
+}
+.hairline-table th,.hairline-table td{
+  padding:10px 12px;
+  text-align:left;
+  border-bottom:1px solid var(--hairline);
+  border-right:1px solid oklch(0% 0 0 / .048);
+  vertical-align:middle;
+}
+.hairline-table th:first-child,.hairline-table td:first-child{padding-left:0}
+.hairline-table th:last-child,.hairline-table td:last-child{padding-right:0;border-right:0}
+.hairline-table thead th{
+  color:var(--muted);
+  font-weight:500;
+  border-bottom:1px solid var(--hairline-strong);
+  white-space:nowrap;
+}
+.hairline-table .num-col{text-align:right;white-space:nowrap}
+.hairline-table tbody th{font-weight:500;color:var(--ink)}
+.hairline-table tbody tr:hover th,.hairline-table tbody tr:hover td{background:var(--quiet)}
+.th-note{display:block;font-size:.8125rem;font-weight:400;color:var(--muted)}
+.row-jump{text-decoration:underline;text-decoration-color:var(--hairline-strong);text-underline-offset:.24em;font-weight:500;color:var(--ink)}
+.row-jump:hover{text-decoration-color:var(--ink)}
+.matrix-check{color:var(--ink-2);max-width:28ch}
+
+.candidate{
+  margin-top:48px;
+  padding-top:36px;
+  border-top:1px solid var(--hairline-strong);
+  scroll-margin-top:72px;
+}
+.inspector-split{
+  display:grid;
+  grid-template-columns:248px minmax(0,1fr);
+  gap:36px;
+  align-items:start;
+}
+.inspector-rail{display:flex;flex-direction:column;gap:18px}
+@media(min-width:721px){
+  .inspector-rail{position:sticky;top:72px}
+}
+.media-frame{margin:0}
+.media-frame img{
+  display:block;
+  width:100%;
+  height:auto;
+  aspect-ratio:1/1;
+  object-fit:contain;
+  background:var(--frame);
+  border-radius:8px;
+  padding:10px;
+  box-shadow:inset 0 0 0 1px oklch(0% 0 0 / .055);
+}
+.media-frame figcaption{
+  margin-top:8px;
+  font-size:.8125rem;
+  line-height:1.45;
+  color:var(--muted);
+}
+
+.hero-stat{padding-top:2px}
+.hero-stat-val{font-size:1.5rem;font-weight:600;line-height:1.18}
+.hero-stat-sub{margin-top:4px;font-size:.8125rem;line-height:1.4}
+
+.side-ledger{
+  display:flex;
+  flex-direction:column;
+  border-top:1px solid var(--hairline);
+}
+.side-ledger>div{
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  gap:12px;
+  padding:8px 0;
+  border-bottom:1px solid var(--hairline);
+  font-size:.8125rem;
+}
+.side-ledger dt{color:var(--muted);flex-shrink:0}
+.side-ledger dd{text-align:right;color:var(--ink)}
+
+.inspector-main{min-width:0}
+.title-line{
+  display:flex;
+  align-items:baseline;
+  flex-wrap:wrap;
+  gap:8px 12px;
+}
+.title-line h2{flex:1;min-width:min(240px,100%)}
+.queue-tag{font-size:.8125rem}
+.lead-copy{
+  margin-top:10px;
+  font-size:.9375rem;
+  line-height:1.62;
+  color:var(--ink);
+  max-width:70ch;
+}
+.spec-copy{
+  margin-top:6px;
+  font-size:.8125rem;
+  line-height:1.55;
+  color:var(--muted);
+  max-width:72ch;
+}
+.star-ref{margin-top:6px;font-size:.8125rem;color:var(--muted)}
+.inline-score-status{
+  margin-top:12px;
+  padding-block:10px;
+  border-block:1px solid var(--hairline);
+  font-size:.8125rem;
+}
+
+.quiet-surface{
+  margin-top:18px;
+  background:var(--quiet);
+  border-radius:8px;
+  padding:16px 20px;
+}
+.brief-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(260px,1fr));
+  gap:18px 28px;
+}
+.brief-col h3{margin-bottom:8px;color:var(--ink)}
+.brief-list{padding-inline-start:1.15em;margin:0;font-size:.8125rem;line-height:1.58;color:var(--ink-2)}
+.brief-list li+li{margin-top:6px}
+
+.card-tabs{margin-top:24px}
+.segmented-track{
+  display:inline-flex;
+  align-items:center;
+  flex-wrap:wrap;
+  gap:2px;
+  padding:3px;
+  border-radius:10px;
+  background:oklch(0% 0 0 / .052);
+}
+.seg-btn{
+  position:relative;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  height:28px;
+  padding-inline:12px;
+  border-radius:7px;
+  color:var(--muted);
+  font-size:.8125rem;
+  font-weight:500;
+  line-height:1;
+  user-select:none;
+  transition:background-color .14s ease,color .14s ease,box-shadow .14s ease,transform .12s cubic-bezier(.2,0,0,1);
+}
+.seg-btn:hover{color:var(--ink)}
+.tab-panel{display:none;padding-top:20px}
+.seg-btn:has(:checked){
+  background:var(--canvas);
+  color:var(--ink);
+  box-shadow:0 1px 2px oklch(0% 0 0 / .08),0 0 0 .5px oklch(0% 0 0 / .08);
+}
+.card-tabs:has(input[id$="-t1"]:checked) .tab-p1,
+.card-tabs:has(input[id$="-t2"]:checked) .tab-p2,
+.card-tabs:has(input[id$="-t3"]:checked) .tab-p3,
+.card-tabs:has(input[id$="-t4"]:checked) .tab-p4,
+.card-tabs:has(input[id$="-t5"]:checked) .tab-p5{
+  display:block;
+}
+.card-tabs:has(.tab-panel-bib :target) .tab-panel-bib{
+  display:block;
+  margin-top:20px;
+  padding-top:20px;
+  border-top:1px solid var(--hairline-strong);
+}
+@supports not selector(:has(*)){
+  .tab-panel{display:block;margin-top:20px}
+}
+
+.period-meta-line{
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  flex-wrap:wrap;
+  gap:10px 24px;
+  padding-bottom:12px;
+  border-bottom:1px solid var(--hairline);
+}
+.period-note{margin-top:4px;font-size:.8125rem;color:var(--ink-2);max-width:68ch}
+.period-inline-nums{display:flex;gap:16px;flex-wrap:wrap;font-size:.8125rem;color:var(--ink-2)}
+.period-inline-nums strong{color:var(--ink)}
+.coverage-line{margin-top:8px;font-size:.8125rem}
+
+.ledger-section{margin-top:26px}
+.ledger-section>h3{margin-bottom:10px}
+.section-lead{margin-bottom:6px;max-width:72ch}
+.alloc-strip{margin:8px 0 16px;padding:12px 14px;background:var(--quiet);border-radius:8px}
+.alloc-head{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px 16px;font-size:.8125rem;margin-bottom:8px}
+.alloc-track{position:relative;display:flex;height:8px;border-radius:9999px;background:oklch(0% 0 0 / .06);overflow:hidden}
+.alloc-seg{height:100%;display:block}
+.alloc-supply{background:oklch(22% 0 0)}
+.alloc-platform{background:oklch(68% 0 0)}
+.alloc-margin-pass{background:var(--dot-pass)}
+.alloc-margin-fail{background:var(--dot-fail)}
+.alloc-tick{position:absolute;top:0;bottom:0;left:70%;width:1.5px;background:var(--canvas);box-shadow:0 0 0 .75px var(--ink)}
+.alloc-legend{display:flex;flex-wrap:wrap;gap:8px 20px;margin-top:9px;font-size:.8125rem;color:var(--ink-2)}
+.alloc-legend span{display:inline-flex;align-items:center;gap:6px}
+.swatch{width:7px;height:7px;border-radius:2px;display:inline-block;flex-shrink:0}
+.swatch-supply{background:oklch(22% 0 0)}
+.swatch-platform{background:oklch(68% 0 0)}
+.swatch-pass{background:var(--dot-pass)}
+.swatch-fail{background:var(--dot-fail)}
+.waterfall-table thead th:first-child{position:sticky;inset-inline-start:0;background:var(--canvas);z-index:2}
+.waterfall-table tbody th{position:sticky;inset-inline-start:0;background:var(--canvas);z-index:1}
+.waterfall-table tbody tr:hover th{background:#f8f8f8}
+.waterfall-table .row-dim th,.waterfall-table .row-dim td{color:var(--muted)}
+.waterfall-table .row-sum th,.waterfall-table .row-sum td{border-top:1px solid var(--hairline-strong)}
+
+.scenario-folds{margin-top:8px}
+.quiet-fold{border-bottom:1px solid var(--hairline)}
+summary{
+  list-style:none;
+  cursor:pointer;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  min-height:36px;
+  padding:8px 0;
+  font-size:.8125rem;
+  font-weight:500;
+  color:var(--ink-2);
+}
+summary::-webkit-details-marker{display:none}
+summary::before{
+  content:"";
+  width:5px;
+  height:5px;
+  border-right:1.5px solid currentColor;
+  border-bottom:1.5px solid currentColor;
+  transform:rotate(-45deg);
+  flex-shrink:0;
+}
+details[open]>summary::before{transform:rotate(45deg)}
+@media(prefers-reduced-motion:no-preference){
+  summary::before{transition:transform .16s ease}
+  details::details-content{
+    interpolate-size:allow-keywords;
+    overflow:clip;
+    contain:layout;
+    transition:block-size .2s ease,content-visibility .2s ease;
+    transition-behavior:allow-discrete;
+  }
+  details:not([open])::details-content{block-size:0}
+}
+summary:hover{color:var(--ink)}
+.fold-body{padding:4px 0 14px 14px;font-size:.8125rem;color:var(--ink-2)}
+.fold-body h3{margin:12px 0 6px}
+.fold-body ul{padding-inline-start:1.2em;margin:6px 0}
+.fold-body li+li{margin-top:5px}
+
+.score-columns{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(340px,1fr));
+  gap:24px 36px;
+}
+.score-group{border-top:1px solid var(--hairline-strong);padding-top:10px}
+.group-bar{
+  display:flex;
+  justify-content:space-between;
+  align-items:baseline;
+  gap:12px;
+  padding-bottom:8px;
+  border-bottom:1px solid var(--hairline);
+}
+.group-pts{font-size:.8125rem;font-weight:500}
+.item-row{padding:11px 0;border-bottom:1px solid var(--hairline);font-size:.8125rem}
+.item-heading{display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:3px}
+.item-score{font-weight:600;flex-shrink:0}
+.item-input{color:var(--ink-2)}
+.item-reason{margin-top:3px;color:var(--ink)}
+.item-row>.source{margin-top:4px}
+.cite-fold{border:0;margin-top:2px}
+.cite-fold>summary{min-height:24px;padding:2px 0;color:var(--muted)}
+
+.bid-block{margin-top:10px;padding-top:10px;border-top:1px solid var(--hairline)}
+.bid-summary-line{margin-bottom:4px}
+.bid-rows{margin-top:8px;border-top:1px solid var(--hairline)}
+.bid-row{padding:10px 0}
+.bid-row+.bid-row{border-top:1px solid var(--hairline)}
+.bid-row-head{display:flex;justify-content:space-between;align-items:baseline;gap:10px;flex-wrap:wrap}
+.bid-row-meta{font-size:.8125rem}
+.bid-sub{margin-top:2px}
+
+.kv-rows{border-top:1px solid var(--hairline)}
+.kv-row{
+  display:grid;
+  grid-template-columns:180px minmax(0,1fr);
+  gap:16px;
+  padding:10px 0;
+  border-bottom:1px solid var(--hairline);
+  font-size:.8125rem;
+}
+.kv-row dt{color:var(--muted);font-weight:500}
+.kv-main{color:var(--ink);font-weight:500}
+.pill-link{
+  display:inline-flex;
+  align-items:center;
+  height:22px;
+  padding-inline:9px;
+  margin-left:6px;
+  border-radius:9999px;
+  background:var(--pill-bg);
+  color:var(--ink);
+  text-decoration:none;
+  font-size:.8125rem;
+  font-weight:500;
+}
+.pill-link:hover{background:var(--pill-hover)}
+
+.lead-list,.bibliography{padding-inline-start:1.35em;margin:8px 0;font-size:.8125rem}
+.lead-list li+li{margin-top:8px}
+.bibliography li{padding:9px 6px;border-bottom:1px solid var(--hairline);scroll-margin-top:84px}
+.bibliography li:target{background:var(--frame);border-radius:6px}
+.bib-head{display:flex;justify-content:space-between;align-items:baseline;gap:8px 16px;flex-wrap:wrap}
+.bib-meta{color:var(--muted);font-size:.8125rem}
+
+.source{font-size:.8125rem;line-height:1.5;color:var(--muted)}
+p+p{margin-top:5px}
+.method-section{margin-top:44px}
+.empty-state{padding:40px 0;border-top:1px solid var(--hairline)}
+.report-footer{
+  margin-top:28px;
+  padding-top:18px;
+  border-top:1px solid var(--hairline);
+  font-size:.8125rem;
+  color:var(--muted);
+  display:flex;
+  justify-content:space-between;
+  flex-wrap:wrap;
+  gap:8px 24px;
+}
+
+@container (width < 680px){
+  .matrix-table,.matrix-table thead,.matrix-table tbody,.matrix-table tr,.matrix-table th,.matrix-table td{display:block}
+  .matrix-table thead{display:none}
+  .matrix-table tr{padding:12px 0;border-bottom:1px solid var(--hairline-strong)}
+  .matrix-table tbody th{padding:0 0 6px;border-bottom:0;border-right:0}
+  .matrix-table td,.matrix-table .num-col{border-bottom:0;border-right:0;padding:4px 0;display:flex;justify-content:space-between;align-items:baseline;gap:12px;text-align:right;white-space:normal}
+  .matrix-table td::before{flex-shrink:0;white-space:nowrap;color:var(--muted)}
+  .matrix-table td.matrix-check{flex-direction:column;align-items:flex-start;text-align:left;gap:2px;max-width:none}
+  .matrix-table{
+    --m2:"结论";--m3:"美站参照价";--m4:"1688百套含运";--m5:"广告前毛利";
+    --m6:"扣15%广告后";--m7:"单件贡献";--m8:"21项总分";--m9:"采购前头号核查";
+  }
+  .matrix-table td:nth-child(2)::before{content:var(--m2)}
+  .matrix-table td:nth-child(3)::before{content:var(--m3)}
+  .matrix-table td:nth-child(4)::before{content:var(--m4)}
+  .matrix-table td:nth-child(5)::before{content:var(--m5)}
+  .matrix-table td:nth-child(6)::before{content:var(--m6)}
+  .matrix-table td:nth-child(7)::before{content:var(--m7)}
+  .matrix-table td:nth-child(8)::before{content:var(--m8)}
+  .matrix-table td:nth-child(9)::before{content:var(--m9)}
+}
+
+@media(max-width:1024px){
+  .shell{grid-template-columns:1fr;gap:20px;padding:16px 18px 56px}
+  .side-rail{
+    position:static;
+    flex-direction:row;
+    flex-wrap:wrap;
+    align-items:center;
+    justify-content:space-between;
+    gap:12px 20px;
+    padding-right:0;
+    padding-bottom:12px;
+    border-bottom:1px solid var(--hairline);
+  }
+  .rail-specs-group,.rail-foot{display:none}
+  .rail-group{flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px}
+  .rail-heading{flex-basis:100%;margin:0 0 2px}
+  .rail-link{margin-inline:0;background:var(--pill-bg);border-radius:9999px;padding-inline:10px}
+}
+
+@media(max-width:720px){
+  .inspector-split{grid-template-columns:1fr;gap:20px}
+  .media-frame{display:flex;align-items:center;gap:14px}
+  .media-frame img{width:104px;height:104px;flex-shrink:0}
+  .media-frame figcaption{margin-top:0}
+  .score-columns{grid-template-columns:1fr}
+  .kv-row{grid-template-columns:1fr;gap:3px}
+  .waterfall-table th:first-child{max-width:136px;white-space:normal}
+  .sticky-bar{position:static}
+}
+
+@media print{
+  body{background:#fff;color:#000;font-size:9.5pt}
+  .shell{display:block;padding:0}
+  .side-rail,.sticky-bar,.skip-link,.pill-bar,.segmented-track{display:none!important}
+  .tab-panel{display:block!important;padding-top:10pt}
+  details::details-content{display:block;content-visibility:visible}
+  details>*{display:block!important}
+  .item-qualifier{display:block!important}
+  .media-frame img{width:90pt;height:90pt}
+}
+`;
+
+function renderR57Report(result, batch = {}) {
+  const rev = result?.profile_revision ?? 57;
+  const r58 = isR58(result);
+  const rawPresentation = { ...object(batch?.presentation), discovery_summary: batch?.discovery_summary };
+  const presentation = r58 ? sanitizeDisplayTree(rawPresentation) : rawPresentation;
+  const rawCandidates = array(result?.candidates);
+  const candidates = r58 ? rawCandidates.map(c => sanitizeDisplayTree(c)) : rawCandidates;
+  const originals = new Map(array(batch?.candidates).map(candidate => [
+    candidate?.id,
+    r58 && candidate
+      ? {
+        ...candidate,
+        presentation: sanitizeDisplayTree(candidate.presentation, '', true),
+        discovery: sanitizeDisplayTree(candidate.discovery),
+        market: sanitizeDisplayTree(candidate.market),
+      }
+      : candidate,
+  ]));
+  const title = string(presentation.title, '美国站 FBA 选品决策看板');
+  const counts = object(result?.summary);
+  const eligibleCount = candidates.filter(cand => isCandidateEligible(cand, rev)).length;
+  const holdCount = candidates.length - eligibleCount;
+  const completeCount = r58
+    ? candidates.filter(cand => cand?.queue === 'comparable' && isCandidateEligible(cand, rev)).length
+    : counts.complete;
+  const pendingCount = r58
+    ? candidates.filter(cand => cand?.queue === 'pending').length
+    : counts.pending;
+  const seasonalReviewCount = r58
+    ? candidates.filter(cand => cand?.queue === 'seasonal_review').length
+    : counts.seasonal_review;
+  const seasonalEligibleCount = r58
+    ? candidates.filter(cand => cand?.queue === 'seasonal_review' && isCandidateEligible(cand, rev)).length
+    : counts.seasonal_eligible;
+
+  const seasonalCounts = seasonalReviewCount
+    ? `分季评估 ${escape(numberText(seasonalReviewCount))} 个款式，其中 2027 年 2—9 月主营淡季初评达标 ${escape(numberText(seasonalEligibleCount))} 个款式（非强节日依赖且覆盖完整 2027-02-01 至 2027-09-30 淡季窗口）；各经营季节由主人选择。`
+    : '';
+  const r58OrderRule = r58
+    ? '全年 12 个月完整可比卡优先列于 2—9 月主营淡季达标卡之前；区间重叠不代表严格优劣。'
+    : '';
+  const queueLinks = Object.entries(QUEUES).map(([key, label]) => {
+    const index = candidates.findIndex(candidate => candidate?.queue === key);
+    const countVal = r58
+      ? (key === 'comparable' ? completeCount : candidates.filter(c => c?.queue === key).length)
+      : counts[key === 'comparable' ? 'complete' : key];
+    return index >= 0 ? `<a href="#candidate-${index + 1}">${label} ${escape(numberText(countVal))}</a>` : '';
+  }).join('');
+  const maxPanels = r58
+    ? Math.max(12, ...candidates.map(c => (c?.queue === 'seasonal_review' ? array(c.operating_periods).length + 2 : 3)))
+    : 5;
+  const r58ExtraCss = r58
+    ? `\n${Array.from({ length: maxPanels - 5 }, (_, idx) => `.card-tabs:has(input[id$="-t${idx + 6}"]:checked) .tab-p${idx + 6}`).join(',\n')}{\n  display:block;\n}\n`
+    : '';
+
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; script-src 'none'; connect-src 'none'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"><meta name="referrer" content="no-referrer"><title>${escape(title)}</title><style>${R57_CSS}${r58ExtraCss}</style></head><body><a class="skip-link" href="#cards">跳到候选卡</a><div class="shell"><aside class="side-rail" aria-label="选品索引导航"><div class="rail-brand"><span class="brand-mark" aria-hidden="true"></span><span>选品决策</span></div>${candidates.length ? `<nav class="rail-group" aria-label="候选产品直达"><span class="rail-heading">候选目录</span><a class="rail-link" href="#overview"><span class="rail-link-text">横向对比总览</span><span class="mono-id">${candidates.length}</span></a>${candidates.map((cand, i) => {
+    const snap = extractMetricsSnapshot(cand, rev);
+    const dot = statusDotInfo(cand, snap, rev).tone;
+    const shortName = string(cand.label ?? cand.candidate_id).replace(/[（(|].*$/, '').trim();
+    return `<a class="rail-link" href="#candidate-${i + 1}"><span class="rail-link-text">${escape(shortName)}</span><i class="dot dot-${dot}" aria-hidden="true"></i></a>`;
+  }).join('')}</nav>` : ''}<div class="rail-group rail-specs-group"><span class="rail-heading">核算基准</span><dl class="rail-specs"><div><dt>目标站点</dt><dd>US FBA</dd></div><div><dt>参考售价</dt><dd>≥ $29.99</dd></div><div><dt>广告前毛利</dt><dd>≥ 30.0%</dd></div><div><dt>国内采购</dt><dd>${r58 ? '≥100套常规' : '100套常规'}</dd></div><div><dt>规则修订</dt><dd>Rev ${escape(result?.profile_revision ?? 57)}</dd></div></dl></div><p class="rail-foot">离线单文件 · 零外部请求</p></aside><main class="workspace"><header class="banner-line"><h1>${escape(title)}</h1>${typeof presentation.summary === 'string' ? `<p class="banner-sub">${escape(presentation.summary)}</p>` : ''}<p class="batch-counts">本轮 ${escape(numberText(candidates.length))} 个候选；完整可比 ${escape(numberText(completeCount))} 个，待补证 ${escape(numberText(pendingCount))} 个。${seasonalCounts}${r58OrderRule}</p></header>${candidates.length ? `<div class="sticky-bar" role="region" aria-label="筛选与视图控制"><div class="pill-bar" role="radiogroup" aria-label="候选筛选"><label class="pill-btn" for="filter-all"><input class="filter-radio" type="radio" name="wb-filter" id="filter-all" checked>全部 ${escape(numberText(candidates.length))}</label><label class="pill-btn" for="filter-pass"><input class="filter-radio" type="radio" name="wb-filter" id="filter-pass">达标可推进 ${escape(numberText(eligibleCount))}</label><label class="pill-btn" for="filter-hold"><input class="filter-radio" type="radio" name="wb-filter" id="filter-hold">淘汰／待补 ${escape(numberText(holdCount))}</label></div><div class="bar-right">${queueLinks ? `<nav class="queue-nav" aria-label="跳转候选队列">${queueLinks}</nav>` : ''}<label class="ring-btn" for="expand-qualifiers"><input class="mode-check" type="checkbox" id="expand-qualifiers">口径说明</label></div></div>${renderComparisonMatrix(candidates, originals, rev)}<p class="filter-empty muted">当前筛选条件下暂无候选款式，请切换至“全部”查看完整列表。</p>` : ''}<section id="cards" aria-label="候选产品卡">${candidates.length ? candidates.map((candidate, index) => (candidate?.queue === 'seasonal_review' ? r57SeasonalCard(object(candidate), originals.get(candidate?.candidate_id), index, rev) : r57SingleCard(object(candidate), originals.get(candidate?.candidate_id), index, rev))).join('') : '<div class="empty-state"><h2>本轮没有候选卡</h2><p class="muted">保留发现与覆盖记录；没有候选不等于市场中没有机会。</p></div>'}</section>${r57BatchContext(presentation)}<footer class="report-footer"><p>评分反映本轮证据与已确认试评规则。未知不按零计，不把已知部分折算为100分；初步评分、供应验证、主人决定与实际经营效果分别核验。</p><p>规则版本：修订 ${escape(result?.profile_revision ?? '未知')}</p></footer></main></div></body></html>`;
+}
+
+export function renderReport(result, batch = {}) {
+  return isR57(result) ? renderR57Report(result, batch) : renderLegacyReport(result, batch);
 }

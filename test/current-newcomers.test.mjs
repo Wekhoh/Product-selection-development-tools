@@ -5,6 +5,7 @@ import { scoreCandidate } from '../src/scoring.mjs';
 
 const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
 const currentProfile = structuredClone(profile);
+currentProfile.revision = currentProfile.workflow.scoring_and_ordering.revision = 57;
 profile.revision = 51;
 profile.workflow.scoring_and_ordering.revision = 51;
 const obs = (value, unit) => ({ value, unit, evidence: ['source'] });

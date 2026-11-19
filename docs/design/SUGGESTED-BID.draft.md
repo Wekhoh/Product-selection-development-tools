@@ -1,6 +1,6 @@
 # Suggested-bid pressure: confirmed 15-point trial
 
-Updated: 2026-11-17. Revision56 adds the owner-approved equal-entry mean when every main entry has a usable exact point and only monthly search volume is missing. Complete compatible monthly weights remain preferred; revision55's genuine sole-entry rule and the 15-point curve remain unchanged. All 21 mappings are maintained in the current profile. This is trial-rule adoption, not production calibration or an advertising instruction. Earlier revisions remain available for matching historical replay.
+Updated: 2026-11-18. Revision57 confirms acceptance of authentic native exact-match bid points on low-exposure niche or longtail queries (including real-time quotes where weekly search volume is `0`/`--` or exact/phrase/broad return the same platform baseline), preserving `low_exposure_baseline` and `low_exposure_note` disclosures on the rendered card without inventing search volume or discarding the query. Revision56 retains the owner-approved equal-entry mean when every main entry has a usable exact point and only monthly search volume is missing. Complete compatible monthly weights remain preferred; revision55's genuine sole-entry rule and the 15-point curve remain unchanged. All 21 mappings are maintained in the current profile. This is trial-rule adoption, not production calibration or an advertising instruction. Earlier revisions remain available for matching historical replay.
 
 ## Accepted inputs and source treatment
 

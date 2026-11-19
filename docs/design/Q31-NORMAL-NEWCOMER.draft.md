@@ -2,9 +2,18 @@
 
 建立：2026-11-11；更新：2026-11-13。状态：3／2／4／1 分配与四项完整试评规则均已确认，具体真实样本、取数可得性、判断准确度和跨类目校准仍待验证。本稿不是正式算法实现或运行配置。原 2／2／3／3 未获采用。
 
-Current numerical source: [reference-profile.draft.json](reference-profile.draft.json), revision 52. Revision51's reference and curves remain trial choices under the owner's delegated simplification; revision52 adopts the explicit owner tie decision below. Older dated sections preserve revision50/51 history and replay. The single recovery entry is [STATE.md](../STATE.md).
+Current numerical source: [reference-profile.draft.json](reference-profile.draft.json), revision 58. Older dated sections preserve revision 50–57 history and exact replay. The single recovery entry is [STATE.md](../STATE.md).
 
-## Owner-approved evidence-complete ties (revision 52, 2026-11-16)
+## Revision 58 exact-rational full-month mandatory + greedy ramp-up + 5-quintile stratification (2026-11-19)
+
+Revision 58 replaces top-2 selection for 4/1 while keeping the 4-point rating curve, 0.5/0.8 sales cap and 1-point SIF natural curve:
+
+- **Verified non-empty `T` with small-niche floor:** `T_eff = max(T, 10)` applies only when verified non-empty `T >= 0` is supplied (resolving `T = 0` deadlock smoothly); missing or empty `T` remains `pending` and never defaults to `10`.
+- **US-site calendar `age_days` & `<30`-day zero-sale pre-exclusion:** compute `age_days` in US Pacific (`America/Los_Angeles`) calendar days with no 7-day floor (rejecting future launch dates). Pre-exclude verified `<30`-day zero-sales listings (`ramp_up_zero_sales`) before counting `N_active`; if all observed newcomers are `<30`-day zero-sales, score `0/4` and `0/1` with `absence_note` and no lone-newcomer alert. Full-month (`>=30`-day) zero-sales listings remain mandatory in `M_{>=30}`.
+- **Exact rational greedy selection & shared `S*`/`D`:** include all deduplicated verified full-month listings `M_{>=30}`, then greedily add positive-score `<30`-day ramp-up listings descending by exact `BigInt` rational `e_u` strictly increasing `F(S) = sum(e_i) / max(|S|, 2)` (stopping on ties at the shortest prefix). Both 4-pt and 1-pt items share identical `S*` and `D = max(|S*|, 2)`. Missing SIF on `S*` stays `needs_evidence` with `conditional_range = [knownSum/D, (knownSum+m)/D]` without swapping. Lone-newcomer alert triggers when `|S*| === 1` or fewer than 2 members in `S*` reach `e >= 2`.
+- **Deterministic 5-quintile stratification (`N_active > 5`):** partition `N_active` into 5 quintiles, pick lower-midpoint `floor((lo+hi-1)/2)` with in-stratum distance-from-center replacement and nearest-stratum borrowing on `old_reviews_predate_launch`. Verified `unsampled_stratified` rows (requiring reliable ratings & 30-day sales) remain non-blocking, allowing `21/21` completion with explicit `"Q31 为 5/N 分层代表估计"` disclosure and closed-form `O(N log N)` `stratified_bounds = [low_min, low_max]`. Cherry-picking or using `unsampled_stratified` when `N_active <= 5` blocks scoring.
+
+## Owner-approved evidence-complete ties (revision 52–57 history, 2026-11-16)
 
 Once two qualified examples have supported complete capped low-rating scores, an unresolved example whose supported maximum only equals the second complete score no longer blocks their selection. Preserve the unresolved sample, null inputs and possible maximum; do not assign it zero or its hypothetical maximum as an actual score. A strictly higher possible score still blocks the 4/1 items for evidence. With fewer than two complete examples, an unresolved additional example still blocks: the rule does not pretend a one-case result already represents two examples.
 

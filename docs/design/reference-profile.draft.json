@@ -83,7 +83,8 @@
               "requires": "A researched main-entry set and usable exact point per entry, consistent US/USD/exact scope and registered evidence. Missing any required exact point keeps the item pending. Supplied invalid/conflicting volumes or an all-zero total are not missing-volume exceptions. Neither sole-entry nor equal-entry scoring establishes demand size.",
               "interpretation": "Research importance, not actual orders, candidate traffic shares or ad-budget allocation.",
               "single_entry": "Exactly one evidenced genuine main purchase entry: B=b_1, with the unchanged two-source mean or labeled single-source point. Monthly volume and period are not required; missing volume remains unknown. Do not drop unresolved additional entries to invoke this rule.",
-              "missing_volume_equal_entries": "Revision56: all selected main entries must have usable native exact points. If at least one monthly volume is absent, average all entry points equally after source fusion. Retain known volumes and missing values without imputation; partial monthly coverage must not overweight the available subset. Disclose equal weighting and its lack of demand-share evidence."
+              "missing_volume_equal_entries": "Revision56: all selected main entries must have usable native exact points. If at least one monthly volume is absent, average all entry points equally after source fusion. Retain known volumes and missing values without imputation; partial monthly coverage must not overweight the available subset. Disclose equal weighting and its lack of demand-share evidence.",
+              "low_exposure_native_bids": "Revision57: when an authentic native exact-match tool query returns a low-exposure or platform-baseline exact point (such as zero/unreported weekly impressions or identical values across match types), accept that native exact point for scoring and disclose its low-exposure baseline characteristic on the card."
             },
             "full_score_at_or_below": 0.5,
             "zero_score_at_or_above": 3,
@@ -135,7 +136,7 @@
             ],
             "formula": "Interpolate linearly between adjacent anchors; cap at item_weight for supported units >= 5000.",
             "calibration_status": "pending_real_samples_across_categories_and_rounds",
-            "evidence_requirement": "Initial r51 scope uses the declared relevant current category after removing obvious parts/unrelated uses, a completed tool query and deduplicated families with aligned 30-day units. Prefer parent totals; when only representative-ASIN units exist use one disclosed fixed representative per family, not a sum or a false parent total. No mandatory fine-niche census. Preserve zero vs missing, proxy coverage and intervals; no own-sales forecast or minimum-sales exclusion."
+            "evidence_requirement": "Initial r51 scope uses the declared relevant current category after removing obvious parts/unrelated uses, a completed tool query and deduplicated families with aligned 30-day units. Revision57 requires provider-native parent-listing monthly unit sales (`grain: \"parent_units\"`, e.g., SellerSprite `units`) directly after family deduplication for initial screening, without child-variant attribution splits; downstream variant selection belongs to owner review after card delivery (representative-ASIN fallback belonged only to frozen revisions 51-56). Preserve zero vs missing, proxy coverage and intervals; no own-sales forecast or minimum-sales exclusion."
           }
         },
         {
@@ -700,9 +701,10 @@
     "comparable_reference_price": {
       "currency": "USD",
       "strictly_greater_than": 30,
+      "minimum_inclusive": 29.99,
       "upper_limit": null,
       "price_bands": null,
-      "basis": "Matched specification competitor reference price; launch discounts are a separate later strategy."
+      "basis": "Revision57: matched specification competitor reference price >= USD 29.99 (frozen revisions50-56 retain > USD 30); launch discounts are a separate later strategy."
     },
     "margin": {
       "minimum": 0.3,
@@ -1147,9 +1149,9 @@
         "upper_ratio": 0.8,
         "max_points": 4
       },
-      "selection": "Revision52: mean of up to two highest supported capped scores. Once two complete scores exist, unresolved examples with upper bounds equal to or below the second complete score do not displace them. Exact ties among complete scores retain family then ASIN ascending; natural-data availability or score never selects a different pair. A single complete example with an unresolved second example remains pending. Frozen revision51 retains stable identity ties against unresolved equal upper bounds.",
-      "no_examples": "Zero support points only after the declared query is complete and no unresolved observed member could qualify. This is not proof of market impossibility.",
-      "missingness": "Keep pending qualification and missing R/S as unknown records with supported upper bounds. They block 4/1 if fewer than two complete examples exist or the upper bound strictly exceeds the second complete score. This removes only equal-bound blocking in revision52, not missing-query, identity/grouping or reference checks. Missing selected SIF shares remain unknown; never substitute a different complete example merely for easier traffic data.",
+      "selection": "Revision58: all deduplicated verified full-month (age_days >= 30, US-site calendar dates) buyer-task-comparable normal newcomers M_{>=30} are mandatory; <30-day zero-sales rows are pre-excluded before active pool counting; positive-sales <30-day ramp-up listings are greedily included in descending score order using exact rational arithmetic only when strictly increasing F(S) = sum(e_i) / max(|S|, 2) (ties stop at shortest prefix). When N_active > 5, deterministic 5-quintile stratification with lower-midpoint selection, in-stratum distance-from-center replacement and nearest-stratum borrowing allows unsampled_stratified rows to remain non-blocking while disclosing 'Q31 为 5/N 分层代表估计' and closed-form stratified_bounds [low_min, low_max]. Both 4-pt and 1-pt items share S* and D = max(|S*|, 2); T_eff = max(T, 10) applies only to a verified non-empty T >= 0 (missing T remains pending). Frozen revisions51-57 preserve their respective top-2 selection and tie policies.",
+      "no_examples": "Zero support points only after the declared query is complete and no unresolved observed member could qualify (including when all observed <30-day listings have zero sales). Disclose '所查范围内无同任务正常起步新品样板'; this is not proof of market impossibility.",
+      "missingness": "Revision58: missing T, unresolved qualification, cherry-picked stratification or missing ratings/units on unsampled_stratified rows block Q31. Missing SIF overall shares on selected S* keep the 1-pt item needs_evidence with conditional_range [knownSum/D, (knownSum+m)/D] without swapping. Frozen revisions51-57 preserve their respective equal-bound blocking rules.",
       "natural": "Same selected examples, share/0.70 capped at one. Both tools keyword counts corroborate; never substitute word-count ratios.",
       "reference_boundary": "Initial category relevance removes obvious parts/unrelated uses, without mandatory fine niche reconstruction or off-list history. Source-complete query is sufficient; no Amazon-wide census.",
       "interpretation": "Observed opportunity support, not a typical outcome, success probability or own-sales forecast."
@@ -1195,15 +1197,15 @@
     },
     "scoring_and_ordering": {
       "status": "confirmed_for_trial",
-      "revision": 56,
+      "revision": 58,
       "scale": 100,
       "complete_total": "Sum all fully supported item scores at original weights. Do not add AI impression adjustments or duplicate penalties.",
       "supported_intervals": "Evaluate coherent supported scenarios with shared price/cost/refund inputs consistent across dependent items; keep the full resulting interval, not a midpoint or incompatible independent endpoints. Item-specific input rules still apply.",
       "missing_total": null,
       "seasonal_review": {
         "total": null,
-        "order": "Stable form order; no cross-period best-score rank.",
-        "count": "Count a unique form with at least one fully supported eligible period once, separately from ordinary complete cards. Pending and excluded periods remain visible.",
+        "order": "Revision58: scoring.mjs outputs a single authoritative qualification object (counts_toward_target, mode, primary_period_id, display_period_id, reasons) consumed without re-judging by report.mjs. Flat full-year (12 calendar months, YYYY-01-01..YYYY-12-31) comparable cards rank ahead of seasonal_eligible cards (complete primary 2027-02-01..2027-09-30 off-peak plus companion [10,11,12] peak panel and non-holiday-dependent), followed by pending, seasonal_remaining, deferred and excluded. All six queues use permutation-invariant deterministic tie-breaks ending in candidate_id ASC, and seasonal operating_periods sort by min(months) ASC then id ASC. Frozen revisions52-57 retain their legacy queue placement and counts.",
+        "count": "In revision58+, qualifying = complete (full 12-month flat comparable) + seasonal_eligible (unique non-holiday-dependent seasonal form with complete comparable 2027-02-01..2027-09-30 off-peak panel and companion [10,11,12] peak panel). Flat annual forms covering fewer than all 12 calendar months remain pending instead of comparable. Pre-declared expected_primary_scenarios (active or evidenced cancelled) prevent silently dropping a pending/failing primary scenario; optional stress_scenarios[] remain isolated sensitivity displays outside the 21-item score and 30% floor.",
         "contract": "Optional economics.operating_periods uses unique ids, explicit nonoverlapping calendar months and coherent same-unit scenarios; it cannot coexist with root economics.scenarios."
       },
       "missing_display": [
@@ -1238,7 +1240,7 @@
         "contract": "Every scenario supplies a same-ID, same-saleable-unit cost_ledger. The scorer recomputes refund-adjusted economics; cached margins never establish support. Registered sources, per-fee effective dates, separate sales/storage/inbound windows and included-charge components are validated before scoring.",
         "legacy": "Frozen revisions50-53 remain arithmetic-only historical replay, not fee-policy acceptance.",
         "unavailable": "An unavailable or out-of-period rate withholds that period margin and dependent collection; no cross-season or cross-year fill.",
-        "domestic_delivery": "The current 100-purchased-unit quote is required. Legacy deferred domestic delivery is not accepted in revision54."
+        "domestic_delivery": "The current 100-purchased-unit quote is required. Legacy deferred domestic delivery is not accepted in revision54. Revision57 rejects one-time new-buyer shipping waivers (such as 1688 first-order free shipping) and requires the regular repeat-order 100-saleable-unit delivered quotation. Revision58 generalizes regular repeat-order procurement and domestic delivery to explicit integer order_units >= 100 (matching across procurement, domestic delivery, source_inputs and optional carton/MOQ sku_lines[]), distinguishes refund_fraction vs physical_return_fraction and rejects unexempted returns_processing = 0 whenever physical_return_fraction > return_threshold (or apparel with positive returns)."
       }
     }
   },
@@ -1251,7 +1253,9 @@
     "Complete end-to-end product design and real-card acceptance.",
     "Suggested-bid revision 47 is confirmed for trial: equal native source points per query, labeled single-source fallback, consistent SellerSprite monthly-search importance across relevant main entries, and USD 0.50 full / USD 3.00 zero. Keep source points/ranges, approximate strategy/time limitations and missingness visible. This is not actual CPC, evidence of better accuracy, acceptance of a fixed collection size or activation of research. Later calibrated field/coverage/runtime acceptance remains pending.",
     "Revision55 adopts one evidenced genuine main-entry direct point on 2026-11-17; retained for current and historical use. Source-set relevance and useful-card calibration remain evidence responsibilities.",
-    "Revision56 adopts equal main-entry means only when every selected entry has usable exact quotes and monthly volume is missing. Prefer complete compatible monthly weights; preserve source fusion, all21 weights/curves, economics and frozen revisions50-55 replay."
+    "Revision56 adopts equal main-entry means only when every selected entry has usable exact quotes and monthly volume is missing. Prefer complete compatible monthly weights; preserve source fusion, all21 weights/curves, economics and frozen revisions50-55 replay.",
+    "Revision57 (2026-11-17) adopts matched-spec reference price >= USD 29.99, prioritizes seasonal-eligible complete off-peak forms ahead of incomplete pending cards while 2027 holiday fulfillment fees remain unpublished, rejects first-order promotional domestic shipping waivers in favor of regular repeat-order 100-saleable-unit quotes, standardizes initial demand-scale aggregation on deduplicated parent monthly units, accepts disclosed low-exposure native exact bids, and surfaces 15%-ad sensitivity, risks/next-checks and niche star references in reports.",
+    "Revision58 (2026-11-19) unifies authoritative qualification output in scoring.mjs (consumed without self-judging in report.mjs), adds expected_primary_scenarios anti-drop completeness, full-12-month flat-annual enforcement, isolated stress_scenarios[], permutation-invariant 6-queue sorting, aligned r_refund vs r_physical excess returns processing across early-screen/fee-basis/economics, tri-state Gate-1 rights/date checks, >=100 carton/MOQ sku_lines[] support, verified 2027 US common Standard-size FBA rate table (src/fba-rates-2027.mjs) with landed domestic cap & $50 cliff, and exact-rational Q31 full-month mandatory + greedy ramp-up + deterministic 5-quintile stratification (N_active > 5) with T_eff = max(T, 10) for verified non-empty T >= 0 while preserving byte-exact frozen r50-57 replay."
   ],
-  "revision": 56
+  "revision": 58
 }
