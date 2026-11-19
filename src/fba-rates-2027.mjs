@@ -149,6 +149,25 @@ const PLACEMENT_MINIMAL_LARGE_LB = Object.freeze([
 
 // VERIFIED_2027_RETURN_THRESHOLDS is owned by and re-exported from src/fee-basis.mjs to keep the module graph acyclic.
 
+const STORAGE_2027_RATES = { off_peak: 0.78, peak: 2.40 };
+
+/**
+ * Return the live 2027 US Standard-size rate tables & metadata for immutable evaluation fingerprinting.
+ * Shares exact live rate objects with lookup functions so any rate-cell change alters evidence_bundle_sha256.
+ */
+export function getFba2027RateTableSnapshot() {
+  return {
+    metadata: FBA_2027_METADATA,
+    small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
+    large_standard_2027_lb: LARGE_STANDARD_2027_LB,
+    large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
+    placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
+    placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
+    storage_usd_per_cuft_month: STORAGE_2027_RATES,
+    verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS,
+  };
+}
+
 function parsePackage(pkg) {
   const dims = resolvePackageDimsRat(pkg);
   if (!dims || !dims.wtLbRat || !dims.shipLbRat) return null;
@@ -377,7 +396,7 @@ export function lookupStorageFee2027({
   if (hasOffPeak && hasPeak) {
     return { status: 'needs_calculator_verification', reason: 'Storage window mixes Jan–Sep ($0.78) and Oct–Dec ($2.40) rates; evaluate seasons separately.' };
   }
-  const rateUsdPerCuftMonth = hasPeak ? 2.40 : 0.78;
+  const rateUsdPerCuftMonth = hasPeak ? STORAGE_2027_RATES.peak : STORAGE_2027_RATES.off_peak;
   const allocatedRat = divBigRat(
     mulBigRat(mulBigRat(cls.rawRat.cubicFtRat, toBigRat(rateUsdPerCuftMonth)), toBigRat(average_inventory_days)),
     { n: 30n, d: 1n },
