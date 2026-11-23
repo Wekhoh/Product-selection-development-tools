@@ -306,18 +306,35 @@ function isTrustedAbsolutePath(candidatePath, platform = process.platform) {
   return pathPosix.isAbsolute(trimmed);
 }
 
+function isWinStylePath(p) {
+  return typeof p === 'string' && (/^[A-Za-z]:[\\/]/.test(p) || /^\\\\/.test(p));
+}
+
 function isInsideDirectory(parentDir, candidatePath, platform = process.platform) {
-  if (platform === 'win32' && (/^[A-Za-z]:[\\/]/.test(parentDir) || /^\\\\/.test(parentDir)) && (/^[A-Za-z]:[\\/]/.test(candidatePath) || /^\\\\/.test(candidatePath))) {
+  const parentWin = isWinStylePath(parentDir);
+  const candWin = isWinStylePath(candidatePath);
+  if (parentWin !== candWin) return false;
+  if (parentWin) {
     const rel = pathWin32.relative(pathWin32.resolve(parentDir).toLowerCase(), pathWin32.resolve(candidatePath).toLowerCase());
     return Boolean(rel) && rel !== '.' && !rel.startsWith('..') && !pathWin32.isAbsolute(rel);
+  }
+  if (platform !== 'win32' || (typeof parentDir === 'string' && parentDir.startsWith('/'))) {
+    const rel = pathPosix.relative(pathPosix.resolve(parentDir), pathPosix.resolve(candidatePath));
+    return Boolean(rel) && rel !== '.' && !rel.startsWith('..') && !pathPosix.isAbsolute(rel);
   }
   const rel = relative(resolve(parentDir), resolve(candidatePath));
   return Boolean(rel) && rel !== '.' && !rel.startsWith('..') && !isAbsolute(rel);
 }
 
 function isSameDirectory(dirA, dirB, platform = process.platform) {
-  if (platform === 'win32' && (/^[A-Za-z]:[\\/]/.test(dirA) || /^\\\\/.test(dirA)) && (/^[A-Za-z]:[\\/]/.test(dirB) || /^\\\\/.test(dirB))) {
+  const aWin = isWinStylePath(dirA);
+  const bWin = isWinStylePath(dirB);
+  if (aWin !== bWin) return false;
+  if (aWin) {
     return pathWin32.resolve(dirA).toLowerCase() === pathWin32.resolve(dirB).toLowerCase();
+  }
+  if (platform !== 'win32' || (typeof dirA === 'string' && dirA.startsWith('/'))) {
+    return pathPosix.resolve(dirA) === pathPosix.resolve(dirB);
   }
   return resolve(dirA) === resolve(dirB);
 }
@@ -327,29 +344,41 @@ function isSameOrInsideDirectory(parentDir, candidatePath, platform = process.pl
 }
 
 function joinForPlatform(platform, ...segments) {
-  if (platform === 'win32' && /^[A-Za-z]:[\\/]|^\\\\/.test(segments[0] || '')) {
+  if (isWinStylePath(segments[0])) {
     return pathWin32.join(...segments);
+  }
+  if (platform !== 'win32' || (typeof segments[0] === 'string' && segments[0].startsWith('/'))) {
+    return pathPosix.join(...segments);
   }
   return join(...segments);
 }
 
 function resolveForPlatform(platform, ...segments) {
-  if (platform === 'win32' && /^[A-Za-z]:[\\/]|^\\\\/.test(segments[0] || '')) {
+  if (isWinStylePath(segments[0])) {
     return pathWin32.resolve(...segments);
+  }
+  if (platform !== 'win32' || (typeof segments[0] === 'string' && segments[0].startsWith('/'))) {
+    return pathPosix.resolve(...segments);
   }
   return resolve(...segments);
 }
 
 function dirnameForPlatform(platform, p) {
-  if (platform === 'win32' && /^[A-Za-z]:[\\/]|^\\\\/.test(p || '')) {
+  if (isWinStylePath(p)) {
     return pathWin32.dirname(p);
+  }
+  if (platform !== 'win32' || (typeof p === 'string' && p.startsWith('/'))) {
+    return pathPosix.dirname(p);
   }
   return dirname(p);
 }
 
 function basenameForPlatform(platform, p) {
-  if (platform === 'win32' && /^[A-Za-z]:[\\/]|^\\\\/.test(p || '')) {
+  if (isWinStylePath(p)) {
     return pathWin32.basename(p);
+  }
+  if (platform !== 'win32' || (typeof p === 'string' && p.startsWith('/'))) {
+    return pathPosix.basename(p);
   }
   return basename(p);
 }
@@ -519,7 +548,7 @@ function evaluateCodexInstallLocation(realTargetPath, {
   if (typeof posixHome === 'string' && isTrustedAbsolutePath(posixHome, platform)) {
     const cleanHome = posixHome.trim();
     for (const sub of ['.codex', '.local/bin', '.local/lib', '.npm-global', '.nvm', '.volta', '.fnm', '.cargo/bin']) {
-      rawPosixApproved.push(join(cleanHome, sub));
+      rawPosixApproved.push(pathPosix.join(cleanHome, sub));
     }
   }
 
@@ -812,13 +841,13 @@ export function resolveCodexCommand(codexBin = 'codex', {
 
   if (platform !== 'win32') {
     for (const dir of pathDirs) {
-      const candidate = join(dir, trimmed);
+      const candidate = pathPosix.join(dir, trimmed);
       if (fsImpl.existsSync(candidate)) {
         const realTarget = requireCandidateRealpath(candidate);
         return finalizeResolved({
           command: realTarget,
           prefixArgs: [],
-          resolvedShimPath: resolve(candidate),
+          resolvedShimPath: pathPosix.resolve(candidate),
           resolvedTargetPath: realTarget,
         });
       }

@@ -3008,6 +3008,18 @@ test('Round 3 codex-runner regressions (P0-24, P0-26, P0-27, P0-28, P1-02, P1-06
         true,
         `Expected approved Windows install location: ${approvedWinTarget}`,
       );
+      // Cross-platform Linux host regression: POSIX cwd / tempDirRoot must NEVER collide with C:\ Windows paths!
+      assert.equal(
+        isApprovedInstallLocation(approvedWinTarget, {
+          platform: 'win32',
+          env: winEnv,
+          realpathFn: p => p,
+          cwd: '/home/runner/work/repo',
+          tempDirRoot: '/tmp',
+        }),
+        true,
+        `Expected approved Windows install location under POSIX host cwd: ${approvedWinTarget}`,
+      );
     }
 
     for (const rejectedWinTarget of [
