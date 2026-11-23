@@ -9,6 +9,7 @@
   },
   "scripts": {
     "test": "node --test",
-    "trial": "node src/cli.mjs"
+    "trial": "node src/cli.mjs",
+    "phase2": "node src/phase2-cli.mjs"
   }
 }

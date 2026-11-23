@@ -1,32 +1,100 @@
 /**
  * Phase 2 operational CLI for the local SQLite store (Core 5 business objects),
- * historical ledger/lock import, frozen replay verification, queue resume, and lineage trace.
- * Read-only inspection commands (status, trace) open SQLite strictly read-only without mutating
- * active in-flight requests. Leaves legacy src/cli.mjs completely untouched.
+ * multi-channel discovery planning & anti-convergence coverage audit, Stage-1 price-band
+ * denoising, Stage-2 contact-sheet rendering, Gate 1A/1B local evaluation, unknown-attempt
+ * reconciliation, historical ledger/lock import, frozen replay & report export, queue resume,
+ * and lineage trace.
+ * Read-only inspection commands (status, trace, coverage, plan-discovery) open SQLite strictly
+ * read-only without mutating active in-flight requests. Leaves legacy src/cli.mjs untouched.
  */
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { openSelectionStore } from './store.mjs';
+import { canonicalJson, computeEvidenceBundleHash, openSelectionStore, sha256Hex } from './store.mjs';
+import { getFba2027RateTableSnapshot, solveMinPriceForMargin2027 } from './fba-rates-2027.mjs';
+import { buildFunnelLedger, checkFormDuplicates } from './funnel-ledger.mjs';
 import {
   importRecoveryLockFile,
   importRequestLedgerFile,
   importRetainedAssetsManifest,
   replayBatchIntoStore,
 } from './history-import.mjs';
+import { attachGate1APriceCliffStress, runGate1AForForm, runGate1BForForm,
+  runOptionalStage12LunaTriage, runOptionalTerraWorkflowTask } from './pipeline.mjs';
+import {
+  evaluateGate0CategoryBoundary,
+  analyzeMainstreamPriceBand,
+  tightenClusterBands,
+} from './price-band.mjs';
+import {
+  auditDiscoveryCoverage,
+  planDiscoveryBatch,
+} from './discovery-channels.mjs';
+import { attachDiscovery, attachStoreDiscoveryProvenance, prepareDiscovery } from './discovery.mjs';
+import { scoreBatch } from './scoring.mjs';
+import { renderReport } from './report.mjs';
+import { ingestTrialSpecification } from './raw-ingest.mjs';
+import { assertNoRawPii, containsSecretToken, sanitizeDiagnosticText } from './contracts.mjs';
+import {
+  WORKFLOW_RESPONSES_TASKS,
+  OpenAiClient,
+  assertAuthorizedReviewExecutionPolicy,
+  assertSafeOpenAiAccountScope,
+  assertValidMonthUtc,
+  buildBatchJsonl,
+  buildWorkflowTaskRequest,
+  currentMonthUtc,
+  inspectLegacyAutopilotBudget,
+  openOpenAiBudgetLedger,
+  resolveCodexCommand,
+  runCodexEvidenceReview,
+  verifySavedCodexReceipt,
+} from './openai/index.mjs';
+
+const THIS_DIR = dirname(fileURLToPath(import.meta.url));
+const CONTACT_SHEET_SCRIPT = resolve(THIS_DIR, '..', 'scripts', 'render_contact_sheet.py');
+const ioCode = error => (typeof error?.code === 'string' && /^[A-Z_]+$/.test(error.code) ? error.code : 'IO_ERROR');
+const pathKey = value => (process.platform === 'win32' ? value.toLowerCase() : value);
 
 const USAGE = [
   '用法：node src/phase2-cli.mjs <command> [options]',
   '命令：',
   '  init            --db <sqlite-path> [--reconcile-crashed]',
   '  import-history  --db <sqlite-path> [--recovery <file>...] [--ledger <file>...] [--assets <manifest.json>]',
-  '  replay          --db <sqlite-path> --batch <batch.json> --profile <profile.json> [--profile-revision <n>] [--discovery <bundle.json>] [--verify-result <sha256>] [--verify-html <sha256>]',
+  '  replay          --db <sqlite-path> --batch <batch.json> --profile <profile.json> [--profile-revision <n>] [--discovery <bundle.json>] [--verify-result <sha256>] [--verify-html <sha256>] [--output <dir>]',
+  '  export-report   --db <sqlite-path> --batch <batch.json> --profile <profile.json> --output <dir> [--profile-revision <n>] [--discovery <bundle.json>]',
   '  status          --db <sqlite-path>  (只读，不干扰在途请求)',
-  '  resume-1688     --db <sqlite-path> --login-verified --city <city> --quantity <n> --sku <sku> --validity <YYYY-MM-DD> [--form <paused-form-id>] [--as-of <YYYY-MM-DD>]',
   '  trace           --db <sqlite-path> --form <form-id>  (只读，不干扰在途请求)',
+  '  coverage        --db <sqlite-path>  (只读，输出多通道反同质化覆盖审计)',
+  '  plan-discovery  --db <sqlite-path> [--budget <n>]  (只读，按 5 路径配额生成下一批挖掘任务)',
+  '  gate1a          --db <sqlite-path> --input <gate1a-spec.json>',
+  '  gate1b          --db <sqlite-path> --input <gate1b-spec.json> [--as-of <YYYY-MM-DD>]',
+  '  reconcile       --db <sqlite-path> --attempt <id> --status <completed|failed|permanently_locked> [--note <text>] [--sif-units <n>] [--ss-mcp-units <n>] [--ss-web-units <n>] [--exa-calls <n>] [--confirmed-zero-charge]',
+  '  resume-1688     --db <sqlite-path> --login-verified --city <city> --quantity <n> --sku <sku> --validity <YYYY-MM-DD> [--form <paused-form-id>] [--as-of <YYYY-MM-DD>]',
+  '  price-band         --input <listings.json> [--output <out.json>]  (无状态，执行 Gate-0 边界 + Stage-1 主流价位带去噪)',
+  '  contact-sheet      --input <items.json> --output <sheet.png> [--manifest-out <out.json>] [--title <text>] [--offline]',
+  '  openai-status      --db <sqlite> [--legacy-budget <sqlite>] [--account-scope <scope>] [--month <YYYY-MM>]  (只读)',
+  '  openai-reconcile   --db <sqlite> [--legacy-budget <sqlite>] [--enable --confirm-auto-recharge-off --confirm-hard-limit | --disable] [--monthly-limit-cents <0..20000>] [--same-month-pending-buffer-cents <0..2000>] [--account-scope <scope>] [--attempt <id> --status <completed|failed_known|pending_recovery> --note <text> (--usage-cost-micros <n> | --posted-billed-cents <n> | --confirmed-zero-charge)]',
+  '  luna-triage        --db <sqlite> --credential-file <json> --listings <listings.json> [--contact-sheet <png>] [--detail <low|high|auto>] --output <out.json>',
+  '  openai-task        --db <sqlite> --credential-file <json> --task <social-bridge|spec-matcher|1688-vision|review-judge|rights-prescreen> --input <task.json> --output <out.json> [--background] [--progress-file <progress.json>] [--max-tool-calls <n>] [--delete-after]',
+  '  openai-cancel      --db <sqlite> --credential-file <json> --attempt <id> [--output <out.json>]',
+  '  solve-min-price    --input <spec.json> [--output <out.json>]',
+  '  dedupe-forms       --db <sqlite> --input <leads-or-forms.json> [--output <out.json>]',
+  '  funnel-ledger      --db <sqlite> [--since <ISO-timestamp>] [--output <out.json>]',
+  '  openai-batch-build --task <social-bridge|spec-matcher|1688-vision|review-judge|rights-prescreen> --input <items.json> --output <batch.jsonl> [--max-tool-calls <n>]',
+  '  ingest-trial       --input <spec.json> --profile <profile.json> [--output <out.batch.json>]  (无状态，校验原始回执 ASIN 溯源并生成 r59 双季批次)',
+  '  redteam-review     --packet <packet.json> --output <review.json> [--effort <xhigh|max>] [--image <file>...] [--dry-run | --offline]  (未传 --dry-run/--offline 时调用本地订阅 codex exec)',
   '',
 ].join('\n');
+
+const STATELESS_COMMANDS = new Set(['price-band', 'solve-min-price', 'contact-sheet', 'openai-batch-build', 'ingest-trial', 'redteam-review']);
+const LIVE_COMMANDS = new Set(['luna-triage', 'openai-task', 'openai-cancel']);
+const OPENAI_DB_COMMANDS = new Set(['openai-status', 'openai-reconcile', ...LIVE_COMMANDS]);
+const READ_ONLY_DB_COMMANDS = new Set(['status', 'trace', 'coverage', 'plan-discovery', 'openai-status', 'dedupe-forms', 'funnel-ledger']);
 
 class Phase2CliError extends Error {}
 
@@ -37,7 +105,775 @@ function requireOption(value, label) {
   return value.trim();
 }
 
-export async function runPhase2Cli(args = process.argv.slice(2), streams = { stdout: process.stdout, stderr: process.stderr }) {
+function parseOptionalNonNegNumber(value, label) {
+  if (value === undefined) return 0;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Phase2CliError(`参数 --${label} 必须为非负数字。`);
+  }
+  return n;
+}
+
+function parseOptionalNonNegSafeInt(value, label) {
+  if (value === undefined) return undefined;
+  if (!/^\d+$/.test(String(value).trim())) {
+    throw new Phase2CliError(`参数 --${label} 必须为非负整数。`);
+  }
+  const n = Number(String(value).trim());
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new Phase2CliError(`参数 --${label} 必须为安全非负整数。`);
+  }
+  return n;
+}
+
+function sanitizeCliDisplayPath(rawPath) {
+  if (!rawPath || rawPath === ':memory:') return ':memory:';
+  const abs = resolve(String(rawPath));
+  const rel = relative(resolve(process.cwd()), abs).replace(/\\/g, '/');
+  if (rel && !rel.startsWith('..') && !isAbsolute(rel)) {
+    return sanitizeDiagnosticText(rel);
+  }
+  return `[REDACTED_PATH]/${sanitizeDiagnosticText(basename(abs))}`;
+}
+
+function isSamePhysicalFileCli(pathA, pathB) {
+  if (!pathA || !pathB || pathA === ':memory:' || pathB === ':memory:') return false;
+  const absA = resolve(String(pathA));
+  const absB = resolve(String(pathB));
+  if (pathKey(absA) === pathKey(absB)) return true;
+
+  const resolveExistingOrParent = p => {
+    try { return realpathSync(p); }
+    catch {
+      try { return join(realpathSync(dirname(p)), basename(p)); }
+      catch { return p; }
+    }
+  };
+  const realA = resolveExistingOrParent(absA);
+  const realB = resolveExistingOrParent(absB);
+  if (pathKey(realA) === pathKey(realB)) return true;
+
+  try {
+    if (existsSync(absA) && existsSync(absB)) {
+      const stA = statSync(absA, { bigint: true });
+      const stB = statSync(absB, { bigint: true });
+      if (stA.ino !== 0n && stA.dev === stB.dev && stA.ino === stB.ino) {
+        return true;
+      }
+    }
+  } catch { /* ignore stat errors on missing paths */ }
+  return false;
+}
+
+async function preflightSingleFileDestination(outputPath, protectedPaths = []) {
+  const absOut = resolve(outputPath);
+  if (existsSync(absOut)) {
+    let lstOut;
+    let stOut;
+    try {
+      lstOut = lstatSync(absOut);
+      stOut = statSync(absOut);
+    } catch (error) {
+      throw new Phase2CliError(`无法检查输出路径状态（${ioCode(error)}）。`);
+    }
+    if (lstOut.isDirectory() || stOut.isDirectory()) {
+      throw new Phase2CliError('输出路径指向已存在的目录；请指定具体输出文件路径。');
+    }
+    if (!stOut.isFile()) {
+      throw new Phase2CliError('输出路径不能指向特殊设备、管道或非普通文件。');
+    }
+  }
+  const outDir = dirname(absOut);
+  try {
+    await mkdir(outDir, { recursive: true });
+  } catch (error) {
+    throw new Phase2CliError(`无法创建输出目录（${ioCode(error)}）。`);
+  }
+  const canonicalOutDir = await realpath(outDir);
+  let targetKey = pathKey(join(canonicalOutDir, basename(absOut)));
+  try {
+    targetKey = pathKey(await realpath(absOut));
+  } catch { /* file may not exist yet */ }
+
+  for (const p of protectedPaths) {
+    if (!p || p === ':memory:') continue;
+    if (isSamePhysicalFileCli(absOut, p)) {
+      throw new Phase2CliError('输出路径不能覆盖输入、数据包、可执行脚本或图片文件；请选择不同的 --output 路径。');
+    }
+    let pKey;
+    try { pKey = pathKey(await realpath(p)); }
+    catch { pKey = pathKey(resolve(p)); }
+    if (pKey === targetKey) {
+      throw new Phase2CliError('输出路径不能覆盖输入、数据包、可执行脚本或图片文件；请选择不同的 --output 路径。');
+    }
+  }
+
+  const tmp = join(canonicalOutDir, `.${basename(absOut)}.${randomUUID()}.tmp`);
+  let handle;
+  try {
+    handle = await open(tmp, 'wx', 0o600);
+  } catch (error) {
+    throw new Phase2CliError(`无法创建受保护的临时输出文件（${ioCode(error)}）。`);
+  }
+  return { absOut, tmp, handle, closed: false, cleaned: false };
+}
+
+async function cleanupStagedSingleFile(stageState) {
+  if (!stageState || stageState.cleaned) return;
+  stageState.cleaned = true;
+  if (stageState.handle && !stageState.closed) {
+    stageState.closed = true;
+    try { await stageState.handle.close(); } catch { /* ignore */ }
+  }
+  if (stageState.tmp) {
+    try { await unlink(stageState.tmp); } catch { /* ignore */ }
+  }
+}
+
+async function commitStagedSingleFile(stageState, bytes) {
+  const expectedSha = sha256Hex(bytes);
+  try {
+    try {
+      await stageState.handle.writeFile(bytes);
+    } finally {
+      if (!stageState.closed) {
+        stageState.closed = true;
+        await stageState.handle.close();
+      }
+    }
+    await rename(stageState.tmp, stageState.absOut);
+    stageState.cleaned = true;
+    const readback = await readFile(stageState.absOut);
+    const actualSha = sha256Hex(readback);
+    if (actualSha !== expectedSha) {
+      throw new Error('Output readback SHA-256 mismatch.');
+    }
+    return actualSha;
+  } catch (error) {
+    await cleanupStagedSingleFile({ ...stageState, cleaned: false });
+    throw new Phase2CliError(`写入输出文件失败（${ioCode(error)}）。`);
+  }
+}
+
+async function writeSingleFileSafe(outputPath, bytes, protectedPaths = []) {
+  const stageState = await preflightSingleFileDestination(outputPath, protectedPaths);
+  return commitStagedSingleFile(stageState, bytes);
+}
+
+/**
+ * Safely read and parse a UTF-8 JSON file without EVER echoing raw file bytes/content in error messages.
+ */
+async function readJsonFileSafe(absPath, label) {
+  let bytes;
+  try {
+    bytes = await readFile(absPath);
+  } catch (error) {
+    throw new Phase2CliError(`${label}无法读取（${ioCode(error)}，文件：${basename(absPath)}）。`);
+  }
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Phase2CliError(`${label}不是有效的 UTF-8 编码文件（文件：${basename(absPath)}）。`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Phase2CliError(`${label}不是有效的 JSON 格式（文件：${basename(absPath)}）；请修正后重新运行。`);
+  }
+}
+
+/**
+ * Collision-safe, staged publication matching src/cli.mjs:
+ *  - Verifies no output file collides with any input/profile/discovery/db file.
+ *  - Stages temp files with 'wx', invalidates older receipt via status:'writing',
+ *    atomically renames, verifies readback SHA-256 of both result.json and index.html,
+ *    and writes a failure receipt if publication fails mid-way.
+ */
+async function writeReportArtifacts(outputDir, {
+  resultBytes,
+  htmlBytes,
+  resultSha,
+  htmlSha,
+  summary,
+  profileRevision,
+  protectedInputPaths = [],
+}) {
+  const absOut = resolve(outputDir);
+  try {
+    await mkdir(absOut, { recursive: true });
+  } catch (error) {
+    throw new Phase2CliError(`无法创建输出目录（${ioCode(error)}）。`);
+  }
+  const canonicalOut = await realpath(absOut);
+  const protectedKeys = new Set();
+  for (const p of protectedInputPaths) {
+    if (!p || p === ':memory:') continue;
+    try {
+      protectedKeys.add(pathKey(await realpath(p)));
+    } catch {
+      protectedKeys.add(pathKey(resolve(p)));
+    }
+  }
+  for (const name of ['result.json', 'index.html', 'receipt.json']) {
+    if (protectedKeys.has(pathKey(join(canonicalOut, name)))) {
+      throw new Phase2CliError('输出文件会覆盖输入、评分配置、发现记录或数据库文件；请选择另一个输出目录。');
+    }
+  }
+
+  const runId = randomUUID();
+  const pending = new Set();
+  const published = [];
+  const files = { 'result.json': resultBytes, 'index.html': htmlBytes };
+  const expected = {
+    'result.json': { sha256: resultSha, bytes: resultBytes.length },
+    'index.html': { sha256: htmlSha, bytes: htmlBytes.length },
+  };
+  const baseReceipt = {
+    schema_version: 1,
+    kind: 'phase2_report_export',
+    run_id: runId,
+    started_at: new Date().toISOString(),
+    profile_revision: profileRevision,
+    result_sha256: resultSha,
+    html_sha256: htmlSha,
+    summary,
+  };
+
+  const stage = async (name, bytes) => {
+    const tmp = join(canonicalOut, `.${name}.${runId}.tmp`);
+    const handle = await open(tmp, 'wx');
+    pending.add(tmp);
+    try { await handle.writeFile(bytes); }
+    finally { await handle.close(); }
+    return tmp;
+  };
+  const commit = async (tmp, name) => {
+    await rename(tmp, join(canonicalOut, name));
+    pending.delete(tmp);
+  };
+  const writeReceipt = async value => {
+    const tmp = await stage('receipt.json', Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8'));
+    await commit(tmp, 'receipt.json');
+  };
+  const cleanup = async () => {
+    for (const tmp of [...pending]) {
+      try { await unlink(tmp); pending.delete(tmp); }
+      catch (err) { if (err.code === 'ENOENT') pending.delete(tmp); }
+    }
+  };
+
+  try {
+    const staged = [];
+    for (const [name, bytes] of Object.entries(files)) {
+      staged.push([name, await stage(name, bytes)]);
+    }
+    await writeReceipt({ ...baseReceipt, status: 'writing', expected_outputs: expected });
+    for (const [name, tmp] of staged) {
+      await commit(tmp, name);
+      published.push(name);
+    }
+    const outputs = {};
+    for (const name of Object.keys(files)) {
+      const actual = await readFile(join(canonicalOut, name));
+      outputs[name] = { sha256: sha256Hex(actual), bytes: actual.length };
+      if (outputs[name].sha256 !== expected[name].sha256) {
+        throw new Error('Output readback SHA-256 does not match staged bytes.');
+      }
+    }
+    await writeReceipt({
+      ...baseReceipt,
+      status: 'complete',
+      completed_at: new Date().toISOString(),
+      outputs,
+    });
+    return {
+      output_dir: sanitizeDiagnosticText(canonicalOut),
+      result_sha256: resultSha,
+      html_sha256: htmlSha,
+    };
+  } catch (error) {
+    await cleanup();
+    let failedReceiptWritten = false;
+    try {
+      await writeReceipt({
+        ...baseReceipt,
+        status: 'failed',
+        failed_at: new Date().toISOString(),
+        error_code: ioCode(error),
+        published_outputs: published,
+        expected_outputs: expected,
+        temporary_files_remaining: [...pending].map(p => basename(p)),
+      });
+      failedReceiptWritten = true;
+    } catch {
+      await cleanup();
+    }
+    throw new Phase2CliError(
+      `输出未完整写入（${ioCode(error)}）。已发布：${published.join('、') || '无'}；${failedReceiptWritten ? 'receipt.json 已记录失败状态' : '失败收据未能写入，请核对输出目录'}。`,
+    );
+  }
+}
+
+const PUBLIC_LEGACY_STATUS_LABELS = new Set([
+  'complete',
+  'completed',
+  'failed',
+  'failed_known',
+  'rejected',
+  'cancelled',
+  'in_progress',
+  'pending',
+  'pending_recovery',
+  'unknown_needs_reconciliation',
+  'error',
+  'expired',
+  'not_submitted',
+]);
+
+function sanitizePublicStatusHistogram(rawCounts) {
+  const safe = Object.create(null);
+  if (!rawCounts || typeof rawCounts !== 'object') return safe;
+  for (const [k, v] of Object.entries(rawCounts)) {
+    const count = typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : 0;
+    if (count === 0) continue;
+    const normKey = String(k).trim().toLowerCase();
+    const bucket = PUBLIC_LEGACY_STATUS_LABELS.has(normKey) ? normKey : 'unknown';
+    safe[bucket] = (safe[bucket] ?? 0) + count;
+  }
+  return safe;
+}
+
+function formatNarrowLegacySummary(leg) {
+  if (!leg || typeof leg !== 'object') return null;
+  return {
+    recognized_schema: Boolean(leg.recognized_schema),
+    month_utc: leg.month_utc,
+    total_rows: leg.total_rows,
+    status_counts: sanitizePublicStatusHistogram(leg.status_counts),
+    unresolved_count: leg.unresolved_count,
+    has_unresolved_holds: Boolean(leg.has_unresolved_holds),
+    same_month_reserved_cents: leg.same_month_reserved_cents,
+    total_reserved_cents_all_months: leg.total_reserved_cents_all_months,
+  };
+}
+
+function formatNarrowLedgerStatus(st) {
+  if (!st || typeof st !== 'object') return st;
+  const pol = st.policy ?? {};
+  const mon = st.monthly ?? {};
+  const activeFences = Array.isArray(st.active_fences) ? st.active_fences : [];
+  const computedCrossMonthCents = activeFences
+    .filter(f => f && f.month_utc && mon.month_utc && f.month_utc !== mon.month_utc)
+    .reduce((sum, f) => sum + (Number.isSafeInteger(f.reserved_cents) && f.reserved_cents > 0 ? f.reserved_cents : 0), 0);
+  const crossMonthFencedCents = mon.cross_month_fenced_cents ?? mon.prior_month_fenced_cents ?? computedCrossMonthCents;
+  const currentMonthCommitted = mon.current_month_committed_cents ?? mon.committed_cents ?? 0;
+  const blockingCount = Array.isArray(mon.blocking_attempt_ids)
+    ? mon.blocking_attempt_ids.length
+    : activeFences.length;
+
+  return {
+    read_only: Boolean(st.read_only),
+    policy: {
+      account_scope: pol.account_scope,
+      enabled: Boolean(pol.enabled),
+      monthly_limit_cents: pol.monthly_limit_cents,
+      same_month_pending_buffer_cents: pol.same_month_pending_buffer_cents ?? 0,
+      allow_stage4_media: Boolean(pol.allow_stage4_media),
+      auto_recharge_off_confirmed: Boolean(pol.auto_recharge_off_confirmed),
+      hard_monthly_limit_confirmed: Boolean(pol.hard_monthly_limit_confirmed),
+      legacy_reconciled: Boolean(pol.legacy_reconciled),
+      legacy_carryover_cents: pol.legacy_carryover_cents ?? 0,
+      legacy_carryover_month: pol.legacy_carryover_month ?? pol.reconciled_snapshot_month_utc ?? null,
+      updated_at: pol.updated_at ?? null,
+    },
+    monthly: {
+      account_scope: mon.account_scope,
+      month_utc: mon.month_utc,
+      monthly_limit_cents: mon.monthly_limit_cents,
+      legacy_carryover_cents: mon.legacy_carryover_cents ?? 0,
+      current_month_committed_cents: currentMonthCommitted,
+      cross_month_fenced_cents: crossMonthFencedCents,
+      effective_committed_cents: mon.effective_committed_cents ?? 0,
+      same_month_pending_recovery_cents: mon.same_month_pending_recovery_cents ?? 0,
+      remaining_cents: mon.remaining_cents ?? 0,
+      active_attempt_count: mon.active_attempt_count ?? activeFences.length,
+      fenced: Boolean(mon.fenced ?? (activeFences.length > 0)),
+      blocking_attempt_count: blockingCount,
+    },
+  };
+}
+
+function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
+  const {
+    profileRevision = null,
+    profile = null,
+    manifest = null,
+    feeTableSnapshot = null,
+    expectedHtmlSha256 = null,
+    currentAttachmentSha256s = null,
+    attachmentShasByCandidateId = null,
+    verifyReceiptFn = null,
+  } = typeof options === 'number' ? { profileRevision: options } : (options ?? {});
+  const effectiveFeeSnapshot = feeTableSnapshot ?? (profile ? getFba2027RateTableSnapshot() : null);
+
+  const notesByFormId = new Map();
+  if (Array.isArray(boundBatch?.candidates)) {
+    for (const cand of boundBatch.candidates) {
+      if (!cand?.id) continue;
+      const form = store.getCandidateForm(cand.id);
+      if (form?.gate1a_result_json) {
+        try {
+          attachGate1APriceCliffStress(cand, JSON.parse(form.gate1a_result_json));
+        } catch { /* ignore malformed historical JSON */ }
+      }
+      const evals = store.getEvaluationsForForm(cand.id);
+
+      let expectedBundleSha = null;
+      if (form?.spec_sha256 && profile && effectiveFeeSnapshot) {
+        try {
+          const deterministicCandInput = Object.hasOwn(cand, 'evidence_review')
+            ? (() => { const { evidence_review: _adv, ...rest } = cand; return rest; })()
+            : cand;
+          expectedBundleSha = computeEvidenceBundleHash({
+            form_spec_sha256: form.spec_sha256,
+            candidate_input: deterministicCandInput,
+            discovery_manifest: manifest,
+            profile_snapshot: profile,
+            fee_table_snapshot: effectiveFeeSnapshot,
+          });
+        } catch {
+          expectedBundleSha = null;
+        }
+      }
+
+      const matchingBundleEvals = expectedBundleSha
+        ? evals.filter(ev => ev.evidence_bundle_sha256 === expectedBundleSha)
+        : evals;
+      // P1-17: Never fall back to unrelated evidence bundles' review notes when expectedBundleSha was computed!
+      const noteSourceEvals = expectedBundleSha ? matchingBundleEvals : evals;
+
+      const seen = new Set();
+      const notes = [];
+      for (const n of Array.isArray(cand.review_notes) ? cand.review_notes : []) {
+        const key = JSON.stringify(n);
+        if (!seen.has(key)) { seen.add(key); notes.push(n); }
+      }
+      for (const ev of noteSourceEvals) {
+        if (!ev.review_notes_json) continue;
+        try {
+          for (const n of JSON.parse(ev.review_notes_json)) {
+            const key = JSON.stringify(n);
+            if (!seen.has(key)) { seen.add(key); notes.push(n); }
+          }
+        } catch { /* ignore */ }
+      }
+      if (notes.length > 0) {
+        cand.review_notes = notes;
+        notesByFormId.set(cand.id, notes);
+      }
+
+      const perCandSuppliedShas = attachmentShasByCandidateId instanceof Map && attachmentShasByCandidateId.has(cand.id)
+        ? attachmentShasByCandidateId.get(cand.id)
+        : (Array.isArray(currentAttachmentSha256s) ? currentAttachmentSha256s : null);
+
+      const verifyAndSanitizeCandidateReview = (parsedEvRev) => {
+        if (!parsedEvRev || typeof parsedEvRev !== 'object' || Array.isArray(parsedEvRev)) return null;
+        if (
+          parsedEvRev.candidate_id !== cand.id ||
+          (form?.spec_sha256 && (!parsedEvRev.form_spec_sha256 || parsedEvRev.form_spec_sha256 !== form.spec_sha256))
+        ) {
+          return {
+            status: 'unavailable',
+            execution_status: 'stale_packet_mismatch',
+            advisory_only: true,
+            validated_envelope: false,
+            candidate_id: cand.id,
+            reason: 'Evidence review candidate_id or form_spec_sha256 does not match current candidate specification.',
+          };
+        }
+        const boundShas = Array.isArray(parsedEvRev.attachment_sha256s) ? parsedEvRev.attachment_sha256s : [];
+        const attachmentMismatch = boundShas.length > 0
+          ? (!perCandSuppliedShas || perCandSuppliedShas.length !== boundShas.length || boundShas.some((h, idx) => h !== perCandSuppliedShas[idx]))
+          : (perCandSuppliedShas !== null && perCandSuppliedShas.length > 0);
+        if (attachmentMismatch) {
+          return {
+            status: 'unavailable',
+            execution_status: 'stale_packet_mismatch',
+            advisory_only: true,
+            validated_envelope: false,
+            candidate_id: cand.id,
+            reason: 'Evidence review requires matching current per-candidate attachment digests on export.',
+          };
+        }
+        if (typeof verifyReceiptFn === 'function' && parsedEvRev.status === 'ready') {
+          const recCheck = verifyReceiptFn(parsedEvRev);
+          if (!recCheck || recCheck.verified !== true) {
+            return {
+              status: 'unavailable',
+              execution_status: 'unverified_execution_provenance',
+              advisory_only: true,
+              validated_envelope: false,
+              candidate_id: cand.id,
+              reason: sanitizeDiagnosticText(recCheck?.reason || 'Evidence review lacks a verified saved execution receipt.'),
+            };
+          }
+        }
+        return parsedEvRev;
+      };
+
+      if (cand.evidence_review !== undefined && cand.evidence_review !== null) {
+        // P1-17: Inline `evidence_review` already present in batch.json MUST undergo the exact same binding, attachment, and receipt checks!
+        cand.evidence_review = verifyAndSanitizeCandidateReview(cand.evidence_review);
+      } else {
+        const candidateEvals = (expectedBundleSha ? matchingBundleEvals : evals).filter(
+          ev => profileRevision === null || profileRevision === undefined || ev.profile_revision === profileRevision,
+        );
+        let selectedReviewJson = undefined;
+        for (const ev of candidateEvals) {
+          if (expectedHtmlSha256 && ev.receipt_json) {
+            try {
+              const rec = JSON.parse(ev.receipt_json);
+              const matchedReceipt = Array.isArray(rec.batch_receipts)
+                ? rec.batch_receipts.find(b => b.batch_html_sha256 === expectedHtmlSha256)
+                : null;
+              if (matchedReceipt && Object.hasOwn(matchedReceipt, 'evidence_review_json')) {
+                selectedReviewJson = matchedReceipt.evidence_review_json;
+                continue;
+              }
+            } catch { /* ignore */ }
+          }
+          if (ev.evidence_review_json) {
+            selectedReviewJson = ev.evidence_review_json;
+          }
+        }
+
+        if (selectedReviewJson) {
+          try {
+            const parsedEvRev = JSON.parse(selectedReviewJson);
+            const verified = verifyAndSanitizeCandidateReview(parsedEvRev);
+            if (verified) cand.evidence_review = verified;
+          } catch { /* ignore */ }
+        }
+      }
+    }
+  }
+  const shortlistForms = store.db.prepare(`
+    SELECT form_id, lifecycle_status, spec_sha256, label, gate1a_result_json, gate1b_result_json, negotiation_shortlist_json
+    FROM candidate_forms
+    WHERE negotiation_shortlist_json IS NOT NULL
+    ORDER BY form_id ASC
+  `).all();
+  const storedShortlist = [];
+  for (const row of shortlistForms) {
+    // Only Gate 1B economically rejected forms where all scenarios fell below 30% may enter negotiation_shortlist;
+    // 30%-crossing / gate1b_pending forms never enter the shortlist.
+    if (row.lifecycle_status !== 'gate1b_rejected') continue;
+    let g1b = null;
+    try {
+      g1b = row.gate1b_result_json ? JSON.parse(row.gate1b_result_json) : null;
+    } catch { g1b = null; }
+    if (!g1b || g1b.margin_interval_verdict !== 'all_below_30pct') continue;
+    if (g1b.spec_sha256 && g1b.spec_sha256 !== row.spec_sha256) continue;
+    let hasRights = false;
+    for (const raw of [row.gate1a_result_json, row.gate1b_result_json]) {
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed?.specific_rights_conflict_proven === true && (!parsed.spec_sha256 || parsed.spec_sha256 === row.spec_sha256)) {
+          hasRights = true;
+        }
+      } catch { /* ignore */ }
+    }
+    if (hasRights) continue;
+    try {
+      const neg = JSON.parse(row.negotiation_shortlist_json);
+      const disc = neg?.required_discount_fraction ?? neg?.required_reduction_fraction;
+      if (neg && neg.eligible === true && typeof disc === 'number' && Number.isFinite(disc) && disc > 0 && disc <= 0.12) {
+        storedShortlist.push({
+          ...neg,
+          form_id: row.form_id,
+          label: row.label,
+        });
+      }
+    } catch { /* ignore */ }
+  }
+  return { notesByFormId, storedShortlist };
+}
+
+function runPythonContactSheet({ inputPath, outputPath, manifestOut, title, offline }) {
+  const pyArgs = [
+    CONTACT_SHEET_SCRIPT,
+    '--input', resolve(inputPath),
+    '--output', resolve(outputPath),
+  ];
+  if (manifestOut) pyArgs.push('--manifest-out', resolve(manifestOut));
+  if (title) pyArgs.push('--title', title);
+  if (offline) pyArgs.push('--offline');
+
+  const env = { ...process.env, PYTHONUTF8: '1' };
+  const candidates = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python'];
+  let lastRes = null;
+  for (const bin of candidates) {
+    const res = spawnSync(bin, pyArgs, { encoding: 'utf8', env });
+    if (!res.error || res.error.code !== 'ENOENT') {
+      lastRes = res;
+      break;
+    }
+  }
+  if (!lastRes) {
+    throw new Phase2CliError('未找到可用的 Python 3 解释器（python / python3）。');
+  }
+  if (lastRes.status !== 0) {
+    const detail = sanitizeDiagnosticText((lastRes.stderr || lastRes.stdout || 'contact-sheet 脚本执行失败').trim());
+    throw new Phase2CliError(`contact-sheet 渲染失败：${detail}`);
+  }
+  const stdoutText = (lastRes.stdout || '').trim();
+  try {
+    return JSON.parse(stdoutText);
+  } catch {
+    return { ok: true, raw_output: sanitizeDiagnosticText(stdoutText) };
+  }
+}
+
+function sqlitePaths(path) {
+  return path && path !== ':memory:' ? [path, path + '-wal', path + '-shm', path + '-journal'] : [];
+}
+
+function checkOperatorPayload(value) {
+  if (containsSecretToken(value)) throw new Phase2CliError('输入或回执含有凭据标记，请使用已脱敏的数据。');
+  assertNoRawPii(value, 'operator data');
+}
+
+function workflowSearchOptions(task, rawCap) {
+  const maxToolCalls = parseOptionalNonNegSafeInt(rawCap, 'max-tool-calls');
+  if (maxToolCalls === undefined) return {};
+  if (maxToolCalls < 1 || task !== 'rights-prescreen') throw new Phase2CliError('--max-tool-calls 仅适用于权利预筛，且必须大于零。');
+  return { maxToolCalls };
+}
+
+function spendReceipt(ledger, attemptId, accountScope) {
+  const row = ledger.getAttemptById(attemptId, { accountScope });
+  if (!row) return null;
+  return {
+    attempt_id: row.attempt_id, logical_request_id: row.logical_request_id, provider_response_id: row.provider_response_id,
+    model: row.model, status: row.status, content_status: row.content_status, cleanup_status: row.cleanup_status,
+    reserved_cents: row.reserved_cents, usage_cost_micros: row.usage_cost_micros, posted_billed_cents: row.posted_billed_cents,
+    input_tokens: row.usage?.input_tokens ?? null, output_tokens: row.usage?.output_tokens ?? null,
+    reasoning_tokens: row.usage?.output_tokens_details?.reasoning_tokens ?? null,
+    web_search_calls: row.usage?.web_search_calls ?? (row.endpoint === '/v1/decisions' ? 0 : null),
+  };
+}
+
+async function runLiveCommand(command, values, streams, dbPath, accountScope, testHooks) {
+  if (values.offline || values['dry-run']) throw new Phase2CliError('该命令执行实时请求，不能与离线参数一起使用。');
+  const credentialFile = resolve(requireOption(values['credential-file'], 'credential-file'));
+  const inputPath = command === 'openai-cancel' ? null : command === 'luna-triage'
+    ? resolve(requireOption(values.listings, 'listings')) : resolve(requireOption(values.input, 'input'));
+  const output = command === 'openai-cancel' ? values.output : requireOption(values.output, 'output');
+  const sheet = values['contact-sheet'] && resolve(values['contact-sheet']);
+  const progress = values['progress-file'] && resolve(values['progress-file']);
+  const inputs = [credentialFile, inputPath, sheet].filter(Boolean);
+  if (inputs.some(p => sqlitePaths(dbPath).some(s => isSamePhysicalFileCli(p, s))) ||
+      [inputPath, sheet].some(p => isSamePhysicalFileCli(p, credentialFile))) throw new Phase2CliError('凭据、输入与数据库需要各自独立的路径。');
+  const input = inputPath && await readJsonFileSafe(inputPath, '任务输入文件');
+  if (input) checkOperatorPayload(input);
+  const ledger = openOpenAiBudgetLedger(dbPath, testHooks?.testLedgerOptions);
+  let stage;
+  try {
+    const protectedPaths = [...sqlitePaths(dbPath), ...sqlitePaths(ledger._effectiveRegistryPath), ...inputs];
+    if (output) stage = await preflightSingleFileDestination(output, [...protectedPaths, progress]);
+    if (progress) {
+      const progressStage = await preflightSingleFileDestination(progress, [...protectedPaths, output]);
+      await cleanupStagedSingleFile(progressStage);
+    }
+    const client = new OpenAiClient({ ...testHooks?.openAiClientOptions, ledger, credentialFile });
+    const policy = { accountScope, maxRetries: 0 };
+    let result, receipts, ok;
+    if (command === 'openai-cancel') {
+      const attemptId = requireOption(values.attempt, 'attempt');
+      let response;
+      try {
+        response = await client.cancelResponse(attemptId, policy);
+      } catch (error) {
+        if (error.attempt_id !== attemptId || error.not_dispatched ||
+            ledger.getAttemptById(attemptId, { accountScope })?.status !== 'pending_recovery') throw error;
+        response = { status: 'pending_recovery', error_code: error.code };
+      }
+      const receipt = spendReceipt(ledger, attemptId, accountScope);
+      result = { response_status: response.response_status ?? response.status, receipt,
+        ...(response.error_code ? { error_code: response.error_code } : {}) };
+      ok = ['completed','failed_known'].includes(receipt?.status);
+    } else if (command === 'openai-task') {
+      const task = requireOption(values.task, 'task');
+      if (!Object.hasOwn(WORKFLOW_RESPONSES_TASKS, task)) throw new Phase2CliError('未知 Terra 任务。');
+      const requestOptions = workflowSearchOptions(task, values['max-tool-calls']);
+      const background = task === 'rights-prescreen' || values.background === true;
+      if (progress && !background) throw new Phase2CliError('--progress-file 需要后台任务。');
+      Object.assign(policy, { background, deleteAfterPersist: values['delete-after'] === true,
+        ...(progress ? { progressFile: progress } : {}) });
+      const taskResult = await runOptionalTerraWorkflowTask(task, input, {
+        enabled: true, requestOptions,
+        responseExecutor: async request => {
+          policy.logicalRequestId = 'cli-task-' + sha256Hex(canonicalJson([accountScope, task, request, background, policy.deleteAfterPersist]));
+          const prior = ledger.getAttemptByLogicalId(policy.logicalRequestId, { accountScope });
+          if (background && prior?.provider_response_id) {
+            return client.pollBackgroundResponse({ ...policy, attemptId: prior.attempt_id });
+          }
+          return client.createResponse(request, policy);
+        },
+      });
+      const attempt = policy.logicalRequestId && ledger.getAttemptByLogicalId(policy.logicalRequestId, { accountScope });
+      result = { ...taskResult, receipt: attempt ? spendReceipt(ledger, attempt.attempt_id, accountScope) : null };
+      ok = taskResult.status === 'ready';
+    } else {
+      const listings = Array.isArray(input) ? input : input?.listings ?? input?.candidates ?? input?.items;
+      if (!Array.isArray(listings) || !listings.length || listings.length > (sheet ? 16 : 200)) {
+        throw new Phase2CliError('Luna 需要 1 至 200 行候选；单张 4×4 联系表最多 16 行。');
+      }
+      const detail = values.detail ?? 'high';
+      if (!['low','high','auto'].includes(detail)) throw new Phase2CliError('--detail 必须为 low、high 或 auto。');
+      const sheetBytes = sheet ? await readFile(sheet) : null;
+      const candidates = listings.map((row, i) => ({ ...row, candidate_id: row.candidate_id ?? row.asin ?? row.id,
+        ...(sheet ? { tile_index: row.tile_index ?? row.idx ?? i + 1 } : {}) }));
+      policy.logicalRequestId = 'cli-triage-' + sha256Hex(canonicalJson([accountScope, candidates, input.target_spec ?? null,
+        sheetBytes && sha256Hex(sheetBytes), detail, input.gate0_options ?? {}]));
+      const triage = await runOptionalStage12LunaTriage({ enabled: true, client, policy, candidates,
+        contactSheetDataUrl: sheetBytes ? 'data:image/png;base64,' + sheetBytes.toString('base64') : null,
+        imageDetail: detail, targetSpec: input.target_spec, gate0Config: input.gate0_options });
+      const peerIds = new Set(triage.triage?.items.filter(r => r.gate0_status === 'allowed' && r.visual_cluster === 'exact_peer')
+        .map(r => r.candidate_id));
+      const peers = candidates.filter(r => peerIds.has(r.candidate_id)).map(r => ({ ...r, asin: r.asin ?? r.candidate_id }));
+      const bandOptions = { ...input.options, gate0_config: input.gate0_options ?? input.options?.gate0_config };
+      const analysis = analyzeMainstreamPriceBand(peers, bandOptions);
+      const tightened_clusters = peers.length ? tightenClusterBands(analysis, [{ cluster_id: 'exact_peer', asins: peers.map(p => p.asin) }], bandOptions) : null;
+      receipts = [];
+      for (let i = 0; i < triage.request_count; i++) {
+        const row = ledger.getAttemptByLogicalId(policy.logicalRequestId + '-chunk-' + (i + 1), { accountScope });
+        if (row) receipts.push(spendReceipt(ledger, row.attempt_id, accountScope));
+      }
+      result = { ...triage, analysis, tightened_clusters, receipts };
+      ok = triage.status === 'ready';
+    }
+    const out = { ok, command, ...result };
+    checkOperatorPayload(out);
+    if (stage) await commitStagedSingleFile(stage, Buffer.from(JSON.stringify(out, null, 2) + '\n'));
+    streams.stdout.write(JSON.stringify(output ? { ok, command, output: sanitizeCliDisplayPath(output),
+      ...(result.receipt ? { receipt: result.receipt } : {}), ...(receipts ? { receipts } : {}),
+      ...(result.progress_error ? { progress_error: result.progress_error } : {}),
+      ...(result.reason ? { reason: result.reason } : {}) } : out, null, 2) + '\n');
+    return ok ? 0 : 2;
+  } finally {
+    await cleanupStagedSingleFile(stage);
+    ledger.close();
+  }
+}
+
+export async function runPhase2Cli(
+  args = process.argv.slice(2),
+  streams = { stdout: process.stdout, stderr: process.stderr },
+  testHooks = null,
+) {
   try {
     const command = args[0];
     if (!command || command === '--help' || command === '-h') {
@@ -54,6 +890,12 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
         allowPositionals: false,
         options: {
           db: { type: 'string' },
+          input: { type: 'string' },
+          output: { type: 'string' },
+          'manifest-out': { type: 'string' },
+          title: { type: 'string' },
+          offline: { type: 'boolean' },
+          budget: { type: 'string' },
           recovery: { type: 'string', multiple: true },
           ledger: { type: 'string', multiple: true },
           assets: { type: 'string' },
@@ -71,6 +913,47 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
           'as-of': { type: 'string' },
           form: { type: 'string' },
           'profile-revision': { type: 'string' },
+          attempt: { type: 'string' },
+          status: { type: 'string' },
+          note: { type: 'string' },
+          'sif-units': { type: 'string' },
+          'ss-mcp-units': { type: 'string' },
+          'ss-web-units': { type: 'string' },
+          'exa-calls': { type: 'string' },
+          'exa-units': { type: 'string' },
+          'confirmed-zero-charge': { type: 'boolean' },
+          'legacy-budget': { type: 'string' },
+          enable: { type: 'boolean' },
+          disable: { type: 'boolean' },
+          'confirm-auto-recharge-off': { type: 'boolean' },
+          'confirm-hard-limit': { type: 'boolean' },
+          'monthly-limit-cents': { type: 'string' },
+          'same-month-pending-buffer-cents': { type: 'string' },
+          'credential-file': { type: 'string' },
+          'contact-sheet': { type: 'string' },
+          'progress-file': { type: 'string' },
+          'max-tool-calls': { type: 'string' },
+          'delete-after': { type: 'boolean' },
+          background: { type: 'boolean' },
+          detail: { type: 'string' },
+          listings: { type: 'string' },
+          since: { type: 'string' },
+          'account-scope': { type: 'string' },
+          month: { type: 'string' },
+          'usage-cost-micros': { type: 'string' },
+          'posted-billed-cents': { type: 'string' },
+          'provider-response-id': { type: 'string' },
+          'allow-stage4-media': { type: 'boolean' },
+          'disallow-stage4-media': { type: 'boolean' },
+          task: { type: 'string' },
+          packet: { type: 'string' },
+          effort: { type: 'string' },
+          'service-tier': { type: 'string' },
+          'form-spec-sha256': { type: 'string' },
+          image: { type: 'string', multiple: true },
+          'dry-run': { type: 'boolean' },
+          'allow-synthetic': { type: 'boolean' },
+          'codex-bin': { type: 'string' },
         },
       });
     } catch {
@@ -78,17 +961,587 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
     }
 
     const { values } = parsed;
+
+    // Stateless commands that do not require SQLite.
+    if (STATELESS_COMMANDS.has(command)) {
+      if (command === 'ingest-trial') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const profilePath = resolve(requireOption(values.profile, 'profile'));
+        const spec = await readJsonFileSafe(inputPath, '试跑摄入规格文件');
+        const profile = await readJsonFileSafe(profilePath, '评分配置文件');
+        const {
+          raw_receipt_files: _rf,
+          expected_raw_sha256s: _er,
+          non_ledger_auxiliary_files: _na,
+          ledger_db_path: _ld,
+          ...specBodyRaw
+        } = spec ?? {};
+        const sanitizedCandidates = Array.isArray(specBodyRaw.candidates)
+          ? specBodyRaw.candidates.map(entry => {
+              if (!entry || typeof entry !== 'object') return entry;
+              const { raw_receipt_files: _crf, ...restEntry } = entry;
+              return restEntry;
+            })
+          : specBodyRaw.candidates;
+        checkOperatorPayload({ ...specBodyRaw, candidates: sanitizedCandidates });
+        const rawReceiptPaths = Array.isArray(spec?.raw_receipt_files)
+          ? spec.raw_receipt_files.map(fp => resolve(dirname(inputPath), String(fp)))
+          : [];
+        const optLedgerDb = values.db && values.db !== ':memory:' ? resolve(values.db) : null;
+        const {
+          batch,
+          scored,
+          verified_raw_asin_count,
+          per_candidate_verified_asin_counts,
+          verified_receipt_sha256s,
+        } = ingestTrialSpecification(
+          spec,
+          profile,
+          {
+            baseDir: dirname(inputPath),
+            allowSyntheticWithoutReceipts: values['allow-synthetic'] === true,
+            ledgerDbPath: optLedgerDb,
+          },
+        );
+        checkOperatorPayload(batch);
+        let outSha = null;
+        if (values.output) {
+          const outPath = resolve(values.output);
+          outSha = await writeSingleFileSafe(
+            outPath,
+            Buffer.from(`${JSON.stringify(batch, null, 2)}\n`, 'utf8'),
+            [inputPath, profilePath, ...(optLedgerDb ? [optLedgerDb] : []), ...rawReceiptPaths],
+          );
+        }
+        const out = {
+          ok: true,
+          command,
+          profile_revision: scored.profile_revision,
+          verified_raw_asin_count,
+          per_candidate_verified_asin_counts,
+          verified_receipt_count: Object.keys(verified_receipt_sha256s ?? {}).length,
+          summary: scored.summary,
+          ...(values.output ? {
+            output_path: sanitizeCliDisplayPath(values.output),
+            output_sha256: outSha,
+          } : {}),
+        };
+        streams.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'solve-min-price') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const spec = await readJsonFileSafe(inputPath, '定价输入文件');
+        const { quote, mature_price_band, ...assumptions } = spec;
+        if (quote && assumptions.fx_cny_per_usd != null && quote.fx_cny_per_usd != null &&
+            assumptions.fx_cny_per_usd !== quote.fx_cny_per_usd) throw new Phase2CliError('场景汇率与报价汇率不一致。');
+        const solution = solveMinPriceForMargin2027({ ...assumptions,
+          min_retail_price_usd: Math.max(29.99, assumptions.min_retail_price_usd ?? 29.99),
+          ...(quote ? { landed_domestic_quote: quote, fx_cny_per_usd: quote.fx_cny_per_usd ?? assumptions.fx_cny_per_usd } : {}),
+        });
+        const price = solution.feasible_min_price_usd ?? null;
+        const band = mature_price_band?.regular_band_reference ?? mature_price_band?.band ?? mature_price_band;
+        const comparable = Number.isFinite(price) && Number.isFinite(band?.p25_usd) &&
+          Number.isFinite(band?.p75_usd) && band.p25_usd > 0 && band.p25_usd <= band.p75_usd;
+        const comparison = comparable ? (price < band.p25_usd ? 'below_band' : price > band.p75_usd ? 'above_band' : 'within_band') : null;
+        const out = { ok: true, command, solution, min_retail_price_for_30pct_usd: solution.margin_floor === 0.30 ? price : null,
+          mature_band_comparison: comparison };
+        const json = JSON.stringify(out, null, 2) + '\n';
+        if (values.output) await writeSingleFileSafe(values.output, Buffer.from(json), [inputPath]);
+        streams.stdout.write(json);
+        return 0;
+      }
+      if (command === 'price-band') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const payload = await readJsonFileSafe(inputPath, '价位带输入文件');
+        const listings = Array.isArray(payload) ? payload : payload.listings;
+        const gate0Opts = payload?.gate0_options ?? payload?.options?.gate0_config ?? {};
+        const gate0 = payload?.category_check
+          ? evaluateGate0CategoryBoundary(payload.category_check, gate0Opts)
+          : null;
+        const analysis = analyzeMainstreamPriceBand(listings, payload?.options ?? {});
+        const tightened = Array.isArray(payload?.clusters) && payload.clusters.length > 0
+          ? tightenClusterBands(analysis, payload.clusters, payload?.options ?? {})
+          : null;
+        const out = {
+          ok: true,
+          command,
+          ...(gate0 ? { gate0 } : {}),
+          analysis,
+          ...(tightened ? { tightened_clusters: tightened } : {}),
+        };
+        if (values.output) {
+          const outPath = resolve(values.output);
+          await writeSingleFileSafe(outPath, Buffer.from(`${JSON.stringify(out, null, 2)}\n`, 'utf8'), [inputPath]);
+        }
+        streams.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'contact-sheet') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const outputPath = resolve(requireOption(values.output, 'output'));
+        const manifestOut = values['manifest-out'] ? resolve(values['manifest-out']) : null;
+        if (pathKey(outputPath) === pathKey(inputPath) || (manifestOut && pathKey(manifestOut) === pathKey(inputPath))) {
+          throw new Phase2CliError('联系表输出或清单路径不能覆盖输入文件；请选择不同的输出路径。');
+        }
+        const rendered = runPythonContactSheet({
+          inputPath,
+          outputPath,
+          manifestOut,
+          title: values.title ?? null,
+          offline: values.offline === true,
+        });
+        streams.stdout.write(`${JSON.stringify({ ok: true, command, rendered }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'openai-batch-build') {
+        const task = requireOption(values.task, 'task');
+        if (!Object.hasOwn(WORKFLOW_RESPONSES_TASKS, task)) {
+          throw new Phase2CliError(
+            `不支持的 --task "${task}"；可选值：${Object.keys(WORKFLOW_RESPONSES_TASKS).join(' | ')}。`,
+          );
+        }
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const outputPath = resolve(requireOption(values.output, 'output'));
+        const rawPayload = await readJsonFileSafe(inputPath, 'OpenAI Batch 任务输入文件');
+        const rawItems = Array.isArray(rawPayload)
+          ? rawPayload
+          : (Array.isArray(rawPayload?.items)
+            ? rawPayload.items
+            : (Array.isArray(rawPayload?.requests) ? rawPayload.requests : null));
+        if (!Array.isArray(rawItems) || rawItems.length === 0) {
+          throw new Phase2CliError('Batch 输入 JSON 必须为非空数组，或包含非空 items[] 数组的对象。');
+        }
+
+        const batchRequests = rawItems.map((rawItem, idx) => {
+          if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
+            throw new Phase2CliError(`Batch 第 ${idx + 1} 项必须为 JSON 对象。`);
+          }
+          const customId = typeof rawItem.custom_id === 'string' && rawItem.custom_id.trim()
+            ? rawItem.custom_id.trim()
+            : (typeof rawItem.customId === 'string' && rawItem.customId.trim()
+              ? rawItem.customId.trim()
+              : `${task}-${idx + 1}`);
+          const taskPayload = rawItem.input && typeof rawItem.input === 'object' && !Array.isArray(rawItem.input)
+            ? rawItem.input
+            : (() => {
+              const { custom_id: _c1, customId: _c2, ...rest } = rawItem;
+              return rest;
+            })();
+          const body = buildWorkflowTaskRequest(task, taskPayload, {
+            model: 'gpt-6.1-terra',
+            reasoningEffort: 'xhigh',
+            ...workflowSearchOptions(task, values['max-tool-calls']),
+          });
+          return {
+            custom_id: customId,
+            method: 'POST',
+            url: '/v1/responses',
+            body,
+          };
+        });
+
+        const built = buildBatchJsonl(batchRequests, {
+          endpoint: '/v1/responses',
+          allowAstraApi: false,
+        });
+        await writeSingleFileSafe(outputPath, Buffer.from(built.jsonl, 'utf8'), [inputPath]);
+
+        const out = {
+          ok: true,
+          command,
+          task,
+          endpoint: '/v1/responses',
+          model: 'gpt-6.1-terra',
+          reasoning_effort: 'xhigh',
+          service_tier: 'batch',
+          output_path: sanitizeCliDisplayPath(outputPath),
+          line_count: built.line_count,
+          custom_ids: built.custom_ids,
+          jsonl_sha256: built.jsonl_sha256,
+          estimated_micros: built.estimated_micros,
+          estimated_reservation_cents: built.estimated_reservation_cents,
+        };
+        streams.stdout.write(`${JSON.stringify(out, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'redteam-review') {
+        const packetPath = resolve(requireOption(values.packet, 'packet'));
+        const outputPath = resolve(requireOption(values.output, 'output'));
+        const effort = values.effort ? values.effort.trim() : 'xhigh';
+        if (!['xhigh', 'max'].includes(effort)) {
+          throw new Phase2CliError('--effort 必须为 xhigh 或 max。');
+        }
+        const imagePaths = (values.image ?? []).map(p => resolve(p));
+        const isOffline = values.offline === true;
+        const isDryRun = values['dry-run'] === true || isOffline;
+        const mockExecutor = typeof testHooks?.codexMockExecutor === 'function' ? testHooks.codexMockExecutor : null;
+        const testReceiptDir = typeof testHooks?.codexReceiptDir === 'string' ? resolve(testHooks.codexReceiptDir) : undefined;
+        const codexBin = values['codex-bin'] ? values['codex-bin'].trim() : undefined;
+        const protectedCodexPaths = [];
+        if (codexBin && (codexBin.includes('/') || codexBin.includes('\\') || existsSync(resolve(codexBin)))) {
+          protectedCodexPaths.push(resolve(codexBin));
+        }
+        if (!isDryRun && !mockExecutor) {
+          try {
+            const resolvedTarget = resolveCodexCommand(codexBin ?? 'codex', { env: process.env, testMode: false });
+            if (resolvedTarget?.command) protectedCodexPaths.push(resolvedTarget.command);
+            if (resolvedTarget?.resolvedShimPath) protectedCodexPaths.push(resolvedTarget.resolvedShimPath);
+            if (resolvedTarget?.resolvedTargetPath) protectedCodexPaths.push(resolvedTarget.resolvedTargetPath);
+            for (const arg of resolvedTarget?.prefixArgs ?? []) {
+              if (typeof arg === 'string' && existsSync(arg)) protectedCodexPaths.push(resolve(arg));
+            }
+          } catch {
+            // Let runCodexEvidenceReview produce the canonical resolution/install diagnostic if binary is missing/untrusted.
+          }
+        }
+
+        const packet = await readJsonFileSafe(packetPath, '红队复核数据包');
+        if (!isDryRun) {
+          try {
+            assertAuthorizedReviewExecutionPolicy(packet);
+          } catch {
+            throw new Phase2CliError(
+              '数据包缺少已授权的 execution_policy_ref（或为 null / disabled，禁止本地实时执行）；请传入 --dry-run 或 --offline 进行离线校验。',
+            );
+          }
+        }
+
+        const packetSubjectId = typeof packet?.candidate?.subject_id === 'string' && packet.candidate.subject_id.trim()
+          ? packet.candidate.subject_id.trim()
+          : undefined;
+        const explicitFormArg = typeof values.form === 'string' && values.form.trim() ? values.form.trim() : undefined;
+        if (explicitFormArg && packetSubjectId && explicitFormArg !== packetSubjectId) {
+          throw new Phase2CliError(
+            `--form ("${sanitizeDiagnosticText(explicitFormArg)}") 与数据包 candidate.subject_id ("${sanitizeDiagnosticText(packetSubjectId)}") 不一致。`,
+          );
+        }
+        const boundCandidateId = packetSubjectId ?? explicitFormArg;
+        let boundFormSpecSha256 = values['form-spec-sha256'] ? values['form-spec-sha256'].trim() : undefined;
+        const optDbPaths = [];
+        if (values.db && values.db !== ':memory:') {
+          const absDb = resolve(values.db);
+          optDbPaths.push(absDb);
+          if (boundCandidateId && existsSync(absDb)) {
+            const roStore = openSelectionStore(absDb, { readOnly: true });
+            try {
+              const dbForm = roStore.getCandidateForm(boundCandidateId);
+              if (dbForm?.spec_sha256) {
+                if (boundFormSpecSha256 && boundFormSpecSha256 !== dbForm.spec_sha256) {
+                  throw new Phase2CliError(
+                    `--form-spec-sha256 与数据库中候选形态 "${sanitizeDiagnosticText(boundCandidateId)}" 的当前 spec_sha256 不一致。`,
+                  );
+                }
+                boundFormSpecSha256 = dbForm.spec_sha256;
+              }
+            } finally {
+              roStore.close();
+            }
+          }
+        }
+        const serviceTier = values['service-tier'] ? values['service-tier'].trim() : null;
+
+        // P2-11: Preflight and stage protected destination (including directory, special-file, PATH/shim/JS target & --codex-bin checks) BEFORE invoking Codex CLI!
+        const stageState = await preflightSingleFileDestination(outputPath, [
+          packetPath,
+          ...imagePaths,
+          ...protectedCodexPaths,
+          ...optDbPaths,
+        ]);
+        let reviewEnvelope;
+        let outSha;
+        try {
+          reviewEnvelope = await runCodexEvidenceReview(packet, {
+            reasoningEffort: effort,
+            ...(serviceTier ? { serviceTier } : {}),
+            ...(boundCandidateId ? { candidateId: boundCandidateId } : {}),
+            ...(boundFormSpecSha256 ? { formSpecSha256: boundFormSpecSha256 } : {}),
+            imagePaths,
+            dryRun: isDryRun,
+            enabled: !isDryRun,
+            ...(mockExecutor ? { testMode: true, mockExecutor } : {}),
+            ...(testReceiptDir ? { receiptDir: testReceiptDir } : {}),
+            ...(codexBin ? { codexBin } : {}),
+          });
+
+          const serialized = Buffer.from(`${JSON.stringify(reviewEnvelope, null, 2)}\n`, 'utf8');
+          outSha = await commitStagedSingleFile(stageState, serialized);
+        } finally {
+          await cleanupStagedSingleFile(stageState);
+        }
+
+        const summary = {
+          ok: isDryRun || reviewEnvelope.status === 'ready',
+          command,
+          dry_run: isDryRun,
+          ...(isOffline ? { offline: true } : {}),
+          status: reviewEnvelope.status,
+          execution_status: reviewEnvelope.execution_status,
+          content_status: reviewEnvelope.content_status,
+          review_id: reviewEnvelope.review_id,
+          packet_sha256: reviewEnvelope.packet_sha256,
+          payload_sha256: reviewEnvelope.payload_sha256,
+          ...(Array.isArray(reviewEnvelope.attachment_sha256s) ? { attachment_sha256s: reviewEnvelope.attachment_sha256s } : {}),
+          ...(reviewEnvelope.execution_provenance ? { execution_provenance: reviewEnvelope.execution_provenance } : {}),
+          ...(reviewEnvelope.private_receipt_ref ? { private_receipt_ref: reviewEnvelope.private_receipt_ref } : {}),
+          reviewer_label: reviewEnvelope.reviewer_label,
+          disposition_counts: reviewEnvelope.disposition_counts,
+          output_path: sanitizeCliDisplayPath(outputPath),
+          output_sha256: outSha,
+          ...(reviewEnvelope.reason ? { reason: reviewEnvelope.reason } : {}),
+        };
+
+        if (!isDryRun && reviewEnvelope.status !== 'ready') {
+          streams.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+          streams.stderr.write(
+            `Phase 2 CLI 失败：红队复核未生成可用结果（${sanitizeDiagnosticText(reviewEnvelope.reason || reviewEnvelope.status)}）；已将不可用回执保存至输出文件。\n`,
+          );
+          return 2;
+        }
+        streams.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+        return 0;
+      }
+    }
+
+    if (OPENAI_DB_COMMANDS.has(command)) {
+      const rawDb = requireOption(values.db, 'db');
+      const dbPath = rawDb === ':memory:' ? ':memory:' : resolve(rawDb);
+      const accountScope = assertSafeOpenAiAccountScope(
+        values['account-scope'] ? values['account-scope'].trim() : 'openai-default',
+      );
+      const monthUtc = assertValidMonthUtc(
+        values.month ? values.month.trim() : currentMonthUtc(),
+      );
+      const legacyPath = values['legacy-budget'] ? resolve(values['legacy-budget']) : null;
+      const testLedgerOpts = testHooks?.testLedgerOptions && typeof testHooks.testLedgerOptions === 'object'
+        ? testHooks.testLedgerOptions
+        : {};
+
+      if (LIVE_COMMANDS.has(command)) return await runLiveCommand(command, values, streams, dbPath, accountScope, testHooks);
+
+      if (command === 'openai-status') {
+        const ledger = openOpenAiBudgetLedger(dbPath, { readOnly: true, ...testLedgerOpts });
+        try {
+          const status = ledger.getStatus({ accountScope, monthUtc });
+          const legacySummary = legacyPath
+            ? inspectLegacyAutopilotBudget(legacyPath, { monthUtc })
+            : null;
+          streams.stdout.write(`${JSON.stringify({
+            ok: true,
+            command,
+            private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(dbPath)}#scope:${accountScope}`,
+            status: formatNarrowLedgerStatus(status),
+            ...(legacySummary ? { legacy_budget: formatNarrowLegacySummary(legacySummary) } : {}),
+          }, null, 2)}\n`);
+          return 0;
+        } finally {
+          ledger.close();
+        }
+      }
+
+      if (command === 'openai-reconcile') {
+        if (values.enable === true && values.disable === true) {
+          throw new Phase2CliError('--enable 与 --disable 不能同时传入。');
+        }
+        if (values['allow-stage4-media'] === true && values['disallow-stage4-media'] === true) {
+          throw new Phase2CliError('--allow-stage4-media 与 --disallow-stage4-media 不能同时传入。');
+        }
+        // P0-11: Physical file-identity collision check (resolving junctions, symlinks, and hard links) BEFORE writable open!
+        if (legacyPath && dbPath !== ':memory:' && isSamePhysicalFileCli(legacyPath, dbPath)) {
+          throw new Phase2CliError('--legacy-budget 不能与目标可写 --db 指向同一物理数据库文件（含软硬链接/目录联接）。');
+        }
+
+        const enableFlag = values.enable === true ? true : (values.disable === true ? false : undefined);
+        const confirmAutoRechargeOff = values['confirm-auto-recharge-off'] === true ? true : undefined;
+        const confirmHardLimit = values['confirm-hard-limit'] === true ? true : undefined;
+        const allowStage4Media = values['allow-stage4-media'] === true
+          ? true
+          : (values['disallow-stage4-media'] === true ? false : undefined);
+        const monthlyLimitCents = parseOptionalNonNegSafeInt(values['monthly-limit-cents'], 'monthly-limit-cents');
+        const sameMonthPendingBufferCents = parseOptionalNonNegSafeInt(values['same-month-pending-buffer-cents'], 'same-month-pending-buffer-cents');
+        if (sameMonthPendingBufferCents > 2000) throw new Phase2CliError('--same-month-pending-buffer-cents 不能超过 2000。');
+        if (monthlyLimitCents !== undefined && monthlyLimitCents > 20_000) {
+          throw new Phase2CliError('--monthly-limit-cents 不能超过 20000（$200.00/月封顶）。');
+        }
+        const usageCostMicros = parseOptionalNonNegSafeInt(values['usage-cost-micros'], 'usage-cost-micros');
+        const postedBilledCents = parseOptionalNonNegSafeInt(values['posted-billed-cents'], 'posted-billed-cents');
+        const attemptId = values.attempt ? values.attempt.trim() : null;
+        const noteText = values.note ? values.note.trim() : undefined;
+
+        let targetStatus = null;
+        let reqNote = null;
+        if (attemptId) {
+          targetStatus = requireOption(values.status, 'status');
+          if (!['completed', 'failed_known', 'pending_recovery'].includes(targetStatus)) {
+            throw new Phase2CliError('--status 必须为 completed、failed_known 或 pending_recovery。');
+          }
+          reqNote = requireOption(values.note, 'note');
+        }
+
+        const hasPolicyAction = Boolean(
+          legacyPath ||
+          enableFlag !== undefined ||
+          confirmAutoRechargeOff !== undefined ||
+          confirmHardLimit !== undefined ||
+          monthlyLimitCents !== undefined ||
+          sameMonthPendingBufferCents !== undefined ||
+          allowStage4Media !== undefined,
+        );
+        if (!hasPolicyAction && !attemptId) {
+          throw new Phase2CliError(
+            'openai-reconcile 需要提供 --legacy-budget、策略开关（--enable / --disable / --monthly-limit-cents）或请求核销参数（--attempt --status --note）。',
+          );
+        }
+
+        // Inspect legacy DB BEFORE opening target DB writable so unrecognized/missing legacy DB never creates/mutates target DB!
+        const legacySummary = legacyPath
+          ? inspectLegacyAutopilotBudget(legacyPath, { monthUtc })
+          : null;
+
+        const ledger = openOpenAiBudgetLedger(dbPath, { readOnly: false, ...testLedgerOpts });
+        try {
+          let reconciledAttempt = null;
+          const hasLegacyHolds = Boolean(
+            legacySummary && (legacySummary.unresolved_count > 0 || legacySummary.has_unresolved_holds === true),
+          );
+
+          if (hasLegacyHolds) {
+            // P0-09: Persist discovered legacy hold & durably revoke enabled/legacy_reconciled BEFORE any unrelated attempt validation can exit!
+            ledger.reconcileLegacySummary(legacySummary, {
+              accountScope,
+              enable: enableFlag,
+              autoRechargeOffConfirmed: confirmAutoRechargeOff,
+              hardMonthlyLimitConfirmed: confirmHardLimit,
+              monthlyLimitCents,
+              sameMonthPendingBufferCents,
+              allowStage4Media,
+              note: !attemptId ? (noteText ?? null) : null,
+            });
+          } else {
+            // P1-05: Validate attempt ownership and execute combined policy + attempt mutation atomically in ONE transaction!
+            ledger._withImmediateTx(() => {
+              if (attemptId) {
+                const existingAttempt = typeof ledger.getAttemptById === 'function'
+                  ? ledger.getAttemptById(attemptId)
+                  : ledger.getAttempt(attemptId);
+                if (!existingAttempt) {
+                  throw new Phase2CliError(`未找到待核销请求记录 "${sanitizeDiagnosticText(attemptId)}"。`);
+                }
+                if (existingAttempt.account_scope !== accountScope) {
+                  throw new Phase2CliError(
+                    `请求 "${sanitizeDiagnosticText(attemptId)}" 归属作用域 "${sanitizeDiagnosticText(existingAttempt.account_scope)}"，与所选 --account-scope "${sanitizeDiagnosticText(accountScope)}" 不一致。`,
+                  );
+                }
+              }
+
+              if (legacySummary) {
+                ledger.reconcileLegacySummary(legacySummary, {
+                  accountScope,
+                  enable: enableFlag,
+                  autoRechargeOffConfirmed: confirmAutoRechargeOff,
+                  hardMonthlyLimitConfirmed: confirmHardLimit,
+                  monthlyLimitCents,
+                  sameMonthPendingBufferCents,
+                  allowStage4Media,
+                  note: !attemptId ? (noteText ?? null) : null,
+                });
+              } else if (hasPolicyAction) {
+                ledger.configurePolicy({
+                  accountScope,
+                  enabled: enableFlag,
+                  autoRechargeOffConfirmed: confirmAutoRechargeOff,
+                  hardMonthlyLimitConfirmed: confirmHardLimit,
+                  monthlyLimitCents,
+                  sameMonthPendingBufferCents,
+                  allowStage4Media,
+                  note: !attemptId ? noteText : undefined,
+                });
+              }
+
+              if (attemptId) {
+                reconciledAttempt = ledger.reconcileAttempt(attemptId, {
+                  accountScope,
+                  status: targetStatus,
+                  note: reqNote,
+                  confirmedZeroCharge: values['confirmed-zero-charge'] === true,
+                  usageCostMicros,
+                  postedBilledCents,
+                  providerResponseId: values['provider-response-id'] ? values['provider-response-id'].trim() : undefined,
+                });
+              }
+            });
+          }
+
+          // P1-20: Project ENTIRE CLI response onto narrow operator fields + private receipt reference (omitting source fingerprints, unrelated row IDs, and raw receipts).
+          const narrowAttemptSummary = reconciledAttempt
+            ? {
+                attempt_id: reconciledAttempt.attempt_id,
+                logical_request_id: reconciledAttempt.logical_request_id,
+                account_scope: reconciledAttempt.account_scope,
+                month_utc: reconciledAttempt.month_utc,
+                endpoint: reconciledAttempt.endpoint,
+                model: reconciledAttempt.model,
+                status: reconciledAttempt.status,
+                cleanup_status: reconciledAttempt.cleanup_status,
+                reserved_cents: reconciledAttempt.reserved_cents,
+                usage_cost_micros: reconciledAttempt.usage_cost_micros,
+                posted_billed_cents: reconciledAttempt.posted_billed_cents,
+                confirmed_zero_charge: reconciledAttempt.confirmed_zero_charge,
+                reconciliation_note: reconciledAttempt.reconciliation_note,
+                updated_at: reconciledAttempt.updated_at,
+                private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(dbPath)}#attempt:${reconciledAttempt.attempt_id}`,
+              }
+            : null;
+
+          streams.stdout.write(`${JSON.stringify({
+            ok: true,
+            command,
+            private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(dbPath)}#scope:${accountScope}`,
+            ...(legacySummary ? { legacy_budget: formatNarrowLegacySummary(legacySummary) } : {}),
+            ...(narrowAttemptSummary ? { reconciled_attempt: narrowAttemptSummary } : {}),
+            status: formatNarrowLedgerStatus(ledger.getStatus({ accountScope, monthUtc })),
+          }, null, 2)}\n`);
+          return 0;
+        } finally {
+          ledger.close();
+        }
+      }
+    }
+
     const rawDb = requireOption(values.db, 'db');
     const dbPath = rawDb === ':memory:' ? ':memory:' : resolve(rawDb);
-    const isReadOnlyCmd = command === 'status' || command === 'trace';
-    // Read-only commands NEVER mutate SQLite or trigger crash reconciliation on active requests.
+    const isReadOnlyCmd = READ_ONLY_DB_COMMANDS.has(command);
+    const openReadOnly = (isReadOnlyCmd || (command === 'export-report' && existsSync(dbPath))) && dbPath !== ':memory:';
     const reconcileOnOpen = command === 'init' && values['reconcile-crashed'] === true;
 
     const store = openSelectionStore(dbPath, {
-      readOnly: isReadOnlyCmd && dbPath !== ':memory:',
+      readOnly: openReadOnly,
       reconcileOnOpen,
     });
     try {
+      if (command === 'dedupe-forms' || command === 'funnel-ledger') {
+        const inputPath = command === 'dedupe-forms' ? resolve(requireOption(values.input, 'input')) : null;
+        const input = inputPath && await readJsonFileSafe(inputPath, '去重输入文件');
+        if (input) checkOperatorPayload(input);
+        // All counts and comparisons use a single read snapshot, including in WAL mode.
+        store.db.exec('BEGIN');
+        let out;
+        try {
+          out = inputPath ? { ok: true, command, proposals: checkFormDuplicates(store.db, input) }
+            : { ok: true, command, ...buildFunnelLedger(store.db, values.since) };
+        } finally {
+          store.db.exec('ROLLBACK');
+        }
+        checkOperatorPayload(out);
+        const json = JSON.stringify(out, null, 2) + '\n';
+        if (values.output) await writeSingleFileSafe(values.output, Buffer.from(json), [...sqlitePaths(dbPath), inputPath]);
+        streams.stdout.write(json);
+        return 0;
+      }
       if (command === 'init') {
         streams.stdout.write(`${JSON.stringify({ ok: true, command, summary: store.getSummary() }, null, 2)}\n`);
         return 0;
@@ -96,6 +1549,22 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
 
       if (command === 'status') {
         streams.stdout.write(`${JSON.stringify({ ok: true, command, summary: store.getSummary() }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'coverage') {
+        const audit = auditDiscoveryCoverage(store);
+        streams.stdout.write(`${JSON.stringify({ ok: true, command, audit }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'plan-discovery') {
+        const budget = values.budget !== undefined ? Number(values.budget) : 6;
+        if (!Number.isInteger(budget) || budget < 1) {
+          throw new Phase2CliError('--budget 必须为正整数。');
+        }
+        const plan = planDiscoveryBatch(store, { max_channels: budget, task_slots: budget, enforce_80_20_mix: true });
+        streams.stdout.write(`${JSON.stringify({ ok: true, command, plan }, null, 2)}\n`);
         return 0;
       }
 
@@ -108,7 +1577,7 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
           imported.ledgers.push(importRequestLedgerFile(store, resolve(ledFile)));
         }
         if (values.assets) {
-          const manifest = JSON.parse(readFileSync(resolve(values.assets), 'utf8'));
+          const manifest = await readJsonFileSafe(resolve(values.assets), '资产清单文件');
           imported.assets = importRetainedAssetsManifest(store, manifest);
         }
         streams.stdout.write(`${JSON.stringify({ ok: true, command, imported, summary: store.getSummary() }, null, 2)}\n`);
@@ -118,15 +1587,16 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
       if (command === 'replay') {
         const batchPath = resolve(requireOption(values.batch, 'batch'));
         const profilePath = resolve(requireOption(values.profile, 'profile'));
-        const batch = JSON.parse(readFileSync(batchPath, 'utf8'));
-        const profile = JSON.parse(readFileSync(profilePath, 'utf8'));
+        const discoveryPath = values.discovery ? resolve(values.discovery) : null;
+        const batch = await readJsonFileSafe(batchPath, '批次输入文件');
+        const profile = await readJsonFileSafe(profilePath, '评分配置文件');
         if (values['profile-revision']) {
           const rev = Number(values['profile-revision']);
           if (!Number.isInteger(rev) || rev < 50) throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
           profile.revision = rev;
           if (profile.workflow?.scoring_and_ordering) profile.workflow.scoring_and_ordering.revision = rev;
         }
-        const discovery = values.discovery ? JSON.parse(readFileSync(resolve(values.discovery), 'utf8')) : null;
+        const discovery = discoveryPath ? await readJsonFileSafe(discoveryPath, '发现记录文件') : null;
         const out = replayBatchIntoStore(store, {
           batch,
           profile,
@@ -134,6 +1604,18 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
           expected_result_sha256: values['verify-result'] ?? null,
           expected_html_sha256: values['verify-html'] ?? null,
         });
+        let exported = null;
+        if (values.output) {
+          exported = await writeReportArtifacts(values.output, {
+            resultBytes: out.result_bytes,
+            htmlBytes: out.html_bytes,
+            resultSha: out.result_sha256,
+            htmlSha: out.html_sha256,
+            summary: out.summary,
+            profileRevision: profile.revision,
+            protectedInputPaths: [batchPath, profilePath, discoveryPath, dbPath],
+          });
+        }
         streams.stdout.write(`${JSON.stringify({
           ok: true,
           command,
@@ -141,7 +1623,260 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
           html_sha256: out.html_sha256,
           evaluations_recorded: out.evaluations_recorded,
           summary: out.summary,
+          ...(exported ? { exported } : {}),
         }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'export-report') {
+        const batchPath = resolve(requireOption(values.batch, 'batch'));
+        const profilePath = resolve(requireOption(values.profile, 'profile'));
+        const discoveryPath = values.discovery ? resolve(values.discovery) : null;
+        const outputDir = requireOption(values.output, 'output');
+        const batch = await readJsonFileSafe(batchPath, '批次输入文件');
+        const profile = await readJsonFileSafe(profilePath, '评分配置文件');
+        if (values['profile-revision']) {
+          const rev = Number(values['profile-revision']);
+          if (!Number.isInteger(rev) || rev < 50) throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+          profile.revision = rev;
+          if (profile.workflow?.scoring_and_ordering) profile.workflow.scoring_and_ordering.revision = rev;
+        }
+        const discoveryBundle = discoveryPath ? await readJsonFileSafe(discoveryPath, '发现记录文件') : null;
+        const manifest = discoveryBundle ? prepareDiscovery(discoveryBundle.pool, discoveryBundle.decisions) : null;
+        const withManifest = manifest ? attachDiscovery(batch, manifest) : structuredClone(batch);
+        const rawImageArgs = values.image ?? [];
+        const candCount = Array.isArray(withManifest?.candidates) ? withManifest.candidates.length : 0;
+        const exportImagePaths = [];
+        const attachmentShasByCandidateId = new Map();
+        let singleCandShas = null;
+        for (const rawArg of rawImageArgs) {
+          const kvMatch = /^([A-Za-z0-9._-]+)=(.+)$/.exec(String(rawArg));
+          if (kvMatch) {
+            const cid = kvMatch[1];
+            const absImg = resolve(kvMatch[2]);
+            exportImagePaths.push(absImg);
+            const list = attachmentShasByCandidateId.get(cid) ?? [];
+            list.push(sha256Hex(readFileSync(absImg)));
+            attachmentShasByCandidateId.set(cid, list);
+          } else {
+            if (candCount > 1) {
+              throw new Phase2CliError('多候选批次导出时，--image 必须采用 <candidate_id>=<文件路径> 逐卡绑定附件。');
+            }
+            const absImg = resolve(rawArg);
+            exportImagePaths.push(absImg);
+            singleCandShas = singleCandShas ?? [];
+            singleCandShas.push(sha256Hex(readFileSync(absImg)));
+          }
+        }
+        const boundBatch = attachStoreDiscoveryProvenance(withManifest, store);
+        const testReceiptStoreDir = typeof testHooks?.codexReceiptDir === 'string'
+          ? resolve(testHooks.codexReceiptDir)
+          : (typeof testHooks?.reportOptions?.receiptStoreDir === 'string' ? resolve(testHooks.reportOptions.receiptStoreDir) : null);
+        const allowTestDoubleReceipts = Boolean(
+          testHooks?.allowTestDoubleReceipts === true || testHooks?.reportOptions?.allowTestDoubleReceipts === true,
+        );
+        const reportRenderOpts = {
+          ...(testHooks?.reportOptions && typeof testHooks.reportOptions === 'object' ? testHooks.reportOptions : {}),
+          ...(testReceiptStoreDir ? { receiptStoreDir: testReceiptStoreDir } : {}),
+          ...(allowTestDoubleReceipts ? { allowTestDoubleReceipts: true } : {}),
+        };
+        const defaultVerifyReceiptFn = (ev) => verifySavedCodexReceipt(ev, {
+          receiptStoreDir: testReceiptStoreDir,
+          allowTestDouble: allowTestDoubleReceipts,
+        });
+        const { notesByFormId, storedShortlist } = enrichBatchAndResultFromStore(boundBatch, store, {
+          profileRevision: profile.revision,
+          profile,
+          manifest,
+          expectedHtmlSha256: values['verify-html'] ?? null,
+          currentAttachmentSha256s: singleCandShas,
+          attachmentShasByCandidateId: attachmentShasByCandidateId.size > 0 ? attachmentShasByCandidateId : null,
+          verifyReceiptFn: typeof testHooks?.verifyReceiptFn === 'function' ? testHooks.verifyReceiptFn : defaultVerifyReceiptFn,
+        });
+        const scoredResult = scoreBatch(boundBatch, profile);
+        if (manifest) scoredResult.discovery = { ...manifest, summary: boundBatch.discovery_summary };
+        if (notesByFormId.size > 0 && Array.isArray(scoredResult.candidates)) {
+          for (const sc of scoredResult.candidates) {
+            const notes = notesByFormId.get(sc.candidate_id || sc.id);
+            if (notes && notes.length > 0) sc.review_notes = notes;
+          }
+        }
+        if (storedShortlist.length > 0) {
+          const existingList = Array.isArray(scoredResult.negotiation_shortlist) ? scoredResult.negotiation_shortlist : [];
+          const seenIds = new Set(existingList.map(x => x?.form_id || x?.id).filter(Boolean));
+          const mergedShortlist = [...existingList];
+          for (const item of storedShortlist) {
+            if (!seenIds.has(item.form_id)) {
+              seenIds.add(item.form_id);
+              mergedShortlist.push(item);
+            }
+          }
+          scoredResult.negotiation_shortlist = mergedShortlist;
+        }
+
+        const resultBytes = Buffer.from(`${JSON.stringify(scoredResult, null, 2)}\n`, 'utf8');
+        const htmlBytes = Buffer.from(renderReport(scoredResult, boundBatch, reportRenderOpts), 'utf8');
+        const resultSha = sha256Hex(resultBytes);
+        const htmlSha = sha256Hex(htmlBytes);
+        if (values['verify-result'] && resultSha !== values['verify-result']) {
+          throw new Phase2CliError(`导出结果摘要不匹配：期望 ${values['verify-result']}，实际 ${resultSha}。`);
+        }
+        if (values['verify-html'] && htmlSha !== values['verify-html']) {
+          throw new Phase2CliError(`导出 HTML 摘要不匹配：期望 ${values['verify-html']}，实际 ${htmlSha}。`);
+        }
+        const exported = await writeReportArtifacts(outputDir, {
+          resultBytes,
+          htmlBytes,
+          resultSha,
+          htmlSha,
+          summary: scoredResult.summary,
+          profileRevision: profile.revision,
+          protectedInputPaths: [batchPath, profilePath, discoveryPath, dbPath, ...exportImagePaths],
+        });
+        streams.stdout.write(`${JSON.stringify({
+          ok: true,
+          command,
+          exported,
+          summary: scoredResult.summary,
+        }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'gate1a') {
+        const specPath = resolve(requireOption(values.input, 'input'));
+        const spec = await readJsonFileSafe(specPath, 'Gate 1A 输入文件');
+        let formId = spec.form_id;
+        if (spec.form && typeof spec.form === 'object') {
+          const { form } = store.upsertCandidateForm(spec.form);
+          formId = form.form_id;
+        }
+        for (const leadSpec of spec.leads ?? []) {
+          if (leadSpec && leadSpec.social_bridge) {
+            store.ingestSocialBridgeLead(leadSpec.social_bridge, {
+              ...leadSpec,
+              form_id: formId,
+              link_role: leadSpec.link_role ?? 'primary_discovery',
+              link_note: leadSpec.link_note ?? null,
+            });
+          } else {
+            const { lead } = store.upsertRawLead(leadSpec);
+            store.linkLeadToForm({
+              lead_id: lead.lead_id,
+              form_id: formId,
+              link_role: leadSpec.link_role ?? 'primary_discovery',
+              note: leadSpec.link_note ?? null,
+            });
+          }
+        }
+        const g1aProfileRev = values['profile-revision'] !== undefined
+          ? Number(values['profile-revision'])
+          : (spec.profile_revision ?? 58);
+        if (!Number.isInteger(g1aProfileRev) || g1aProfileRev < 50) {
+          throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+        }
+        const result = runGate1AForForm(store, {
+          form_id: formId,
+          scenarios: spec.scenarios ?? spec.gate1a_scenarios,
+          minimum_price_usd: spec.minimum_price_usd ?? 29.99,
+          specific_rights_conflict: spec.specific_rights_conflict ?? 'unknown',
+          strong_date_dependency: spec.strong_date_dependency ?? 'unknown',
+          category_check: spec.category_check ?? null,
+          gate0_options: spec.gate0_options ?? {},
+          price_band_analysis: spec.price_band_analysis ?? null,
+          cluster_bands: spec.cluster_bands ?? null,
+          profile_revision: g1aProfileRev,
+          allow_forward_price_discovery: spec.allow_forward_price_discovery,
+          disallow_pre1688_cost_guess_kill: spec.disallow_pre1688_cost_guess_kill,
+        });
+        streams.stdout.write(`${JSON.stringify({ ok: true, command, form_id: formId, result }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'gate1b') {
+        const specPath = resolve(requireOption(values.input, 'input'));
+        const spec = await readJsonFileSafe(specPath, 'Gate 1B 输入文件');
+        const formId = spec.form_id;
+        if (typeof formId !== 'string' || !formId.trim()) {
+          throw new Phase2CliError('gate1b 输入 JSON 必须包含非空 form_id。');
+        }
+        const g1bProfileRev = values['profile-revision'] !== undefined
+          ? Number(values['profile-revision'])
+          : (spec.profile_revision ?? 58);
+        if (!Number.isInteger(g1bProfileRev) || g1bProfileRev < 50) {
+          throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+        }
+        if (g1bProfileRev >= 59 && spec.require_ui_readback === false) {
+          throw new Phase2CliError('Revision 59 严禁关闭 1688 ui_readback 核验门禁。');
+        }
+        const form = store.getCandidateForm(formId);
+        if (!form) throw new Phase2CliError(`未找到候选形态：${formId}`);
+        if (Array.isArray(spec.quotes) && spec.quotes.length > 0) {
+          store.recordSourcingQuotesBatch1688(spec.quotes.map(qObj => {
+            if (g1bProfileRev >= 59 && qObj?.require_ui_readback === false) {
+              throw new Phase2CliError('Revision 59 严禁关闭 1688 ui_readback 核验门禁。');
+            }
+            return {
+              ...qObj,
+              ...(g1bProfileRev >= 59 ? { require_ui_readback: true } : {}),
+              form_id: formId,
+              spec_version: form.spec_version,
+            };
+          }));
+        } else if (spec.quote && typeof spec.quote === 'object') {
+          if (g1bProfileRev >= 59 && spec.quote.require_ui_readback === false) {
+            throw new Phase2CliError('Revision 59 严禁关闭 1688 ui_readback 核验门禁。');
+          }
+          store.recordSourcingQuote1688({
+            ...spec.quote,
+            ...(g1bProfileRev >= 59 ? { require_ui_readback: true } : {}),
+            form_id: formId,
+            spec_version: form.spec_version,
+          });
+        }
+        const existingQuotes = store.getQuotesForForm(formId).filter(
+          q => q.quote_status === 'verified' && q.spec_version === form.spec_version,
+        );
+        const scenarios = Array.isArray(spec.early_screen_scenarios)
+          ? spec.early_screen_scenarios
+          : (spec.early_screen_scenario ? [spec.early_screen_scenario] : null);
+        const result = await runGate1BForForm(store, {
+          form_id: formId,
+          existing_quote: existingQuotes[0] ?? null,
+          existing_quotes: existingQuotes,
+          profile_revision: g1bProfileRev,
+          early_screen_builder: scenarios ? () => scenarios : undefined,
+          as_of_date: values['as-of'] ? values['as-of'].trim() : (spec.as_of_date ?? new Date().toISOString().slice(0, 10)),
+          allow_crossing_to_gate2_3: spec.allow_crossing_to_gate2_3 === true,
+        });
+        streams.stdout.write(`${JSON.stringify({ ok: true, command, result }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'reconcile') {
+        const attemptId = requireOption(values.attempt, 'attempt');
+        const rawStatus = requireOption(values.status, 'status');
+        const resolvedStatus = rawStatus === 'succeeded' ? 'completed' : rawStatus;
+        const hasExplicitChargeFlag =
+          values['sif-units'] !== undefined ||
+          values['ss-mcp-units'] !== undefined ||
+          values['ss-web-units'] !== undefined ||
+          values['exa-calls'] !== undefined ||
+          values['exa-units'] !== undefined ||
+          values['confirmed-zero-charge'] === true;
+        if (resolvedStatus === 'failed' && !hasExplicitChargeFlag) {
+          throw new Phase2CliError(
+            '核销为 failed 时必须显式提供扣费结算参数（--sif-units / --ss-mcp-units / --ss-web-units / --exa-calls）或明确传入 --confirmed-zero-charge，防止省略参数误解锁重复扣费请求。',
+          );
+        }
+        const out = store.reconcileUnknownAttempt(attemptId, {
+          resolved_status: resolvedStatus,
+          note: values.note ? values.note.trim() : `CLI reconciled as ${resolvedStatus}`,
+          sif_units: parseOptionalNonNegNumber(values['sif-units'], 'sif-units'),
+          ss_mcp_units: parseOptionalNonNegNumber(values['ss-mcp-units'], 'ss-mcp-units'),
+          ss_web_realtime_tasks: parseOptionalNonNegNumber(values['ss-web-units'], 'ss-web-units'),
+          exa_calls: parseOptionalNonNegNumber(values['exa-calls'] ?? values['exa-units'], 'exa-calls'),
+        });
+        streams.stdout.write(`${JSON.stringify({ ok: true, command, reconciled: out, quota_summary: store.getQuotaSummary() }, null, 2)}\n`);
         return 0;
       }
 
@@ -172,9 +1907,10 @@ export async function runPhase2Cli(args = process.argv.slice(2), streams = { std
       store.close();
     }
   } catch (error) {
-    const message = error instanceof Phase2CliError || error instanceof TypeError || error instanceof Error
+    const rawMsg = error instanceof Phase2CliError || error instanceof TypeError || error instanceof Error
       ? error.message
       : '执行失败。';
+    const message = sanitizeDiagnosticText(rawMsg);
     streams.stderr.write(`Phase 2 CLI 失败：${message}\n`);
     return 2;
   }

@@ -88,6 +88,52 @@ function makeStandardGate1AScenario(overrides = {}) {
   };
 }
 
+function alignMockCandidateToQuote(cand, { priceUsd = 54.99, goodsCnyTotal = 10000, domesticFreightCnyTotal = 200, actualSets = 100, fx = 7.0, headhaulUsd = 4.0, fulfillmentUsd = null, placementUsd = 0.34 } = {}) {
+  const clone = structuredClone(cand);
+  if (clone.screening?.reference_price_usd) {
+    clone.screening.reference_price_usd.value = priceUsd;
+    if (Array.isArray(clone.screening.reference_price_usd.supported_price_range)) {
+      clone.screening.reference_price_usd.supported_price_range = [Math.min(clone.screening.reference_price_usd.supported_price_range[0], priceUsd), Math.max(clone.screening.reference_price_usd.supported_price_range[1], priceUsd)];
+    }
+  }
+  const procUsd = Number(((goodsCnyTotal / actualSets) / fx).toFixed(4));
+  const domUsd = Number(((domesticFreightCnyTotal / actualSets) / fx).toFixed(4));
+  const resolvedFulUsd = fulfillmentUsd ?? (priceUsd <= 50 ? 5.76495 : 6.3549);
+  const allScens = Array.isArray(clone.economics?.operating_periods)
+    ? clone.economics.operating_periods.flatMap(p => p.scenarios ?? [])
+    : (clone.economics?.scenarios ?? []);
+  for (const sc of allScens) {
+    if (!sc?.cost_ledger) continue;
+    sc.cost_ledger.price_usd = priceUsd;
+    sc.cost_ledger.fx_cny_per_usd = fx;
+    const pLine = sc.cost_ledger.lines?.find(l => l.id === 'procurement');
+    if (pLine) {
+      pLine.amount_usd = procUsd;
+      pLine.order_units = actualSets;
+      pLine.fx_cny_per_usd = fx;
+    }
+    const dLine = sc.cost_ledger.lines?.find(l => l.id === 'domestic_freight');
+    if (dLine) {
+      dLine.amount_usd = domUsd;
+      dLine.order_units = actualSets;
+      dLine.status = 'confirmed';
+    }
+    const hLine = sc.cost_ledger.lines?.find(l => l.id === 'headhaul');
+    if (hLine) {
+      hLine.amount_usd = headhaulUsd;
+    }
+    const fLine = sc.cost_ledger.lines?.find(l => l.id === 'fulfillment');
+    if (fLine) {
+      fLine.amount_usd = resolvedFulUsd;
+    }
+    const plLine = sc.cost_ledger.lines?.find(l => l.id === 'placement');
+    if (plLine) {
+      plLine.amount_usd = placementUsd;
+    }
+  }
+  return clone;
+}
+
 function makeEarlyScreenBuilder(priceUsd, goodsCnyPerUnit, domesticFreightCnyPerUnit) {
   return () => ({
     profile_revision: 58,
@@ -107,7 +153,7 @@ function makeEarlyScreenBuilder(priceUsd, goodsCnyPerUnit, domesticFreightCnyPer
     returns_processing_usd: 0,
     is_apparel_or_shoes: false,
     referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.0, minimum_referral_usd: 0.30 },
-    fulfillment_usd: 5.9202,
+    fulfillment_usd: priceUsd <= 50 ? 5.76495 : 6.3549,
     placement_usd: 0.34,
     storage: {
       cubic_feet_per_unit: 0.069444,
@@ -628,7 +674,13 @@ test('Phase 2 End-to-End Pipeline: non-Amazon lead Gate 1A 0-call rejection, Gat
     const store = openSelectionStore(dbPath);
 
     // Pre-seed one already-quoted form so it bypasses 1688 and MUST finish Gate 2/3 even when 1688 hits CAPTCHA!
-    const preQuotedCand = structuredClone(fixture.candidates[0]);
+    const preQuotedCand = alignMockCandidateToQuote(fixture.candidates[0], {
+      priceUsd: 54.99,
+      goodsCnyTotal: 10000,
+      domesticFreightCnyTotal: 200,
+      actualSets: 100,
+      fx: 7.0,
+    });
     preQuotedCand.id = 'form-already-quoted';
     store.upsertCandidateForm({
       form_id: 'form-already-quoted',
@@ -689,7 +741,7 @@ test('Phase 2 End-to-End Pipeline: non-Amazon lead Gate 1A 0-call rejection, Gat
           provider: 'sif',
           tool_name: 'ops_get_listing_traffic_overview',
           observation_cutoff_date: '2026-11-19',
-          params: { asin: 'B9PREQ001', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30' },
+          params: { asin: 'B9PREQ0001', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30', isListingSearch: true },
         }, async () => ({
           payload: { natural_ratio: 0.72 },
           sif_units: 3,
@@ -1024,7 +1076,7 @@ test('Round-1 Codex Regressions #2, #3, #5, #6: default pagination dedup, cached
       provider: 'sif',
       tool_name: 'ops_get_listing_keyword_distribution',
       observation_cutoff_date: '2026-11-19',
-      params: { asin: 'B9DEDUP01', timePieceType: 'latelyDay', timePieceValue: '30', showType: 1 },
+      params: { asin: 'B9DEDUP001', timePieceType: 'latelyDay', timePieceValue: '30', showType: 1 },
     };
     const first = await store.executeGuardedRequest(specNoPage, async () => {
       calls++;
@@ -1184,7 +1236,8 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   // #11a: Negotiation shortlist persisted in SQLite and readable from traceFormLineage!
   assert.ok(store.traceFormLineage('f-forge-cost').negotiation_shortlist);
 
-  // #8b: Multi-scenario Gate 1B ($40 fail + $60 pass) MUST pass instead of falsely killing the form!
+  // #8b (P0-1 upgraded): Multi-scenario Gate 1B ($40 fail + $60 pass) crosses 30%:
+  // MUST NOT falsely reject AND MUST NOT blindly auto-pass; parks pending with owner_review_required!
   store.upsertCandidateForm({
     form_id: 'f-multi-scen',
     product_family_key: 'fam-multi',
@@ -1224,8 +1277,52 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
       ];
     },
   });
-  assert.equal(multiRes.status, 'gate1b_passed');
-  assert.equal(multiRes.proceed_to_gate2_3, true);
+  assert.equal(multiRes.status, 'gate1b_pending');
+  assert.equal(multiRes.margin_interval_verdict, 'crosses_30pct');
+  assert.equal(multiRes.owner_review_required, true);
+  assert.equal(multiRes.proceed_to_gate2_3, false);
+  assert.deepEqual(multiRes.passing_prices_usd, [60]);
+  assert.deepEqual(multiRes.failing_prices_usd, [40]);
+
+  // All-passing multi-scenario ($54.99 + $60) cleanly returns gate1b_passed with all_ge_30pct!
+  store.upsertCandidateForm({
+    form_id: 'f-multi-allpass',
+    product_family_key: 'fam-multi-allpass',
+    label: 'Multi-scenario all-pass form',
+    buyer_task: 'Task',
+    saleable_set_composition: { qty: 1 },
+  });
+  runGate1AForForm(store, {
+    form_id: 'f-multi-allpass',
+    scenarios: [
+      makeStandardGate1AScenario({ id: 'p55', price_usd: 54.99 }),
+      makeStandardGate1AScenario({ id: 'p60', price_usd: 60 }),
+    ],
+  });
+  const qMultiPass = store.recordSourcingQuote1688({
+    form_id: 'f-multi-allpass',
+    observed_at: '2026-11-19',
+    redacted_destination: '广东深圳',
+    raw_readback_ref: 'readback:synth-multi-allpass',
+    goods_first_order_promotion: false,
+    freight_first_order_promotion: false,
+    sku_lines: [{ offer_id: 'o2p', sku_id: 's2p', qty_per_saleable_set: 1, pack_multiple: 10, moq_qty: 100, ordered_qty: 100, unit_price_cny: 100, regular_goods_promo_false: true }],
+    actual_sets: 100,
+    actual_complete_sets: 100,
+    goods_cny_total: 10000,
+    domestic_freight_cny_total: 200,
+  }).quote;
+  const multiAllPassRes = await runGate1BForForm(store, {
+    form_id: 'f-multi-allpass',
+    existing_quote: qMultiPass,
+    early_screen_builder: () => [
+      makeEarlyScreenBuilder(54.99, 100, 2)(),
+      makeEarlyScreenBuilder(60, 100, 2)(),
+    ],
+  });
+  assert.equal(multiAllPassRes.status, 'gate1b_passed');
+  assert.equal(multiAllPassRes.margin_interval_verdict, 'all_ge_30pct');
+  assert.equal(multiAllPassRes.proceed_to_gate2_3, true);
 
   // #11b: Strong date dependency ('deferred' from evaluateEarlyScreen) persists as lifecycle_status = 'deferred'!
   store.upsertCandidateForm({
@@ -1379,7 +1476,13 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   // #12: delivery_only lead blocked from Gate 2/3, AND mismatched candidate B under form A is isolated while sibling B completes!
   const candB = structuredClone(fixture.candidates[0]);
   candB.id = 'cand-B-wrong';
-  const candHealthyB = structuredClone(fixture.candidates[0]);
+  const candHealthyB = alignMockCandidateToQuote(fixture.candidates[0], {
+    priceUsd: 54.99,
+    goodsCnyTotal: 8000,
+    domesticFreightCnyTotal: 100,
+    actualSets: 100,
+    fx: 7.0,
+  });
   candHealthyB.id = 'form-B-healthy';
   const batchDeliveryOnly = await runPhase2Batch(store, {
     profile,
@@ -1650,14 +1753,14 @@ test('Round-2 Codex Regressions #1, #2, #3: receipt charge extraction, CLI forma
       provider: 'sif',
       tool_name: 'ops_get_listing_keyword_distribution',
       observation_cutoff_date: '2026-11-19',
-      params: { asin: 'B9DEF100', timePieceType: 'latelyDay', timePieceValue: '30' },
+      params: { asin: 'B9DEF10000', timePieceType: 'latelyDay', timePieceValue: '30' },
     }, async () => { kdCalls++; return { payload: { total: 40 }, sif_units: 2 }; });
     const kd2 = await sFwd.executeGuardedRequest({
       account_scope: 'default-us',
       provider: 'sif',
       tool_name: 'ops_get_listing_keyword_distribution',
       observation_cutoff_date: '2026-11-19',
-      params: { asin: 'B9DEF100', timePieceType: 'latelyDay', timePieceValue: '30', pageNum: 1, pageSize: 100, country: 'US', dimension: 'asin', showType: 1 },
+      params: { asin: 'B9DEF10000', timePieceType: 'latelyDay', timePieceValue: '30', pageNum: 1, pageSize: 100, country: 'US', dimension: 'asin', showType: 1 },
     }, async () => { kdCalls++; return { payload: { total: 99 }, sif_units: 2 }; });
     assert.equal(kdCalls, 1);
     assert.equal(kd1.payload.total, 40);
@@ -1670,6 +1773,7 @@ test('Round-2 Codex Regressions #1, #2, #3: receipt charge extraction, CLI forma
       provider: 'sif',
       tool_name: 'ops_get_listing_traffic_overview',
       observation_cutoff_date: '2026-11-19',
+      enforce_provider_guards: false, // explicitly testing legacy server-default 7-day key dedup
       params: { asin: 'B9OV01' },
     }, async () => { ovCalls++; return { payload: { ratio: 0.6 }, sif_units: 3 }; });
     const ov2 = await sFwd.executeGuardedRequest({
@@ -1677,6 +1781,7 @@ test('Round-2 Codex Regressions #1, #2, #3: receipt charge extraction, CLI forma
       provider: 'sif',
       tool_name: 'ops_get_listing_traffic_overview',
       observation_cutoff_date: '2026-11-19',
+      enforce_provider_guards: false, // explicitly testing legacy server-default 7-day key dedup
       params: { asin: 'B9OV01', country: 'US', timePieceType: 'latelyDay', timePieceValue: '7', isListingSearch: true },
     }, async () => { ovCalls++; return { payload: { ratio: 0.9 }, sif_units: 3 }; });
     assert.equal(ovCalls, 1);
@@ -1732,7 +1837,7 @@ test('Round-2 Codex Regressions #1, #2, #3: receipt charge extraction, CLI forma
       tool_name: 'ops_get_listing_traffic_overview',
       observation_cutoff_date: '2026-11-19',
       estimated_sif_units: 3,
-      params: { asin: 'B9NULLOUT' },
+      params: { asin: 'B9NULLOUT1', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30', isListingSearch: true },
     }, async () => null);
     assert.equal(nullRes.completed, false);
     assert.equal(nullRes.status, 'unknown_needs_reconciliation');
@@ -2267,9 +2372,9 @@ test('Round-2 Codex Regressions #8, #9, #10: primary_discovery admissibility & c
     provider: 'sif',
     tool_name: 'ops_get_listing_traffic_overview',
     observation_cutoff_date: '2026-11-19',
-    params: { asin: 'B9TOKERR1' },
+    params: { asin: 'B9TOKERR01', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30', isListingSearch: true },
   }, async () => { throw new Error('401 Unauthorized ghp_1234567890abcdef123456 Bearer secret_abc_999'); }));
-  const tokAttempt = store.db.prepare("SELECT reconciliation_note FROM api_request_ledger WHERE normalized_params_json LIKE '%B9TOKERR1%'").get();
+  const tokAttempt = store.db.prepare("SELECT reconciliation_note FROM api_request_ledger WHERE normalized_params_json LIKE '%B9TOKERR01%'").get();
   assert.equal(tokAttempt.reconciliation_note.includes('ghp_1234567890'), false);
   assert.equal(tokAttempt.reconciliation_note.includes('secret_abc_999'), false);
 
@@ -2279,7 +2384,7 @@ test('Round-2 Codex Regressions #8, #9, #10: primary_discovery admissibility & c
     provider: 'sif',
     tool_name: 'ops_get_listing_traffic_overview',
     observation_cutoff_date: '2026-11-19',
-    params: { asin: 'B9PIIRESP' },
+    params: { asin: 'B9PIIRESP1', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30', isListingSearch: true },
   }, async () => ({
     payload: { receiver_name: '张三', phone: '13800138000', ok: true },
     sif_units: 3,
@@ -2298,7 +2403,7 @@ test('Round-2 Codex Regressions #8, #9, #10: primary_discovery admissibility & c
     tool_name: 'ops_get_listing_traffic_overview',
     observation_cutoff_date: '2026-11-19',
     estimated_sif_units: 5,
-    params: { asin: 'B9NULLPAY' },
+    params: { asin: 'B9NULLPAY1', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30', isListingSearch: true },
   }, async () => ({ payload: null }));
   assert.equal(nullPayloadRes.completed, false);
   assert.equal(store.getAttempt(nullPayloadRes.attempt_id).unknown_reserved_sif_units, 5);
@@ -2310,7 +2415,7 @@ test('Round-2 Codex Regressions #8, #9, #10: primary_discovery admissibility & c
     tool_name: 'ops_get_listing_traffic_overview',
     observation_cutoff_date: '2026-11-19',
     estimated_sif_units: 5,
-    params: { asin: 'B9SETTLE5' },
+    params: { asin: 'B9SETTLE05', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30', isListingSearch: true },
   });
   store.markAttemptInFlight(unkBillComp.attempt_id);
   store.completeAttempt(unkBillComp.attempt_id, { billing_status: 'unknown_not_exposed', payload: { ok: true } });
@@ -2329,7 +2434,7 @@ test('Round-2 Codex Regressions #8, #9, #10: primary_discovery admissibility & c
     provider: 'sif',
     tool_name: 'ops_get_listing_traffic_overview',
     observation_cutoff_date: '2026-11-19',
-    params: { asin: 'B9MCPPII1' },
+    params: { asin: 'B9MCPPII01', country: 'US', timePieceType: 'latelyDay', timePieceValue: '30', isListingSearch: true },
   }, async () => ({
     payload: {
       content: [{ type: 'text', text: JSON.stringify({ _quota: { costThisCall: 6 }, receiver_name: '李四', token: 'ghp_1234567890abcdef' }) }],
