@@ -199,3 +199,36 @@ export function attachDiscovery(batch, manifest) {
     bound_candidates: checked.forms.length, unbound_candidates: result.candidates.length - checked.forms.length };
   return result;
 }
+
+/**
+ * Attach non-keyword and multi-channel discovery provenance exported from SQLite
+ * (raw_leads + lead_form_links) onto a revision-58+ batch without modifying scoring inputs.
+ */
+export function attachStoreDiscoveryProvenance(batch, store) {
+  object(batch, 'batch');
+  if (!store || typeof store.exportFormDiscoveryProvenance !== 'function') {
+    throw new TypeError('A SelectionStore instance with exportFormDiscoveryProvenance() is required.');
+  }
+  const cloned = structuredClone(batch);
+  if (!Array.isArray(cloned.candidates)) return cloned;
+  for (const cand of cloned.candidates) {
+    if (!cand || typeof cand !== 'object' || typeof cand.id !== 'string') continue;
+    const formId = cand.discovery?.form_id || cand.id;
+    const exported = store.exportFormDiscoveryProvenance(formId);
+    if (!exported || !Array.isArray(exported.store_leads) || exported.store_leads.length === 0) continue;
+    if (!cand.discovery || typeof cand.discovery !== 'object') {
+      cand.discovery = {
+        form_id: exported.form_id,
+        label: exported.label,
+        description: exported.description,
+        offer_evidence: [],
+        lead_keywords: [],
+        leads: [],
+      };
+    }
+    cand.discovery.store_leads = exported.store_leads;
+    if (exported.promotion_track) cand.discovery.promotion_track = exported.promotion_track;
+    if (exported.cooldown_until) cand.discovery.cooldown_until = exported.cooldown_until;
+  }
+  return cloned;
+}

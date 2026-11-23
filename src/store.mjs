@@ -12,7 +12,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, isAbsolute, relative, resolve } from 'node:path';
 import { validEvidenceDate } from './observations.mjs';
 import {
   ALLOWED_DISPOSITIONS,
@@ -20,8 +20,18 @@ import {
   containsSecretToken,
   sanitizeDiagnosticText,
   validateRedactedDestination,
+  validateSocialBridgeOutput,
+  validateSpecMatcherOutput,
   validateSourcingVerifier1688Output,
 } from './contracts.mjs';
+import {
+  DISCOVERY_ROUTES,
+  OPPORTUNITY_TYPES,
+  PROMOTION_TRACKS,
+  resolveChannelMeta,
+} from './discovery-channels.mjs';
+import { validateProviderCall } from './provider-guards.mjs';
+import { bindSourcingQuotePricingInputs } from './fba-rates-2027.mjs';
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
@@ -38,6 +48,7 @@ const LIFECYCLE_STATUSES = Object.freeze([
   'gate1b_passed',
   'gate1b_rejected',
   'gate1b_pending',
+  'private_mold_reserved',
   'gate2_3_in_progress',
   'evaluated',
   'deferred',
@@ -342,8 +353,14 @@ CREATE TABLE IF NOT EXISTS api_request_ledger (
   ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(ss_web_realtime_tasks >= 0),
   sif_units REAL NOT NULL DEFAULT 0 CHECK(sif_units >= 0),
   exa_calls REAL NOT NULL DEFAULT 0 CHECK(exa_calls >= 0),
+  estimated_ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_mcp_units >= 0),
+  estimated_ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_web_realtime_tasks >= 0),
   estimated_sif_units REAL NOT NULL DEFAULT 0 CHECK(estimated_sif_units >= 0),
+  estimated_exa_calls REAL NOT NULL DEFAULT 0 CHECK(estimated_exa_calls >= 0),
+  unknown_reserved_ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_mcp_units >= 0),
+  unknown_reserved_ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_web_realtime_tasks >= 0),
   unknown_reserved_sif_units REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_sif_units >= 0),
+  unknown_reserved_exa_calls REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_exa_calls >= 0),
   payload_sha256 TEXT,
   response_payload_json TEXT,
   raw_artifact_path TEXT,
@@ -366,7 +383,10 @@ CREATE TABLE IF NOT EXISTS raw_leads (
   event_dedup_key TEXT NOT NULL,
   source_ref_hash TEXT NOT NULL,
   source_channel TEXT NOT NULL,
+  route TEXT,
   entry_group TEXT NOT NULL DEFAULT 'in_site',
+  opportunity_type TEXT NOT NULL DEFAULT 'unclassified',
+  promotion_track TEXT,
   source_ref TEXT NOT NULL,
   phrase_or_title TEXT NOT NULL,
   raw_excerpt TEXT,
@@ -397,13 +417,17 @@ CREATE TABLE IF NOT EXISTS candidate_forms (
   leaf_node_path TEXT,
   lifecycle_status TEXT NOT NULL DEFAULT 'discovered' CHECK(lifecycle_status IN (
     'discovered', 'gate1a_passed', 'gate1a_rejected', 'gate1a_needs_verification',
-    'gate1b_queued', 'gate1b_passed', 'gate1b_rejected', 'gate1b_pending',
+    'gate1b_queued', 'gate1b_passed', 'gate1b_rejected', 'gate1b_pending', 'private_mold_reserved',
     'gate2_3_in_progress', 'evaluated', 'deferred', 'excluded'
   )),
+  sourcing_disposition TEXT,
   gate1a_result_json TEXT,
   gate1b_result_json TEXT,
   negotiation_shortlist_json TEXT,
   landed_domestic_cap_cny REAL,
+  cooldown_until TEXT,
+  cooldown_reason TEXT,
+  promotion_track TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -414,7 +438,8 @@ CREATE INDEX IF NOT EXISTS idx_forms_status ON candidate_forms(lifecycle_status)
 CREATE TABLE IF NOT EXISTS lead_form_links (
   lead_id TEXT NOT NULL REFERENCES raw_leads(lead_id),
   form_id TEXT NOT NULL REFERENCES candidate_forms(form_id),
-  link_role TEXT NOT NULL CHECK(link_role IN ('primary_discovery', 'corroboration')),
+  link_role TEXT NOT NULL CHECK(link_role IN ('primary_discovery', 'corroboration', 'station_verification')),
+  verification_subrole TEXT,
   event_dedup_key TEXT NOT NULL,
   source_ref_hash TEXT NOT NULL,
   linked_at TEXT NOT NULL,
@@ -436,6 +461,8 @@ CREATE TABLE IF NOT EXISTS sourcing_quotes_1688 (
   actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
   goods_cny_total REAL CHECK((quote_status = 'pending' AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status != 'pending' AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
   domestic_freight_cny_total REAL CHECK((quote_status = 'pending' AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status != 'pending' AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
+  pkg_json TEXT,
+  fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
   goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
   freight_first_order_promotion INTEGER NOT NULL CHECK(freight_first_order_promotion IN (0, 1)),
   lead_time_days INTEGER CHECK(lead_time_days IS NULL OR lead_time_days >= 0),
@@ -468,6 +495,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
   html_sha256 TEXT,
   receipt_json TEXT NOT NULL,
   source_attempt_ids_json TEXT NOT NULL DEFAULT '[]',
+  review_notes_json TEXT,
+  evidence_review_json TEXT,
   created_at TEXT NOT NULL,
   UNIQUE(form_id, period_id, profile_revision, evidence_bundle_sha256)
 );
@@ -491,6 +520,165 @@ CREATE TABLE IF NOT EXISTS queue_state (
 );
 `;
 
+export function classifyBillingLane(provider, toolName = '', row = null) {
+  const norm = normalizeProvider(provider, toolName);
+  if (norm === 'sif') return 'sif';
+  if (norm === 'exa') return 'exa';
+  if (norm === 'sellersprite') {
+    const t = String(toolName || '');
+    if (
+      (row && (
+        (Number(row.ss_web_realtime_tasks) > 0) ||
+        (Number(row.estimated_ss_web_realtime_tasks) > 0) ||
+        (Number(row.unknown_reserved_ss_web_realtime_tasks) > 0)
+      )) ||
+      /(?:web_realtime|realtime_task|cua_task|browser_realtime)/i.test(t)
+    ) {
+      return 'ss_web';
+    }
+    return 'ss_mcp';
+  }
+  return null;
+}
+
+const ALIGNMENT_STOPWORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'that', 'this', 'are', 'was', 'were', 'has', 'have',
+  'had', 'your', 'our', 'their', 'not', 'can', 'use', 'using', 'used', 'need', 'needs',
+  'want', 'wants', 'product', 'products', 'item', 'items', 'thing', 'things', 'good', 'best',
+  'very', 'just', 'like', 'into', 'onto', 'over', 'under', 'about', 'more', 'most', 'some',
+  'any', 'all', 'one', 'two', 'set', 'pack', 'kit', 'form', 'task', 'buyer', 'social',
+]);
+
+export function extractDomainTokens(text) {
+  const s = String(text || '').normalize('NFKC').toLowerCase();
+  const latin = new Set();
+  const cjk = new Set();
+  for (const m of s.matchAll(/[a-z][a-z0-9]{2,}/g)) {
+    const tok = m[0].endsWith('s') && m[0].length > 4 ? m[0].slice(0, -1) : m[0];
+    if (!ALIGNMENT_STOPWORDS.has(tok) && !ALIGNMENT_STOPWORDS.has(m[0])) {
+      latin.add(tok);
+    }
+  }
+  const cjkSeqs = s.match(/[\u4e00-\u9fff]+/g) || [];
+  for (const seq of cjkSeqs) {
+    if (seq.length === 1) {
+      cjk.add(seq);
+    } else {
+      for (let i = 0; i < seq.length - 1; i++) cjk.add(seq.slice(i, i + 2));
+    }
+  }
+  return { latin, cjk };
+}
+
+export function isSocialBridgeAlignedWithForm(socialContract, form, { linkNote = null } = {}) {
+  if (!socialContract || typeof socialContract !== 'object' || !form || typeof form !== 'object') {
+    return { aligned: true, reason: null };
+  }
+  if (socialContract.status !== 'extracted') {
+    return {
+      aligned: false,
+      reason: `SocialBridge status is "${socialContract.status}", not "extracted"; cannot serve as primary_discovery.`,
+    };
+  }
+  const leadText = [
+    socialContract.buyer_task,
+    ...(Array.isArray(socialContract.candidate_phrases) ? socialContract.candidate_phrases : []),
+  ].filter(Boolean).join(' ');
+  const formText = [
+    form.label,
+    form.buyer_task,
+    form.core_form,
+  ].filter(Boolean).join(' ');
+  const leadTok = extractDomainTokens(leadText);
+  const formTok = extractDomainTokens(formText);
+
+  const shareLatin = [...leadTok.latin].some(t => formTok.latin.has(t));
+  const shareCjk = [...leadTok.cjk].some(t => formTok.cjk.has(t));
+  if (shareLatin || shareCjk) return { aligned: true, reason: null };
+
+  // Both sides have substantive same-script domain terms yet zero overlap -> unrelated buyer task!
+  if (leadTok.latin.size >= 2 && formTok.latin.size >= 2) {
+    return {
+      aligned: false,
+      reason: `SocialBridge buyer_task/phrases share zero domain terms with form "${form.form_id}" (${form.buyer_task || form.label}).`,
+    };
+  }
+  if (leadTok.cjk.size >= 2 && formTok.cjk.size >= 2) {
+    return {
+      aligned: false,
+      reason: `SocialBridge buyer_task/phrases share zero CJK domain terms with form "${form.form_id}".`,
+    };
+  }
+  // Cross-script (one purely Latin, one purely CJK): require explicit bridge alignment note.
+  const crossScript = (leadTok.latin.size >= 2 && formTok.cjk.size >= 2 && leadTok.cjk.size === 0 && formTok.latin.size === 0) ||
+    (leadTok.cjk.size >= 2 && formTok.latin.size >= 2 && leadTok.latin.size === 0 && formTok.cjk.size === 0);
+  if (crossScript && !nonemptyStr(linkNote)) {
+    return {
+      aligned: false,
+      reason: `Cross-script SocialBridge lead requires an explicit link_note confirming buyer_task equivalence with form "${form.form_id}".`,
+    };
+  }
+  return { aligned: true, reason: null };
+}
+
+function isTrustedNotDispatchedError(error) {
+  if (!error || typeof error !== 'object') return false;
+  if (error.not_dispatched === true || error.outcome === 'not_dispatched') return true;
+  if (error.code === 'PREFLIGHT_NOT_DISPATCHED') return true;
+  if (error.data && typeof error.data === 'object') {
+    if (error.data.outcome === 'not_dispatched' || error.data.not_dispatched === true) return true;
+  }
+  return false;
+}
+
+function isTransientSqliteOpenContention(error) {
+  const code = Number(error?.errcode);
+  if (!Number.isFinite(code)) return false;
+  const base = code & 0xff;
+  if (base === 5 || base === 6) return true; // SQLITE_BUSY / SQLITE_LOCKED
+  // Windows concurrent WAL/SHM creation contention on initial open (TRUNCATE/LOCK/SHM*)
+  return code === 1546 || code === 3850 || code === 4874 || code === 5130 || code === 5386 || code === 5642;
+}
+
+function sleepSyncMs(ms) {
+  const view = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(view, 0, 0, Math.max(1, Math.trunc(ms)));
+}
+
+function isVerifiedFiveFieldUiReadback(ui) {
+  return Boolean(
+    ui &&
+    typeof ui === 'object' &&
+    ui.logged_in === true &&
+    Number(ui.viewport_width_px) >= 1440 &&
+    ui.selected_sku_row_visible === true &&
+    ui.settlement_bar_visible === true &&
+    (ui.applied_quantity_confirmed === true || ui.applied_qty_confirmed === true),
+  );
+}
+
+function sourcingQuoteFromRow(row) {
+  const { pkg_json, fx_cny_per_usd, ...quote } = row;
+  if (pkg_json != null) quote.pkg = JSON.parse(pkg_json);
+  if (fx_cny_per_usd != null) quote.fx_cny_per_usd = fx_cny_per_usd;
+  if (quote.order_plan_json) {
+    try {
+      const parsedPlan = JSON.parse(quote.order_plan_json);
+      if (parsedPlan?.carton_pack_unverified_stage1 === true) {
+        quote.carton_pack_unverified_stage1 = true;
+        quote.carton_verification_tag = parsedPlan.carton_verification_tag ?? '整箱装箱率待向客服核实';
+      }
+      if (parsedPlan?.ui_readback && typeof parsedPlan.ui_readback === 'object') {
+        quote.ui_readback = parsedPlan.ui_readback;
+        quote.ui_readback_verified = isVerifiedFiveFieldUiReadback(parsedPlan.ui_readback);
+      } else if (parsedPlan?.ui_readback_verified === false) {
+        quote.ui_readback_verified = false;
+      }
+    } catch { /* ignore */ }
+  }
+  return quote;
+}
+
 export class SelectionStore {
   /**
    * reconcileOnOpen defaults to false so secondary writable helpers cannot hijack active
@@ -509,14 +697,117 @@ export class SelectionStore {
     if (dbPath !== ':memory:') {
       mkdirSync(dirname(dbPath), { recursive: true });
     }
-    this.db = new DatabaseSync(dbPath);
-    if (dbPath !== ':memory:') {
-      this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL;');
+    const maxAttempts = dbPath === ':memory:' ? 1 : 12;
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      this.db = new DatabaseSync(dbPath);
+      try {
+        // Set busy_timeout BEFORE WAL transition and DDL so concurrent openers wait instead of failing immediately.
+        this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
+        if (dbPath !== ':memory:') {
+          const curMode = String(this.db.prepare('PRAGMA journal_mode').get()?.journal_mode || '').toLowerCase();
+          if (curMode !== 'wal') {
+            this.db.exec('PRAGMA journal_mode = WAL;');
+          }
+          this.db.exec('PRAGMA synchronous = FULL;');
+        }
+        this._withImmediateTx(() => {
+          this.db.exec(SCHEMA_SQL);
+          this._migrateSchema();
+          this._ensureDefaultQueues();
+        });
+        lastError = null;
+        break;
+      } catch (err) {
+        lastError = err;
+        try { this.db.close(); } catch { /* ignore close error */ }
+        if (attempt < maxAttempts && isTransientSqliteOpenContention(err)) {
+          sleepSyncMs(20 + attempt * 15);
+          continue;
+        }
+        throw err;
+      }
     }
-    this.db.exec('PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
-    this.db.exec(SCHEMA_SQL);
-    this._ensureDefaultQueues();
+    if (lastError) throw lastError;
     this.startup_reconciled_attempts = reconcileOnOpen ? this.reconcileInFlightOnStartup() : [];
+  }
+
+  _tableColumns(tableName) {
+    return new Set(this.db.prepare(`PRAGMA table_info(${tableName})`).all().map(c => c.name));
+  }
+
+  _migrateSchema() {
+    const ensureColumns = (tableName, specs) => {
+      const existing = this._tableColumns(tableName);
+      for (const [colName, colDef] of specs) {
+        if (!existing.has(colName)) {
+          this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${colName} ${colDef};`);
+        }
+      }
+    };
+    ensureColumns('api_request_ledger', [
+      ['estimated_ss_mcp_units', 'REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_mcp_units >= 0)'],
+      ['estimated_ss_web_realtime_tasks', 'REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_web_realtime_tasks >= 0)'],
+      ['estimated_exa_calls', 'REAL NOT NULL DEFAULT 0 CHECK(estimated_exa_calls >= 0)'],
+      ['unknown_reserved_ss_mcp_units', 'REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_mcp_units >= 0)'],
+      ['unknown_reserved_ss_web_realtime_tasks', 'REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_web_realtime_tasks >= 0)'],
+      ['unknown_reserved_exa_calls', 'REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_exa_calls >= 0)'],
+    ]);
+    ensureColumns('raw_leads', [
+      ['route', 'TEXT'],
+      ['opportunity_type', "TEXT NOT NULL DEFAULT 'unclassified'"],
+      ['promotion_track', 'TEXT'],
+    ]);
+    ensureColumns('candidate_forms', [
+      ['cooldown_until', 'TEXT'],
+      ['cooldown_reason', 'TEXT'],
+      ['promotion_track', 'TEXT'],
+      ['sourcing_disposition', 'TEXT'],
+    ]);
+    ensureColumns('lead_form_links', [
+      ['verification_subrole', 'TEXT'],
+    ]);
+    ensureColumns('sourcing_quotes_1688', [
+      ['pkg_json', 'TEXT'],
+      ['fx_cny_per_usd', 'REAL CHECK(fx_cny_per_usd > 0)'],
+    ]);
+    ensureColumns('evaluations', [
+      ['review_notes_json', 'TEXT'],
+      ['evidence_review_json', 'TEXT'],
+    ]);
+    // Lane-accurate, idempotent backfill for unresolved unknown rows with zero billed AND zero reserved units.
+    // Never adds an ss_mcp reserve to an ss_web row, and never changes totals when reopening the database.
+    const unreservedUnknowns = this.db.prepare(`
+      SELECT attempt_id, provider, tool_name, canonical_tool,
+             ss_mcp_units, ss_web_realtime_tasks, sif_units, exa_calls,
+             estimated_ss_mcp_units, estimated_ss_web_realtime_tasks, estimated_sif_units, estimated_exa_calls,
+             unknown_reserved_ss_mcp_units, unknown_reserved_ss_web_realtime_tasks, unknown_reserved_sif_units, unknown_reserved_exa_calls
+      FROM api_request_ledger
+      WHERE status = 'unknown_needs_reconciliation'
+        AND ss_mcp_units = 0 AND ss_web_realtime_tasks = 0 AND sif_units = 0 AND exa_calls = 0
+        AND unknown_reserved_ss_mcp_units = 0 AND unknown_reserved_ss_web_realtime_tasks = 0
+        AND unknown_reserved_sif_units = 0 AND unknown_reserved_exa_calls = 0
+    `).all();
+    const updStmt = this.db.prepare(`
+      UPDATE api_request_ledger
+      SET unknown_reserved_ss_mcp_units = ?,
+          unknown_reserved_ss_web_realtime_tasks = ?,
+          unknown_reserved_sif_units = ?,
+          unknown_reserved_exa_calls = ?
+      WHERE attempt_id = ?
+    `);
+    for (const row of unreservedUnknowns) {
+      const lane = classifyBillingLane(row.provider, row.canonical_tool || row.tool_name, row);
+      if (lane === 'ss_mcp') {
+        updStmt.run(Math.max(1, row.estimated_ss_mcp_units || 0), 0, 0, 0, row.attempt_id);
+      } else if (lane === 'ss_web') {
+        updStmt.run(0, Math.max(1, row.estimated_ss_web_realtime_tasks || 0), 0, 0, row.attempt_id);
+      } else if (lane === 'exa') {
+        updStmt.run(0, 0, 0, Math.max(1, row.estimated_exa_calls || 0), row.attempt_id);
+      } else if (lane === 'sif' && row.estimated_sif_units > 0) {
+        updStmt.run(0, 0, row.estimated_sif_units, 0, row.attempt_id);
+      }
+    }
   }
 
   _now() {
@@ -568,7 +859,9 @@ export class SelectionStore {
     const now = this._now();
     return this._withImmediateTx(() => {
       const dangling = this.db.prepare(`
-        SELECT attempt_id, estimated_sif_units, unknown_reserved_sif_units
+        SELECT attempt_id, provider, tool_name, canonical_tool,
+               estimated_ss_mcp_units, estimated_ss_web_realtime_tasks, estimated_sif_units, estimated_exa_calls,
+               unknown_reserved_ss_mcp_units, unknown_reserved_ss_web_realtime_tasks, unknown_reserved_sif_units, unknown_reserved_exa_calls
         FROM api_request_ledger
         WHERE status IN ('reserved', 'in_flight')
       `).all();
@@ -576,12 +869,22 @@ export class SelectionStore {
         UPDATE api_request_ledger
         SET status = 'unknown_needs_reconciliation',
             repeat_submission_allowed = 0,
-            unknown_reserved_sif_units = MAX(unknown_reserved_sif_units, estimated_sif_units),
+            unknown_reserved_ss_mcp_units = ?,
+            unknown_reserved_ss_web_realtime_tasks = ?,
+            unknown_reserved_sif_units = ?,
+            unknown_reserved_exa_calls = ?,
             reconciliation_note = COALESCE(reconciliation_note || ' | ', '') || 'Crash recovery on startup: prior attempt interrupted before receipt; reconcile before retrying.',
             updated_at = ?
         WHERE attempt_id = ?
       `);
-      for (const row of dangling) stmt.run(now, row.attempt_id);
+      for (const row of dangling) {
+        const lane = classifyBillingLane(row.provider, row.canonical_tool || row.tool_name, row);
+        const resSsMcp = Math.max(row.unknown_reserved_ss_mcp_units || 0, row.estimated_ss_mcp_units || 0, lane === 'ss_mcp' ? 1 : 0);
+        const resSsWeb = Math.max(row.unknown_reserved_ss_web_realtime_tasks || 0, row.estimated_ss_web_realtime_tasks || 0, lane === 'ss_web' ? 1 : 0);
+        const resSif = Math.max(row.unknown_reserved_sif_units || 0, row.estimated_sif_units || 0, lane === 'sif' ? 1 : 0);
+        const resExa = Math.max(row.unknown_reserved_exa_calls || 0, row.estimated_exa_calls || 0, lane === 'exa' ? 1 : 0);
+        stmt.run(resSsMcp, resSsWeb, resSif, resExa, now, row.attempt_id);
+      }
 
       // Clear stale serial queue leases left behind by a crashed controller.
       this.db.prepare(`
@@ -611,9 +914,23 @@ export class SelectionStore {
     const stage = spec.stage ?? 'general';
     const formId = spec.form_id ?? null;
     const reuseCompleted = spec.reuse_completed !== false;
+    const lane = classifyBillingLane(keys.provider, keys.canonical_tool, spec);
     const estimatedSifUnits = spec.estimated_sif_units ?? 0;
-    if (!finite(estimatedSifUnits) || estimatedSifUnits < 0) {
-      throw new TypeError('estimated_sif_units must be a nonnegative finite number.');
+    const defaultSsEst = lane === 'ss_mcp' ? 1 : 0;
+    const defaultSsWebEst = lane === 'ss_web' ? 1 : 0;
+    const defaultExaEst = lane === 'exa' ? 1 : 0;
+    const estimatedSsMcpUnits = spec.estimated_ss_mcp_units ?? defaultSsEst;
+    const estimatedSsWebTasks = spec.estimated_ss_web_realtime_tasks ?? defaultSsWebEst;
+    const estimatedExaCalls = spec.estimated_exa_calls ?? defaultExaEst;
+    for (const [label, val] of Object.entries({
+      estimated_sif_units: estimatedSifUnits,
+      estimated_ss_mcp_units: estimatedSsMcpUnits,
+      estimated_ss_web_realtime_tasks: estimatedSsWebTasks,
+      estimated_exa_calls: estimatedExaCalls,
+    })) {
+      if (!finite(val) || val < 0) {
+        throw new TypeError(`${label} must be a nonnegative finite number.`);
+      }
     }
     const now = this._now();
 
@@ -704,15 +1021,16 @@ export class SelectionStore {
         }
       }
 
-      // Check 4: Reserve synchronously before dispatch (persisting estimated_sif_units for crash safety).
+      // Check 4: Reserve synchronously before dispatch (persisting 4-way estimated units for crash safety).
       this.db.prepare(`
         INSERT INTO api_request_ledger (
           attempt_id, logical_request_key, semantic_lock_key, account_scope,
           provider, tool_name, canonical_tool, tool_version, marketplace, mode,
           observation_cutoff_date, page_or_cursor, normalized_params_json,
-          form_id, stage, status, repeat_submission_allowed, estimated_sif_units,
+          form_id, stage, status, repeat_submission_allowed,
+          estimated_ss_mcp_units, estimated_ss_web_realtime_tasks, estimated_sif_units, estimated_exa_calls,
           created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'fresh_observation', ?, ?, ?, ?, ?, 'reserved', 0, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'fresh_observation', ?, ?, ?, ?, ?, 'reserved', 0, ?, ?, ?, ?, ?, ?)
       `).run(
         attemptId,
         keys.logical_request_key,
@@ -728,7 +1046,10 @@ export class SelectionStore {
         keys.normalized_params_json,
         formId,
         stage,
+        estimatedSsMcpUnits,
+        estimatedSsWebTasks,
         estimatedSifUnits,
+        estimatedExaCalls,
         now,
         now,
       );
@@ -811,7 +1132,10 @@ export class SelectionStore {
           ss_web_realtime_tasks = ?,
           sif_units = ?,
           exa_calls = ?,
+          unknown_reserved_ss_mcp_units = CASE WHEN ? = 1 THEN MAX(unknown_reserved_ss_mcp_units, estimated_ss_mcp_units) ELSE 0 END,
+          unknown_reserved_ss_web_realtime_tasks = CASE WHEN ? = 1 THEN MAX(unknown_reserved_ss_web_realtime_tasks, estimated_ss_web_realtime_tasks) ELSE 0 END,
           unknown_reserved_sif_units = CASE WHEN ? = 1 THEN MAX(unknown_reserved_sif_units, estimated_sif_units) ELSE 0 END,
+          unknown_reserved_exa_calls = CASE WHEN ? = 1 THEN MAX(unknown_reserved_exa_calls, estimated_exa_calls) ELSE 0 END,
           payload_sha256 = ?,
           response_payload_json = COALESCE(?, response_payload_json),
           raw_artifact_path = ?,
@@ -827,6 +1151,9 @@ export class SelectionStore {
       sif_units,
       exa_calls,
       keepReserve,
+      keepReserve,
+      keepReserve,
+      keepReserve,
       effectiveHash,
       serializedPayload,
       raw_artifact_path,
@@ -841,7 +1168,10 @@ export class SelectionStore {
 
   failAttemptUnknownOutcome(attemptId, {
     note = 'Unknown execution/billing outcome; do not retry without reconciliation.',
+    unknown_reserved_ss_mcp_units = null,
+    unknown_reserved_ss_web_realtime_tasks = null,
     unknown_reserved_sif_units = null,
+    unknown_reserved_exa_calls = null,
     ss_mcp_units = 0,
     ss_web_realtime_tasks = 0,
     sif_units = 0,
@@ -851,8 +1181,15 @@ export class SelectionStore {
     raw_artifact_path = null,
   } = {}) {
     this._assertWritable();
-    if (unknown_reserved_sif_units !== null && (!finite(unknown_reserved_sif_units) || unknown_reserved_sif_units < 0)) {
-      throw new TypeError('unknown_reserved_sif_units must be a nonnegative finite number or null.');
+    for (const [k, v] of Object.entries({
+      unknown_reserved_ss_mcp_units,
+      unknown_reserved_ss_web_realtime_tasks,
+      unknown_reserved_sif_units,
+      unknown_reserved_exa_calls,
+    })) {
+      if (v !== null && (!finite(v) || v < 0)) {
+        throw new TypeError(`${k} must be a nonnegative finite number or null.`);
+      }
     }
     const cleanNote = sanitizeDiagnosticText(note);
     const now = this._now();
@@ -865,7 +1202,10 @@ export class SelectionStore {
           ss_web_realtime_tasks = ss_web_realtime_tasks + ?,
           sif_units = sif_units + ?,
           exa_calls = exa_calls + ?,
+          unknown_reserved_ss_mcp_units = MAX(unknown_reserved_ss_mcp_units, COALESCE(?, estimated_ss_mcp_units)),
+          unknown_reserved_ss_web_realtime_tasks = MAX(unknown_reserved_ss_web_realtime_tasks, COALESCE(?, estimated_ss_web_realtime_tasks)),
           unknown_reserved_sif_units = MAX(unknown_reserved_sif_units, COALESCE(?, estimated_sif_units)),
+          unknown_reserved_exa_calls = MAX(unknown_reserved_exa_calls, COALESCE(?, estimated_exa_calls)),
           payload_sha256 = COALESCE(?, payload_sha256),
           raw_artifact_path = COALESCE(?, raw_artifact_path),
           reconciliation_note = ?,
@@ -878,7 +1218,10 @@ export class SelectionStore {
       ss_web_realtime_tasks,
       sif_units,
       exa_calls,
+      unknown_reserved_ss_mcp_units,
+      unknown_reserved_ss_web_realtime_tasks,
       unknown_reserved_sif_units,
+      unknown_reserved_exa_calls,
       payload_sha256,
       raw_artifact_path,
       cleanNote,
@@ -889,20 +1232,25 @@ export class SelectionStore {
     if (res.changes !== 1) throw new Error(`Cannot mark attempt ${attemptId} unknown_needs_reconciliation.`);
   }
 
-  failAttemptBeforeDispatch(attemptId, note = 'Failed locally before network dispatch.') {
+  failAttemptBeforeDispatch(attemptId, note = 'Failed locally before network dispatch.', { allowInFlightPreflight = false } = {}) {
     this._assertWritable();
     const now = this._now();
+    const statusClause = allowInFlightPreflight ? "status IN ('reserved', 'in_flight')" : "status = 'reserved'";
     const res = this.db.prepare(`
       UPDATE api_request_ledger
       SET status = 'failed',
           repeat_submission_allowed = 1,
+          billing_status = 'known',
+          unknown_reserved_ss_mcp_units = 0,
+          unknown_reserved_ss_web_realtime_tasks = 0,
           unknown_reserved_sif_units = 0,
+          unknown_reserved_exa_calls = 0,
           reconciliation_note = ?,
           updated_at = ?,
           finished_at = ?
-      WHERE attempt_id = ? AND status = 'reserved'
+      WHERE attempt_id = ? AND ${statusClause}
     `).run(sanitizeDiagnosticText(note), now, now, attemptId);
-    if (res.changes !== 1) throw new Error(`Cannot mark attempt ${attemptId} failed before dispatch (must be in reserved state).`);
+    if (res.changes !== 1) throw new Error(`Cannot mark attempt ${attemptId} failed before dispatch (must be in ${allowInFlightPreflight ? 'reserved/in_flight' : 'reserved'} state).`);
   }
 
   reconcileUnknownAttempt(attemptId, {
@@ -920,10 +1268,17 @@ export class SelectionStore {
       throw new TypeError('resolved_status must be completed, failed, or permanently_locked.');
     }
     if (!nonemptyStr(note)) throw new TypeError('A nonempty reconciliation note is required.');
+    for (const [k, v] of Object.entries({ ss_mcp_units, ss_web_realtime_tasks, sif_units, exa_calls })) {
+      if (!finite(v) || v < 0) throw new TypeError(`${k} must be a nonnegative finite number.`);
+    }
     const cleanNote = sanitizeDiagnosticText(note.trim());
     const now = this._now();
     return this._withImmediateTx(() => {
-      const existing = this.db.prepare('SELECT status, billing_status FROM api_request_ledger WHERE attempt_id = ?').get(attemptId);
+      const existing = this.db.prepare(`
+        SELECT status, billing_status, repeat_submission_allowed, ss_mcp_units, ss_web_realtime_tasks, sif_units, exa_calls
+        FROM api_request_ledger
+        WHERE attempt_id = ?
+      `).get(attemptId);
       if (!existing) throw new Error(`Attempt ${attemptId} not found.`);
       if (existing.status === 'permanently_locked') {
         throw new Error(`Attempt ${attemptId} is permanently_locked and cannot be unlocked.`);
@@ -933,7 +1288,18 @@ export class SelectionStore {
       if (!canReconcile) {
         throw new Error(`Attempt ${attemptId} is in state ${existing.status} (billing ${existing.billing_status}), not eligible for reconciliation.`);
       }
-      const repeatAllowed = resolved_status === 'permanently_locked' ? 0 : 1;
+      const totalBilledUnits =
+        (existing.ss_mcp_units + ss_mcp_units) +
+        (existing.ss_web_realtime_tasks + ss_web_realtime_tasks) +
+        (existing.sif_units + sif_units) +
+        (existing.exa_calls + exa_calls);
+      // Preserve no_retry lock on historical completed attempts AND on billed failures or permanent locks!
+      const preserveHistoricalNoRetry = existing.status === 'completed' && existing.repeat_submission_allowed === 0;
+      const repeatAllowed = (
+        resolved_status === 'permanently_locked' ||
+        preserveHistoricalNoRetry ||
+        (resolved_status === 'failed' && totalBilledUnits > 0)
+      ) ? 0 : 1;
       const keepUnknownReserve = resolved_status === 'permanently_locked';
       this.db.prepare(`
         UPDATE api_request_ledger
@@ -944,7 +1310,10 @@ export class SelectionStore {
             ss_web_realtime_tasks = ss_web_realtime_tasks + ?,
             sif_units = sif_units + ?,
             exa_calls = exa_calls + ?,
+            unknown_reserved_ss_mcp_units = CASE WHEN ? = 1 THEN unknown_reserved_ss_mcp_units ELSE 0 END,
+            unknown_reserved_ss_web_realtime_tasks = CASE WHEN ? = 1 THEN unknown_reserved_ss_web_realtime_tasks ELSE 0 END,
             unknown_reserved_sif_units = CASE WHEN ? = 1 THEN unknown_reserved_sif_units ELSE 0 END,
+            unknown_reserved_exa_calls = CASE WHEN ? = 1 THEN unknown_reserved_exa_calls ELSE 0 END,
             payload_sha256 = COALESCE(?, payload_sha256),
             raw_artifact_path = COALESCE(?, raw_artifact_path),
             reconciliation_note = ?,
@@ -958,6 +1327,9 @@ export class SelectionStore {
         ss_web_realtime_tasks,
         sif_units,
         exa_calls,
+        keepUnknownReserve ? 1 : 0,
+        keepUnknownReserve ? 1 : 0,
+        keepUnknownReserve ? 1 : 0,
         keepUnknownReserve ? 1 : 0,
         payload_sha256,
         raw_artifact_path,
@@ -993,7 +1365,20 @@ export class SelectionStore {
     const noRetry = record.no_retry === true;
     const repeatAllowed = (status === 'permanently_locked' || status === 'unknown_needs_reconciliation' || noRetry) ? 0 : 1;
     const billingStatus = record.billing_status ?? 'known';
+    const lane = classifyBillingLane(keys.provider, keys.canonical_tool, record);
     const incomingReserve = Number(record.unknown_reserved_sif_units ?? 0) || 0;
+    const incomingSsMcpReserve = Number(
+      record.unknown_reserved_ss_mcp_units ??
+      (status === 'unknown_needs_reconciliation' && lane === 'ss_mcp' && !(record.ss_mcp_units > 0) ? 1 : 0),
+    ) || 0;
+    const incomingSsWebReserve = Number(
+      record.unknown_reserved_ss_web_realtime_tasks ??
+      (status === 'unknown_needs_reconciliation' && lane === 'ss_web' && !(record.ss_web_realtime_tasks > 0) ? 1 : 0),
+    ) || 0;
+    const incomingExaReserve = Number(
+      record.unknown_reserved_exa_calls ??
+      (status === 'unknown_needs_reconciliation' && lane === 'exa' && !(record.exa_calls > 0) ? 1 : 0),
+    ) || 0;
     const cleanNote = record.reconciliation_note ? sanitizeDiagnosticText(record.reconciliation_note) : null;
     const preferIncomingId = record.canonical_recovery_lock === true;
     const now = this._now();
@@ -1020,10 +1405,28 @@ export class SelectionStore {
           }
         }
 
+        // Never let a stale unknown_needs_reconciliation or unknown_not_exposed re-import revert an operator-reconciled row!
+        const alreadyOperatorSettled =
+          (existing.status === 'completed' || existing.status === 'failed') &&
+          existing.billing_status === 'known' &&
+          (status === 'unknown_needs_reconciliation' || billingStatus === 'unknown_not_exposed');
+
         const nextStatus = existing.status === 'permanently_locked' || status === 'permanently_locked'
           ? 'permanently_locked'
-          : (status === 'unknown_needs_reconciliation' ? 'unknown_needs_reconciliation' : existing.status);
-        const nextRepeat = (existing.repeat_submission_allowed === 0 || repeatAllowed === 0 || nextStatus === 'permanently_locked') ? 0 : 1;
+          : (alreadyOperatorSettled
+            ? existing.status
+            : (status === 'unknown_needs_reconciliation' ? 'unknown_needs_reconciliation' : existing.status));
+        const nextRepeat = alreadyOperatorSettled
+          ? existing.repeat_submission_allowed
+          : ((existing.repeat_submission_allowed === 0 || repeatAllowed === 0 || nextStatus === 'permanently_locked') ? 0 : 1);
+        const nextBillingStatus = alreadyOperatorSettled
+          ? existing.billing_status
+          : (billingStatus === 'unknown_not_exposed' ? 'unknown_not_exposed' : existing.billing_status);
+        const effSsMcpRes = alreadyOperatorSettled ? existing.unknown_reserved_ss_mcp_units : incomingSsMcpReserve;
+        const effSsWebRes = alreadyOperatorSettled ? existing.unknown_reserved_ss_web_realtime_tasks : incomingSsWebReserve;
+        const effSifRes = alreadyOperatorSettled ? existing.unknown_reserved_sif_units : incomingReserve;
+        const effExaRes = alreadyOperatorSettled ? existing.unknown_reserved_exa_calls : incomingExaReserve;
+        const nextNote = alreadyOperatorSettled ? existing.reconciliation_note : (cleanNote ?? existing.reconciliation_note);
         const nextSourceRef = preferIncomingId
           ? (record.source_ledger_ref ?? existing.source_ledger_ref)
           : (existing.source_ledger_ref ?? record.source_ledger_ref ?? null);
@@ -1031,37 +1434,44 @@ export class SelectionStore {
           UPDATE api_request_ledger
           SET status = ?,
               repeat_submission_allowed = ?,
-              billing_status = CASE WHEN ? = 'unknown_not_exposed' THEN 'unknown_not_exposed' ELSE billing_status END,
+              billing_status = ?,
               ss_mcp_units = MAX(ss_mcp_units, ?),
               ss_web_realtime_tasks = MAX(ss_web_realtime_tasks, ?),
               sif_units = MAX(sif_units, ?),
               exa_calls = MAX(exa_calls, ?),
+              unknown_reserved_ss_mcp_units = MAX(unknown_reserved_ss_mcp_units, ?),
+              unknown_reserved_ss_web_realtime_tasks = MAX(unknown_reserved_ss_web_realtime_tasks, ?),
               unknown_reserved_sif_units = MAX(unknown_reserved_sif_units, ?),
+              unknown_reserved_exa_calls = MAX(unknown_reserved_exa_calls, ?),
               payload_sha256 = COALESCE(payload_sha256, ?),
               raw_artifact_path = COALESCE(raw_artifact_path, ?),
               source_ledger_ref = ?,
-              reconciliation_note = COALESCE(?, reconciliation_note),
+              reconciliation_note = ?,
               updated_at = ?
           WHERE attempt_id = ?
         `).run(
           nextStatus,
           nextRepeat,
-          billingStatus,
+          nextBillingStatus,
           record.ss_mcp_units ?? 0,
           record.ss_web_realtime_tasks ?? 0,
           record.sif_units ?? 0,
           record.exa_calls ?? 0,
-          incomingReserve,
+          effSsMcpRes,
+          effSsWebRes,
+          effSifRes,
+          effExaRes,
           record.payload_sha256 ?? null,
           record.raw_artifact_path ?? null,
           nextSourceRef,
-          cleanNote,
+          nextNote,
           now,
           targetId,
         );
         return {
           inserted: false,
           upgraded_to_lock: nextStatus === 'permanently_locked' && existing.status !== 'permanently_locked',
+          preserved_settlement: alreadyOperatorSettled,
           attempt_id: targetId,
         };
       }
@@ -1072,10 +1482,12 @@ export class SelectionStore {
           provider, tool_name, canonical_tool, tool_version, marketplace, mode,
           observation_cutoff_date, page_or_cursor, normalized_params_json,
           form_id, stage, status, repeat_submission_allowed, billing_status,
-          ss_mcp_units, ss_web_realtime_tasks, sif_units, exa_calls, estimated_sif_units, unknown_reserved_sif_units,
+          ss_mcp_units, ss_web_realtime_tasks, sif_units, exa_calls,
+          estimated_ss_mcp_units, estimated_ss_web_realtime_tasks, estimated_sif_units, estimated_exa_calls,
+          unknown_reserved_ss_mcp_units, unknown_reserved_ss_web_realtime_tasks, unknown_reserved_sif_units, unknown_reserved_exa_calls,
           payload_sha256, raw_artifact_path, pagination_complete, source_ledger_ref, reconciliation_note,
           created_at, updated_at, finished_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'historical_replay', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'historical_replay', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         attemptId,
         keys.logical_request_key,
@@ -1098,7 +1510,10 @@ export class SelectionStore {
         record.ss_web_realtime_tasks ?? 0,
         record.sif_units ?? 0,
         record.exa_calls ?? 0,
+        incomingSsMcpReserve,
+        incomingSsWebReserve,
         incomingReserve,
+        incomingExaReserve,
         record.payload_sha256 ?? null,
         record.raw_artifact_path ?? null,
         record.pagination_complete === undefined || record.pagination_complete === null ? null : (record.pagination_complete ? 1 : 0),
@@ -1152,6 +1567,16 @@ export class SelectionStore {
     }
 
     if (typeof executor !== 'function') throw new TypeError('executor function is required.');
+    // Enforce SellerSprite/SIF connector guards BEFORE reservation by default on every paid dispatch.
+    if (spec.enforce_provider_guards !== false) {
+      const prov = normalizeProvider(spec.provider, spec.tool_name);
+      if (prov === 'sellersprite' || prov === 'sif') {
+        validateProviderCall(prov, spec.tool_name, spec.params ?? {}, {
+          ...(spec.provider_guard_context ?? {}),
+          throwOnError: true,
+        });
+      }
+    }
     const reservation = this.reserveRequestAttempt(spec);
     if (!reservation.allowed) return reservation;
 
@@ -1170,6 +1595,32 @@ export class SelectionStore {
           reused: false,
           completed: false,
           status: 'unknown_needs_reconciliation',
+          attempt_id: attemptId,
+          payload: null,
+          payload_sha256: null,
+          raw_artifact_path: null,
+        };
+      }
+
+      // Trusted proven pre-dispatch failure returned by adapter (0 upstream calls made): do NOT reserve quota or lock.
+      if (
+        (outcome.not_dispatched === true || outcome.outcome === 'not_dispatched') &&
+        !(outcome.ss_mcp_units > 0) &&
+        !(outcome.ss_web_realtime_tasks > 0) &&
+        !(outcome.sif_units > 0) &&
+        !(outcome.exa_calls > 0)
+      ) {
+        this.failAttemptBeforeDispatch(
+          attemptId,
+          outcome.error || outcome.reconciliation_note || 'Trusted pre-dispatch failure (not_dispatched); no upstream call was sent.',
+          { allowInFlightPreflight: true },
+        );
+        return {
+          allowed: true,
+          reused: false,
+          completed: false,
+          not_dispatched: true,
+          status: 'failed',
           attempt_id: attemptId,
           payload: null,
           payload_sha256: null,
@@ -1280,22 +1731,47 @@ export class SelectionStore {
         raw_artifact_path: outcome.raw_artifact_path ?? null,
       };
     } catch (error) {
-      this.failAttemptUnknownOutcome(attemptId, {
-        note: `Executor error after dispatch (${sanitizeDiagnosticText(error?.message || 'unknown_error')}); reconcile before retrying.`,
-        unknown_reserved_sif_units: spec.estimated_sif_units ?? 0,
-      });
+      if (isTrustedNotDispatchedError(error)) {
+        this.failAttemptBeforeDispatch(
+          attemptId,
+          `Pre-dispatch failure (${sanitizeDiagnosticText(error?.message || 'not_dispatched')}); request was not sent.`,
+          { allowInFlightPreflight: true },
+        );
+      } else {
+        this.failAttemptUnknownOutcome(attemptId, {
+          note: `Executor error after dispatch (${sanitizeDiagnosticText(error?.message || 'unknown_error')}); reconcile before retrying.`,
+          unknown_reserved_sif_units: spec.estimated_sif_units ?? 0,
+        });
+      }
       throw error;
     }
   }
 
   getQuotaSummary() {
+    const cols = this._tableColumns('api_request_ledger');
+    const has4Way = cols.has('unknown_reserved_ss_mcp_units') &&
+      cols.has('unknown_reserved_ss_web_realtime_tasks') &&
+      cols.has('unknown_reserved_exa_calls');
+
     const totals = this.db.prepare(`
       SELECT
         COALESCE(SUM(ss_mcp_units), 0) AS ss_mcp_units,
         COALESCE(SUM(ss_web_realtime_tasks), 0) AS ss_web_realtime_tasks,
         COALESCE(SUM(sif_units), 0) AS sif_units,
         COALESCE(SUM(exa_calls), 0) AS exa_calls,
+        ${has4Way
+          ? 'COALESCE(SUM(unknown_reserved_ss_mcp_units), 0)'
+          : '0'
+        } AS unknown_reserved_ss_mcp_units,
+        ${has4Way
+          ? 'COALESCE(SUM(unknown_reserved_ss_web_realtime_tasks), 0)'
+          : '0'
+        } AS unknown_reserved_ss_web_realtime_tasks,
         COALESCE(SUM(unknown_reserved_sif_units), 0) AS unknown_reserved_sif_units,
+        ${has4Way
+          ? 'COALESCE(SUM(unknown_reserved_exa_calls), 0)'
+          : '0'
+        } AS unknown_reserved_exa_calls,
         COUNT(*) AS total_attempts,
         COALESCE(SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END), 0) AS completed_attempts,
         COALESCE(SUM(CASE WHEN status = 'permanently_locked' THEN 1 ELSE 0 END), 0) AS permanently_locked_attempts,
@@ -1304,7 +1780,61 @@ export class SelectionStore {
         COALESCE(SUM(CASE WHEN billing_status = 'unknown_not_exposed' THEN 1 ELSE 0 END), 0) AS unknown_billing_attempts
       FROM api_request_ledger
     `).get();
-    return { ...totals };
+    const unknownSelectCols = has4Way
+      ? 'provider, tool_name, canonical_tool, ss_mcp_units, ss_web_realtime_tasks, sif_units, exa_calls, estimated_ss_mcp_units, estimated_ss_web_realtime_tasks, estimated_sif_units, estimated_exa_calls, unknown_reserved_ss_mcp_units, unknown_reserved_ss_web_realtime_tasks, unknown_reserved_sif_units, unknown_reserved_exa_calls'
+      : 'provider, tool_name, canonical_tool, ss_mcp_units, ss_web_realtime_tasks, sif_units, exa_calls, unknown_reserved_sif_units';
+    const unknownRows = this.db.prepare(`
+      SELECT ${unknownSelectCols}
+      FROM api_request_ledger
+      WHERE status = 'unknown_needs_reconciliation'
+    `).all();
+    const unknownByProvider = {};
+    const unknownByLane = { ss_mcp: 0, ss_web: 0, sif: 0, exa: 0 };
+    let fallbackResSsMcp = 0;
+    let fallbackResSsWeb = 0;
+    let fallbackResExa = 0;
+    for (const r of unknownRows) {
+      unknownByProvider[r.provider] = (unknownByProvider[r.provider] ?? 0) + 1;
+      const lane = classifyBillingLane(r.provider, r.canonical_tool || r.tool_name, r);
+      if (lane && Object.hasOwn(unknownByLane, lane)) unknownByLane[lane]++;
+      if (!has4Way) {
+        if (lane === 'ss_mcp' && !(r.ss_mcp_units > 0)) fallbackResSsMcp += 1;
+        else if (lane === 'ss_web' && !(r.ss_web_realtime_tasks > 0)) fallbackResSsWeb += 1;
+        else if (lane === 'exa' && !(r.exa_calls > 0)) fallbackResExa += 1;
+      }
+    }
+    const unkResSsMcp = has4Way ? totals.unknown_reserved_ss_mcp_units : fallbackResSsMcp;
+    const unkResSsWeb = has4Way ? totals.unknown_reserved_ss_web_realtime_tasks : fallbackResSsWeb;
+    const unkResExa = has4Way ? totals.unknown_reserved_exa_calls : fallbackResExa;
+    return {
+      ...totals,
+      unknown_reserved_ss_mcp_units: unkResSsMcp,
+      unknown_reserved_ss_web_realtime_tasks: unkResSsWeb,
+      unknown_reserved_exa_calls: unkResExa,
+      unknown_attempts_by_provider: unknownByProvider,
+      by_lane: {
+        ss_mcp: {
+          spent: totals.ss_mcp_units,
+          unknown_reserved: unkResSsMcp,
+          unknown_attempts: unknownByLane.ss_mcp,
+        },
+        ss_web: {
+          spent: totals.ss_web_realtime_tasks,
+          unknown_reserved: unkResSsWeb,
+          unknown_attempts: unknownByLane.ss_web,
+        },
+        sif: {
+          spent: totals.sif_units,
+          unknown_reserved: totals.unknown_reserved_sif_units,
+          unknown_attempts: unknownByLane.sif,
+        },
+        exa: {
+          spent: totals.exa_calls,
+          unknown_reserved: unkResExa,
+          unknown_attempts: unknownByLane.exa,
+        },
+      },
+    };
   }
 
   /**
@@ -1351,6 +1881,15 @@ export class SelectionStore {
     if (!ALLOWED_DISPOSITIONS.includes(disposition)) {
       throw new TypeError(`lead.disposition must be one of ${ALLOWED_DISPOSITIONS.join(', ')}.`);
     }
+    const channelMeta = resolveChannelMeta(sourceChannel, lead.route ?? null, lead.entry_group ?? null);
+    const opportunityType = lead.opportunity_type ?? 'unclassified';
+    if (!OPPORTUNITY_TYPES.includes(opportunityType)) {
+      throw new TypeError(`lead.opportunity_type must be one of ${OPPORTUNITY_TYPES.join(', ')}.`);
+    }
+    const promotionTrack = lead.promotion_track ?? null;
+    if (promotionTrack !== null && !PROMOTION_TRACKS.includes(promotionTrack)) {
+      throw new TypeError(`lead.promotion_track must be one of ${PROMOTION_TRACKS.join(', ')} or null.`);
+    }
     const sourceRefHash = sha256Hex(canonicalizeSourceRef(sourceRef));
     const eventDedupKey = nonemptyStr(lead.event_dedup_key)
       ? lead.event_dedup_key.trim().toLowerCase()
@@ -1382,25 +1921,43 @@ export class SelectionStore {
         if (preserveExisting) return { inserted: false, lead: { ...existing } };
         this.db.prepare(`
           UPDATE raw_leads
-          SET disposition = ?, disposition_reason = COALESCE(?, disposition_reason),
+          SET disposition = ?,
+              disposition_reason = COALESCE(?, disposition_reason),
+              route = COALESCE(?, route),
+              entry_group = COALESCE(?, entry_group),
+              opportunity_type = COALESCE(?, opportunity_type),
+              promotion_track = COALESCE(?, promotion_track),
               metadata_json = ?
           WHERE lead_id = ?
-        `).run(disposition, lead.disposition_reason ?? null, canonicalJson(lead.metadata ?? JSON.parse(existing.metadata_json)), leadId);
+        `).run(
+          disposition,
+          lead.disposition_reason ?? null,
+          lead.route !== undefined && lead.route !== null ? channelMeta.route : null,
+          lead.entry_group !== undefined && lead.entry_group !== null ? channelMeta.entry_group : null,
+          lead.opportunity_type ?? null,
+          promotionTrack,
+          canonicalJson(lead.metadata ?? JSON.parse(existing.metadata_json)),
+          leadId,
+        );
         return { inserted: false, lead: { ...this.db.prepare('SELECT * FROM raw_leads WHERE lead_id = ?').get(leadId) } };
       }
       this.db.prepare(`
         INSERT INTO raw_leads (
-          lead_id, normalized_key, event_dedup_key, source_ref_hash, source_channel, entry_group,
+          lead_id, normalized_key, event_dedup_key, source_ref_hash, source_channel, route, entry_group,
+          opportunity_type, promotion_track,
           source_ref, phrase_or_title, raw_excerpt, observed_at, first_seen_at,
           evidence_sha256, disposition, disposition_reason, source_attempt_id, metadata_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         leadId,
         normalizedKey,
         eventDedupKey,
         sourceRefHash,
         sourceChannel,
-        lead.entry_group ?? 'in_site',
+        channelMeta.route,
+        channelMeta.entry_group,
+        opportunityType,
+        promotionTrack,
         sourceRef,
         phrase,
         lead.raw_excerpt ?? null,
@@ -1418,14 +1975,98 @@ export class SelectionStore {
   }
 
   /**
+   * Validate a SocialBridgeExtractor structured output and persist it into raw_leads
+   * with canonical social route, entry_group, and non-keyword provenance metadata.
+   */
+  ingestSocialBridgeLead(socialOutput, {
+    lead_id = undefined,
+    form_id = null,
+    link_role = 'primary_discovery',
+    link_note = null,
+    disposition = null,
+    disposition_reason = null,
+    opportunity_type = 'unclassified',
+    promotion_track = null,
+    source_attempt_id = null,
+    metadata = {},
+    preserveExisting = false,
+  } = {}) {
+    const validated = validateSocialBridgeOutput(socialOutput);
+    const meta = resolveChannelMeta(validated.platform, 'social_cross_platform', 'social');
+    if (validated.status !== 'extracted' && disposition === 'product') {
+      throw new TypeError(`SocialBridgeExtractor status "${validated.status}" cannot be promoted to disposition "product".`);
+    }
+    const resolvedDisposition = disposition ?? (
+      validated.status === 'extracted'
+        ? 'product'
+        : validated.status === 'no_buyable_product'
+          ? 'needs_context'
+          : 'unreviewed'
+    );
+    const socialContract = {
+      status: validated.status,
+      platform: validated.platform,
+      buyer_task: socialOutput.buyer_task ?? null,
+      candidate_phrases: validated.candidate_phrases,
+      form_id: nonemptyStr(socialOutput.form_id) ? socialOutput.form_id.trim() : null,
+    };
+    const trimmedFormId = nonemptyStr(form_id) ? form_id.trim() : null;
+    if (trimmedFormId) {
+      if (socialContract.form_id && socialContract.form_id !== trimmedFormId) {
+        throw new TypeError(`SocialBridgeExtractor form_id (${socialContract.form_id}) conflicts with target form_id (${trimmedFormId}).`);
+      }
+      const targetForm = this.getCandidateForm(trimmedFormId);
+      if (!targetForm) throw new TypeError(`Unknown form_id for SocialBridge lead: ${trimmedFormId}`);
+      if (link_role === 'primary_discovery') {
+        const alignment = isSocialBridgeAlignedWithForm(socialContract, targetForm, { linkNote: link_note });
+        if (!alignment.aligned) {
+          throw new TypeError(`SocialBridge primary_discovery alignment failed: ${alignment.reason}`);
+        }
+      }
+    }
+    const primaryPhrase = validated.candidate_phrases[0] ?? socialOutput.buyer_task ?? validated.event_dedup_key;
+    const sourceRef = socialOutput.source_url ?? socialOutput.source_ref;
+    const upserted = this.upsertRawLead({
+      lead_id,
+      source_channel: meta.channel_id,
+      route: meta.route,
+      entry_group: meta.entry_group,
+      opportunity_type,
+      promotion_track,
+      event_dedup_key: validated.event_dedup_key,
+      source_ref: sourceRef,
+      phrase_or_title: primaryPhrase,
+      raw_excerpt: socialOutput.verbatim_excerpt ?? null,
+      observed_at: socialOutput.observed_at,
+      disposition: resolvedDisposition,
+      disposition_reason: disposition_reason ?? (socialOutput.buyer_task ? `SocialBridgeExtractor: ${socialOutput.buyer_task}` : null),
+      source_attempt_id,
+      metadata: {
+        ...metadata,
+        social_bridge_contract: socialContract,
+      },
+    }, { preserveExisting });
+    if (trimmedFormId) {
+      const linked = this.linkLeadToForm({
+        lead_id: upserted.lead.lead_id,
+        form_id: trimmedFormId,
+        link_role,
+        note: link_note,
+      });
+      return { ...upserted, link: linked.link };
+    }
+    return upserted;
+  }
+
+  /**
    * Link a raw lead to a candidate form, deduplicating primary_discovery by BOTH event_dedup_key
    * AND canonical source_ref_hash so two tools citing the same original post with distinct custom
    * event keys never double-count independent discovery.
    */
   linkLeadToForm({ lead_id, form_id, link_role = 'primary_discovery', note = null }) {
     this._assertWritable();
-    if (!['primary_discovery', 'corroboration'].includes(link_role)) {
-      throw new TypeError('link_role must be primary_discovery or corroboration.');
+    if (!['primary_discovery', 'corroboration', 'station_verification'].includes(link_role)) {
+      throw new TypeError('link_role must be primary_discovery, corroboration, or station_verification.');
     }
     const now = this._now();
     return this._withImmediateTx(() => {
@@ -1435,7 +2076,12 @@ export class SelectionStore {
       if (!form) throw new TypeError(`Unknown form_id: ${form_id}`);
 
       const existingLink = this.db.prepare('SELECT * FROM lead_form_links WHERE lead_id = ? AND form_id = ?').get(lead_id, form_id);
-      if (existingLink) return { inserted: false, link: { ...existingLink } };
+      if (existingLink) {
+        return {
+          inserted: false,
+          link: { ...existingLink, link_role: existingLink.verification_subrole || existingLink.link_role },
+        };
+      }
 
       let effectiveRole = link_role;
       let effectiveNote = note;
@@ -1454,20 +2100,30 @@ export class SelectionStore {
         }
       }
 
+      const linksSql = String(this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='lead_form_links'").get()?.sql || '');
+      const supportsStationRoleInCheck = linksSql.includes('station_verification');
+      const storedRole = effectiveRole === 'station_verification' && !supportsStationRoleInCheck
+        ? 'corroboration'
+        : effectiveRole;
+      const subrole = effectiveRole === 'station_verification' ? 'station_verification' : null;
+
       this.db.prepare(`
-        INSERT INTO lead_form_links (lead_id, form_id, link_role, event_dedup_key, source_ref_hash, linked_at, note)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `).run(lead_id, form_id, effectiveRole, lead.event_dedup_key, lead.source_ref_hash, now, effectiveNote);
+        INSERT INTO lead_form_links (lead_id, form_id, link_role, verification_subrole, event_dedup_key, source_ref_hash, linked_at, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(lead_id, form_id, storedRole, subrole, lead.event_dedup_key, lead.source_ref_hash, now, effectiveNote);
+      const saved = this.db.prepare('SELECT * FROM lead_form_links WHERE lead_id = ? AND form_id = ?').get(lead_id, form_id);
       return {
         inserted: true,
-        link: { ...this.db.prepare('SELECT * FROM lead_form_links WHERE lead_id = ? AND form_id = ?').get(lead_id, form_id) },
+        link: { ...saved, link_role: saved.verification_subrole || saved.link_role },
       };
     });
   }
 
   getLeadsForForm(formId) {
+    const linkCols = this._tableColumns('lead_form_links');
+    const subCol = linkCols.has('verification_subrole') ? 'j.verification_subrole' : 'NULL';
     return this.db.prepare(`
-      SELECT l.*, j.link_role, j.linked_at, j.note AS link_note
+      SELECT l.*, COALESCE(${subCol}, j.link_role) AS link_role, j.linked_at, j.note AS link_note
       FROM lead_form_links j
       JOIN raw_leads l ON l.lead_id = j.lead_id
       WHERE j.form_id = ?
@@ -1495,6 +2151,21 @@ export class SelectionStore {
     const status = form.lifecycle_status ?? 'discovered';
     if (!LIFECYCLE_STATUSES.includes(status)) {
       throw new TypeError(`Invalid lifecycle_status: ${status}`);
+    }
+    if (form.spec_match !== undefined && form.spec_match !== null) {
+      validateSpecMatcherOutput(form.spec_match);
+    }
+    if (Array.isArray(form.spec_matches)) {
+      for (const sm of form.spec_matches) validateSpecMatcherOutput(sm);
+    }
+    const cooldownUntil = form.cooldown_until ?? null;
+    if (cooldownUntil !== null) {
+      assertIsoDateOnly(cooldownUntil, 'form.cooldown_until');
+    }
+    const cooldownReason = nonemptyStr(form.cooldown_reason) ? sanitizeDiagnosticText(form.cooldown_reason.trim()) : null;
+    const promotionTrack = form.promotion_track ?? null;
+    if (promotionTrack !== null && !PROMOTION_TRACKS.includes(promotionTrack)) {
+      throw new TypeError(`form.promotion_track must be one of ${PROMOTION_TRACKS.join(', ')} or null.`);
     }
 
     const specPayload = {
@@ -1526,6 +2197,9 @@ export class SelectionStore {
               target_child_asin = ?,
               leaf_node_path = ?,
               lifecycle_status = COALESCE(?, lifecycle_status),
+              cooldown_until = COALESCE(?, cooldown_until),
+              cooldown_reason = COALESCE(?, cooldown_reason),
+              promotion_track = COALESCE(?, promotion_track),
               updated_at = ?
           WHERE form_id = ?
         `).run(
@@ -1539,6 +2213,9 @@ export class SelectionStore {
           form.target_child_asin ?? null,
           form.leaf_node_path ?? null,
           form.lifecycle_status ?? null,
+          cooldownUntil,
+          cooldownReason,
+          promotionTrack,
           now,
           formId,
         );
@@ -1550,8 +2227,8 @@ export class SelectionStore {
           form_id, product_family_key, spec_version, spec_sha256, label, buyer_task,
           saleable_set_composition_json, grade_or_material, target_child_asin, leaf_node_path,
           lifecycle_status, gate1a_result_json, gate1b_result_json, negotiation_shortlist_json,
-          landed_domestic_cap_cny, created_at, updated_at
-        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?)
+          landed_domestic_cap_cny, cooldown_until, cooldown_reason, promotion_track, created_at, updated_at
+        ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
       `).run(
         formId,
         familyKey,
@@ -1563,6 +2240,9 @@ export class SelectionStore {
         form.target_child_asin ?? null,
         form.leaf_node_path ?? null,
         status,
+        cooldownUntil,
+        cooldownReason,
+        promotionTrack,
         now,
         now,
       );
@@ -1570,20 +2250,43 @@ export class SelectionStore {
     });
   }
 
+  setFormCooldown(formId, cooldownUntil, reason = null) {
+    this._assertWritable();
+    const until = cooldownUntil === null ? null : assertIsoDateOnly(cooldownUntil, 'cooldown_until');
+    const cleanReason = nonemptyStr(reason) ? sanitizeDiagnosticText(reason.trim()) : null;
+    const res = this.db.prepare(`
+      UPDATE candidate_forms
+      SET cooldown_until = ?, cooldown_reason = ?, updated_at = ?
+      WHERE form_id = ?
+    `).run(until, cleanReason, this._now(), formId);
+    if (res.changes !== 1) throw new Error(`Form ${formId} not found.`);
+    return this.getCandidateForm(formId);
+  }
+
   updateFormLifecycle(formId, lifecycleStatus, {
     gate1a_result = undefined,
     gate1b_result = undefined,
     negotiation_shortlist = undefined,
     landed_domestic_cap_cny = undefined,
+    sourcing_disposition = undefined,
   } = {}) {
     this._assertWritable();
     if (!LIFECYCLE_STATUSES.includes(lifecycleStatus)) {
       throw new TypeError(`Invalid lifecycle_status: ${lifecycleStatus}`);
     }
+    const formsSql = String(this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='candidate_forms'").get()?.sql || '');
+    const supportsPrivateMoldInCheck = formsSql.includes('private_mold_reserved');
+    const storedStatus = lifecycleStatus === 'private_mold_reserved' && !supportsPrivateMoldInCheck
+      ? 'deferred'
+      : lifecycleStatus;
+    const effectiveSourcingDisp = sourcing_disposition !== undefined
+      ? sourcing_disposition
+      : (lifecycleStatus === 'private_mold_reserved' ? 'private_mold_reserved' : undefined);
     const now = this._now();
     const res = this.db.prepare(`
       UPDATE candidate_forms
       SET lifecycle_status = ?,
+          sourcing_disposition = CASE WHEN ? = 1 THEN ? ELSE sourcing_disposition END,
           gate1a_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1a_result_json END,
           gate1b_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1b_result_json END,
           negotiation_shortlist_json = CASE WHEN ? = 1 THEN ? ELSE negotiation_shortlist_json END,
@@ -1591,7 +2294,9 @@ export class SelectionStore {
           updated_at = ?
       WHERE form_id = ?
     `).run(
-      lifecycleStatus,
+      storedStatus,
+      effectiveSourcingDisp !== undefined ? 1 : 0,
+      effectiveSourcingDisp ?? null,
       gate1a_result !== undefined ? 1 : 0,
       gate1a_result !== undefined ? canonicalJson(gate1a_result) : null,
       gate1b_result !== undefined ? 1 : 0,
@@ -1609,7 +2314,11 @@ export class SelectionStore {
 
   getCandidateForm(formId) {
     const row = this.db.prepare('SELECT * FROM candidate_forms WHERE form_id = ?').get(formId);
-    return row ? { ...row } : null;
+    if (!row) return null;
+    const effectiveStatus = row.sourcing_disposition === 'private_mold_reserved'
+      ? 'private_mold_reserved'
+      : row.lifecycle_status;
+    return { ...row, effective_lifecycle_status: effectiveStatus };
   }
 
   // ---------------------------------------------------------------------------
@@ -1638,6 +2347,9 @@ export class SelectionStore {
     const verified = validateSourcingVerifier1688Output({
       schema_version: 1,
       contract: 'SourcingVerifier1688',
+      stage: quote.stage ?? null,
+      allow_default_pack_multiple: quote.allow_default_pack_multiple ?? false,
+      require_ui_readback: quote.require_ui_readback ?? false,
       status: contractStatus,
       observed_at: quote.observed_at,
       expires_at: quote.expires_at ?? null,
@@ -1648,6 +2360,8 @@ export class SelectionStore {
       lead_time_days: quote.lead_time_days ?? null,
       goods_first_order_promotion: quote.goods_first_order_promotion,
       freight_first_order_promotion: quote.freight_first_order_promotion,
+      includes_platform_subsidy_in_freight: quote.includes_platform_subsidy_in_freight ?? false,
+      ui_readback: quote.ui_readback ?? undefined,
       sku_lines: quote.sku_lines,
       allow_remainder: quote.allow_remainder ?? false,
       target_sets: quote.target_sets ?? 100,
@@ -1661,8 +2375,24 @@ export class SelectionStore {
     if (quoteStatus === 'verified' && !verified.order_plan) {
       throw new TypeError('Verified 1688 quote requires a valid computed order_plan.');
     }
-    const orderPlan = verified.order_plan;
-    const skuLines = Array.isArray(quote.sku_lines) ? quote.sku_lines : [];
+    const pricingInputs = bindSourcingQuotePricingInputs(quote);
+    if (pricingInputs.issue) throw new TypeError(pricingInputs.issue);
+    const orderPlan = verified.order_plan ? { ...verified.order_plan } : null;
+    const ui = quote.ui_readback;
+    if (orderPlan && ui && typeof ui === 'object') {
+      const normalizedUi = {
+        logged_in: ui.logged_in === true,
+        viewport_width_px: Number.isFinite(Number(ui.viewport_width_px)) ? Number(ui.viewport_width_px) : null,
+        selected_sku_row_visible: ui.selected_sku_row_visible === true,
+        settlement_bar_visible: ui.settlement_bar_visible === true,
+        applied_quantity_confirmed: Boolean(ui.applied_quantity_confirmed === true || ui.applied_qty_confirmed === true),
+      };
+      orderPlan.ui_readback = normalizedUi;
+      orderPlan.ui_readback_verified = isVerifiedFiveFieldUiReadback(normalizedUi);
+    }
+    const skuLines = Array.isArray(verified.normalized_sku_lines)
+      ? verified.normalized_sku_lines
+      : (Array.isArray(quote.sku_lines) ? quote.sku_lines : []);
     const packMultiple = quote.pack_multiple ?? (skuLines.length > 0 ? Math.max(...skuLines.map(l => l.pack_multiple ?? 1)) : 1);
     const moqSets = quote.moq_sets ?? (skuLines.length > 0
       ? Math.max(100, ...skuLines.map(l => Math.ceil((l.moq_qty ?? 1) / l.qty_per_saleable_set)))
@@ -1676,11 +2406,11 @@ export class SelectionStore {
     this.db.prepare(`
       INSERT INTO sourcing_quotes_1688 (
         quote_id, form_id, spec_version, sku_lines_json, order_plan_json, pack_multiple, moq_sets,
-        actual_sets, actual_complete_sets, goods_cny_total, domestic_freight_cny_total,
+        actual_sets, actual_complete_sets, goods_cny_total, domestic_freight_cny_total, pkg_json, fx_cny_per_usd,
         goods_first_order_promotion, freight_first_order_promotion, lead_time_days,
         sensitive_freebie_flags_json, redacted_destination, redacted_screenshot_path,
         redacted_webp_sha256, raw_readback_ref, observed_at, expires_at, quote_status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       quoteId,
       form.form_id,
@@ -1693,6 +2423,8 @@ export class SelectionStore {
       actualCompleteSets,
       quote.goods_cny_total ?? null,
       quote.domestic_freight_cny_total ?? null,
+      pricingInputs.pkg ? canonicalJson(pricingInputs.pkg) : null,
+      pricingInputs.fx_cny_per_usd ?? null,
       quote.goods_first_order_promotion ? 1 : 0,
       quote.freight_first_order_promotion ? 1 : 0,
       quote.lead_time_days ?? null,
@@ -1708,13 +2440,35 @@ export class SelectionStore {
     );
 
     return {
-      quote: { ...this.db.prepare('SELECT * FROM sourcing_quotes_1688 WHERE quote_id = ?').get(quoteId) },
+      quote: this.getQuoteById(quoteId),
       order_plan: orderPlan,
     };
   }
 
+  recordSourcingQuotesBatch1688(quotes) {
+    this._assertWritable();
+    if (!Array.isArray(quotes) || quotes.length === 0) {
+      throw new TypeError('quotes must be a nonempty array.');
+    }
+    return this._withImmediateTx(() => {
+      const prevOuter = this._inOuterTx;
+      this._inOuterTx = true;
+      try {
+        return quotes.map(q => this.recordSourcingQuote1688(q));
+      } finally {
+        this._inOuterTx = prevOuter;
+      }
+    });
+  }
+
   getQuotesForForm(formId) {
-    return this.db.prepare('SELECT * FROM sourcing_quotes_1688 WHERE form_id = ? ORDER BY created_at DESC').all(formId).map(r => ({ ...r }));
+    return this.db.prepare('SELECT * FROM sourcing_quotes_1688 WHERE form_id = ? ORDER BY created_at DESC').all(formId).map(sourcingQuoteFromRow);
+  }
+
+  getQuoteById(quoteId) {
+    if (!nonemptyStr(quoteId)) return null;
+    const row = this.db.prepare('SELECT * FROM sourcing_quotes_1688 WHERE quote_id = ?').get(quoteId.trim());
+    return row ? sourcingQuoteFromRow(row) : null;
   }
 
   // ---------------------------------------------------------------------------
@@ -1753,6 +2507,35 @@ export class SelectionStore {
         WHERE form_id = ? AND period_id = ? AND profile_revision = ? AND evidence_bundle_sha256 = ?
       `).get(form.form_id, periodId, ev.profile_revision, ev.evidence_bundle_sha256);
 
+      const sanitizeReviewNotes = notes => {
+        if (!Array.isArray(notes) || notes.length === 0) return null;
+        return notes.map(n => {
+          if (typeof n === 'string') return { kind: 'CALIBRATION_NOTE', note: sanitizeDiagnosticText(n) };
+          if (n && typeof n === 'object') {
+            assertNoRawPii(n, 'evaluation.review_note');
+            return {
+              kind: nonemptyStr(n.kind) ? n.kind.trim() : 'CALIBRATION_NOTE',
+              reviewer: nonemptyStr(n.reviewer) ? n.reviewer.trim() : null,
+              observed_at: nonemptyStr(n.observed_at) ? n.observed_at.trim() : null,
+              note: sanitizeDiagnosticText(String(n.note ?? n.message ?? '')),
+            };
+          }
+          return null;
+        }).filter(Boolean);
+      };
+      const incomingNotes = sanitizeReviewNotes(ev.review_notes);
+      let incomingEvidenceReviewJson = null;
+      if (ev.evidence_review !== undefined && ev.evidence_review !== null) {
+        if (typeof ev.evidence_review !== 'object' || Array.isArray(ev.evidence_review)) {
+          throw new TypeError('evaluation.evidence_review must be a JSON object when provided.');
+        }
+        assertNoRawPii(ev.evidence_review, 'evaluation.evidence_review');
+        if (containsSecretToken(ev.evidence_review)) {
+          throw new TypeError('evaluation.evidence_review contains a credential or token; redact before persisting.');
+        }
+        incomingEvidenceReviewJson = canonicalJson(ev.evidence_review);
+      }
+
       if (existing) {
         if (existing.result_sha256 !== ev.result_sha256) {
           throw new Error(
@@ -1760,7 +2543,7 @@ export class SelectionStore {
             'cannot overwrite existing evaluation with a different result hash; update fee/evidence bundle to create a new version.',
           );
         }
-        // Append newly discovered source_attempt_ids and new batch_receipts without mutating the immutable evaluation score/result!
+        // Append newly discovered source_attempt_ids, batch_receipts, review_notes, and advisory evidence_review without mutating the immutable evaluation score/result!
         const prevAttempts = JSON.parse(existing.source_attempt_ids_json || '[]');
         const mergedAttempts = [...new Set([...prevAttempts, ...(ev.source_attempt_ids ?? [])])].sort();
         const prevReceipt = JSON.parse(existing.receipt_json || '{}');
@@ -1769,26 +2552,72 @@ export class SelectionStore {
           batchReceipts.push({
             batch_result_sha256: prevReceipt.batch_result_sha256,
             batch_html_sha256: prevReceipt.batch_html_sha256 ?? existing.html_sha256 ?? null,
+            evidence_review_json: existing.evidence_review_json ?? null,
           });
         }
         const incomingBatchSha = ev.receipt?.batch_result_sha256 ?? null;
         const incomingHtmlSha = ev.receipt?.batch_html_sha256 ?? ev.html_sha256 ?? null;
         let receiptChanged = false;
-        if (incomingBatchSha && !batchReceipts.some(b => b.batch_result_sha256 === incomingBatchSha && b.batch_html_sha256 === incomingHtmlSha)) {
+        if (
+          incomingBatchSha &&
+          !batchReceipts.some(
+            b =>
+              b.batch_result_sha256 === incomingBatchSha &&
+              b.batch_html_sha256 === incomingHtmlSha &&
+              (b.evidence_review_json ?? null) === (incomingEvidenceReviewJson ?? null),
+          )
+        ) {
           batchReceipts.push({
             batch_result_sha256: incomingBatchSha,
             batch_html_sha256: incomingHtmlSha,
+            evidence_review_json: incomingEvidenceReviewJson ?? null,
           });
           receiptChanged = true;
         }
+        const prevNotes = existing.review_notes_json ? JSON.parse(existing.review_notes_json) : [];
+        const seenNoteKeys = new Set(prevNotes.map(n => canonicalJson(n)));
+        const mergedNotes = [...prevNotes];
+        let notesChanged = false;
+        for (const n of incomingNotes ?? []) {
+          const key = canonicalJson(n);
+          if (!seenNoteKeys.has(key)) {
+            seenNoteKeys.add(key);
+            mergedNotes.push(n);
+            notesChanged = true;
+          }
+        }
+        // Pair evidence_review_json and html_sha256 atomically so an unreviewed rerun never overwrites
+        // html_sha256 while leaving an older evidence_review_json active (or vice versa).
+        let nextEvidenceReviewJson = existing.evidence_review_json ?? null;
+        let nextHtmlSha = existing.html_sha256 ?? null;
+        if (incomingEvidenceReviewJson !== null) {
+          nextEvidenceReviewJson = incomingEvidenceReviewJson;
+          nextHtmlSha = ev.html_sha256 ?? existing.html_sha256 ?? null;
+        } else if (!existing.evidence_review_json) {
+          nextEvidenceReviewJson = null;
+          nextHtmlSha = ev.html_sha256 ?? existing.html_sha256 ?? null;
+        }
+        const evidenceReviewChanged = nextEvidenceReviewJson !== (existing.evidence_review_json ?? null);
+        const htmlShaChanged = nextHtmlSha !== (existing.html_sha256 ?? null);
         const attemptsChanged = mergedAttempts.length !== prevAttempts.length;
-        if (attemptsChanged || receiptChanged) {
-          const nextReceipt = { ...prevReceipt, batch_receipts: batchReceipts };
+        if (attemptsChanged || receiptChanged || notesChanged || evidenceReviewChanged || htmlShaChanged) {
+          const nextReceipt = {
+            ...prevReceipt,
+            batch_html_sha256: nextHtmlSha ?? prevReceipt.batch_html_sha256 ?? null,
+            batch_receipts: batchReceipts,
+          };
           this.db.prepare(`
             UPDATE evaluations
-            SET source_attempt_ids_json = ?, receipt_json = ?
+            SET source_attempt_ids_json = ?, receipt_json = ?, review_notes_json = ?, evidence_review_json = ?, html_sha256 = ?
             WHERE evaluation_id = ?
-          `).run(canonicalJson(mergedAttempts), canonicalJson(nextReceipt), existing.evaluation_id);
+          `).run(
+            canonicalJson(mergedAttempts),
+            canonicalJson(nextReceipt),
+            mergedNotes.length ? canonicalJson(mergedNotes) : null,
+            nextEvidenceReviewJson,
+            nextHtmlSha,
+            existing.evaluation_id,
+          );
         }
         const updated = this.db.prepare('SELECT * FROM evaluations WHERE evaluation_id = ?').get(existing.evaluation_id);
         return { inserted: false, identical: true, evaluation: { ...updated } };
@@ -1799,6 +2628,7 @@ export class SelectionStore {
         initialReceipt.batch_receipts = [{
           batch_result_sha256: initialReceipt.batch_result_sha256,
           batch_html_sha256: initialReceipt.batch_html_sha256 ?? ev.html_sha256 ?? null,
+          evidence_review_json: incomingEvidenceReviewJson ?? null,
         }];
       }
 
@@ -1807,8 +2637,8 @@ export class SelectionStore {
           evaluation_id, form_id, period_id, profile_revision, evidence_bundle_sha256,
           qualification_json, sort_keys_json, queue_bucket, covered_weight,
           supported_range_json, total_range_json, result_sha256, html_sha256,
-          receipt_json, source_attempt_ids_json, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          receipt_json, source_attempt_ids_json, review_notes_json, evidence_review_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evaluationId,
         form.form_id,
@@ -1825,6 +2655,8 @@ export class SelectionStore {
         ev.html_sha256 ?? null,
         canonicalJson(initialReceipt),
         canonicalJson([...new Set(ev.source_attempt_ids ?? [])].sort()),
+        incomingNotes ? canonicalJson(incomingNotes) : null,
+        incomingEvidenceReviewJson,
         now,
       );
 
@@ -1851,6 +2683,36 @@ export class SelectionStore {
 
   getEvaluationsForForm(formId) {
     return this.db.prepare('SELECT * FROM evaluations WHERE form_id = ? ORDER BY created_at ASC').all(formId).map(r => ({ ...r }));
+  }
+
+  appendEvaluationReviewNotes(evaluationId, notes) {
+    this._assertWritable();
+    if (!Array.isArray(notes) || notes.length === 0) throw new TypeError('notes must be a nonempty array.');
+    const existing = this.db.prepare('SELECT * FROM evaluations WHERE evaluation_id = ?').get(evaluationId);
+    if (!existing) throw new Error(`Evaluation ${evaluationId} not found.`);
+    const clean = notes.map(n => {
+      if (typeof n === 'string') return { kind: 'CALIBRATION_NOTE', note: sanitizeDiagnosticText(n) };
+      assertNoRawPii(n, 'evaluation.review_note');
+      return {
+        kind: nonemptyStr(n.kind) ? n.kind.trim() : 'CALIBRATION_NOTE',
+        reviewer: nonemptyStr(n.reviewer) ? n.reviewer.trim() : null,
+        observed_at: nonemptyStr(n.observed_at) ? n.observed_at.trim() : this._now().slice(0, 10),
+        note: sanitizeDiagnosticText(String(n.note ?? n.message ?? '')),
+      };
+    });
+    const prev = existing.review_notes_json ? JSON.parse(existing.review_notes_json) : [];
+    const seen = new Set(prev.map(n => canonicalJson(n)));
+    const merged = [...prev];
+    for (const n of clean) {
+      const key = canonicalJson(n);
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(n);
+      }
+    }
+    this.db.prepare('UPDATE evaluations SET review_notes_json = ? WHERE evaluation_id = ?')
+      .run(canonicalJson(merged), evaluationId);
+    return { ...this.db.prepare('SELECT * FROM evaluations WHERE evaluation_id = ?').get(evaluationId) };
   }
 
   // ---------------------------------------------------------------------------
@@ -2059,6 +2921,32 @@ export class SelectionStore {
     const quotes = this.getQuotesForForm(formId);
     const evaluations = this.getEvaluationsForForm(formId);
     const attemptIds = new Set(leads.map(l => l.source_attempt_id).filter(Boolean));
+    const collectSharedAttemptRefs = (obj, depth = 0) => {
+      if (!obj || typeof obj !== 'object' || depth > 4) return;
+      if (Array.isArray(obj)) {
+        for (const it of obj) collectSharedAttemptRefs(it, depth + 1);
+        return;
+      }
+      for (const [k, v] of Object.entries(obj)) {
+        if ((k === 'attempt_id' || k === 'source_attempt_id') && nonemptyStr(v)) {
+          attemptIds.add(v.trim());
+        } else if ((k === 'source_attempt_ids' || k === 'shared_attempt_ids' || k === 'attempt_ids') && Array.isArray(v)) {
+          for (const id of v) if (nonemptyStr(id)) attemptIds.add(id.trim());
+        } else if (v && typeof v === 'object') {
+          collectSharedAttemptRefs(v, depth + 1);
+        }
+      }
+    };
+    for (const l of leads) {
+      try { collectSharedAttemptRefs(JSON.parse(l.metadata_json || '{}')); } catch { /* ignore */ }
+    }
+    const gate1aResult = form.gate1a_result_json ? JSON.parse(form.gate1a_result_json) : null;
+    const gate1bResult = form.gate1b_result_json ? JSON.parse(form.gate1b_result_json) : null;
+    collectSharedAttemptRefs(gate1aResult);
+    collectSharedAttemptRefs(gate1bResult);
+    for (const q of quotes) {
+      if (nonemptyStr(q.raw_readback_ref)) attemptIds.add(q.raw_readback_ref.trim());
+    }
     for (const ev of evaluations) {
       for (const id of JSON.parse(ev.source_attempt_ids_json || '[]')) attemptIds.add(id);
     }
@@ -2078,15 +2966,66 @@ export class SelectionStore {
 
     return {
       form,
-      gate1a_result: form.gate1a_result_json ? JSON.parse(form.gate1a_result_json) : null,
-      gate1b_result: form.gate1b_result_json ? JSON.parse(form.gate1b_result_json) : null,
+      gate1a_result: gate1aResult,
+      gate1b_result: gate1bResult,
       negotiation_shortlist: form.negotiation_shortlist_json ? JSON.parse(form.negotiation_shortlist_json) : null,
       primary_discovery_leads: leads.filter(l => l.link_role === 'primary_discovery'),
       corroboration_leads: leads.filter(l => l.link_role === 'corroboration'),
+      station_verification_leads: leads.filter(l => l.link_role === 'station_verification'),
       sourcing_quotes_1688: quotes,
       evaluations,
       ledger_attempts: attempts,
     };
+  }
+
+  /**
+   * Export full keyword and non-keyword provenance directly from SQLite raw_leads + lead_form_links
+   * for attaching to card reports (Reddit/Pinterest/X/Etsy/YouTube/1688/supply-gap/Trends/keywords).
+   */
+  exportFormDiscoveryProvenance(formId) {
+    const form = this.getCandidateForm(formId);
+    if (!form) return null;
+    const leads = this.getLeadsForForm(formId);
+    const leadCols = this._tableColumns('raw_leads');
+    return {
+      form_id: form.form_id,
+      label: form.label,
+      description: form.buyer_task,
+      promotion_track: form.promotion_track ?? null,
+      cooldown_until: form.cooldown_until ?? null,
+      store_leads: leads.map(l => {
+        const meta = resolveChannelMeta(l.source_channel, leadCols.has('route') ? l.route : null, l.entry_group);
+        return {
+          lead_id: l.lead_id,
+          phrase_or_title: l.phrase_or_title,
+          source_channel: l.source_channel,
+          channel_id: l.source_channel === 'sif_keyword_opportunity' ? 'sif_keyword_opportunity' : meta.channel_id,
+          route: meta.route,
+          entry_group: meta.entry_group,
+          non_keyword_origin: meta.non_keyword_origin,
+          opportunity_type: leadCols.has('opportunity_type') ? (l.opportunity_type ?? 'unclassified') : 'unclassified',
+          promotion_track: leadCols.has('promotion_track') ? (l.promotion_track ?? null) : null,
+          link_role: l.link_role,
+          source_ref: l.source_ref,
+          raw_excerpt: l.raw_excerpt ?? null,
+          observed_at: l.observed_at,
+          disposition: l.disposition,
+          disposition_reason: l.disposition_reason ?? null,
+          source_attempt_id: l.source_attempt_id ?? null,
+        };
+      }),
+    };
+  }
+
+  _sanitizeDbPath(rawPath) {
+    if (!rawPath || rawPath === ':memory:') return ':memory:';
+    const cwd = resolve(process.cwd());
+    if (isAbsolute(rawPath)) {
+      const rel = relative(cwd, resolve(rawPath)).replace(/\\/g, '/');
+      if (rel && !rel.startsWith('..') && !isAbsolute(rel)) return rel;
+      return sanitizeDiagnosticText(rawPath);
+    }
+    return sanitizeDiagnosticText(rawPath.replace(/\\/g, '/'));
   }
 
   getSummary() {
@@ -2098,11 +3037,75 @@ export class SelectionStore {
       sourcing_quotes_1688: this.db.prepare('SELECT COUNT(*) AS c FROM sourcing_quotes_1688').get().c,
       evaluations: this.db.prepare('SELECT COUNT(*) AS c FROM evaluations').get().c,
     };
+    const quota = this.getQuotaSummary();
+    const leadCols = this._tableColumns('raw_leads');
+    const allLeads = this.db.prepare('SELECT lead_id, source_channel, entry_group' + (leadCols.has('route') ? ', route' : '') + ' FROM raw_leads').all();
+    const allLinks = this.db.prepare('SELECT lead_id, form_id, link_role FROM lead_form_links').all();
+    const allForms = this.db.prepare('SELECT form_id, spec_sha256, lifecycle_status, gate1a_result_json, gate1b_result_json FROM candidate_forms').all();
+    const evaluatedFormIds = new Set(
+      this.db.prepare('SELECT DISTINCT form_id FROM evaluations').all().map(r => r.form_id),
+    );
+    const formMetaById = new Map();
+    for (const f of allForms) {
+      let g1aPassed = false;
+      let g1bPassed = false;
+      try {
+        const g1a = f.gate1a_result_json ? JSON.parse(f.gate1a_result_json) : null;
+        g1aPassed = Boolean(g1a && (!g1a.spec_sha256 || g1a.spec_sha256 === f.spec_sha256) && g1a.proceed_to_gate1b === true);
+      } catch { /* ignore */ }
+      try {
+        const g1b = f.gate1b_result_json ? JSON.parse(f.gate1b_result_json) : null;
+        g1bPassed = Boolean(g1b && (!g1b.spec_sha256 || g1b.spec_sha256 === f.spec_sha256) && (g1b.status === 'gate1b_passed' || g1b.owner_crossing_override === true));
+      } catch { /* ignore */ }
+      formMetaById.set(f.form_id, {
+        lifecycle_status: f.lifecycle_status,
+        gate1a_passed: g1aPassed,
+        gate1b_passed: g1bPassed,
+        evaluated: f.lifecycle_status === 'evaluated' || evaluatedFormIds.has(f.form_id),
+      });
+    }
+
+    const funnel = Object.fromEntries(DISCOVERY_ROUTES.map(r => [r, {
+      leads: 0, forms: new Set(), gate1a_passed_or_beyond: new Set(), gate1b_passed_or_beyond: new Set(), evaluated: new Set(),
+    }]));
+    const leadRouteById = new Map();
+    for (const l of allLeads) {
+      const meta = resolveChannelMeta(l.source_channel, leadCols.has('route') ? l.route : null, l.entry_group);
+      leadRouteById.set(l.lead_id, meta.route);
+      if (!funnel[meta.route]) {
+        funnel[meta.route] = { leads: 0, forms: new Set(), gate1a_passed_or_beyond: new Set(), gate1b_passed_or_beyond: new Set(), evaluated: new Set() };
+      }
+      funnel[meta.route].leads++;
+    }
+    for (const lk of allLinks) {
+      // Attribute form and gate funnel counts strictly to primary_discovery origin routes (not corroboration links).
+      if (lk.link_role !== 'primary_discovery') continue;
+      const route = leadRouteById.get(lk.lead_id);
+      if (!route || !funnel[route]) continue;
+      funnel[route].forms.add(lk.form_id);
+      const fm = formMetaById.get(lk.form_id);
+      if (!fm) continue;
+      if (fm.gate1a_passed) funnel[route].gate1a_passed_or_beyond.add(lk.form_id);
+      if (fm.gate1b_passed) funnel[route].gate1b_passed_or_beyond.add(lk.form_id);
+      if (fm.evaluated) funnel[route].evaluated.add(lk.form_id);
+    }
+    const funnelByRoute = Object.fromEntries(
+      Object.entries(funnel).map(([route, b]) => [route, {
+        leads: b.leads,
+        forms: b.forms.size,
+        gate1a_passed_or_beyond: b.gate1a_passed_or_beyond.size,
+        gate1b_passed_or_beyond: b.gate1b_passed_or_beyond.size,
+        evaluated: b.evaluated.size,
+      }]),
+    );
+
     return {
-      db_path: this.dbPath,
+      db_path: this._sanitizeDbPath(this.dbPath),
       read_only: this.readOnly,
       counts,
-      quota: this.getQuotaSummary(),
+      quota,
+      quota_by_lane: quota.by_lane,
+      funnel_by_route: funnelByRoute,
       queues: this.db.prepare('SELECT * FROM queue_state ORDER BY queue_name ASC').all().map(r => ({ ...r })),
       startup_reconciled_attempts: [...this.startup_reconciled_attempts],
     };

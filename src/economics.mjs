@@ -4,8 +4,10 @@ import {
   validateSkuLinesR58,
   resolveConsistentSkuLines,
   resolveConsistentText,
+  resolveConsistentFeeCategory,
   resolveConsistentPkgWeightLb,
   resolveUniquePackageByRef,
+  resolveEffectivePricing,
   collectLedgerFlag,
   isOfficial2027ScheduleWindowValid,
   lookupVerified2027ReturnThreshold,
@@ -137,7 +139,17 @@ export function collectionFromDisbursement({ net_revenue_usd, amazon_deductions_
 }
 
 export function calculateEconomics(input, options = {}) {
-  const { id, saleable_unit, price_usd: p, refund_fraction: r, assumptions } = input;
+  const isR57Plus = (options.profileRevision ?? 0) >= 57;
+  const isR58Plus = (options.profileRevision ?? 0) >= 58;
+  const pricing = isR58Plus ? resolveEffectivePricing(input) : null;
+  if (isR58Plus && !pricing.valid && (input?.list_price_usd !== undefined || input?.net_effective_price_usd !== undefined ||
+    input?.ongoing_coupon_usd !== undefined || input?.ongoing_coupon_pct !== undefined ||
+    input?.prime_exclusive_discount_usd !== undefined || input?.prime_exclusive_discount_pct !== undefined ||
+    input?.promo_basis_already_net === true)) {
+    throw new TypeError(pricing.reason);
+  }
+  const { id, saleable_unit, refund_fraction: r, assumptions } = input;
+  const p = isR58Plus && pricing?.valid ? pricing.net_effective_price_usd : input.price_usd;
   if (!id || !saleable_unit || !finite(p) || p <= 0 || !Array.isArray(input.lines) ||
     !Array.isArray(assumptions) || !assumptions.length) throw new TypeError('A coherent named saleable-unit scenario is required');
   const cnyDerivations = new Map();
@@ -162,8 +174,6 @@ export function calculateEconomics(input, options = {}) {
     map.set(line.id, line);
   }
   let refundComponents = null, payoutComponents = null, returnsComponents = null;
-  const isR57Plus = (options.profileRevision ?? 0) >= 57;
-  const isR58Plus = (options.profileRevision ?? 0) >= 58;
   const amazonDeductions = ['referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'returns_disposal'];
 
   let r58ReturnsInvalid = false;
@@ -252,7 +262,7 @@ export function calculateEconomics(input, options = {}) {
     const backdatedOfficial2027Ret = !isOfficial2027ScheduleWindowValid('returns_processing', retLine?.fee_basis, isApparel);
     const in2027RetSchedule = Boolean(salesWin?.from && salesWin?.through && salesWin.from >= '2027-02-01' && salesWin.through <= '2027-12-31');
     const verifiedPerRet = !isApparel && (in2027RetSchedule || isOfficial2027RetVersion) ? lookupVerified2027PerReturnFee(matchedPkg) : null;
-    const catCheck = resolveConsistentText([retLine?.fee_basis?.fee_category, retLine?.fee_category, input.fee_category]);
+    const catCheck = resolveConsistentFeeCategory([retLine?.fee_basis?.fee_category, retLine?.fee_category, input.fee_category]);
     const verifiedCat = catCheck.valid && catCheck.present ? lookupVerified2027ReturnThreshold(catCheck.value) : null;
     const threshCheck = consistentNum(
       [retLine?.fee_basis?.return_threshold, retLine?.return_threshold, input.return_threshold],
@@ -400,6 +410,7 @@ export function calculateEconomics(input, options = {}) {
   const sensitivityInvalid = isR58Plus && input.sensitivity_only !== undefined && typeof input.sensitivity_only !== 'boolean';
   const supported = complete && input.sensitivity_only !== true && !sensitivityInvalid;
   let landedDomesticCap = null;
+  let landedDomesticCapCny = null;
   if (isR58Plus && !invalid.has('context')) {
     const nonDomesticPending = pending.filter(k => k !== 'procurement' && k !== 'domestic_freight');
     if (nonDomesticPending.length === 0) {
@@ -409,12 +420,33 @@ export function calculateEconomics(input, options = {}) {
         nonDomesticCost += (key === 'recovery_credit' ? -1 : 1) * line.amount_usd;
       }
       landedDomesticCap = round(net * 0.7 - nonDomesticCost);
+      const fxCheck = consistentNum(
+        [map.get('procurement')?.fx_cny_per_usd, input.fx_cny_per_usd, input.source_inputs?.fx_cny_per_usd],
+        v => finite(v) && v > 0,
+      );
+      if (fxCheck.present && fxCheck.valid) {
+        landedDomesticCapCny = round(landedDomesticCap * fxCheck.value);
+      }
     }
   }
+  const hasPricingDetails = Boolean(isR58Plus && pricing && (
+    pricing.has_ongoing_discount ||
+    input.list_price_usd !== undefined ||
+    input.net_effective_price_usd !== undefined
+  ));
   return { id, saleable_unit, assumptions, lines, price_usd: p, refund_fraction: r,
+    ...(hasPricingDetails ? {
+      list_price_usd: pricing.list_price_usd,
+      net_effective_price_usd: pricing.net_effective_price_usd,
+      ongoing_discount_usd: pricing.total_discount_usd,
+    } : {}),
     ...(validation ? { fee_validation: validation } : {}),
     ...(options.requireFeeBasis ? { refund_components: refundComponents, payout_components: payoutComponents } : {}),
-    ...(isR58Plus ? { returns_processing_components: returnsComponents, landed_domestic_cap_at_30pct_usd: landedDomesticCap } : {}),
+    ...(isR58Plus ? {
+      returns_processing_components: returnsComponents,
+      landed_domestic_cap_at_30pct_usd: landedDomesticCap,
+      ...(landedDomesticCapCny !== null ? { landed_domestic_cap_at_30pct_cny: landedDomesticCapCny } : {}),
+    } : {}),
     expected_refund_usd: round(p * r), net_revenue_usd: round(net),
     known_cost_usd: round(known), pending_lines: pending, deferred_lines: deferred,
     net_cost_usd: complete ? round(cost) : null,

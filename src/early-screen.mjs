@@ -8,11 +8,13 @@ import { calculateEconomics, netReferral, collectionFromDisbursement, ledgerMeet
 import {
   resolveConsistentNumeric,
   resolveConsistentText,
+  resolveConsistentFeeCategory,
   resolveConsistentBoolean,
   resolveConsistentPkgWeightLb,
   resolveConsistentSkuLines,
   resolveUniquePackageByRef,
   resolvePackageDimsRat,
+  resolveEffectivePricing,
   isOfficial2027ScheduleWindowValid,
   lookupVerified2027ReturnThreshold,
   lookupVerified2027PerReturnFee,
@@ -377,7 +379,14 @@ export function evaluateEarlyScreen(input, options = {}) {
   const {
     id = 'early-screen',
     saleable_unit,
-    price_usd,
+    price_usd: rawPriceUsd,
+    list_price_usd = undefined,
+    net_effective_price_usd = undefined,
+    ongoing_coupon_usd = undefined,
+    ongoing_coupon_pct = undefined,
+    prime_exclusive_discount_usd = undefined,
+    prime_exclusive_discount_pct = undefined,
+    promo_basis_already_net = false,
     minimum_price_usd = 29.99,
     margin_floor = 0.3,
     fx_cny_per_usd: rawFx = null,
@@ -428,6 +437,25 @@ export function evaluateEarlyScreen(input, options = {}) {
   } = input;
 
   if (typeof saleable_unit !== 'string' || !saleable_unit.trim()) throw new TypeError('A nonempty saleable_unit is required.');
+  const pricing = isR58
+    ? resolveEffectivePricing({
+      price_usd: rawPriceUsd,
+      list_price_usd,
+      net_effective_price_usd,
+      ongoing_coupon_usd,
+      ongoing_coupon_pct,
+      prime_exclusive_discount_usd,
+      prime_exclusive_discount_pct,
+      promo_basis_already_net,
+    })
+    : null;
+  if (isR58 && !pricing.valid && (list_price_usd !== undefined || net_effective_price_usd !== undefined ||
+    ongoing_coupon_usd !== undefined || ongoing_coupon_pct !== undefined ||
+    prime_exclusive_discount_usd !== undefined || prime_exclusive_discount_pct !== undefined ||
+    promo_basis_already_net === true)) {
+    throw new TypeError(pricing.reason);
+  }
+  const price_usd = isR58 && pricing?.valid ? pricing.net_effective_price_usd : rawPriceUsd;
   if (!finite(price_usd) || price_usd <= 0) throw new TypeError('A positive finite price_usd is required.');
   if (!finite(minimum_price_usd) || minimum_price_usd < 29.99) throw new TypeError('minimum_price_usd must be at least the revision-57 floor of USD 29.99.');
   if (!finite(margin_floor) || margin_floor < 0.3 || margin_floor >= 1) throw new TypeError('margin_floor must be in [0.3, 1) under revision 57.');
@@ -713,7 +741,7 @@ export function evaluateEarlyScreen(input, options = {}) {
 
   const rPhysical = hasExplicitPhysical ? physical_return_fraction : refund_fraction;
   const catCheck = isR58
-    ? resolveConsistentText([returns_processing_fee_basis?.fee_category, fee_category])
+    ? resolveConsistentFeeCategory([returns_processing_fee_basis?.fee_category, fee_category])
     : { present: false, valid: true, value: null };
   const verifiedCat = catCheck.valid && catCheck.present ? lookupVerified2027ReturnThreshold(catCheck.value) : null;
   const threshCheck = isR58
@@ -1016,7 +1044,7 @@ export function evaluateEarlyScreen(input, options = {}) {
   }
 
   let negotiationShortlist = null;
-  if (isR58 && marginComplete && !marginPass && procurementUsd !== null && domesticUsd !== null) {
+  if (isR58 && pricePass && rightsState !== true && marginComplete && !marginPass && procurementUsd !== null && domesticUsd !== null) {
     const negotiableCostUsd = procurementUsd > 0 ? procurementUsd : 0;
     if (negotiableCostUsd > 0) {
       // Exact unrounded BigInt rational shortlist check: max(0, floor*R - G) / C <= 0.12

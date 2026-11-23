@@ -20,26 +20,221 @@ function monthsIn(window) {
 }
 
 export const VERIFIED_2027_RETURN_THRESHOLDS = Object.freeze({
-  'Business, Industrial, and Scientific Supplies': 0.06,
+  '3D Printers': 0.06,
+  'Amazon Device Accessories': 0.113,
+  'Amazon Explore': 0.048,
+  'Automotive and Powersports': 0.091,
+  'Baby Products': 0.093,
+  'Backpacks, Handbags, and Luggage': 0.128,
   'Base Equipment Power Tools': 0.071,
-  'Tools and Home Improvement': 0.087,
+  'Beauty, Health, and Personal Care': 0.055,
+  'Business, Industrial, and Scientific Supplies': 0.06,
+  'Compact Appliances': 0.126,
+  Computers: 0.114,
+  'Consumer Electronics': 0.112,
+  'Electronics Accessories': 0.088,
   'Everything Else': 0.048,
+  Eyewear: 0.121,
+  'Fine Art': 0.056,
+  'Full-Size Appliances': 0.119,
+  Furniture: 0.096,
+  'Gift Cards': 0.048,
+  'Grocery and Gourmet': 0.029,
+  'Home and Kitchen': 0.081,
+  Jewelry: 0.108,
+  'Lawn and Garden': 0.077,
+  'Lawn mowers and Snow Throwers': 0.095,
+  Mattresses: 0.093,
+  'Media - Books, DVD, Music, Software, Video': 0.051,
+  'Musical Instruments and AV Production': 0.092,
+  'Office Products': 0.044,
+  'Pet Products': 0.102,
+  'Sports and Outdoors': 0.087,
+  Tires: 0.087,
+  'Tools and Home Improvement': 0.087,
+  'Toys and Games': 0.047,
+  'Video Game Consoles': 0.107,
+  'Video Games and Gaming Accessories': 0.065,
+  Watches: 0.12,
 });
 
-const NORMALIZED_RETURN_THRESHOLDS = new Map(
-  Object.entries(VERIFIED_2027_RETURN_THRESHOLDS).map(([k, v]) => [
-    k.toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim(),
+const RETURN_THRESHOLD_ALIASES = Object.freeze({
+  'patio lawn and garden': 'Lawn and Garden',
+  'pet supplies': 'Pet Products',
+  automotive: 'Automotive and Powersports',
+  'musical instruments': 'Musical Instruments and AV Production',
+  'industrial and scientific': 'Business, Industrial, and Scientific Supplies',
+  'beauty and personal care': 'Beauty, Health, and Personal Care',
+  'health and personal care': 'Beauty, Health, and Personal Care',
+  'grocery and gourmet food': 'Grocery and Gourmet',
+  'video games': 'Video Games and Gaming Accessories',
+  media: 'Media - Books, DVD, Music, Software, Video',
+});
+
+const normalizeFeeCategoryKey = value => value
+  .toLowerCase()
+  .replace(/&/g, ' and ')
+  .replace(/[^a-z0-9]+/g, ' ')
+  .trim();
+
+const NORMALIZED_RETURN_THRESHOLDS = new Map([
+  ...Object.entries(VERIFIED_2027_RETURN_THRESHOLDS).map(([k, v]) => [
+    normalizeFeeCategoryKey(k),
     { canonical: k, threshold: v },
   ]),
-);
+  ...Object.entries(RETURN_THRESHOLD_ALIASES).map(([alias, canonical]) => [
+    normalizeFeeCategoryKey(alias),
+    { canonical, threshold: VERIFIED_2027_RETURN_THRESHOLDS[canonical] },
+  ]),
+]);
 
 export function lookupVerified2027ReturnThreshold(category) {
   if (!text(category)) return null;
   if (Object.hasOwn(VERIFIED_2027_RETURN_THRESHOLDS, category)) {
     return { canonical: category, threshold: VERIFIED_2027_RETURN_THRESHOLDS[category] };
   }
-  const key = category.toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
+  const key = normalizeFeeCategoryKey(category);
   return NORMALIZED_RETURN_THRESHOLDS.get(key) ?? null;
+}
+
+/**
+ * Resolve ongoing Coupon / Prime exclusive discount into a single net effective USD price
+ * without double-deducting when price_usd is already supplied net.
+ * Returns { valid, has_ongoing_discount, list_price_usd, net_effective_price_usd, total_discount_usd, reason }.
+ */
+export function resolveEffectivePricing(input = {}) {
+  const {
+    price_usd,
+    list_price_usd,
+    net_effective_price_usd,
+    ongoing_coupon_usd = 0,
+    ongoing_coupon_pct = 0,
+    prime_exclusive_discount_usd = 0,
+    prime_exclusive_discount_pct = 0,
+    promo_basis_already_net = false,
+  } = input ?? {};
+
+  const hasList = list_price_usd !== undefined && list_price_usd !== null;
+  const hasNet = net_effective_price_usd !== undefined && net_effective_price_usd !== null;
+  const hasDiscountField =
+    (ongoing_coupon_usd !== undefined && ongoing_coupon_usd !== null && ongoing_coupon_usd !== 0) ||
+    (ongoing_coupon_pct !== undefined && ongoing_coupon_pct !== null && ongoing_coupon_pct !== 0) ||
+    (prime_exclusive_discount_usd !== undefined && prime_exclusive_discount_usd !== null && prime_exclusive_discount_usd !== 0) ||
+    (prime_exclusive_discount_pct !== undefined && prime_exclusive_discount_pct !== null && prime_exclusive_discount_pct !== 0);
+
+  if (!hasList && !hasNet && !hasDiscountField) {
+    if (!finite(price_usd) || price_usd <= 0) {
+      return { valid: false, has_ongoing_discount: false, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: 0, reason: 'Positive finite price_usd is required.' };
+    }
+    return {
+      valid: true,
+      has_ongoing_discount: false,
+      list_price_usd: price_usd,
+      net_effective_price_usd: price_usd,
+      total_discount_usd: 0,
+      reason: null,
+    };
+  }
+
+  const cUsd = ongoing_coupon_usd ?? 0;
+  const cPct = ongoing_coupon_pct ?? 0;
+  const pUsd = prime_exclusive_discount_usd ?? 0;
+  const pPct = prime_exclusive_discount_pct ?? 0;
+  if (!finite(cUsd) || cUsd < 0 || !finite(pUsd) || pUsd < 0 ||
+    !finite(cPct) || cPct < 0 || cPct >= 1 || !finite(pPct) || pPct < 0 || pPct >= 1 ||
+    (cPct + pPct) >= 1) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'Ongoing coupon/Prime discounts must be finite nonnegative amounts or fractions < 1.' };
+  }
+  if (hasList && (!finite(list_price_usd) || list_price_usd <= 0)) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'list_price_usd must be a positive finite number.' };
+  }
+  if (hasNet && (!finite(net_effective_price_usd) || net_effective_price_usd <= 0)) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'net_effective_price_usd must be a positive finite number.' };
+  }
+  if (price_usd !== undefined && price_usd !== null && (!finite(price_usd) || price_usd <= 0)) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'price_usd must be a positive finite number when supplied.' };
+  }
+  if (promo_basis_already_net === true && hasDiscountField && !hasList) {
+    return {
+      valid: false,
+      has_ongoing_discount: true,
+      list_price_usd: null,
+      net_effective_price_usd: null,
+      total_discount_usd: null,
+      reason: 'Double-deduction guard: cannot apply additional coupon/Prime discounts when promo_basis_already_net is true without an explicit gross list_price_usd.',
+    };
+  }
+
+  const baseList = hasList ? list_price_usd : (finite(price_usd) ? price_usd : (hasNet && !hasDiscountField ? net_effective_price_usd : null));
+  if (baseList === null) {
+    return { valid: false, has_ongoing_discount: hasDiscountField, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'list_price_usd or price_usd is required to derive net_effective_price_usd.' };
+  }
+
+  const listR = toBigRat(baseList);
+  const discUsdR = addBigRat(toBigRat(cUsd), toBigRat(pUsd));
+  const discPctR = addBigRat(toBigRat(cPct), toBigRat(pPct));
+  const pctAmtR = mulBigRat(listR, discPctR);
+  const totalDiscR = addBigRat(discUsdR, pctAmtR);
+  const computedNetR = addBigRat(listR, { n: -totalDiscR.n, d: totalDiscR.d });
+  if (computedNetR.n <= 0n) {
+    return { valid: false, has_ongoing_discount: hasDiscountField, list_price_usd: baseList, net_effective_price_usd: null, total_discount_usd: null, reason: 'Ongoing discounts cannot reduce net_effective_price_usd to <= 0.' };
+  }
+  const computedNetRaw = roundBigRat(computedNetR.n, computedNetR.d, 4);
+  // Amazon US retail prices settle in whole USD cents; round percentage-discounted net price to payable cents.
+  const computedNet = roundBigRat(computedNetR.n, computedNetR.d, 2);
+  const totalDisc = roundBigRat(addBigRat(listR, { n: -toBigRat(computedNet).n, d: toBigRat(computedNet).d }).n,
+    addBigRat(listR, { n: -toBigRat(computedNet).n, d: toBigRat(computedNet).d }).d, 4);
+
+  if (hasNet && Math.abs(net_effective_price_usd - computedNet) > 1e-6 && Math.abs(net_effective_price_usd - computedNetRaw) > 1e-4) {
+    return {
+      valid: false,
+      has_ongoing_discount: hasDiscountField,
+      list_price_usd: baseList,
+      net_effective_price_usd: null,
+      total_discount_usd: totalDisc,
+      reason: `Supplied net_effective_price_usd (${net_effective_price_usd}) disagrees with payable list price (${baseList}) minus ongoing discounts (${computedNet}).`,
+    };
+  }
+  // Always resolve to exact payable whole cents derived from gross minus discount (prevents half-cent drift across $10/$50 cliffs).
+  const resolvedNet = computedNet;
+
+  if (finite(price_usd)) {
+    const matchesNet = Math.abs(price_usd - resolvedNet) <= 1e-4 || Math.abs(price_usd - computedNetRaw) <= 1e-4;
+    const matchesList = Math.abs(price_usd - baseList) <= 1e-4;
+    if (promo_basis_already_net === true && !matchesNet) {
+      return {
+        valid: false,
+        has_ongoing_discount: hasDiscountField,
+        list_price_usd: baseList,
+        net_effective_price_usd: null,
+        total_discount_usd: totalDisc,
+        reason: `price_usd (${price_usd}) does not match net_effective_price_usd (${resolvedNet}) under promo_basis_already_net.`,
+      };
+    }
+    if (!matchesNet && !matchesList) {
+      return {
+        valid: false,
+        has_ongoing_discount: hasDiscountField,
+        list_price_usd: baseList,
+        net_effective_price_usd: null,
+        total_discount_usd: totalDisc,
+        reason: `Supplied price_usd (${price_usd}) matches neither list_price_usd (${baseList}) nor net_effective_price_usd (${resolvedNet}).`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    has_ongoing_discount: hasDiscountField || (resolvedNet < baseList - 1e-6),
+    list_price_usd: baseList,
+    net_effective_price_usd: resolvedNet,
+    total_discount_usd: totalDisc,
+    ongoing_coupon_usd: cUsd,
+    ongoing_coupon_pct: cPct,
+    prime_exclusive_discount_usd: pUsd,
+    prime_exclusive_discount_pct: pPct,
+    reason: null,
+  };
 }
 
 export function resolveConsistentText(values) {
@@ -51,6 +246,23 @@ export function resolveConsistentText(values) {
     if (norm(present[i]) !== norm(present[0])) return { present: true, valid: false, value: null };
   }
   return { present: true, valid: true, value: present[0].trim() };
+}
+
+export function resolveConsistentFeeCategory(values) {
+  const present = values.filter(v => v !== undefined && v !== null);
+  if (present.length === 0) return { present: false, valid: true, value: null };
+  if (present.some(v => !text(v))) return { present: true, valid: false, value: null };
+  const canon = s => {
+    const m = lookupVerified2027ReturnThreshold(s);
+    if (m) return m.canonical.toLowerCase();
+    return s.trim().toLowerCase().replace(/&/g, ' and ').replace(/\s+/g, ' ');
+  };
+  const firstCanon = canon(present[0]);
+  for (let i = 1; i < present.length; i++) {
+    if (canon(present[i]) !== firstCanon) return { present: true, valid: false, value: null };
+  }
+  const m0 = lookupVerified2027ReturnThreshold(present[0]);
+  return { present: true, valid: true, value: m0 ? m0.canonical : present[0].trim() };
 }
 
 export function gcdBig(a, b) {
@@ -551,7 +763,7 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         const backdatedOfficial2027Ret = !isOfficial2027ScheduleWindowValid('returns_processing', line.fee_basis, isApparel);
         const in2027RetSchedule = validContext && context.sales.from >= '2027-02-01' && context.sales.through <= '2027-12-31';
         const verifiedPerRet = !isApparel && (in2027RetSchedule || isOfficial2027RetVersion) ? lookupVerified2027PerReturnFee(matchedPkgR58) : null;
-        const catCheck = resolveConsistentText([line.fee_basis?.fee_category, line.fee_category, input.fee_category]);
+        const catCheck = resolveConsistentFeeCategory([line.fee_basis?.fee_category, line.fee_category, input.fee_category]);
         const verifiedCat = catCheck.valid && catCheck.present ? lookupVerified2027ReturnThreshold(catCheck.value) : null;
         const threshCheck = resolveConsistentNumeric(
           [line.fee_basis?.return_threshold, line.return_threshold, input.return_threshold],
@@ -653,8 +865,49 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         add(line.id, 'fee_season_mismatch', `${line.id}: the target months are not covered by the declared seasonal rate.`);
       }
     }
+    if (isR58 && line.id === 'fulfillment' && line.status !== 'pending') {
+      const pricingRes = resolveEffectivePricing(input);
+      if (pricingRes.valid) {
+        const bandOf = p => (p < 10 ? 'under_10' : p <= 50 ? '10_to_50' : 'over_50');
+        const listBand = bandOf(pricingRes.list_price_usd);
+        const netBand = bandOf(pricingRes.net_effective_price_usd);
+        const declaredBand = text(basis?.price_band) ? basis.price_band.trim() : null;
+        const promoVerified = line.fulfillment_promo_tier_verified === true || input.fulfillment_promo_tier_verified === true;
+        if (pricingRes.has_ongoing_discount && listBand !== netBand && !promoVerified) {
+          add('fulfillment', 'invalid_fee_basis', `Ongoing discount crosses FBA price tier (${listBand} -> ${netBand}) without fulfillment_promo_tier_verified: true; verify exact Amazon promo tier fee before scoring.`);
+        }
+        if (declaredBand && declaredBand !== netBand && !(pricingRes.has_ongoing_discount && promoVerified)) {
+          add('fulfillment', 'fee_scope_mismatch', `Fulfillment fee_basis.price_band (${declaredBand}) conflicts with payable net price band (${netBand}).`);
+        }
+      }
+    }
     if (isR58 && line.id === 'storage' && !storageMeets2027Floor(input, line, monthsIn(target))) {
       add('storage', 'fee_season_mismatch', 'storage: amount or rate violates the 2027 US unified monthly storage floor ($0.78 Jan–Sep / $2.40 Oct–Dec, >=45d average inventory).');
+    }
+  }
+  if (isR58) {
+    const headhaulLine = input.lines.find(l => l.id === 'headhaul');
+    if (headhaulLine && headhaulLine.amount_usd > 0 && !['pending', 'deferred'].includes(headhaulLine.status)) {
+      const hasBondExemption = Boolean(
+        headhaulLine.bond_exemption &&
+        typeof headhaulLine.bond_exemption === 'object' &&
+        text(headhaulLine.bond_exemption.reason) &&
+        evidenced(headhaulLine.bond_exemption.evidence),
+      );
+      const bondInHeadhaul = Array.isArray(headhaulLine.components) && headhaulLine.components.includes('carrier_bond');
+      const bondElsewherePositive = input.lines.some(
+        l => l &&
+          l.id !== 'headhaul' &&
+          l.id !== 'recovery_credit' &&
+          !['pending', 'deferred'].includes(l.status) &&
+          typeof l.amount_usd === 'number' &&
+          l.amount_usd > 0 &&
+          Array.isArray(l.components) &&
+          l.components.includes('carrier_bond'),
+      );
+      if (!bondInHeadhaul && !bondElsewherePositive && !hasBondExemption) {
+        add('headhaul', 'missing_carrier_bond', 'Revision 58 requires positive headhaul to include "carrier_bond" in components (or declare carrier_bond once in another positive cost line, never recovery_credit or negative credit, or supply an evidenced bond_exemption).');
+      }
     }
   }
   return { status: issues.length ? 'needs_evidence' : 'validated', context: context ?? null, issues };

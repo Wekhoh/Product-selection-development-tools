@@ -3,6 +3,7 @@
  * LLM outputs judge purpose/relevance; deterministic code validates currency, dates,
  * quantities, sets, component coverage, SKU-level review provenance, and PII boundaries.
  */
+import { crc32, inflateSync } from 'node:zlib';
 import { validEvidenceDate } from './observations.mjs';
 import { computeOrderPlan } from './fba-rates-2027.mjs';
 import { toBigRat, addBigRat, mulBigRat, roundBigRat, ratCmp } from './fee-basis.mjs';
@@ -19,12 +20,13 @@ export const ALLOWED_DISPOSITIONS = Object.freeze([
 ]);
 
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
+const NON_PHONE_MACHINE_TOKEN_RE = /\b(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{96}|[0-9a-f]{128}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b|\bdata:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+/gi;
 
 const PII_PATTERNS = [
-  { name: 'cn_mobile_number', re: /(?<!\d)1[3-9]\d[\s-]?\d{4}[\s-]?\d{4}(?!\d)/ },
-  { name: 'cn_landline_number', re: /(?<!\d)0\d{2,3}[\s-]\d{7,8}(?!\d)/ },
+  { name: 'cn_mobile_number', re: /(?<!\d)1[3-9]\d[\s-]?\d{4}[\s-]?\d{4}(?!\d)/, maskMachineTokens: true },
+  { name: 'cn_landline_number', re: /(?<!\d)0\d{2,3}[\s-]\d{7,8}(?!\d)/, maskMachineTokens: true },
   { name: 'receiver_contact_label', re: /(收货人|收件人|联系人)\s*[:：]\s*[^\s,，;；]+/ },
-  { name: 'detailed_street_address', re: /(?:路|大道|街|巷|弄)\s*[零一二三四五六七八九十百千\d]+\s*号|(?:栋|幢|单元|室|号楼|楼层)\s*[零一二三四五六七八九十百千\d]+|[零一二三四五六七八九十百千\d]+\s*(?:栋|幢|单元|室|号楼|层)/ },
+  { name: 'detailed_street_address', re: /(?:路|大道|街|巷|弄)\s*[零一二三四五六七八九十百千\d]+\s*号|(?:栋|幢|单元|室|号楼|楼层)\s*[零一二三四五六七八九十百千\d]+|[零一二三四五六七八九十百千\d]+\s*(?:栋|幢|单元|室|号楼)|[零一二三四五六七八九十百千\d]+\s*层(?!硬盒|纸箱|瓦楞|纸板|实木|木板|胶合|板|搁板|架|收纳|抽屉|托盘|隔板|漆|涂装|刀片|防护|过滤)/ },
   { name: 'windows_user_path', re: /[A-Za-z]:\\Users\\[^\\\s"'<>]+/i },
   { name: 'posix_user_path', re: /(?:^|[\s"'(=/])(?:file:\/\/\/)?(?:Users|home)\/[^/\s"'<>]+/i },
 ];
@@ -96,8 +98,12 @@ export function detectRawPii(value) {
     return null;
   }
   if (typeof value !== 'string' || !value) return null;
-  for (const { name, re } of PII_PATTERNS) {
-    if (re.test(value)) return name;
+  let phoneScrubbed = null;
+  for (const { name, re, maskMachineTokens } of PII_PATTERNS) {
+    const candidate = maskMachineTokens
+      ? (phoneScrubbed ??= value.replace(NON_PHONE_MACHINE_TOKEN_RE, '_'))
+      : value;
+    if (re.test(candidate)) return name;
   }
   return null;
 }
@@ -112,8 +118,18 @@ export function containsRawPii(value) {
 export function sanitizeDiagnosticText(text) {
   if (typeof text !== 'string' || !text) return '';
   let out = text;
-  out = out.replace(/(?<!\d)1[3-9]\d[\s-]?\d{4}[\s-]?\d{4}(?!\d)/g, '[REDACTED_PHONE]');
-  out = out.replace(/(?<!\d)0\d{2,3}[\s-]\d{7,8}(?!\d)/g, '[REDACTED_PHONE]');
+  const machineSpans = [];
+  for (const m of out.matchAll(NON_PHONE_MACHINE_TOKEN_RE)) {
+    machineSpans.push([m.index, m.index + m[0].length]);
+  }
+  out = out.replace(
+    /(?<!\d)(?:1[3-9]\d[\s-]?\d{4}[\s-]?\d{4}|0\d{2,3}[\s-]\d{7,8})(?!\d)/g,
+    (match, offset) => (
+      machineSpans.some(([start, end]) => offset >= start && offset + match.length <= end)
+        ? match
+        : '[REDACTED_PHONE]'
+    ),
+  );
   out = out.replace(/(收货人|收件人|联系人)\s*[:：]\s*[^\s,，;；]+/g, '$1:[REDACTED_NAME]');
   out = out.replace(/\b(receiver_name|recipient_name|contact_name)\s*[:=]\s*[^\s,，;；]+/gi, '$1=[REDACTED_NAME]');
   out = out.replace(/(?:路|大道|街|巷|弄)\s*[零一二三四五六七八九十百千\d]+\s*号/g, '[REDACTED_STREET]');
@@ -126,30 +142,228 @@ export function sanitizeDiagnosticText(text) {
   return out;
 }
 
-const SECRET_VALUE_RE = /\b(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9_]{6,}|github_pat_[A-Za-z0-9_]{6,}|xox[bpas]-[A-Za-z0-9-]{6,}|AIza[A-Za-z0-9_-]{10,}|AKIA[0-9A-Z]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{6,})|\bBearer\s+\S+/i;
+const DEDICATED_RASTER_DATA_URI_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$/i;
+const DEDICATED_RASTER_IMAGE_KEYS = new Set([
+  'image_url',
+  'image_urls',
+  'image_data_uri',
+  'image_data_uris',
+  'contact_sheet_data_uri',
+  'hero_image_data_uri',
+  'sheet_data_uri',
+  'screenshot_data_uri',
+  'screenshot_data_uris',
+]);
+const SAFE_PNG_CHUNKS = new Set([
+  'IHDR', 'PLTE', 'IDAT', 'IEND', 'tRNS', 'gAMA', 'cHRM', 'sRGB', 'pHYs', 'sBIT', 'bKGD',
+]);
+
+function pngBytesPerPixelBits(colorType, bitDepth) {
+  const validDepths = {
+    0: [1, 2, 4, 8, 16],
+    2: [8, 16],
+    3: [1, 2, 4, 8],
+    4: [8, 16],
+    6: [8, 16],
+  }[colorType];
+  if (!validDepths || !validDepths.includes(bitDepth)) return 0;
+  const channels = colorType === 2 ? 3 : colorType === 6 ? 4 : colorType === 4 ? 2 : 1;
+  return channels * bitDepth;
+}
+
+function isDecodedValidPng(buf) {
+  if (buf.length < 57) return false;
+  if (
+    buf[0] !== 0x89 || buf[1] !== 0x50 || buf[2] !== 0x4e || buf[3] !== 0x47 ||
+    buf[4] !== 0x0d || buf[5] !== 0x0a || buf[6] !== 0x1a || buf[7] !== 0x0a
+  ) {
+    return false;
+  }
+  let offset = 8;
+  let sawIhdr = false;
+  let sawIend = false;
+  let width = 0;
+  let height = 0;
+  let bppBits = 0;
+  let interlace = 0;
+  const idatParts = [];
+  while (offset < buf.length) {
+    if (sawIend || offset + 12 > buf.length) return false;
+    const len = buf.readUInt32BE(offset);
+    if (len > 64 * 1024 * 1024 || offset + 12 + len > buf.length) return false;
+    const type = buf.subarray(offset + 4, offset + 8).toString('ascii');
+    if (!SAFE_PNG_CHUNKS.has(type)) return false;
+    const expectedCrc = buf.readUInt32BE(offset + 8 + len);
+    const actualCrc = crc32(buf.subarray(offset + 4, offset + 8 + len)) >>> 0;
+    if (actualCrc !== expectedCrc) return false;
+    const data = buf.subarray(offset + 8, offset + 8 + len);
+    if (!sawIhdr) {
+      if (type !== 'IHDR' || len !== 13) return false;
+      width = data.readUInt32BE(0);
+      height = data.readUInt32BE(4);
+      const bitDepth = data[8];
+      const colorType = data[9];
+      const compression = data[10];
+      const filter = data[11];
+      interlace = data[12];
+      bppBits = pngBytesPerPixelBits(colorType, bitDepth);
+      if (
+        width < 1 || height < 1 || width > 16384 || height > 16384 ||
+        bppBits === 0 || compression !== 0 || filter !== 0 || (interlace !== 0 && interlace !== 1)
+      ) {
+        return false;
+      }
+      sawIhdr = true;
+    } else if (type === 'IHDR') {
+      return false;
+    } else if (type === 'IDAT') {
+      if (len === 0) return false;
+      idatParts.push(data);
+    } else if (type === 'IEND') {
+      if (len !== 0) return false;
+      sawIend = true;
+    }
+    offset += 12 + len;
+  }
+  if (!sawIhdr || !sawIend || idatParts.length === 0 || offset !== buf.length) return false;
+  try {
+    const rawPixels = inflateSync(Buffer.concat(idatParts), { maxOutputLength: 128 * 1024 * 1024 });
+    if (interlace === 0) {
+      const expectedBytes = height * (1 + Math.ceil((width * bppBits) / 8));
+      return rawPixels.length === expectedBytes;
+    }
+    return rawPixels.length >= height;
+  } catch {
+    return false;
+  }
+}
+
+function isDecodedValidJpeg(buf) {
+  if (buf.length < 20 || buf[0] !== 0xff || buf[1] !== 0xd8 || buf[buf.length - 2] !== 0xff || buf[buf.length - 1] !== 0xd9) {
+    return false;
+  }
+  let offset = 2;
+  let sawSof = false;
+  let sawSos = false;
+  while (offset < buf.length - 2) {
+    if (buf[offset] !== 0xff) return false;
+    while (offset < buf.length - 2 && buf[offset] === 0xff) offset++;
+    const marker = buf[offset++];
+    if (marker === 0xd9 || marker === 0x00) return false;
+    if (marker >= 0xd0 && marker <= 0xd7) continue;
+    // Reject comment (COM = 0xFE) and metadata APP1..APP15 (0xE1..0xEF) segments from secret-scan exemption; allow JFIF APP0 (0xE0).
+    if (marker === 0xfe || (marker >= 0xe1 && marker <= 0xef)) return false;
+    if (offset + 2 > buf.length - 2) return false;
+    const segLen = buf.readUInt16BE(offset);
+    if (segLen < 2 || offset + segLen > buf.length - 2) return false;
+    if ((marker >= 0xc0 && marker <= 0xc3) || (marker >= 0xc5 && marker <= 0xc7) || (marker >= 0xc9 && marker <= 0xcb) || (marker >= 0xcd && marker <= 0xcf)) {
+      if (segLen < 8) return false;
+      const h = buf.readUInt16BE(offset + 3);
+      const w = buf.readUInt16BE(offset + 5);
+      if (w < 1 || h < 1) return false;
+      sawSof = true;
+    }
+    offset += segLen;
+    if (marker === 0xda) {
+      sawSos = true;
+      while (offset < buf.length - 2) {
+        if (buf[offset] === 0xff) {
+          const next = buf[offset + 1];
+          if (next === 0x00 || (next >= 0xd0 && next <= 0xd7) || next === 0xff) {
+            offset += next === 0xff ? 1 : 2;
+            continue;
+          }
+          break;
+        }
+        offset++;
+      }
+    }
+  }
+  return sawSof && sawSos && offset === buf.length - 2;
+}
+
+function isDecodedValidWebp(buf) {
+  if (buf.length < 20) return false;
+  if (
+    buf.subarray(0, 4).toString('ascii') !== 'RIFF' ||
+    buf.subarray(8, 12).toString('ascii') !== 'WEBP' ||
+    buf.readUInt32LE(4) + 8 !== buf.length
+  ) {
+    return false;
+  }
+  let offset = 12;
+  let sawImageChunk = false;
+  while (offset < buf.length) {
+    if (offset + 8 > buf.length) return false;
+    const fourcc = buf.subarray(offset, offset + 4).toString('ascii');
+    const sz = buf.readUInt32LE(offset + 4);
+    const padded = sz + (sz % 2);
+    if (offset + 8 + padded > buf.length) return false;
+    if (fourcc === 'VP8 ' || fourcc === 'VP8L') {
+      if (sz < 5) return false;
+      sawImageChunk = true;
+    } else if (fourcc !== 'VP8X' && fourcc !== 'ALPH') {
+      // Reject EXIF / XMP / arbitrary RIFF metadata chunks from secret-scan exemption.
+      return false;
+    }
+    offset += 8 + padded;
+  }
+  return sawImageChunk && offset === buf.length;
+}
+
+function isVerifiedDedicatedRasterDataUri(value) {
+  if (typeof value !== 'string') return false;
+  const trimmed = value.trim();
+  const match = DEDICATED_RASTER_DATA_URI_RE.exec(trimmed);
+  if (!match) return false;
+  const [, rawSubtype, b64] = match;
+  if (b64.length < 32 || b64.length % 4 !== 0) return false;
+  const buf = Buffer.from(b64, 'base64');
+  if (buf.toString('base64') !== b64) return false;
+  const fmt = rawSubtype.toLowerCase();
+  if (fmt === 'png') return isDecodedValidPng(buf);
+  if (fmt === 'jpeg' || fmt === 'jpg') return isDecodedValidJpeg(buf);
+  if (fmt === 'webp') return isDecodedValidWebp(buf);
+  return false;
+}
+
+const SECRET_CASE_INSENSITIVE_RE = /\b(?:sk-[a-z0-9_-]{6,}|gh[pousr]_[a-z0-9_]{6,}|github_pat_[a-z0-9_]{6,}|xox[bpas]-[a-z0-9-]{6,}|pk_live_[a-z0-9_-]{6,}|rk_live_[a-z0-9_-]{6,}|eyj[a-z0-9_-]{10,}\.[a-z0-9._-]{6,})|\bbearer\s+\S+/i;
+const SECRET_CASE_EXACT_RE = /\b(?:(?:AKIA|ASIA)[0-9A-Z]{10,}|AIza[0-9A-Za-z_-]{10,})/;
 const SENSITIVE_SECRET_KEYS = new Set([
   'api_key', 'apikey', 'access_token', 'refresh_token', 'secret_key', 'authorization', 'cookie', 'password',
 ]);
 
-export function containsSecretToken(value, seen = new Set(), depth = 0) {
-  if (value === null || value === undefined || depth > 6) return false;
+function matchesSecretText(text) {
+  return SECRET_CASE_INSENSITIVE_RE.test(text) || SECRET_CASE_EXACT_RE.test(text);
+}
+
+export function containsSecretToken(value, seen = new Set(), depth = 0, inDedicatedImageField = false) {
+  if (value === null || value === undefined || depth > 8) return false;
   if (typeof value === 'string') {
-    if (SECRET_VALUE_RE.test(value)) return true;
+    if (inDedicatedImageField && isVerifiedDedicatedRasterDataUri(value)) {
+      return false;
+    }
     const s = value.trim();
     if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
-      try { return containsSecretToken(JSON.parse(s), seen, depth + 1); } catch { /* ignore */ }
+      try {
+        return containsSecretToken(JSON.parse(s), seen, depth + 1, false);
+      } catch { /* fall through to plain-text scan on invalid JSON */ }
     }
-    return false;
+    return matchesSecretText(value);
   }
   if (typeof value !== 'object') return false;
   if (seen.has(value)) return false;
   seen.add(value);
-  if (Array.isArray(value)) return value.some(item => containsSecretToken(item, seen, depth + 1));
+  if (Array.isArray(value)) {
+    return value.some(item => containsSecretToken(item, seen, depth + 1, inDedicatedImageField));
+  }
   for (const [k, v] of Object.entries(value)) {
-    if (SENSITIVE_SECRET_KEYS.has(k.toLowerCase()) && v !== null && v !== undefined && String(v).trim() !== '') {
+    const kl = k.toLowerCase();
+    if (SENSITIVE_SECRET_KEYS.has(kl) && v !== null && v !== undefined && String(v).trim() !== '') {
       return true;
     }
-    if (containsSecretToken(v, seen, depth + 1)) return true;
+    const isImageKey = DEDICATED_RASTER_IMAGE_KEYS.has(kl);
+    if (containsSecretToken(v, seen, depth + 1, isImageKey)) return true;
   }
   return false;
 }
@@ -193,7 +407,53 @@ export function assertNoRawPii(value, label = 'payload', seen = new Set(), depth
 
 export function isShenzhenDestination(dest) {
   if (typeof dest !== 'string') return false;
-  return /深圳|shenzhen/i.test(dest);
+  const trimmed = dest.trim();
+  if (!trimmed) return false;
+
+  const ORIGIN_MARKER_RE = /(?:发货地|始发地|产地|发自|发出地|发货|origin|\bfrom\b)/i;
+  const DEST_MARKER_RE = /(?:收货地|收货|目的地|送至|发往|寄往|配送至|destination|\bto\b)\s*[:：]?\s*/i;
+
+  // 1) Explicit destination marker: allow province+city commas (e.g. "收货地：广东省，深圳市" or "To: Guangdong, Shenzhen")
+  //    while stopping at semicolons, newlines, or an origin marker.
+  const destMatch = trimmed.match(new RegExp(`${DEST_MARKER_RE.source}([^;；\\n]+)`, 'i'));
+  if (destMatch) {
+    let destSegment = destMatch[1].split(ORIGIN_MARKER_RE)[0].trim();
+    // Strip trailing comma left before an origin marker like "To: Shanghai, From: Shenzhen"
+    destSegment = destSegment.replace(/[,，\s]+$/, '');
+    return /深圳|shenzhen/i.test(destSegment);
+  }
+
+  // 2) Explicit arrow / directional separator (origin -> destination, or "从X发Y" / "X发货，Y").
+  const arrowParts = trimmed.split(/(?:->|=>|→|至)/);
+  if (arrowParts.length >= 2) {
+    const tail = arrowParts[arrowParts.length - 1].split(ORIGIN_MARKER_RE)[0].trim();
+    return /深圳|shenzhen/i.test(tail);
+  }
+  const congFaMatch = trimmed.match(/^从\s*([^发]+?)发\s*(.+)$/);
+  if (congFaMatch) {
+    return /深圳|shenzhen/i.test(congFaMatch[2]);
+  }
+
+  // 3) Origin marker without explicit destination marker:
+  //    - "发货地：深圳" / "From: Guangdong Shenzhen" -> false (origin-only)
+  //    - "上海 发货地：深圳" -> evaluate only prefix before origin marker (false)
+  //    - "广东深圳发货，上海" -> origin precedes "发货"; only text after delimiter could be destination (false unless Shenzhen!)
+  const originMatch = trimmed.match(ORIGIN_MARKER_RE);
+  if (originMatch) {
+    const matchedToken = originMatch[0];
+    if (matchedToken === '发货') {
+      const afterShip = trimmed.slice(originMatch.index + matchedToken.length).replace(/^[\s:：,，;；]+/, '').trim();
+      if (!afterShip) return false;
+      return /深圳|shenzhen/i.test(afterShip);
+    }
+    const beforeOrigin = trimmed.slice(0, originMatch.index).trim();
+    if (!beforeOrigin) return false;
+    return /深圳|shenzhen/i.test(beforeOrigin);
+  }
+
+  // 4) Plain destination-only province/city string (e.g. "广东深圳", "Guangdong, Shenzhen")
+  if (/发$/.test(trimmed)) return false;
+  return /深圳|shenzhen/i.test(trimmed);
 }
 
 /**
@@ -380,6 +640,47 @@ export function validateSourcingVerifier1688Output(output, { expected_components
 
   const goodsPromo = assertBoolean(output.goods_first_order_promotion, 'goods_first_order_promotion');
   const freightPromo = assertBoolean(output.freight_first_order_promotion, 'freight_first_order_promotion');
+  const isStage1Initial = output.stage === 'stage1_initial' || output.allow_default_pack_multiple === true;
+
+  if (output.status === 'verified') {
+    if (output.includes_platform_subsidy_in_freight === true) {
+      throw new TypeError('Verified regular 1688 quote cannot deduct temporary platform_subsidy (可再减) from domestic_freight_cny_total; record full regular Shenzhen freight.');
+    }
+    const requiresUiReadback = output.require_ui_readback === true || isStage1Initial;
+    if (requiresUiReadback && (output.ui_readback === undefined || output.ui_readback === null)) {
+      throw new TypeError('Verified Stage-1 / Revision-59 1688 quote requires a populated ui_readback object.');
+    }
+    if (output.ui_readback !== undefined && output.ui_readback !== null) {
+      const ui = assertObject(output.ui_readback, 'ui_readback');
+      if (ui.logged_in !== true) {
+        throw new TypeError('Verified 1688 quote requires ui_readback.logged_in === true (logged-out or empty 1688 readbacks cannot establish verified repeat-order quotes).');
+      }
+      if (ui.selected_sku_row_visible !== true) {
+        throw new TypeError('Verified 1688 quote requires ui_readback.selected_sku_row_visible === true so the selected SKU row matches the saleable set.');
+      }
+      if (ui.settlement_bar_visible !== true) {
+        throw new TypeError('Verified 1688 quote requires ui_readback.settlement_bar_visible === true (wide >=1440px viewport without cropped Shenzhen freight bar).');
+      }
+      if (!finite(ui.viewport_width_px) || ui.viewport_width_px < 1440) {
+        throw new TypeError('Verified 1688 quote requires ui_readback.viewport_width_px >= 1440 so the right-side Shenzhen freight bar is uncropped.');
+      }
+      if (ui.applied_quantity_confirmed === false || ui.applied_qty_confirmed === false ||
+        (requiresUiReadback && ui.applied_quantity_confirmed !== true && ui.applied_qty_confirmed !== true)) {
+        throw new TypeError('Verified 1688 quote requires applied_quantity_confirmed === true after quantity field blur.');
+      }
+    }
+  }
+
+  let cartonPackUnverifiedStage1 = false;
+  const normalizedInputSkuLines = Array.isArray(output.sku_lines)
+    ? output.sku_lines.map(line => {
+      if (isStage1Initial && line && typeof line === 'object' && (line.pack_multiple === undefined || line.pack_multiple === null)) {
+        cartonPackUnverifiedStage1 = true;
+        return { ...line, pack_multiple: 1, pack_multiple_unverified_stage1: true };
+      }
+      return line;
+    })
+    : output.sku_lines;
 
   if (output.status === 'unknown') {
     // Pending/unknown quotes may omit goods_cny_total or domestic_freight_cny_total while keeping strict validation if supplied.
@@ -390,9 +691,9 @@ export function validateSourcingVerifier1688Output(output, { expected_components
       throw new TypeError('domestic_freight_cny_total must be a nonnegative finite number or null when pending.');
     }
     let pendingPlan = null;
-    if (Array.isArray(output.sku_lines) && output.sku_lines.length > 0) {
+    if (Array.isArray(normalizedInputSkuLines) && normalizedInputSkuLines.length > 0) {
       pendingPlan = computeOrderPlan({
-        sku_lines: output.sku_lines,
+        sku_lines: normalizedInputSkuLines,
         allow_remainder: Boolean(output.allow_remainder ?? false),
         target_sets: output.target_sets ?? 100,
       });
@@ -406,10 +707,14 @@ export function validateSourcingVerifier1688Output(output, { expected_components
       order_plan: pendingPlan,
       goods_first_order_promotion: goodsPromo,
       freight_first_order_promotion: freightPromo,
+      ...(cartonPackUnverifiedStage1 ? {
+        carton_pack_unverified_stage1: true,
+        stage2_sample_check_tag: '整箱装箱率待向客服核实',
+      } : {}),
     };
   }
 
-  if (!Array.isArray(output.sku_lines) || output.sku_lines.length === 0) {
+  if (!Array.isArray(normalizedInputSkuLines) || normalizedInputSkuLines.length === 0) {
     throw new TypeError('SourcingVerifier1688 requires a nonempty sku_lines array.');
   }
 
@@ -422,7 +727,7 @@ export function validateSourcingVerifier1688Output(output, { expected_components
       if (!Number.isSafeInteger(reqQty) || reqQty < 1) {
         throw new TypeError(`expected_component ${compId} requires positive integer qty_per_saleable_set.`);
       }
-      const matched = output.sku_lines.filter(l => (l.component_id ?? l.sku_id) === compId);
+      const matched = normalizedInputSkuLines.filter(l => (l.component_id ?? l.sku_id) === compId);
       const coveredQty = matched.reduce((sum, l) => sum + (Number.isSafeInteger(l.qty_per_saleable_set) ? l.qty_per_saleable_set : 0), 0);
       if (coveredQty < reqQty) {
         throw new TypeError(
@@ -435,10 +740,14 @@ export function validateSourcingVerifier1688Output(output, { expected_components
   const allowRemainder = Boolean(output.allow_remainder ?? false);
   const targetSets = output.target_sets ?? 100;
   const orderPlan = computeOrderPlan({
-    sku_lines: output.sku_lines,
+    sku_lines: normalizedInputSkuLines,
     allow_remainder: allowRemainder,
     target_sets: targetSets,
   });
+  if (cartonPackUnverifiedStage1) {
+    orderPlan.carton_pack_unverified_stage1 = true;
+    orderPlan.carton_verification_tag = '整箱装箱率待向客服核实';
+  }
 
   if (output.actual_sets !== undefined && output.actual_sets !== orderPlan.allocated_sets) {
     throw new TypeError(`Declared actual_sets (${output.actual_sets}) does not match computed carton/MOQ plan (${orderPlan.allocated_sets}).`);
@@ -448,8 +757,8 @@ export function validateSourcingVerifier1688Output(output, { expected_components
   }
 
   let exactGoodsCny = toBigRat(0);
-  for (let i = 0; i < output.sku_lines.length; i++) {
-    const line = output.sku_lines[i];
+  for (let i = 0; i < normalizedInputSkuLines.length; i++) {
+    const line = normalizedInputSkuLines[i];
     const planned = orderPlan.sku_lines[i];
     if (output.status === 'verified') {
       assertNonemptyString(line.offer_id, `sku_lines[${i}].offer_id`);
@@ -506,9 +815,14 @@ export function validateSourcingVerifier1688Output(output, { expected_components
     redacted_destination: redactedDestination,
     sensitive_freebie_flags: normalizedFlags,
     order_plan: orderPlan,
+    normalized_sku_lines: normalizedInputSkuLines,
     exact_goods_cny_total: roundBigRat(exactGoodsCny.n, exactGoodsCny.d, 4),
     goods_first_order_promotion: goodsPromo,
     freight_first_order_promotion: freightPromo,
+    ...(cartonPackUnverifiedStage1 ? {
+      carton_pack_unverified_stage1: true,
+      stage2_sample_check_tag: '整箱装箱率待向客服核实',
+    } : {}),
   };
 }
 
