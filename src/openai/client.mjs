@@ -4393,9 +4393,9 @@ export class OpenAiClient {
       if (delayBudget !== null && delayBudget <= 0) return detach();
       let getRes;
       try {
-        await delayBackgroundPoll(options.pollIntervalMs, consecutiveErrors, eff.signal, delayBudget);
+        const delayOutcome = await delayBackgroundPoll(options.pollIntervalMs, consecutiveErrors, eff.signal, delayBudget);
         const getBudget = remainingMs();
-        if (getBudget !== null && getBudget <= 0) return detach();
+        if (delayOutcome?.truncatedByDeadline || (getBudget !== null && getBudget <= 0)) return detach();
         const current = eff.ledger.getAttemptById(attempt.attempt_id);
         if (isSettledResponseAttempt(current)) {
           const envelope = this._backgroundActiveEnvelope(current);

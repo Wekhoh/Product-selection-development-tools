@@ -79,12 +79,14 @@ export function validateBackgroundOptions(options = {}, defaultPollIntervalMs = 
   };
 }
 
-export function delayBackgroundPoll(interval, consecutiveErrors, signal, remainingMs = null) {
+export async function delayBackgroundPoll(interval, consecutiveErrors, signal, remainingMs = null) {
   const backoff = Math.min(MAX_BACKOFF_MS, interval * (2 ** consecutiveErrors));
   const wait = Math.max(interval, backoff);
-  return delay(remainingMs === null ? wait : Math.min(wait, Math.ceil(remainingMs)), undefined, {
+  const truncatedByDeadline = remainingMs !== null && remainingMs <= wait;
+  await delay(remainingMs === null ? wait : Math.min(wait, Math.ceil(remainingMs)), undefined, {
     signal: signal ?? undefined,
   });
+  return { truncatedByDeadline };
 }
 
 export async function getBackgroundResponseWithinWait(retrieve, signal, remainingMs) {
