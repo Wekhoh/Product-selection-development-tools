@@ -178,8 +178,10 @@ test('revision 58 flat annual mode rejects partial-year windows and report.mjs c
 
     const html = renderReport(res, batch);
     assert.match(html, /data-eligible="false"/);
+    assert.match(html, /data-bucket="pending"/);
     assert.match(html, /达标可推进 0/);
-    assert.match(html, /淘汰／待补 1/);
+    assert.match(html, /待补证 1/);
+    assert.match(html, /淘汰／暂缓 0/);
   }
 
   // Strong-fail on partial-year flat candidate still routes to excluded (not pending)
@@ -346,7 +348,7 @@ test('revision 58 aligns r_refund vs r_physical excess returns processing, tri-s
     lines: [
       { id: 'procurement', amount_usd: 5.5, status: 'estimated', basis: 'Regular', evidence: ['src'], order_units: 120, first_order_promotion: false, components: ['procurement'] },
       { id: 'domestic_freight', amount_usd: 0.5, status: 'estimated', basis: 'Regular', evidence: ['src'], order_units: 120, first_order_promotion: false, components: ['domestic_freight'] },
-      { id: 'headhaul', amount_usd: 2.0, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul'] },
+      { id: 'headhaul', amount_usd: 2.0, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul', 'carrier_bond'] },
       { id: 'referral', amount_usd: 4.3635, status: 'estimated', basis: 'Ref', evidence: ['src'], components: ['referral'], fee_basis: { status: 'published', version: '2027', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-01', effective_through: '2027-12-31', evidence: ['src'] } },
       { id: 'fulfillment', amount_usd: 5.92, status: 'estimated', basis: 'FBA', evidence: ['src'], components: ['fulfillment'], fee_basis: { status: 'published', version: '2027', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-15', effective_through: '2027-10-14', evidence: ['src'] } },
       { id: 'placement', amount_usd: 0.4, status: 'estimated', basis: 'Place', evidence: ['src'], components: ['placement'], fee_basis: { status: 'published', version: '2027', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-15', effective_through: null, evidence: ['src'] } },
@@ -1137,7 +1139,7 @@ test('B09–B12 & Calibration Notes: 3-way returns_processing parity, Gate 1 bas
     lines: [
       { id: 'procurement', amount_usd: 5.5, status: 'estimated', basis: '1688', evidence: ['src'], components: ['procurement'], order_units: 120, first_order_promotion: false },
       { id: 'domestic_freight', amount_usd: 0.5, status: 'estimated', basis: 'Dom', evidence: ['src'], components: ['domestic_freight'], order_units: 120, first_order_promotion: false },
-      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul'] },
+      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul', 'carrier_bond'] },
       { id: 'referral', amount_usd: 4.3186, status: 'estimated', basis: 'Ref', evidence: ['src'], components: ['referral'], fee_basis: { ...validBasis, package_ref: 'pack-1', effective_through: null } },
       { id: 'fulfillment', amount_usd: 5.92, status: 'estimated', basis: 'FBA', evidence: ['src'], components: ['fulfillment'], fee_basis: { ...validBasis, package_ref: 'pack-1' } },
       { id: 'placement', amount_usd: 0.4, status: 'estimated', basis: 'Place', evidence: ['src'], components: ['placement'], fee_basis: { ...validBasis, package_ref: 'pack-1', effective_through: null } },
@@ -1384,7 +1386,7 @@ test('Round-2 Codex Findings 1–7 & Notes: airtight sku_lines/FX/rounding, peak
         sku_lines: [{ sku_id: 'A', qty_per_saleable_set: 1, pack_multiple: 24, moq_qty: 125, ordered_qty: 144, regular_goods_promo_false: true, ...(!omitUnitPrice ? { unit_price_cny: unitPrice } : {}) }],
       },
       { id: 'domestic_freight', amount_usd: 0.5, status: 'estimated', basis: 'Dom', evidence: ['src'], components: ['domestic_freight'], order_units: 144, first_order_promotion: false },
-      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul'] },
+      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul', 'carrier_bond'] },
       { id: 'referral', amount_usd: 4.3186, status: 'estimated', basis: 'Ref', evidence: ['src'], components: ['referral'], fee_basis: { ...validBasis, package_ref: 'pack-1', effective_through: null } },
       { id: 'fulfillment', amount_usd: 5.92, status: 'estimated', basis: 'FBA', evidence: ['src'], components: ['fulfillment'], fee_basis: { ...validBasis, package_ref: 'pack-1' } },
       { id: 'placement', amount_usd: 0.4, status: 'estimated', basis: 'Place', evidence: ['src'], components: ['placement'], fee_basis: { ...validBasis, package_ref: 'pack-1', effective_through: null } },
@@ -1642,7 +1644,7 @@ test('Round-3 Codex Findings 1–8 & Notes: dual sku_lines conflict & exact rati
         sku_lines: [{ sku_id: 'A', qty_per_saleable_set: 1, pack_multiple: 24, moq_qty: 125, ordered_qty: 144, unit_price_cny: unitPriceCny, regular_goods_promo_false: true }],
       },
       { id: 'domestic_freight', amount_usd: 0.5, status: 'estimated', basis: 'Dom', evidence: ['src'], components: ['domestic_freight'], order_units: 144, first_order_promotion: false },
-      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul'] },
+      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul', 'carrier_bond'] },
       { id: 'referral', amount_usd: 5.76, status: 'estimated', basis: 'Ref', evidence: ['src'], components: ['referral'], fee_basis: { ...validBasis, package_ref: 'pack-1', effective_through: null } },
       { id: 'fulfillment', amount_usd: 5.92, status: 'estimated', basis: 'FBA', evidence: ['src'], components: ['fulfillment'], fee_basis: { ...validBasis, package_ref: 'pack-1' } },
       { id: 'placement', amount_usd: 0.4, status: 'estimated', basis: 'Place', evidence: ['src'], components: ['placement'], fee_basis: { ...validBasis, package_ref: 'pack-1', effective_through: null } },
@@ -1940,7 +1942,7 @@ test('Round-4 Codex Findings 1–11 & Note: untrusted exact_usd_rational strippi
     lines: [
       { id: 'procurement', amount_usd: 40 / 7.2, status: 'estimated', basis: '1688', evidence: ['src'], components: ['procurement'], order_units: 144, first_order_promotion: false, sku_lines: mkSku(40, { offer_id: 'offer-B', quote_unit: 'box_24' }) },
       { id: 'domestic_freight', amount_usd: 0.5, status: 'estimated', basis: 'Dom', evidence: ['src'], components: ['domestic_freight'], order_units: 144, first_order_promotion: false },
-      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul'] },
+      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul', 'carrier_bond'] },
       { id: 'referral', amount_usd: 5.76, status: 'estimated', basis: 'Ref', evidence: ['src'], components: ['referral'], fee_basis: { ...validBasis, effective_through: null } },
       { id: 'fulfillment', amount_usd: 5.92, status: 'estimated', basis: 'FBA', evidence: ['src'], components: ['fulfillment'], fee_basis: validBasis },
       { id: 'placement', amount_usd: 0.4, status: 'estimated', basis: 'Place', evidence: ['src'], components: ['placement'], fee_basis: { ...validBasis, effective_through: null } },
@@ -2260,7 +2262,7 @@ test('Round-5 Codex Findings 1–11 & Note: strict rational tolerance & exact he
     lines: [
       { id: 'procurement', amount_usd: 5, status: 'estimated', basis: '1688', evidence: ['src'], components: ['procurement'], order_units: 120, first_order_promotion: false },
       { id: 'domestic_freight', amount_usd: 0.5, status: 'estimated', basis: 'Dom', evidence: ['src'], components: ['domestic_freight'], order_units: 120, first_order_promotion: false },
-      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul'] },
+      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul', 'carrier_bond'] },
       { id: 'referral', amount_usd: 5.76, status: 'estimated', basis: 'Ref', evidence: ['src'], components: ['referral'], fee_basis: { ...validBasis, effective_through: null } },
       { id: 'fulfillment', amount_usd: 5.92, status: 'estimated', basis: 'FBA', evidence: ['src'], components: ['fulfillment'], fee_basis: validBasis },
       { id: 'placement', amount_usd: 0.4, status: 'estimated', basis: 'Place', evidence: ['src'], components: ['placement'], fee_basis: { ...validBasis, effective_through: null } },
@@ -2374,7 +2376,7 @@ test('Round-6 Codex Findings: cross-line DG & duplicate packages[].id, exact 13x
     lines: [
       { id: 'procurement', amount_usd: 11.425, status: 'estimated', basis: '1688', evidence: ['src'], components: ['procurement'], order_units: 100, first_order_promotion: false },
       { id: 'domestic_freight', amount_usd: 0.5, status: 'estimated', basis: 'Dom', evidence: ['src'], components: ['domestic_freight'], order_units: 100, first_order_promotion: false },
-      { id: 'headhaul', amount_usd: 2.4, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul'] },
+      { id: 'headhaul', amount_usd: 2.4, status: 'estimated', basis: 'Sea', evidence: ['src'], components: ['headhaul', 'carrier_bond'] },
       { id: 'referral', amount_usd: 5.76, status: 'estimated', basis: 'Ref', evidence: ['src'], components: ['referral'], fee_basis: { ...validBasis, effective_through: null } },
       { id: 'fulfillment', amount_usd: 5.92, status: 'estimated', basis: 'FBA', evidence: ['src'], components: ['fulfillment'], fee_basis: validBasis },
       { id: 'placement', amount_usd: 0.4, status: 'estimated', basis: 'Place', evidence: ['src'], components: ['placement'], fee_basis: { ...validBasis, effective_through: null } },

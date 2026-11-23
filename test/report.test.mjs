@@ -246,3 +246,38 @@ test('a real output publication failure records partial state instead of retaini
   for (const name of receipt.published_outputs) assert.equal(hash(readFileSync(join(output, name))), receipt.expected_outputs[name].sha256);
   assert.ok(readdirSync(output).every(name => !name.endsWith('.tmp')));
 }));
+
+test('r58 curatorial studio gallery embeds offline WOFF2 fonts, Polar Rose SVG, hero plinth crops, and CSS lightbox without script or path leaks', () => {
+  const batch = structuredClone(fixture);
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFz8AAAAASUVORK5CYII=';
+  batch.candidates[0].presentation.hero_image_data_uri = png;
+  batch.candidates[0].presentation.short_title = '合成测试短标题';
+  batch.candidates[0].presentation.subtitle_en = 'Synthetic Machined Block Pair';
+  batch.candidates[0].presentation.contact_sheet_data_uri = png;
+  batch.candidates[0].presentation.procurement = [
+    { label: 'NestedHeroProbe', value: { hero_image_data_uri: 'file:///Users/LeakHeroProbe/secret.png' } },
+  ];
+  const result = scoreBatch(batch, profile);
+  const html = renderReport(result, batch);
+  assert.match(html, /meta name="text-scale" content="scale"/);
+  assert.match(html, /font-src data:; script-src 'none'; connect-src 'none'/);
+  assert.match(html, /@font-face\{font-family:"Hanken Grotesk"/);
+  assert.match(html, /@font-face\{font-family:"Newsreader";font-style:italic/);
+  assert.match(html, /class="exhibition-reel"/);
+  assert.match(html, /class="split-stage"/);
+  assert.match(html, /class="rose-svg"/);
+  assert.equal((html.match(/class="rose-sector/g) ?? []).length, 24);
+  assert.equal((html.match(/data-group-id=/g) ?? []).length, 24);
+  assert.equal((html.match(/data-item-id=/g) ?? []).length, 63);
+  assert.match(html, /合成测试短标题/);
+  assert.match(html, /Synthetic Machined Block Pair/);
+  assert.match(html, /id="candidate-1-sheet-zoom" class="css-lightbox"/);
+  assert.equal(html.includes('LeakHeroProbe'), false, 'nested hero_image_data_uri path must be redacted');
+  assert.doesNotMatch(html, /—/, 'r58 report template must emit zero U+2014 em-dashes');
+
+  // Invalid hero_image_data_uri must not emit <img>
+  const badBatch = structuredClone(fixture);
+  badBatch.candidates[0].presentation.hero_image_data_uri = 'data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=';
+  assert.doesNotMatch(renderReport(scoreBatch(badBatch, profile), badBatch), /<img\b/);
+});
+

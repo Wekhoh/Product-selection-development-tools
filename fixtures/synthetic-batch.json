@@ -582,7 +582,8 @@
                     "synthetic-evidence"
                   ],
                   "components": [
-                    "headhaul"
+                    "headhaul",
+                    "carrier_bond"
                   ]
                 },
                 {
@@ -1349,7 +1350,8 @@
                     "synthetic-evidence"
                   ],
                   "components": [
-                    "headhaul"
+                    "headhaul",
+                    "carrier_bond"
                   ]
                 },
                 {
@@ -1626,7 +1628,8 @@
                     "synthetic-evidence"
                   ],
                   "components": [
-                    "headhaul"
+                    "headhaul",
+                    "carrier_bond"
                   ]
                 },
                 {
@@ -2401,7 +2404,8 @@
                     "synthetic-evidence"
                   ],
                   "components": [
-                    "headhaul"
+                    "headhaul",
+                    "carrier_bond"
                   ]
                 },
                 {

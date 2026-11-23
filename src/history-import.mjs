@@ -3,9 +3,10 @@
  * and atomic frozen-batch SQLite replay helper.
  */
 import { readFileSync, existsSync } from 'node:fs';
-import { dirname, join, relative, resolve, isAbsolute } from 'node:path';
+import { basename, dirname, join, relative, resolve, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { prepareDiscovery, attachDiscovery } from './discovery.mjs';
+import { resolveChannelMeta } from './discovery-channels.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
 import { getFba2027RateTableSnapshot } from './fba-rates-2027.mjs';
@@ -17,6 +18,27 @@ import {
 } from './store.mjs';
 
 const toPathStr = p => (p instanceof URL ? fileURLToPath(p) : String(p));
+
+function readJsonSyncSafe(pathStr, label) {
+  let bytes;
+  try {
+    bytes = readFileSync(pathStr);
+  } catch (err) {
+    const code = typeof err?.code === 'string' && /^[A-Z_]+$/.test(err.code) ? err.code : 'IO_ERROR';
+    throw new Error(`Unable to read ${label} (${code}, file: ${basename(pathStr)}).`);
+  }
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error(`${label} is not valid UTF-8 (file: ${basename(pathStr)}).`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${label} is not valid JSON (file: ${basename(pathStr)}).`);
+  }
+}
 
 const PRIMARY_OFF_PEAK_MONTHS = [2, 3, 4, 5, 6, 7, 8, 9];
 const HOLIDAY_PEAK_MONTHS = [10, 11, 12];
@@ -206,10 +228,10 @@ function extractHistoricalCharges(req, provider, artifactInspected = null, isCom
  */
 export function importRecoveryLockFile(store, recoveryPath, { repoRoot = process.cwd(), accountScope = 'historical-default' } = {}) {
   const pathStr = toPathStr(recoveryPath);
-  const data = JSON.parse(readFileSync(pathStr, 'utf8'));
-  const orig = data.original_request;
+  const data = readJsonSyncSafe(pathStr, 'recovery lock file');
+  const orig = data?.original_request;
   if (!orig || typeof orig !== 'object' || !orig.id || !orig.tool) {
-    throw new TypeError(`Invalid recovery lock file: missing original_request in ${pathStr}`);
+    throw new TypeError(`Invalid recovery lock file: missing original_request in ${basename(pathStr)}`);
   }
   const shouldLock = data.repeat_submission_allowed === false ||
     data.execution_outcome === 'unknown' ||
@@ -260,14 +282,14 @@ export function importRecoveryLockFile(store, recoveryPath, { repoRoot = process
  */
 export function importRequestLedgerFile(store, ledgerPath, { repoRoot = process.cwd(), accountScope = 'historical-default' } = {}) {
   const pathStr = toPathStr(ledgerPath);
-  const data = JSON.parse(readFileSync(pathStr, 'utf8'));
+  const data = readJsonSyncSafe(pathStr, 'request ledger file');
   let requests;
   if (Array.isArray(data)) {
     requests = data;
   } else if (data && typeof data === 'object' && Array.isArray(data.requests)) {
     requests = data.requests;
   } else {
-    throw new TypeError(`Unrecognized request ledger format in ${pathStr}: expected an array or an object with a requests[] array.`);
+    throw new TypeError(`Unrecognized request ledger format in ${basename(pathStr)}: expected an array or an object with a requests[] array.`);
   }
 
   const firstDate = requests[0]?.started_at || requests[0]?.created_at || (Array.isArray(data) ? null : data.started_at);
@@ -558,23 +580,30 @@ export function replayBatchIntoStore(store, {
     const leadIdsByNormKey = new Map();
     if (manifest) {
       for (const lead of manifest.leads) {
-        const firstProv = lead.provenance[0];
-        const leadId = `disc:${sha256Hex(canonicalJson({ key: lead.normalized_key, prov: firstProv })).slice(0, 16)}`;
-        // Preserve any later human/review disposition update on an existing lead!
-        store.upsertRawLead({
-          lead_id: leadId,
-          normalized_key: lead.normalized_key,
-          event_dedup_key: `disc:${lead.normalized_key}`,
-          source_channel: firstProv.source_id,
-          entry_group: 'in_site',
-          source_ref: `${firstProv.source_path}#row=${firstProv.row_index}`,
-          phrase_or_title: lead.keyword,
-          observed_at: batch.evaluated_at || '2026-11-18',
-          disposition: lead.disposition,
-          disposition_reason: lead.reason,
-          metadata: { phrases: lead.phrases, provenance_count: lead.provenance.length },
-        }, { preserveExisting: true });
-        leadIdsByNormKey.set(lead.normalized_key, leadId);
+        const provList = Array.isArray(lead.provenance) && lead.provenance.length > 0 ? lead.provenance : [];
+        const idsForKey = [];
+        for (const prov of provList) {
+          const leadId = `disc:${sha256Hex(canonicalJson({ key: lead.normalized_key, prov })).slice(0, 16)}`;
+          const chMeta = resolveChannelMeta(prov.source_id, prov.route ?? null, prov.entry_group ?? null);
+          // Preserve any later human/review disposition update on an existing lead!
+          store.upsertRawLead({
+            lead_id: leadId,
+            normalized_key: lead.normalized_key,
+            event_dedup_key: `disc:${lead.normalized_key}:${prov.source_id}:${prov.row_index}`,
+            source_channel: prov.source_id,
+            route: chMeta.route,
+            entry_group: chMeta.entry_group,
+            opportunity_type: prov.opportunity_type ?? 'unclassified',
+            source_ref: `${prov.source_path}#row=${prov.row_index}`,
+            phrase_or_title: lead.keyword,
+            observed_at: batch.evaluated_at || '2026-11-18',
+            disposition: lead.disposition,
+            disposition_reason: lead.reason,
+            metadata: { phrases: lead.phrases, provenance_count: provList.length },
+          }, { preserveExisting: true });
+          idsForKey.push(leadId);
+        }
+        if (idsForKey.length > 0) leadIdsByNormKey.set(lead.normalized_key, idsForKey);
       }
     }
 
@@ -598,14 +627,14 @@ export function replayBatchIntoStore(store, {
 
       if (inputCand?.discovery?.lead_keywords) {
         inputCand.discovery.lead_keywords.forEach((normKey, idx) => {
-          const lid = leadIdsByNormKey.get(normKey);
-          if (lid) {
+          const lids = leadIdsByNormKey.get(normKey) ?? [];
+          lids.forEach((lid, pIdx) => {
             store.linkLeadToForm({
               lead_id: lid,
               form_id: formId,
-              link_role: idx === 0 ? 'primary_discovery' : 'corroboration',
+              link_role: idx === 0 && pIdx === 0 ? 'primary_discovery' : 'corroboration',
             });
-          }
+          });
         });
       }
 
@@ -676,6 +705,8 @@ export function replayBatchIntoStore(store, {
 
   return {
     result,
+    result_bytes: resultBytes,
+    html_bytes: htmlBytes,
     result_sha256: batchResultSha,
     html_sha256: batchHtmlSha,
     evaluations_recorded: storedEvaluations.length,

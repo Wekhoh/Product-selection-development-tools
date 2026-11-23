@@ -1,6 +1,7 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
 import { validEvidenceDate as validDate } from './observations.mjs';
 import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS } from './economics.mjs';
+import { resolveEffectivePricing } from './fee-basis.mjs';
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -104,8 +105,24 @@ function calendarDayDiff(laterCal, earlierCal) {
   return Math.round((Date.parse(`${laterCal}T00:00:00Z`) - Date.parse(`${earlierCal}T00:00:00Z`)) / 86_400_000);
 }
 
+export function upgradeProfileToR59(baseProfile) {
+  if (!baseProfile || typeof baseProfile !== 'object') {
+    throw new TypeError('A valid base reference profile object is required to upgrade to revision 59.');
+  }
+  const next = structuredClone(baseProfile);
+  next.revision = 59;
+  if (next.workflow?.scoring_and_ordering) {
+    next.workflow.scoring_and_ordering.revision = 59;
+    next.workflow.scoring_and_ordering.crossing_margin_interval_r59 =
+      'When coherent validated primary scenarios cross the 30% pre-ad margin floor (at least one scenario >= 30% and at least one < 30%), extend the below-floor scenario margin score linearly along min(22, max(0, 11 + 55 * (m - 0.30))) paired with the same scenario unit contribution (0-8) so [min_total, max_total] is displayed without inflating strict all-scenario qualifying counts.';
+    next.workflow.scoring_and_ordering.progressive_bid_tiers_r59 =
+      '3-Tier Progressive Suggested Bid: Tier 1 keeps 1-3 searched mid-core purchase terms in entries and moves unbid ultra-long-tail terms to long_tail_opportunistic_terms; Tier 2 accepts SIF cpc_raise_exact (up_and_down) when cpc_fixed_exact is absent plus SellerSprite down_only; Tier 3 allows cold-start parent_functional_proxy with explicit disclosure or deducts the 15-pt item (0/15) when all tiers return zero bids.';
+  }
+  return next;
+}
+
 function definitions(profile) {
-  if (![50, 51, 52, 53, 54, 55, 56, 57, 58].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
+  if (![50, 51, 52, 53, 54, 55, 56, 57, 58, 59].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
     profile.activate_by_import !== false || !Array.isArray(profile.group_budgets) ||
     profile.group_budgets.length !== EXPECTED_GROUPS.length || profile.group_budgets.some((group, index) =>
       group?.id !== EXPECTED_GROUPS[index] || !Array.isArray(group.items))) {
@@ -246,10 +263,13 @@ function scored(item, score, input, extra = {}) {
 function scoreMetric(item, input, ctx, profile) {
   let validScope;
   if (item.id === 'purchase_demand_scale') {
+    const allowedGrains = profile.revision >= 59
+      ? new Set(['parent_units', 'target_child_units'])
+      : new Set(['parent_units']);
     validScope = input?.window_days === 30 && input.window_basis === 'latest_30_days' &&
       input.coverage_supported === true && input.deduplicated === true &&
       ['niche', 'period', 'grain'].every(key => text(input[key])) &&
-      (profile.revision < 57 || input.grain === 'parent_units');
+      (profile.revision < 57 || allowedGrains.has(input.grain));
   } else {
     validScope = input?.applicable === true && text(input.category) && text(input.period);
   }
@@ -309,11 +329,92 @@ function scoreMarket(item, market, ctx) {
     { report_id: market.report_id, source_population: market.population, period: market.period, family_basis: market.family_basis });
 }
 
-function bidSource(input, source, bids, ctx) {
-  const strategy = input?.strategy ?? (source === 'sellersprite' ? 'unspecified' : null);
+function bidSource(input, source, bids, ctx, profile = null) {
+  const isR59 = (profile?.revision ?? 0) >= 59;
+  if (!isR59) {
+    const strategy = input?.strategy ?? (source === 'sellersprite' ? 'unspecified' : null);
+    const compatible = input?.match_type === 'exact' &&
+      (source === 'sif' ? strategy === 'fixed' : ['fixed', 'unspecified'].includes(strategy)) &&
+      (!input.marketplace || input.marketplace === bids.marketplace) && (!input.currency || input.currency === bids.currency);
+    if (!compatible) return { point: null, range: null, reason: 'Missing or incompatible exact-match strategy, currency or marketplace.', strategy };
+    const reading = readNumber(input, 'USD', ctx);
+    const low = readNumber({ ...input, value: input.low }, 'USD', ctx);
+    const high = readNumber({ ...input, value: input.high }, 'USD', ctx);
+    const range = low.value !== null && high.value !== null && low.value <= high.value ? [low.value, high.value] : null;
+    return { point: reading.value, range, reason: reading.reason, strategy,
+      limitation: source === 'sellersprite' && strategy === 'unspecified' ? 'SellerSprite strategy is unspecified; this is an approximate trial input.' : null };
+  }
+  if (!input || typeof input !== 'object') {
+    return { point: null, range: null, reason: 'Source observation not supplied.', strategy: null };
+  }
+  const channel = source === 'sellersprite' && text(input.channel) ? input.channel.trim() : (source === 'sellersprite' ? 'ss_mcp' : null);
+  const rawStrategy = input.strategy ?? (source === 'sellersprite' && channel !== 'ss_web' ? 'unspecified' : null);
+  const marketCurrencyOk = (!input.marketplace || input.marketplace === bids.marketplace) &&
+    (!input.currency || input.currency === bids.currency);
+
+  if (isR59 && source === 'sif') {
+    // Tier 1: SIF fixed exact when present; Tier 2: SIF already-returned "提高和降低（精准）" (cpc_raise_exact / up_and_down) when fixed is absent!
+    const fixedPresent = input.value !== null && input.value !== undefined;
+    const raiseVal = input.cpc_raise_exact ?? input.raise_exact_value ??
+      (['up_and_down', 'raise', 'raise_and_lower'].includes(rawStrategy) ? input.value : null);
+    const raiseLow = input.cpc_raise_exact_low ?? input.raise_exact_low ?? input.low;
+    const raiseHigh = input.cpc_raise_exact_high ?? input.raise_exact_high ?? input.high;
+    if (input.match_type === 'exact' && marketCurrencyOk) {
+      if (rawStrategy === 'fixed' && fixedPresent) {
+        const reading = readNumber(input, 'USD', ctx);
+        const low = readNumber({ ...input, value: input.low }, 'USD', ctx);
+        const high = readNumber({ ...input, value: input.high }, 'USD', ctx);
+        const range = low.value !== null && high.value !== null && low.value <= high.value ? [low.value, high.value] : null;
+        return { point: reading.value, range, reason: reading.reason, strategy: 'fixed', tier_used: 'tier1_fixed_exact', limitation: null };
+      }
+      if (raiseVal !== null && raiseVal !== undefined && ['fixed', 'up_and_down', 'raise', 'raise_and_lower', null].includes(rawStrategy)) {
+        const reading = readNumber({ ...input, value: raiseVal }, 'USD', ctx);
+        const low = readNumber({ ...input, value: raiseLow }, 'USD', ctx);
+        const high = readNumber({ ...input, value: raiseHigh }, 'USD', ctx);
+        const range = low.value !== null && high.value !== null && low.value <= high.value ? [low.value, high.value] : null;
+        return {
+          point: reading.value,
+          range,
+          reason: reading.reason,
+          strategy: 'up_and_down',
+          tier_used: 'tier2_sif_raise_exact',
+          strategy_fallback_note: 'SIF 固定精准为空，自动采用同回包「提高和降低（精准）」出价参考（0 网页等待）。',
+          limitation: 'SIF up-and-down exact bid used as Tier-2 fallback because fixed exact bid was absent.',
+        };
+      }
+    }
+  }
+
+  if (isR59 && source === 'sellersprite') {
+    // Tier 3a ss_web real-time requires explicit down_only or fixed strategy (unspecified web scrapes are rejected).
+    const allowedSsStrategies = channel === 'ss_web' ? ['fixed', 'down_only'] : ['fixed', 'down_only', 'unspecified'];
+    const compatibleSs = input.match_type === 'exact' && allowedSsStrategies.includes(rawStrategy) && marketCurrencyOk;
+    if (!compatibleSs) {
+      return { point: null, range: null, reason: 'Missing or incompatible exact-match strategy, currency or marketplace.', strategy: rawStrategy };
+    }
+    const reading = readNumber(input, 'USD', ctx);
+    const low = readNumber({ ...input, value: input.low }, 'USD', ctx);
+    const high = readNumber({ ...input, value: input.high }, 'USD', ctx);
+    const range = low.value !== null && high.value !== null && low.value <= high.value ? [low.value, high.value] : null;
+    return {
+      point: reading.value,
+      range,
+      reason: reading.reason,
+      strategy: rawStrategy,
+      channel,
+      tier_used: channel === 'ss_web' ? 'tier3_ss_web_realtime' : 'tier1_ss_exact',
+      limitation: rawStrategy === 'unspecified'
+        ? 'SellerSprite strategy is unspecified; this is an approximate trial input.'
+        : rawStrategy === 'down_only'
+          ? 'SellerSprite exact bid uses down-only strategy.'
+          : null,
+    };
+  }
+
+  const strategy = rawStrategy;
   const compatible = input?.match_type === 'exact' &&
     (source === 'sif' ? strategy === 'fixed' : ['fixed', 'unspecified'].includes(strategy)) &&
-    (!input.marketplace || input.marketplace === bids.marketplace) && (!input.currency || input.currency === bids.currency);
+    marketCurrencyOk;
   if (!compatible) return { point: null, range: null, reason: 'Missing or incompatible exact-match strategy, currency or marketplace.', strategy };
   const reading = readNumber(input, 'USD', ctx);
   const low = readNumber({ ...input, value: input.low }, 'USD', ctx);
@@ -324,14 +425,41 @@ function bidSource(input, source, bids, ctx) {
 }
 
 function scoreBids(item, bids, ctx, profile) {
+  const isR59 = profile.revision >= 59;
   const singleEntry = profile.revision >= 55 && bids?.entries?.length === 1;
   const allowEqualEntries = profile.revision >= 56;
+  const longTailTerms = isR59 && Array.isArray(bids?.long_tail_opportunistic_terms)
+    ? bids.long_tail_opportunistic_terms
+      .filter(t => t && typeof t === 'object' && text(t.query))
+      .map(t => ({
+        query: t.query.trim(),
+        volume: number(t.volume) ? t.volume : null,
+        note: text(t.note) ? t.note.trim() : '超长尾蓝海捡漏词（仅作投放捡漏参考，不锁死主词竞价 15 分）',
+      }))
+    : undefined;
+  const isParentProxy = isR59 && bids?.entry_scope === 'parent_functional_proxy';
+  if (isParentProxy && !text(bids?.proxy_reason)) {
+    return missing(item, 'Cold-start parent_functional_proxy requires a nonempty proxy_reason.', bids);
+  }
+  const r59ScopeMeta = {
+    ...(longTailTerms !== undefined ? { long_tail_opportunistic_terms: longTailTerms } : {}),
+    ...(isParentProxy ? {
+      entry_scope: 'parent_functional_proxy',
+      scope_badge: '美亚尚无专属词 · 按上位词参考',
+      proxy_reason: bids.proxy_reason.trim(),
+    } : {}),
+  };
+
   if (!bids || bids.marketplace !== 'US' || bids.currency !== 'USD' || bids.match_type !== 'exact' ||
-    (!singleEntry && !allowEqualEntries && !text(bids.volume_period)) || !text(bids.selection_reason) || !hasEvidence(bids.evidence, ctx) ||
+    (!singleEntry && !allowEqualEntries && !text(bids.volume_period) && !(isR59 && bids?.unbid_after_all_tiers === true)) ||
+    !text(bids.selection_reason) || !hasEvidence(bids.evidence, ctx) ||
     !Array.isArray(bids.entries) || bids.entries.length === 0) {
     return missing(item, bids?.reason ?? (allowEqualEntries
       ? 'A supported main-entry set with US/exact/USD scope is required.'
-      : 'A supported main-entry set with common monthly volume and US/exact/USD scope is required.'), bids);
+      : 'A supported main-entry set with common monthly volume and US/exact/USD scope is required.'), bids, r59ScopeMeta);
+  }
+  if (isR59 && bids.entries.length > 3) {
+    return missing(item, 'Revision 59 Tier 1 restricts main purchase entries to 1–3 core/mid-core queries; move peripheral long-tail queries to long_tail_opportunistic_terms.', bids, r59ScopeMeta);
   }
   const queries = new Set();
   let duplicate = false;
@@ -348,8 +476,12 @@ function scoreBids(item, bids, ctx, profile) {
       volume.value = null;
       volume.reason = 'Supplied monthly volumes need a declared common period.';
     }
-    const sources = Object.fromEntries(['sellersprite', 'sif'].map(source => [source, bidSource(entry?.[source], source, bids, ctx)]));
-    const usable = Object.entries(sources).filter(([, value]) => value.point !== null);
+    const sources = Object.fromEntries(['sellersprite', 'sif'].map(source => [source, bidSource(entry?.[source], source, bids, ctx, profile)]));
+    // Tier 3a ss_web is strictly a fallback when SIF Tier 1/2 has no usable exact bid.
+    const rawUsable = Object.entries(sources).filter(([, value]) => value.point !== null);
+    const usable = isR59 && sources.sif.point !== null && sources.sellersprite.channel === 'ss_web'
+      ? [['sif', sources.sif]]
+      : rawUsable;
     const combined = usable.length ? usable.reduce((sum, [, value]) => sum + value.point / usable.length, 0) : null;
     return { query: entry?.query ?? null, volume: volume.value, volume_reason: volume.reason, sources,
       combined_point: combined, source_label: usable.length === 2 ? 'two_source_mean' : usable.length ? `${usable[0][0]}_only` : 'needs_evidence',
@@ -359,6 +491,30 @@ function scoreBids(item, bids, ctx, profile) {
           : '周曝光极低或无历史数据，采用原生工具返回的平台基准建议竞价。' }
         : {}) };
   });
+
+  if (isR59 && bids.entries.some((rawE, i) =>
+    (rawE?.all_tiers_exhausted === true || rawE?.unbid_after_all_tiers === true) && entries[i]?.combined_point !== null,
+  )) {
+    return missing(item, 'Entry declares all_tiers_exhausted / unbid_after_all_tiers while supplying a usable exact bid.', bids, r59ScopeMeta);
+  }
+  if (isR59 && (bids.unbid_after_all_tiers === true || bids.entries.every(e => e?.all_tiers_exhausted === true || e?.unbid_after_all_tiers === true))) {
+    if (duplicate) {
+      return missing(item, 'Main purchase entries must be unique.', bids, r59ScopeMeta);
+    }
+    if (entries.some(e => e.combined_point !== null)) {
+      return missing(item, 'unbid_after_all_tiers: true conflicts with usable exact bid observations present on one or more entries.', bids, r59ScopeMeta);
+    }
+    return scored(item, 0, bids, {
+      ...r59ScopeMeta,
+      entries,
+      range_scenarios: { sellersprite: null, sif: null },
+      reference_bid_usd: null,
+      aggregation_method: 'unbid_after_all_tiers_deduct_15',
+      unbid_after_all_tiers: true,
+      deduction_note: '三级递进全工具补查后仍无可用精准竞价，按规则扣减本项 15 分（记 0/15，不锁死整张卡）。',
+      evidence: mergeRefs(bids.evidence, ...bids.entries.flatMap(entry => [entry?.volume?.evidence, entry?.sellersprite?.evidence, entry?.sif?.evidence])),
+    });
+  }
   const totalVolume = entries.reduce((sum, entry) => sum + (entry.volume ?? 0), 0);
   const validVolumes = entries.every(entry => entry.volume !== null) && number(totalVolume) && totalVolume > 0;
   const allPoints = entries.every(entry => entry.combined_point !== null);
@@ -375,7 +531,7 @@ function scoreBids(item, bids, ctx, profile) {
     return [source, { source, bid_range_usd: range,
       score_range: [numericScore(item, range[1]), numericScore(item, range[0])], interpretation: 'Source-labeled range scenario; not the main score or actual CPC.' }];
   }));
-  const extra = { entries, range_scenarios: rangeScenarios, reference_bid_usd: null,
+  const extra = { ...r59ScopeMeta, entries, range_scenarios: rangeScenarios, reference_bid_usd: null,
     ...(profile.revision >= 55 ? { aggregation_method: allowEqualEntries && duplicate ? null : singleEntry ? 'single_main_entry' : equalEntries
       ? 'equal_main_entries' : allowEqualEntries && !validVolumes ? null : 'monthly_search_weighted' } : {}),
     ...(equalEntries ? { aggregation_reason: 'Monthly search volume is missing; every main entry has a usable exact point. Equal entry weights do not establish equal demand.' } : {}),
@@ -543,10 +699,10 @@ function scoreNatural(member, ctx, profile, cohortPeriod = null, cohortGrain = n
         (viewGrain && ['child', 'child_asin', 'variant', 'single_asin', 'asin'].includes(viewGrain))) {
         return { score: null, reason: 'Parent/family cohort grain requires parent-aggregated SIF view (isListingSearch: true), not a child-ASIN view.', input };
       }
-    } else if (cohortGrain === 'family_representative') {
+    } else if (cohortGrain === 'family_representative' || cohortGrain === 'target_child_units') {
       if (nestedBags.some(b => b.isListingSearch === true || b.listingSearch === true) ||
         (viewGrain && ['parent', 'parent_units', 'family'].includes(viewGrain))) {
-        return { score: null, reason: 'Representative-ASIN cohort grain conflicts with a parent-aggregated SIF view.', input };
+        return { score: null, reason: `${cohortGrain} cohort grain conflicts with a parent-aggregated SIF view.`, input };
       }
     }
   }
@@ -554,10 +710,19 @@ function scoreNatural(member, ctx, profile, cohortPeriod = null, cohortGrain = n
   const counts = Object.fromEntries(['sellersprite', 'sif'].map(source => [source,
     Object.fromEntries(['organic', 'ad'].map(channel => [channel,
       readNumber(input.keyword_counts?.[source]?.[channel], 'count', ctx, { integer: true }).value]))]));
+  const ssOrg = counts.sellersprite.organic;
+  const ssAd = counts.sellersprite.ad;
+  const coverageExposureMismatch = profile.revision >= 58 && reading.value !== null && ssOrg !== null &&
+    reading.value < 0.35 &&
+    (ssOrg >= 50 || (ssOrg >= 20 && ssAd !== null && ssOrg >= ssAd * 1.5));
   return {
     score: reading.value === null ? null : Math.min(reading.value / profile.measurement.newcomer_natural_visibility_example_score.full_points_at, 1),
     reason: reading.reason, input, keyword_counts: counts,
     source_label: Object.values(counts.sellersprite).some(value => value !== null) ? 'sif_with_sellersprite_corroboration' : 'sif_only',
+    ...(coverageExposureMismatch ? {
+      coverage_exposure_mismatch: true,
+      coverage_exposure_diagnosis: '覆盖广、曝光弱：SellerSprite 收录自然词数较多，但 SIF 近30天自然曝光占比偏低（仅反映口径与曝光不匹配，具体自然坑位与广告结构须结合核心词排名及流量结构进一步核实）。',
+    } : {}),
   };
 }
 
@@ -1060,10 +1225,18 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     low: missing(lowDef, reason, cohort), natural: missing(naturalDef, reason, cohort), diagnostics,
   });
 
+  const isR59 = profile.revision >= 59;
+  const validGrains = isR59
+    ? new Set([...R58_VALID_NEWCOMER_GRAINS, 'target_child_units'])
+    : R58_VALID_NEWCOMER_GRAINS;
+  const validRefScopes = isR59
+    ? new Set(['current_relevant_bsr_top100_all_ages', 'current_relevant_bsr_top100_mature_only'])
+    : new Set(['current_relevant_bsr_top100_all_ages']);
+
   if (!cohort || cohort.reference_supported !== true || cohort.observation_basis !== 'current_latest_30_days' ||
     cohort.scope !== 'current_relevant_bsr_top100' || cohort.query_complete !== true ||
     !['observation_date', 'period', 'niche', 'grain', 'relevant_bsr_node'].every(key => text(cohort[key])) ||
-    !R58_VALID_NEWCOMER_GRAINS.has(cohort.grain) ||
+    !validGrains.has(cohort.grain) ||
     !validDate(cohort.observation_date) || !hasEvidence(cohort.evidence, ctx) || !Array.isArray(cohort.members)) {
     diagnostics.members = Array.isArray(cohort?.members) ? cohort.members : [];
     return pending(cohort?.reason ?? 'A completed current-category query with valid sales grain and aligned all-age sales reference is required.');
@@ -1075,6 +1248,17 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     return pending('Revision 58 newcomer cohort requires a verified latest-30-day period aligned with observation_date (YYYY-MM-DD/YYYY-MM-DD, 30 days).');
   }
   const earliestCal = threeCalendarMonthsEarlier(obsCal);
+
+  const hasParentSalesEvidenceSignal = evList => evList.some(ev => {
+    if (!ev || typeof ev !== 'object') return false;
+    if (text(ev.grain) && ev.grain.trim() !== 'target_child_units') return true;
+    const prose = [ev.summary, ev.note, ev.source, ev.label, ev.locator].filter(Boolean).join(' ');
+    const hasMultiOrNegation = /(?:多变体|多个子体|多子体|非单变体|并非单变体|不是单变体|非唯一子体|并非唯一子体|不等于|不等同|不同于|大于目标子体|高于目标子体|超过目标子体|!=|≠|\b(?:multi[- ]variant|multiple\s+(?:child(?:ren)?|variants?)|not\s+(?:a\s+)?(?:single[- ]variant|sole\s+child)|does(?:n't|\s+not)\s+equal|do(?:n't|\s+not)\s+equal|not\s+equal\s+to|unequal)\b)/i.test(prose);
+    if (!hasMultiOrNegation && /(?<!不|非)(?:单变体|唯一子体|仅1个子体|只有一个子体|等于目标子体)|\b(?:single[- ]variant|sole\s+child|only\s+one\s+child|equals?\s+target\s+child)\b/i.test(prose)) {
+      return false;
+    }
+    return /parent_family_units|family_representative|父体销量|父体月销|父体汇总销量|\bparent\s+(?:family\s+)?(?:monthly\s*)?(?:sales|units)\b/i.test(prose);
+  });
 
   let invalidReference = false;
   const classified = [];
@@ -1091,6 +1275,8 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     const badUnitsWindow = Boolean(
       (member?.units_30d && typeof member.units_30d === 'object' && (
         (member.units_30d.period !== undefined && member.units_30d.period !== cohort.period) ||
+        (text(member.units_30d.grain) && member.units_30d.grain !== cohort.grain) ||
+        (cohort.grain === 'target_child_units' && (member.units_30d.grain !== 'target_child_units' || hasParentSalesEvidenceSignal(unitsEv))) ||
         hasNon30DayWindowParam([member.units_30d, ...unitsEv])
       ))
     );
@@ -1471,12 +1657,12 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     };
   }
 
-  // Verified non-empty all-age market reference T (missing/empty/all-excluded T stays pending, never defaults to 10).
+  // Verified non-empty all-age (or r59 mature-only) market reference T (missing/empty/all-excluded T stays pending, never defaults to 10).
   const reference = cohort.market_reference;
-  if (reference?.scope !== 'current_relevant_bsr_top100_all_ages' || reference.node !== cohort.relevant_bsr_node ||
+  if (!validRefScopes.has(reference?.scope) || reference.node !== cohort.relevant_bsr_node ||
     reference.period !== cohort.period || reference.grain !== cohort.grain ||
     (reference.window_days !== undefined && reference.window_days !== 30) ||
-    !R58_VALID_NEWCOMER_GRAINS.has(reference.grain) || reference.deduplicated !== true ||
+    !validGrains.has(reference.grain) || reference.deduplicated !== true ||
     reference.coverage_supported !== true || !hasEvidence(reference.evidence, ctx) ||
     !Array.isArray(reference.families) || reference.families.length === 0) {
     return pending('A verified non-empty all-age sales reference T is required; missing T cannot default to 10.');
@@ -1523,9 +1709,11 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     const rEv = (Array.isArray(row?.units_30d?.evidence) ? row.units_30d.evidence : []).map(id => ctx.evidence.get(id)).filter(Boolean);
     if (row?.units_30d && typeof row.units_30d === 'object' && (
       (row.units_30d.period !== undefined && row.units_30d.period !== cohort.period) ||
+      (text(row.units_30d.grain) && row.units_30d.grain !== cohort.grain) ||
+      (cohort.grain === 'target_child_units' && (row.units_30d.grain !== 'target_child_units' || hasParentSalesEvidenceSignal(rEv))) ||
       hasNon30DayWindowParam([row.units_30d, ...rEv])
     )) {
-      return pending('All-age reference units_30d observations must cover the aligned 30-day cohort window.');
+      return pending('All-age reference units_30d observations must cover the aligned 30-day cohort window and match cohort.grain.');
     }
   }
   const refSales = comparableRefFamilies.map(row => readNumber(row?.units_30d, 'units', ctx));
@@ -1757,6 +1945,38 @@ function validateR58PriceAnchor(anchor, ctx, minFloor = 29.99) {
   if (!text(anchor.target_variant_asin)) return { supported: false, value: null, min_value: null, max_value: null, reason: 'Revision 58 requires target_variant_asin on the reference price anchor.' };
   if (anchor.fulfillment_channel !== 'FBA') return { supported: false, value: null, min_value: null, max_value: null, reason: 'Revision 58 primary reference price must be fulfillment_channel: "FBA" (FBM benchmarks belong in stress_scenarios[]).' };
   if (anchor.sales_history_supported !== true) return { supported: false, value: null, min_value: null, max_value: null, reason: 'Revision 58 reference price requires sales_history_supported: true.' };
+
+  // Support ongoing Coupon / Prime Exclusive Discount net_effective_price_usd without double-deduction.
+  const hasPromoFields = ['list_price_usd', 'ongoing_coupon_usd', 'ongoing_coupon_pct',
+    'prime_exclusive_discount_usd', 'prime_exclusive_discount_pct', 'net_effective_price_usd', 'promo_basis_already_net']
+    .some(k => anchor[k] !== undefined && anchor[k] !== null);
+  let pricingMeta = null;
+  if (hasPromoFields) {
+    const pricing = resolveEffectivePricing({
+      price_usd: anchor.list_price_usd === undefined ? reading.value : undefined,
+      list_price_usd: anchor.list_price_usd,
+      ongoing_coupon_usd: anchor.ongoing_coupon_usd,
+      ongoing_coupon_pct: anchor.ongoing_coupon_pct,
+      prime_exclusive_discount_usd: anchor.prime_exclusive_discount_usd,
+      prime_exclusive_discount_pct: anchor.prime_exclusive_discount_pct,
+      net_effective_price_usd: anchor.net_effective_price_usd,
+      promo_basis_already_net: anchor.promo_basis_already_net,
+    });
+    if (!pricing.valid) {
+      return { supported: false, value: null, min_value: null, max_value: null, reason: pricing.reason };
+    }
+    if (Math.abs(reading.value - pricing.net_effective_price_usd) > 1e-4) {
+      return {
+        supported: false,
+        value: null,
+        min_value: null,
+        max_value: null,
+        reason: `Reference price anchor value (${reading.value}) must equal resolved ongoing-promo net_effective_price_usd (${pricing.net_effective_price_usd}) without double deduction.`,
+      };
+    }
+    pricingMeta = pricing;
+  }
+
   let minVal = minFloor;
   let maxVal = reading.value;
   if (anchor.supported_price_range !== undefined) {
@@ -1768,7 +1988,19 @@ function validateR58PriceAnchor(anchor, ctx, minFloor = 29.99) {
     minVal = Math.max(minFloor, rng[0]);
     maxVal = rng[1];
   }
-  return { supported: true, value: reading.value, min_value: minVal, max_value: maxVal, reason: null };
+  return {
+    supported: true,
+    value: reading.value,
+    min_value: minVal,
+    max_value: maxVal,
+    reason: null,
+    ...(pricingMeta ? {
+      has_ongoing_discount: pricingMeta.has_ongoing_discount,
+      list_price_usd: pricingMeta.list_price_usd,
+      net_effective_price_usd: pricingMeta.net_effective_price_usd,
+      ongoing_discount_usd: pricingMeta.total_discount_usd,
+    } : {}),
+  };
 }
 
 function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
@@ -1892,25 +2124,104 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
     }
   }
   if (isR58 && Array.isArray(economics?.stress_scenarios)) {
+    const primaryHasOngoingPromo = Boolean(priceRefR58?.has_ongoing_discount) ||
+      diagnostics.scenarios.some(sc => sc.input?.calculation?.ongoing_discount_usd > 0 || sc.input?.cost_ledger?.ongoing_coupon_usd > 0 ||
+        sc.input?.cost_ledger?.ongoing_coupon_pct > 0 || sc.input?.cost_ledger?.prime_exclusive_discount_usd > 0 ||
+        sc.input?.cost_ledger?.prime_exclusive_discount_pct > 0);
+    const primaryNetPrices = diagnostics.scenarios
+      .map(sc => sc.input?.calculation?.price_usd)
+      .filter(number);
+    const primaryListPrices = diagnostics.scenarios
+      .map(sc => sc.input?.calculation?.list_price_usd ?? sc.input?.calculation?.price_usd)
+      .filter(number);
+    if (number(priceRefR58?.net_effective_price_usd)) primaryNetPrices.push(priceRefR58.net_effective_price_usd);
+    if (number(priceRefR58?.list_price_usd)) primaryListPrices.push(priceRefR58.list_price_usd);
+
     const dedupedStress = mergeStressScenarios(undefined, economics.stress_scenarios) ?? [];
     diagnostics.stress_scenarios = dedupedStress.map(stress => {
-      const evaluated = datedScenario(stress, economics, ctx, profile, true);
+      const stressType = stress?.stress_type ?? 'stress_sensitivity';
+      const ledger = stress?.cost_ledger;
+      const isPromoStress = /coupon|promo|prime/i.test(String(stressType)) ||
+        ['self_coupon_usd', 'self_coupon_pct', 'ongoing_coupon_usd', 'ongoing_coupon_pct',
+          'prime_exclusive_discount_usd', 'prime_exclusive_discount_pct']
+          .some(k => number(stress?.[k]) || number(ledger?.[k]));
+      const stressIssues = [];
+      let doubleDeductionBlocked = false;
+
+      if (isPromoStress) {
+        const hasSecondaryDiscount = ['self_coupon_usd', 'self_coupon_pct', 'ongoing_coupon_usd', 'ongoing_coupon_pct',
+          'prime_exclusive_discount_usd', 'prime_exclusive_discount_pct']
+          .some(k => (number(stress?.[k]) && stress[k] > 0) || (number(ledger?.[k]) && ledger[k] > 0));
+        const alreadyNet = stress?.promo_basis_already_net === true || ledger?.promo_basis_already_net === true;
+        const stressBaseList = number(ledger?.list_price_usd) ? ledger.list_price_usd
+          : number(stress?.list_price_usd) ? stress.list_price_usd
+            : (number(ledger?.price_usd) ? ledger.price_usd : null);
+        const stressNetCandidate = number(ledger?.net_effective_price_usd) ? ledger.net_effective_price_usd
+          : (number(ledger?.price_usd) ? ledger.price_usd : null);
+        const stacksOntoPrimaryNet = primaryHasOngoingPromo && stress?.explicit_stackable_promo !== true && (
+          (hasSecondaryDiscount && stressBaseList !== null &&
+            primaryNetPrices.some(p => Math.abs(p - stressBaseList) < 0.01) &&
+            !primaryListPrices.some(p => Math.abs(p - stressBaseList) < 0.01)) ||
+          (stressNetCandidate !== null && !number(ledger?.list_price_usd) && !number(stress?.list_price_usd) &&
+            primaryNetPrices.some(p => stressNetCandidate < p - 0.01) &&
+            (hasSecondaryDiscount || /coupon|promo|prime/i.test(String(stressType))))
+        );
+        if ((alreadyNet && hasSecondaryDiscount) || stacksOntoPrimaryNet) {
+          doubleDeductionBlocked = true;
+          stressIssues.push({
+            code: 'coupon_double_deduction_blocked',
+            reason: 'Self-coupon/promo stress scenario attempts to deduct an ongoing coupon/Prime discount a second time on an already-net effective price without an explicit gross list_price_usd basis or stackable promo proof.',
+          });
+        }
+      }
+
+      const evaluated = doubleDeductionBlocked ? { calculation: null, margin: { reason: stressIssues[0].reason } } : datedScenario(stress, economics, ctx, profile, true);
       const calc = evaluated.calculation;
+      let promoTierUnverified = false;
+      if (!doubleDeductionBlocked) {
+        if (!calc) {
+          stressIssues.push({ code: 'stress_ledger_invalid', reason: evaluated.margin?.reason || 'Stress scenario cost_ledger could not be calculated.' });
+        } else {
+          for (const iss of (calc.fee_validation?.issues ?? [])) {
+            stressIssues.push({ code: iss.code ?? 'fee_issue', line: iss.line ?? null, reason: iss.reason });
+          }
+          if (Array.isArray(calc.pending_lines) && calc.pending_lines.length > 0) {
+            stressIssues.push({ code: 'stress_pending_lines', reason: `Unconfirmed stress cost lines: ${calc.pending_lines.join(', ')}.` });
+          }
+          const stressPrice = calc.price_usd;
+          const baseAbove50 = primaryListPrices.some(p => p > 50.00) || (number(ledger?.list_price_usd) && ledger.list_price_usd > 50.00);
+          if (isPromoStress && baseAbove50 && number(stressPrice) && stressPrice <= 50.00 &&
+            stress?.fulfillment_promo_tier_verified !== true && ledger?.fulfillment_promo_tier_verified !== true) {
+            promoTierUnverified = true;
+            stressIssues.push({
+              code: 'promo_tier_crossing_unverified',
+              reason: 'Self-coupon/promo stress crosses the $50.00 FBA fulfillment threshold without fulfillment_promo_tier_verified: true; margin stays pending until Amazon promo tier fee rules are verified.',
+            });
+          }
+        }
+      }
+
+      const blockNumbers = doubleDeductionBlocked || promoTierUnverified;
       return {
         id: stress?.id ?? null,
         label: stress?.label ?? stress?.id ?? '独立压力情景',
-        stress_type: stress?.stress_type ?? 'stress_sensitivity',
+        stress_type: stressType,
         assumptions: Array.isArray(stress?.assumptions) ? stress.assumptions : [],
         price_usd: calc?.price_usd ?? stress?.cost_ledger?.price_usd ?? null,
-        margin: calc?.margin ?? null,
-        contribution_usd: calc?.contribution_usd ?? null,
-        advertising_scenario_margin: calc?.advertising_scenario_margin ?? null,
-        landed_domestic_cap_at_30pct_usd: calc?.landed_domestic_cap_at_30pct_usd ?? null,
+        margin: blockNumbers ? null : (calc?.margin ?? null),
+        contribution_usd: blockNumbers ? null : (calc?.contribution_usd ?? null),
+        advertising_scenario_margin: blockNumbers ? null : (calc?.advertising_scenario_margin ?? null),
+        landed_domestic_cap_at_30pct_usd: blockNumbers ? null : (calc?.landed_domestic_cap_at_30pct_usd ?? null),
+        landed_domestic_cap_at_30pct_cny: blockNumbers ? null : (calc?.landed_domestic_cap_at_30pct_cny ?? null),
+        double_deduction_blocked: doubleDeductionBlocked,
+        promo_tier_unverified: promoTierUnverified,
+        stress_issues: stressIssues,
         calculation: calc,
       };
     });
   }
   const scenarios = diagnostics.scenarios;
+  const isR59 = profile.revision >= 59;
   const marginsComplete = !structuralReason && scenarios.every(scenario => scenario.margin.value !== null);
   if (marginsComplete) diagnostics.margin_range = span(scenarios.map(scenario => scenario.margin.value));
   let marginStatus = 'pending';
@@ -1924,18 +2235,80 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
     } else if (allPass) {
       marginStatus = 'pass';
       marginReason = 'All supported coherent scenarios meet the margin condition.';
+    } else if (isR59) {
+      // Revision 59: crossing-30% coherent multi-quote / multi-price interval extends below-floor margin score
+      // linearly along the exact BigInt rational slope min(22, max(0, 11 + 55 * (m - 0.30))) paired with the same scenario's unit contribution.
+      const floorRat = ratFromNumber(marginDef.mapping.eligible_margin_floor);
+      const fullAtRat = ratFromNumber(marginDef.mapping.full_score_at);
+      const scoreFloorRat = ratFromNumber(marginDef.mapping.score_at_floor);
+      const weightRat = ratFromNumber(marginDef.weight);
+      const slopeRat = ratDiv(ratSub(weightRat, scoreFloorRat), ratSub(fullAtRat, floorRat));
+      for (const s of scenarios) {
+        if (s.margin_score === null && s.margin.value !== null) {
+          const mRat = ratFromNumber(s.margin.value);
+          const rawRat = ratAdd(scoreFloorRat, ratMul(slopeRat, ratSub(mRat, floorRat)));
+          s.margin_score = ratToNumber(ratMin(weightRat, ratMax(rat(0n, 1n), rawRat)));
+        }
+        if (s.contribution_score === null && s.contribution.value !== null) {
+          s.contribution_score = s.contribution.value <= 0 ? 0 : numericScore(contributionDef, s.contribution.value);
+        }
+      }
+      diagnostics.crossing_margin_floor = true;
+      diagnostics.passing_scenario_ids = scenarios.filter(s => s.margin_eligible).map(s => s.id);
+      diagnostics.below_floor_scenario_ids = scenarios.filter(s => !s.margin_eligible).map(s => s.id);
+      marginStatus = 'crossing_pass';
+      marginReason = `Supported scenarios cross the 30% floor (passing: ${diagnostics.passing_scenario_ids.join(', ')}; below floor: ${diagnostics.below_floor_scenario_ids.join(', ')}); r59 scores full interval along linear slope without inflating strict qualifying count.`;
     } else {
       marginReason = 'The supported margin range crosses 30%; screening remains pending.';
     }
+  } else if (isR58 && !outerStructuralReason && scenarios.length > 0) {
+    // When nonnegative domestic_freight is the ONLY unconfirmed/deferred cost and every scenario's bare-goods
+    // upper-bound margin is already strictly below 30%, no nonnegative domestic freight can rescue eligibility.
+    const scIdCounts = new Map();
+    for (const sc of scenarios) {
+      if (text(sc?.input?.id)) scIdCounts.set(sc.input.id, (scIdCounts.get(sc.input.id) ?? 0) + 1);
+    }
+    const floorRat = ratFromNumber(floor);
+    const bareUpperBounds = [];
+    const allBareBelowFloor = scenarios.every(sc => {
+      const inp = sc?.input;
+      const calc = inp?.calculation;
+      const ledger = inp?.cost_ledger;
+      if (!inp || !calc || !ledger || !text(inp.id) || scIdCounts.get(inp.id) !== 1) return false;
+      if (inp.saleable_unit !== economics.saleable_unit || inp.coherent !== true) return false;
+      if (!Array.isArray(inp.assumptions) || inp.assumptions.length === 0 || !inp.assumptions.every(text)) return false;
+      if (ledger.sensitivity_only === true || sc.price_anchor_supported === false) return false;
+      if (!number(calc.net_revenue_usd) || calc.net_revenue_usd <= 0 || !number(calc.known_cost_usd) || calc.known_cost_usd < 0) return false;
+      const lines = Array.isArray(calc.lines) ? calc.lines : [];
+      const procLine = lines.find(l => l?.id === 'procurement');
+      const domLine = lines.find(l => l?.id === 'domestic_freight');
+      if (!procLine || procLine.status === 'pending' || procLine.status === 'deferred' || !number(procLine.amount_usd) || procLine.amount_usd <= 0) return false;
+      if (!domLine || (domLine.status !== 'pending' && domLine.status !== 'deferred') || domLine.amount_usd !== null) return false;
+      const pend = Array.isArray(calc.pending_lines) ? calc.pending_lines : [];
+      if (pend.length !== 1 || pend[0] !== 'domestic_freight' || pend.includes('recovery_credit')) return false;
+      const issues = Array.isArray(calc.fee_validation?.issues) ? calc.fee_validation.issues : [];
+      if (issues.some(iss => iss?.line !== 'domestic_freight')) return false;
+      const netR = ratFromNumber(calc.net_revenue_usd);
+      const knownR = ratFromNumber(calc.known_cost_usd);
+      if (ratCmp(ratSub(netR, knownR), ratMul(floorRat, netR)) >= 0) return false;
+      bareUpperBounds.push((calc.net_revenue_usd - calc.known_cost_usd) / calc.net_revenue_usd);
+      return true;
+    });
+    if (allBareBelowFloor && bareUpperBounds.length === scenarios.length) {
+      diagnostics.bare_goods_margin_upper_bounds = span(bareUpperBounds);
+      marginStatus = 'fail';
+      marginReason = 'Even before adding unconfirmed nonnegative domestic freight, the supported bare-goods margin upper bound is below the existing 30% floor.';
+    }
   }
-  const completeMargin = marginStatus === 'pass';
+  const completeMargin = marginStatus === 'pass' || marginStatus === 'crossing_pass';
   const completeContribution = completeMargin && scenarios.every(scenario => scenario.contribution.value !== null);
   const marginRange = completeMargin ? span(scenarios.map(scenario => scenario.margin_score)) : null;
   const contributionRange = completeContribution ? span(scenarios.map(scenario => scenario.contribution_score)) : null;
   const marginEvidence = mergeRefs(...scenarios.map(scenario => scenario.input?.margin?.evidence));
   const contributionEvidence = mergeRefs(marginEvidence, ...scenarios.map(scenario => scenario.input?.contribution_usd?.evidence));
   const marginItem = completeMargin ? scored(marginDef, point(marginRange), economics, { score_range: marginRange, evidence: marginEvidence,
-    scenario_scores: scenarios.map(s => ({ id: s.id, value: s.margin.value, score: s.margin_score })) }) :
+    scenario_scores: scenarios.map(s => ({ id: s.id, value: s.margin.value, score: s.margin_score, ...(isR59 ? { margin_eligible: s.margin_eligible } : {}) })),
+    ...(diagnostics.crossing_margin_floor ? { crossing_margin_floor: true } : {}) }) :
     missing(marginDef, marginReason, economics, { evidence: marginEvidence, status: marginStatus === 'fail' ? 'ineligible' : 'needs_evidence' });
   const contributionItem = completeContribution ? scored(contributionDef, point(contributionRange), economics,
     { score_range: contributionRange, evidence: contributionEvidence, scenario_scores: scenarios.map(s => ({ id: s.id, value: s.contribution.value, score: s.contribution_score })) }) :
@@ -1988,7 +2361,8 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
   ];
   const status = conditions.some(condition => condition.status === 'fail') ? 'excluded' :
     conditions.some(condition => condition.status === 'defer') ? 'deferred' :
-      conditions.some(condition => condition.status === 'pending') ? 'pending' : 'eligible';
+      conditions.some(condition => condition.status === 'pending') ? 'pending' :
+        conditions.some(condition => condition.status === 'crossing_pass') ? 'crossing_eligible' : 'eligible';
   return { status, conditions };
 }
 
@@ -2089,52 +2463,64 @@ function coversPrimaryOffPeakDates(scenarios) {
   return true;
 }
 
-function isValidCompanionPeakPanelR58(period) {
+function hasExactPeakMonthsR58(period) {
   if (!period || !Array.isArray(period.months)) return false;
   const sorted = [...period.months].sort((a, b) => a - b);
-  if (sorted.length !== 3 || sorted[0] !== 10 || sorted[1] !== 11 || sorted[2] !== 12) return false;
-  if (period.diagnostics?.economics?.expected_structural_error) return false;
+  return sorted.length === 3 && sorted[0] === 10 && sorted[1] === 11 && sorted[2] === 12;
+}
+
+/**
+ * Returns null when the period is a valid 2027 companion holiday peak panel, otherwise the first
+ * concrete reason (missing/pending cost line, failed binding or date mismatch). Validity rules are
+ * identical to the former boolean check; only the diagnostic wording is added.
+ */
+function diagnoseCompanionPeakPanelR58(period) {
+  if (!hasExactPeakMonthsR58(period)) return 'panel does not cover exact months [10, 11, 12]';
+  if (period.diagnostics?.economics?.expected_structural_error) return 'expected primary scenario structure is invalid';
   const scenarios = period.diagnostics?.economics?.scenarios;
-  if (!Array.isArray(scenarios) || scenarios.length === 0) return false;
+  if (!Array.isArray(scenarios) || scenarios.length === 0) return 'panel has no dated cost_ledger scenarios';
   const allowedPeakPending = new Set(['fulfillment', 'collection']);
   const allowedPublishedFulfillmentIssues = new Set(['fee_outside_dates', 'fee_season_mismatch']);
-  return scenarios.every(sc => {
+  const scenarioReason = sc => {
     const ledger = sc?.input?.cost_ledger;
     const calc = sc?.input?.calculation;
     const ctx = ledger?.fee_context;
-    if (!ledger || !calc || ledger.id !== sc.id || !ctx) return false;
-    if (!(ledger.sensitivity_only === undefined || ledger.sensitivity_only === false) || sc?.input?.coherent !== true) return false;
-    if (sc.price_anchor_supported === false) return false;
-    if (!Array.isArray(ledger.lines)) return false;
+    if (!ledger || !calc || ledger.id !== sc.id || !ctx) return 'cost_ledger, calculation or fee_context is missing or not bound to the scenario id';
+    if (!(ledger.sensitivity_only === undefined || ledger.sensitivity_only === false)) return 'ledger is sensitivity-only';
+    if (sc?.input?.coherent !== true) return 'scenario is not coherent';
+    if (sc.price_anchor_supported === false) return 'price anchor is not supported';
+    if (!Array.isArray(ledger.lines)) return 'cost lines are missing';
     const presentIds = new Set(ledger.lines.map(l => l?.id));
-    if (REQUIRED_COSTS.some(reqId => !presentIds.has(reqId))) return false;
-    if (ctx.marketplace !== 'US' || ctx.currency !== 'USD' || !text(ctx.package_ref)) return false;
-    if (!validIsoWindow(ctx.sales) || !validIsoWindow(ctx.storage) || !validIsoWindow(ctx.inbound)) return false;
+    const missingIds = REQUIRED_COSTS.filter(reqId => !presentIds.has(reqId));
+    if (missingIds.length) return `required cost lines missing: ${missingIds.join(', ')}`;
+    if (ctx.marketplace !== 'US' || ctx.currency !== 'USD' || !text(ctx.package_ref)) return 'fee_context marketplace/currency/package_ref binding is invalid';
+    if (!validIsoWindow(ctx.sales) || !validIsoWindow(ctx.storage) || !validIsoWindow(ctx.inbound)) return 'sales/storage/inbound fee windows are invalid';
     if (!ctx.sales.from.startsWith('2027-') || !ctx.sales.through.startsWith('2027-') ||
-      !ctx.storage.from.startsWith('2027-') || !ctx.storage.through.startsWith('2027-')) return false;
-    if (ctx.inbound.from < '2027-01-15' || ctx.inbound.through > ctx.sales.through) return false;
+      !ctx.storage.from.startsWith('2027-') || !ctx.storage.through.startsWith('2027-')) return 'sales/storage windows are not in 2027';
+    if (ctx.inbound.from < '2027-01-15' || ctx.inbound.through > ctx.sales.through) return 'inbound window falls outside 2027-01-15..sales end';
     const fulLine = ledger.lines.find(l => l?.id === 'fulfillment');
     const fulBasis = fulLine?.fee_basis;
-    if (!fulBasis || typeof fulBasis !== 'object' || !['unavailable', 'published'].includes(fulBasis.status)) return false;
+    if (!fulBasis || typeof fulBasis !== 'object' || !['unavailable', 'published'].includes(fulBasis.status)) return 'fulfillment fee_basis must be published or unavailable';
     const fulIssues = (calc.fee_validation?.issues ?? []).filter(issue => issue.line === 'fulfillment');
+    const fulBinding = 'late-2027 peak fulfillment fee_basis binding is invalid';
     if (fulBasis.status === 'unavailable') {
-      if (!text(fulBasis.version) || fulLine.status !== 'pending' || fulLine.amount_usd !== null) return false;
-      if (fulBasis.marketplace !== undefined && fulBasis.marketplace !== 'US') return false;
-      if (fulBasis.currency !== undefined && fulBasis.currency !== 'USD') return false;
-      if (fulBasis.package_ref !== undefined && fulBasis.package_ref !== ctx.package_ref) return false;
-      if (fulBasis.year !== undefined && fulBasis.year !== 2027) return false;
-      if (/\b20(?!27)\d{2}\b/.test(fulBasis.version) && !/\b2027\b/.test(fulBasis.version)) return false;
+      if (!text(fulBasis.version) || fulLine.status !== 'pending' || fulLine.amount_usd !== null) return `${fulBinding} (unavailable basis needs version, pending status and null amount)`;
+      if (fulBasis.marketplace !== undefined && fulBasis.marketplace !== 'US') return `${fulBinding} (marketplace)`;
+      if (fulBasis.currency !== undefined && fulBasis.currency !== 'USD') return `${fulBinding} (currency)`;
+      if (fulBasis.package_ref !== undefined && fulBasis.package_ref !== ctx.package_ref) return `${fulBinding} (package_ref)`;
+      if (fulBasis.year !== undefined && fulBasis.year !== 2027) return `${fulBinding} (year)`;
+      if (/\b20(?!27)\d{2}\b/.test(fulBasis.version) && !/\b2027\b/.test(fulBasis.version)) return `${fulBinding} (version year)`;
       if (fulBasis.effective_from !== undefined && fulBasis.effective_from !== null) {
-        if (!validDate(fulBasis.effective_from) || fulBasis.effective_from > '2027-12-31') return false;
+        if (!validDate(fulBasis.effective_from) || fulBasis.effective_from > '2027-12-31') return `${fulBinding} (effective_from)`;
       }
       if (fulBasis.effective_through !== undefined && fulBasis.effective_through !== null) {
-        if (!validDate(fulBasis.effective_through) || fulBasis.effective_through < '2027-10-01' || fulBasis.effective_through > '2028-01-14') return false;
-        if (validDate(fulBasis.effective_from) && fulBasis.effective_through < fulBasis.effective_from) return false;
+        if (!validDate(fulBasis.effective_through) || fulBasis.effective_through < '2027-10-01' || fulBasis.effective_through > '2028-01-14') return `${fulBinding} (effective_through)`;
+        if (validDate(fulBasis.effective_from) && fulBasis.effective_through < fulBasis.effective_from) return `${fulBinding} (effective dates reversed)`;
       }
       if (fulBasis.months !== undefined) {
         if (!Array.isArray(fulBasis.months) || !fulBasis.months.length ||
           fulBasis.months.some(m => !Number.isInteger(m) || m < 1 || m > 12) ||
-          !fulBasis.months.some(m => m >= 10 && m <= 12)) return false;
+          !fulBasis.months.some(m => m >= 10 && m <= 12)) return `${fulBinding} (months)`;
       }
     } else {
       // Published fulfillment on peak: either complete & valid for 2027 holiday peak (effective_through up to 2028-01-14),
@@ -2143,24 +2529,36 @@ function isValidCompanionPeakPanelR58(period) {
         fulBasis.effective_through < fulBasis.effective_from ||
         fulBasis.effective_from > '2027-12-31' ||
         fulBasis.effective_through < '2027-10-01' ||
-        fulBasis.effective_through > '2028-01-14') return false;
+        fulBasis.effective_through > '2028-01-14') return `${fulBinding} (published effective dates)`;
       if (fulBasis.months !== undefined && (!Array.isArray(fulBasis.months) || !fulBasis.months.length ||
-        fulBasis.months.some(m => !Number.isInteger(m) || m < 1 || m > 12))) return false;
+        fulBasis.months.some(m => !Number.isInteger(m) || m < 1 || m > 12))) return `${fulBinding} (published months)`;
       const fulIsPending = fulLine.status === 'pending' || fulLine.amount_usd === null;
-      if (fulIsPending && fulIssues.length === 0) return false; // Covering 2027 peak rate cannot be left pending/null!
+      if (fulIsPending && fulIssues.length === 0) return 'published covering 2027 peak fulfillment rate is left pending/null'; // Covering 2027 peak rate cannot be left pending/null!
     }
     // Only late-2027 holiday peak fulfillment unavailability/date-cutoff (and payout-dependent collection) may remain pending on the companion peak panel.
     const validFulIssue = issue => issue.line === 'fulfillment' && (
       (fulBasis.status === 'unavailable' && issue.code === 'unpublished_fee') ||
       (fulBasis.status === 'published' && allowedPublishedFulfillmentIssues.has(issue.code))
     );
-    if (calc.fee_validation?.issues?.some(issue => !validFulIssue(issue))) return false;
-    if (Array.isArray(calc.pending_lines) && calc.pending_lines.some(id => !allowedPeakPending.has(id))) return false;
+    const badIssues = (calc.fee_validation?.issues ?? []).filter(issue => !validFulIssue(issue));
+    if (badIssues.length) return `fee validation issues: ${[...new Set(badIssues.map(i => `${i.line ?? 'ledger'}:${i.code ?? 'issue'}`))].join(', ')}`;
+    const badPending = Array.isArray(calc.pending_lines) ? calc.pending_lines.filter(id => !allowedPeakPending.has(id)) : [];
+    if (badPending.length) return `pending cost inputs: ${badPending.join(', ')} (only late-2027 peak fulfillment and collection may remain pending)`;
     const sm = monthsInIsoWindow(ctx.sales);
     const stm = monthsInIsoWindow(ctx.storage);
-    return sm.length === 3 && sm[0] === 10 && sm[1] === 11 && sm[2] === 12 &&
+    const monthsOk = sm.length === 3 && sm[0] === 10 && sm[1] === 11 && sm[2] === 12 &&
       stm.length === 3 && stm[0] === 10 && stm[1] === 11 && stm[2] === 12;
-  });
+    return monthsOk ? null : 'sales/storage windows do not cover exactly Oct–Dec';
+  };
+  for (const sc of scenarios) {
+    const reason = scenarioReason(sc);
+    if (reason !== null) return `scenario ${text(sc?.id) ? sc.id : '(unnamed)'}: ${reason}`;
+  }
+  return null;
+}
+
+function isValidCompanionPeakPanelR58(period) {
+  return diagnoseCompanionPeakPanelR58(period) === null;
 }
 
 function coversFullCalendarYearDates(scenarios) {
@@ -2291,7 +2689,17 @@ function selectDisplayPeriodR58(periods, primaryPeriodId) {
   return ranked[0].id;
 }
 
-function buildSeasonalQualificationR58(periods) {
+function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldReserved = false) {
+  if (isR59 && isPrivateMoldReserved) {
+    const displayId = selectDisplayPeriodR58(periods, null);
+    return {
+      counts_toward_target: false,
+      mode: 'private_mold_reserved',
+      primary_period_id: null,
+      display_period_id: displayId,
+      reasons: ['Candidate is routed to private_mold_reserved (no open 1688 public mold verified) and never counts toward ready-stock qualifying target.'],
+    };
+  }
   const hasPeakPanel = periods.some(isValidCompanionPeakPanelR58);
   const offPeakCandidates = periods.filter(period =>
     period.queue === 'comparable' &&
@@ -2313,8 +2721,38 @@ function buildSeasonalQualificationR58(periods) {
     };
   }
 
+  if (isR59 && hasPeakPanel) {
+    const crossingOffPeak = periods.filter(period =>
+      Array.isArray(period.total_range) &&
+      period.diagnostics?.economics?.crossing_margin_floor === true &&
+      period.months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
+      PRIMARY_OFF_PEAK_MONTHS.every(month => period.months.includes(month)) &&
+      period.diagnostics?.economics?.scenarios?.length > 0 &&
+      period.diagnostics.economics.scenarios.every(coversPrimaryOffPeakScenario) &&
+      period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass',
+    ).sort(comparePeriodOrder);
+    if (crossingOffPeak.length > 0) {
+      const primary = crossingOffPeak[0];
+      return {
+        counts_toward_target: false,
+        crossing_30pct_actionable: true,
+        mode: 'crossing_30pct_interval',
+        primary_period_id: primary.id,
+        display_period_id: primary.id,
+        reasons: ['Primary 2027-02-01..2027-09-30 off-peak period is 21/21 scored across a crossing-30% scenario interval with companion Oct–Dec 2027 peak panel (held separate from strict all-scenario qualifying count).'],
+      };
+    }
+  }
+
   const reasons = [];
-  if (!hasPeakPanel) reasons.push('Missing valid 2027 companion holiday peak operating panel covering exact months [10, 11, 12] with dated cost_ledger.');
+  if (!hasPeakPanel) {
+    const nominalPeak = periods.filter(hasExactPeakMonthsR58).sort(comparePeriodOrder)[0];
+    if (nominalPeak) {
+      reasons.push(`Companion 2027 holiday peak panel (${nominalPeak.id}) is present with exact months [10, 11, 12], but its cost/fulfillment inputs are incomplete: ${diagnoseCompanionPeakPanelR58(nominalPeak)}.`);
+    } else {
+      reasons.push('Missing valid 2027 companion holiday peak operating panel covering exact months [10, 11, 12] with dated cost_ledger.');
+    }
+  }
   const nominalOffPeak = periods.find(p => p.months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
     PRIMARY_OFF_PEAK_MONTHS.every(m => p.months.includes(m)));
   if (!nominalOffPeak) {
@@ -2339,10 +2777,373 @@ function buildSeasonalQualificationR58(periods) {
   };
 }
 
+const SENSITIVE_FREEBIE_PATTERNS = [
+  { key: 'oil', pattern: /\b(oils?|lubricants?|grease|liquids?|resins?)\b|润滑油|机油|液体/i, label: '含油脂／液体赠品（需核查危险品／MSDS／清关）' },
+  { key: 'glue', pattern: /\b(glues?|adhesives?|epox(?:y|ies)|sealants?|solvents?)\b|胶水|粘合剂|环氧|溶剂/i, label: '含胶水／粘合剂赠品（敏感品／危险品核查）' },
+  { key: 'battery', pattern: /\b(batter(?:y|ies)|lithium|li-ion|coin\s*cells?|button\s*cells?|power\s*banks?)\b|锂电|纽扣电池|电池/i, label: '含电池／纽扣电池（需 UN38.3 / UL4200A / 危险品审）' },
+  { key: 'magnet', pattern: /\b(strong\s*magnets?|neodymium|magnets?|n52|n35)\b|强磁|钕磁|磁铁/i, label: '含磁铁／强磁件（需磁检或航空限制核查）' },
+  { key: 'powder', pattern: /\b(powders?|pastes?|creams?|chemicals?)\b|粉末|膏体|化学/i, label: '含粉末／膏体／化学品（需 MSDS 核查）' },
+];
+// Clause boundaries for freebie text: sentence punctuation and contrast words ("不含电池，但附带润滑油").
+const FREEBIE_CLAUSE_SPLIT = /[。；;!?！？\n]|\b(?:but|however|yet|though|although)\b|但是|但|然而|不过/i;
+// Prohibition cues; the last cue before a keyword negates it unless a later unnegated affirmative verb re-opens inclusion.
+const FREEBIE_NEGATION_CUE_G = /严禁|禁止|不含|不附带|不附|不带|不得|切勿|勿|排除|剔除|去除|不要|不包括|不包含|不配|无需|拒绝|避免|未附|未含|未配|\bno\b|\bnot\b|\bnever\b|\bnon[- ]|\bwithout\b|\bexclud\w*|\bforbid\w*|\bprohibit\w*|\bfree\s+(?:of|from)\b|\bmust\s+not\b/gi;
+const FREEBIE_AFFIRMATIVE_CUE_G = /(?<!严禁|禁止|不得|切勿|不要|拒绝|避免|排除|剔除|[不无免勿未])(?:附带|附送|赠送|含有|内含|包含|配有|随附|自带|另送|加送)|(?<!\b(?:not|never|without|no|forbid|forbids|forbidden|prohibit|prohibits|prohibited)\s+(?:to\s+|be\s+)?)\b(?:includes?|including|comes\s+with|supplied\s+with|packaged\s+with)\b/gi;
+const FREEBIE_NEGATION_CUE = { test: prefix => lastMatchIndex(FREEBIE_NEGATION_CUE_G, prefix) > lastMatchIndex(FREEBIE_AFFIRMATIVE_CUE_G, prefix) };
+// Waiting / pre-verification cues that prevent a tolerance note from marking packaging status as 'clear'.
+const PENDING_TOLERANCE_CUE = /待|尚缺|未核|未经|打样前|下单前|报价前|报价后|报价阶段|询盘|\b(?:waiting|pending|tbd|unverified|awaiting)\b|\bto\s+be\s+(?:verified|checked|confirmed)\b/i;
+function lastMatchIndex(re, s) {
+  let last = -1;
+  for (const m of String(s).matchAll(re)) last = m.index;
+  return last;
+}
+
+/**
+ * Deterministic 6-point operational risk disclosure engine (Revision 58, 04 §5.4).
+ * Zero-veto: purely diagnostic disclosures rendered on decision cards without altering 21-item scores.
+ */
+function buildOperationalDisclosuresR58(candidate, scenarios = []) {
+  const ops = candidate?.operations && typeof candidate.operations === 'object' ? candidate.operations : {};
+  const firstLedger = scenarios.find(s => s?.input?.cost_ledger)?.input?.cost_ledger ?? null;
+  const si = firstLedger?.source_inputs && typeof firstLedger.source_inputs === 'object' ? firstLedger.source_inputs : {};
+  const lines = Array.isArray(firstLedger?.lines) ? firstLedger.lines : [];
+  const procLine = lines.find(l => l?.id === 'procurement') ?? null;
+  const domLine = lines.find(l => l?.id === 'domestic_freight') ?? null;
+  const hhLine = lines.find(l => l?.id === 'headhaul') ?? null;
+  const procurementQuotePending = (!procLine || procLine.status === 'pending' || !number(procLine.amount_usd)) &&
+    !(ops.quote && typeof ops.quote === 'object');
+
+  // (1) Batch cash tie-up + lead_time_days + sku_lines / actual_complete_sets / remainder + MOQ >= 300 alert
+  const orderPlan = ops.order_plan && typeof ops.order_plan === 'object' ? ops.order_plan : null;
+  const orderUnits = [ops.order_units, orderPlan?.allocated_sets, ops.actual_complete_sets, procLine?.order_units, domLine?.order_units, si.order_units, si.complete_saleable_sets]
+    .find(v => Number.isSafeInteger(v) && v > 0) ?? null;
+  const skuLines = Array.isArray(ops.sku_lines) ? ops.sku_lines
+    : Array.isArray(orderPlan?.sku_lines) ? orderPlan.sku_lines
+      : Array.isArray(ops.quote?.sku_lines) ? ops.quote.sku_lines
+        : Array.isArray(procLine?.sku_lines) ? procLine.sku_lines
+          : Array.isArray(si.sku_lines) ? si.sku_lines : [];
+  const hasVerifiedSkuLines = Array.isArray(skuLines) && skuLines.length > 0 &&
+    skuLines.every(l => number(l?.ordered_qty) && l.ordered_qty > 0 && number(l?.qty_per_saleable_set) && l.qty_per_saleable_set > 0);
+  const hasOrderPlanSets = Number.isSafeInteger(orderPlan?.actual_complete_sets) && orderPlan.actual_complete_sets > 0;
+  const actualCompleteSets = hasOrderPlanSets ? orderPlan.actual_complete_sets
+    : hasVerifiedSkuLines ? Math.min(...skuLines.map(l => Math.floor(l.ordered_qty / l.qty_per_saleable_set)))
+      : procurementQuotePending ? null
+        : ([ops.actual_complete_sets, si.actual_complete_sets].find(v => Number.isSafeInteger(v) && v > 0) ?? orderUnits);
+  const remainderUnits = (!procurementQuotePending && number(ops.remainder_units) && ops.remainder_units >= 0)
+    ? ops.remainder_units
+    : number(orderPlan?.total_remainder_pieces) && orderPlan.total_remainder_pieces >= 0
+      ? orderPlan.total_remainder_pieces
+      : (hasVerifiedSkuLines && actualCompleteSets !== null
+        ? skuLines.reduce((sum, l) => {
+          const req = number(l?.qty_per_saleable_set) && l.qty_per_saleable_set > 0 ? l.qty_per_saleable_set : 1;
+          const ord = number(l?.ordered_qty) && l.ordered_qty >= 0 ? l.ordered_qty : 0;
+          return sum + Math.max(0, ord - actualCompleteSets * req);
+        }, 0)
+        : (procurementQuotePending ? null : 0));
+  const leadTimeDays = [ops.lead_time_days, ops.production_lead_time_days, ops.quote?.lead_time_days, si.lead_time_days]
+    .find(v => number(v) && v >= 0) ?? null;
+  const perUnitCashUsd = [procLine?.amount_usd, domLine?.amount_usd, hhLine?.amount_usd]
+    .every(v => number(v) && v >= 0)
+    ? (procLine.amount_usd + domLine.amount_usd + hhLine.amount_usd)
+    : null;
+  const effectiveSetsForCash = actualCompleteSets ?? (procurementQuotePending && perUnitCashUsd === null ? null : orderUnits);
+  // Purchase-to-set lineage: purchased pieces / declared purchase SKUs beyond the saleable-set count reveal a
+  // multi-piece or multi-SKU combination even when no structured sku_lines were carried (e.g. 200 pcs -> 100 sets).
+  const positiveInt = v => Number.isSafeInteger(v) && v > 0;
+  const lineageTexts = [
+    procLine?.basis,
+    ops.quote?.note,
+    ...(Array.isArray(firstLedger?.assumptions) ? firstLedger.assumptions : []),
+  ].filter(text);
+  let textPurchaseUnits = null;
+  let textCompleteSets = null;
+  let textPurchaseSkus = null;
+  for (const lt of lineageTexts) {
+    const eqMatch = String(lt).match(/(\d+)\s*采购[只件个]\s*[=＝]\s*([^=＝；;。\n]+?)\s*[=＝]\s*(\d+)\s*(?:完整销售)?套/);
+    if (eqMatch) {
+      textPurchaseUnits ??= Number(eqMatch[1]);
+      textCompleteSets ??= Number(eqMatch[3]);
+      const parts = eqMatch[2].split(/[＋+]/).filter(p => /\d+\s*[只件个]/.test(p));
+      if (parts.length > 1) textPurchaseSkus ??= parts.length;
+    }
+    const slashMatch = String(lt).match(/单笔\s*(\d+)\s*[只件个]\s*[/／]\s*(\d+)\s*(?:完整销售)?套/);
+    if (slashMatch) {
+      textPurchaseUnits ??= Number(slashMatch[1]);
+      textCompleteSets ??= Number(slashMatch[2]);
+    }
+    const skuCntMatch = String(lt).match(/(\d+)\s*个?采购\s*SKU|\b(\d+)\s+purchase\s+SKUs?\b/i);
+    if (skuCntMatch) textPurchaseSkus ??= Number(skuCntMatch[1] ?? skuCntMatch[2]);
+  }
+  const purchaseUnits = [ops.purchase_units, ops.purchased_units, ops.purchased_pieces, orderPlan?.purchase_units,
+    ops.quote?.purchase_units, ops.quote?.purchased_pieces, procLine?.purchase_units, procLine?.purchased_pieces,
+    si.purchase_units, si.purchased_units, si.purchased_pieces, textPurchaseUnits]
+    .find(positiveInt) ?? null;
+  const declaredSkuList = [ops.purchase_skus, orderPlan?.purchase_skus, ops.quote?.purchase_skus, procLine?.purchase_skus, si.purchase_skus]
+    .find(v => Array.isArray(v) && v.length > 0) ?? null;
+  const declaredPurchaseSkuCount = [ops.purchase_sku_count, orderPlan?.purchase_sku_count, ops.quote?.purchase_sku_count,
+    procLine?.purchase_sku_count, si.purchase_sku_count, declaredSkuList?.length, textPurchaseSkus]
+    .find(positiveInt) ?? null;
+  const setsBasisForPurchase = [si.complete_saleable_sets, actualCompleteSets, orderUnits, textCompleteSets].find(positiveInt) ?? null;
+  const purchaseUnitsPerSet = purchaseUnits !== null && setsBasisForPurchase !== null
+    ? Math.round((purchaseUnits / setsBasisForPurchase) * 1000) / 1000 : null;
+  const purchaseExceedsSets = purchaseUnits !== null && setsBasisForPurchase !== null && purchaseUnits > setsBasisForPurchase;
+  const purchaseLineageNote = purchaseExceedsSets
+    ? `（采购 ${purchaseUnits} 件组成 ${setsBasisForPurchase} 套，每套 ${purchaseUnitsPerSet} 件${declaredPurchaseSkuCount !== null && declaredPurchaseSkuCount > 1 ? `，${declaredPurchaseSkuCount} 个采购 SKU` : ''}）`
+    : (declaredPurchaseSkuCount !== null && declaredPurchaseSkuCount > 1 ? `（${declaredPurchaseSkuCount} 个采购 SKU 组合）` : '');
+  const batchCashUsd = number(ops.batch_cash_tie_up_usd) ? ops.batch_cash_tie_up_usd
+    : (effectiveSetsForCash !== null && perUnitCashUsd !== null ? Math.round(effectiveSetsForCash * perUnitCashUsd * 100) / 100 : null);
+  const fx = [ops.fx_cny_per_usd, procLine?.fx_cny_per_usd, firstLedger?.fx_cny_per_usd, si.fx_cny_per_usd]
+    .find(v => number(v) && v > 0) ?? null;
+  const batchCashCny = number(ops.batch_cash_tie_up_cny) ? ops.batch_cash_tie_up_cny
+    : (batchCashUsd !== null && fx !== null ? Math.round(batchCashUsd * fx * 100) / 100 : null);
+  const moqCapitalAlert = (effectiveSetsForCash !== null && effectiveSetsForCash >= 300) || (orderUnits !== null && orderUnits >= 300);
+  const cashStatus = moqCapitalAlert || (number(remainderUnits) && remainderUnits > 0) ? 'alert'
+    : ((!procurementQuotePending && orderUnits !== null) || actualCompleteSets !== null || batchCashUsd !== null || leadTimeDays !== null) ? 'disclosed' : 'unverified';
+  const batchCashDisclosure = {
+    id: 'batch_cash_and_moq',
+    label: '首批占资、交期与齐套余料',
+    status: cashStatus,
+    order_units: orderUnits,
+    actual_complete_sets: actualCompleteSets,
+    sku_line_count: skuLines.length,
+    purchase_units: purchaseUnits,
+    purchase_units_per_set: purchaseUnitsPerSet,
+    declared_purchase_sku_count: declaredPurchaseSkuCount,
+    remainder_units: remainderUnits,
+    lead_time_days: leadTimeDays,
+    batch_cash_tie_up_usd: batchCashUsd,
+    batch_cash_tie_up_cny: batchCashCny,
+    moq_capital_alert: moqCapitalAlert,
+    note: moqCapitalAlert
+      ? `起订批次数 ${effectiveSetsForCash ?? orderUnits} 齐套（≥300 套 MOQ 占资预警）${purchaseLineageNote}${batchCashCny !== null ? `，首批货款+头程占资约 ¥${batchCashCny}` : ''}${batchCashUsd !== null ? `（US$ ${batchCashUsd}）` : ''}${leadTimeDays !== null ? `，交期 ${leadTimeDays} 天` : ''}${number(remainderUnits) && remainderUnits > 0 ? `，齐套后余料 ${remainderUnits} 件` : ''}。`
+      : effectiveSetsForCash !== null
+        ? `首批 ${actualCompleteSets ?? effectiveSetsForCash} 齐套${orderUnits !== null && actualCompleteSets !== null && orderUnits !== actualCompleteSets ? `（分摊口径 ${orderUnits} 套）` : ''}${purchaseLineageNote}${batchCashCny !== null ? `，货款+头程占资约 ¥${batchCashCny}` : ''}${batchCashUsd !== null ? `（US$ ${batchCashUsd}）` : ''}${leadTimeDays !== null ? `，交期 ${leadTimeDays} 天` : ''}${number(remainderUnits) && remainderUnits > 0 ? `；存在齐套余料 ${remainderUnits} 件` : remainderUnits === 0 ? '；完全齐套无余料' : ''}。`
+        : '尚缺完整的首批套数、交期或占资明细（不影响主分，下单前核实）。',
+  };
+
+  // (2) Offer-bound Amazon 1P presence
+  const offersList = Array.isArray(ops.amazon_1p_offers) ? ops.amazon_1p_offers
+    : Array.isArray(ops.offers) ? ops.offers
+    : Array.isArray(candidate?.market?.offers) ? candidate.market.offers : [];
+  const amz1pOffers = offersList.filter(o =>
+    o && (
+      String(o.seller_type ?? o.seller?.type ?? o.seller?.seller_type ?? '').toUpperCase() === 'AMZ' ||
+      o.sold_by_amazon === true ||
+      o.is_amazon_1p === true ||
+      o.seller?.sold_by_amazon === true
+    ),
+  );
+  const amz1pPresent = ops.amazon_1p_present === true || amz1pOffers.length > 0;
+  const amz1pExplicitClear = ops.amazon_1p_present === false || (offersList.length > 0 && amz1pOffers.length === 0);
+  const amz1pDisclosure = {
+    id: 'amazon_1p_presence',
+    label: 'Amazon 1P（自营 Offer 核查）',
+    status: amz1pPresent ? 'alert' : amz1pExplicitClear ? 'clear' : 'unverified',
+    amazon_1p_present: amz1pPresent ? true : amz1pExplicitClear ? false : null,
+    matched_offers: amz1pOffers.map(o => ({ asin: o.asin ?? null, buybox_share: o.buybox_share ?? null, seller_type: o.seller_type ?? o.seller?.type ?? 'AMZ' })),
+    note: amz1pPresent
+      ? `检测到基于 Offer 实证的 Amazon 1P（Sold by Amazon）在售记录（${amz1pOffers.length || 1} 条）；仅按 Offer 事实提示竞争压力，不作硬否决。`
+      : amz1pExplicitClear
+        ? '已按具体 Offer 核对，未发现 Amazon 1P（Sold by Amazon）直接占坑。'
+        : '尚未提供基于具体 Offer 的 Amazon 1P 核查记录（严禁仅凭品牌名推断自营）。',
+  };
+
+  // (3) Parameterized freight billing-weight rules (ZERO private numeric carrier tariff rates hardcoded!)
+  const ship = ops.shipment && typeof ops.shipment === 'object' ? ops.shipment : {};
+  const actualKg = number(ship.actual_weight_kg) && ship.actual_weight_kg > 0 ? ship.actual_weight_kg : null;
+  const cartonCm = Array.isArray(ship.carton_cm) && ship.carton_cm.length === 3 && ship.carton_cm.every(v => number(v) && v > 0)
+    ? ship.carton_cm : null;
+  const divisor = number(ship.volumetric_divisor) && ship.volumetric_divisor > 0 ? ship.volumetric_divisor : 6000;
+  const cartonCount = Number.isSafeInteger(ship.carton_count) && ship.carton_count > 0 ? ship.carton_count : null;
+  const volWeightPerCartonKg = cartonCm ? (cartonCm[0] * cartonCm[1] * cartonCm[2]) / divisor : null;
+  const totalVolKg = volWeightPerCartonKg !== null ? volWeightPerCartonKg * (cartonCount ?? 1) : null;
+  const totalChargeableKg = number(ship.total_chargeable_kg) && ship.total_chargeable_kg > 0
+    ? ship.total_chargeable_kg
+    : (actualKg !== null || totalVolKg !== null ? Math.max(actualKg ?? 0, totalVolKg ?? 0) : null);
+  const weightPerCartonKg = number(ship.weight_per_carton_kg) && ship.weight_per_carton_kg > 0
+    ? ship.weight_per_carton_kg
+    : (actualKg !== null && cartonCount !== null ? actualKg / cartonCount : null);
+  const below10kg = totalChargeableKg !== null && totalChargeableKg < 10;
+  const below50kg = totalChargeableKg !== null && totalChargeableKg < 50;
+  const volumetricExceedsActual = actualKg !== null && totalVolKg !== null && totalVolKg > actualKg;
+  const below8kgCarton = weightPerCartonKg !== null && weightPerCartonKg < 8;
+  const freightFlags = [];
+  if (below10kg) freightFlags.push(`总计费重 ${totalChargeableKg.toFixed(2)} kg < 10 kg 起运门槛（按最低 10 kg 计费）`);
+  if (below50kg) {
+    const rateTxt = number(ship.small_shipment_surcharge_cny_per_kg)
+      ? `按输入私密价目表附加 +¥${ship.small_shipment_surcharge_cny_per_kg}/kg`
+      : '附加费金额待按私密货代价目表填入';
+    freightFlags.push(`整票计费重 ${totalChargeableKg.toFixed(2)} kg < 50 kg（触发小票附加档，${rateTxt}）`);
+  }
+  if (volumetricExceedsActual) freightFlags.push(`泡重 ${totalVolKg.toFixed(2)} kg（cm³/${divisor}）高于实重 ${actualKg.toFixed(2)} kg，按泡重计费`);
+  if (below8kgCarton) {
+    const cartonTxt = number(ship.small_carton_surcharge_cny_per_carton)
+      ? `按输入私密价目表附加 +¥${ship.small_carton_surcharge_cny_per_carton}/箱`
+      : '附加费金额待按私密货代价目表填入';
+    freightFlags.push(`单外箱重 ${weightPerCartonKg.toFixed(2)} kg < 8 kg（触发小箱附加档，${cartonTxt}）`);
+  }
+  const freightDisclosure = {
+    id: 'freight_a4_rules',
+    label: '头程装柜与计费重规则（10kg/50kg/泡重/8kg外箱）',
+    status: freightFlags.length > 0 ? 'alert' : totalChargeableKg !== null ? 'clear' : 'unverified',
+    total_chargeable_kg: totalChargeableKg !== null ? Math.round(totalChargeableKg * 1000) / 1000 : null,
+    volumetric_divisor: divisor,
+    below_10kg_min_bill: below10kg,
+    below_50kg_small_shipment: below50kg,
+    volumetric_exceeds_actual: volumetricExceedsActual,
+    below_8kg_outer_carton: below8kgCarton,
+    flags: freightFlags,
+    note: freightFlags.length > 0
+      ? freightFlags.join('；') + '。'
+      : totalChargeableKg !== null
+        ? `整票计费重 ${totalChargeableKg.toFixed(2)} kg（≥50 kg）${weightPerCartonKg !== null ? `、单箱 ${weightPerCartonKg.toFixed(2)} kg（≥8 kg）` : ''}，未触发小票/小箱/泡重附加规则。`
+        : '尚缺整票实重/外箱尺寸参数；发运前按私密货代最新价目表核对 10 kg 起运、50 kg 阶梯、cm³/除数泡重及 <8 kg 外箱附加规则。',
+  };
+
+  // (4) 1688 sensitive freebie flags (oil/glue/battery/strong magnet/powder)
+  // Clause-scoped negation: a keyword preceded in the same clause by a prohibition cue (严禁/禁止/不含/排除/no/without/...)
+  // is a procurement requirement, not an included accessory, and never raises a positive alert.
+  const rawFlags = Array.isArray(ops.sensitive_freebie_flags) ? ops.sensitive_freebie_flags.filter(text) : [];
+  const freeTexts = [
+    ...(Array.isArray(ops.included_accessories) ? ops.included_accessories.filter(text) : []),
+    ...(text(ops.freebie_notes) ? [ops.freebie_notes] : []),
+  ];
+  const classifyFreebieText = t => {
+    const affirmative = new Set();
+    const prohibited = new Set();
+    for (const clause of String(t).split(FREEBIE_CLAUSE_SPLIT)) {
+      if (!text(clause)) continue;
+      for (const pat of SENSITIVE_FREEBIE_PATTERNS) {
+        const re = new RegExp(pat.pattern.source, pat.pattern.flags.includes('g') ? pat.pattern.flags : `${pat.pattern.flags}g`);
+        for (const m of clause.matchAll(re)) {
+          const prefix = clause.slice(0, m.index);
+          const suffix = clause.slice(m.index + m[0].length);
+          if (FREEBIE_NEGATION_CUE.test(prefix) || /(?:无|免)$/.test(prefix) ||
+            /^[^，,、]{0,16}?(?:\bnot\s+included\b|\bexcluded\b|除外)/i.test(suffix)) prohibited.add(pat.key);
+          else affirmative.add(pat.key);
+        }
+      }
+    }
+    return { affirmative, prohibited };
+  };
+  const affirmativeKeys = new Set();
+  const prohibitedKeys = new Set();
+  for (const t of freeTexts) {
+    const { affirmative, prohibited } = classifyFreebieText(t);
+    affirmative.forEach(k => affirmativeKeys.add(k));
+    prohibited.forEach(k => prohibitedKeys.add(k));
+  }
+  // An explicit flag stays an alert unless its wording is purely a prohibition (only negated matches).
+  const alertFlags = rawFlags.filter(t => {
+    const { affirmative, prohibited } = classifyFreebieText(t);
+    affirmative.forEach(k => affirmativeKeys.add(k));
+    if (affirmative.size === 0 && prohibited.size > 0) {
+      prohibited.forEach(k => prohibitedKeys.add(k));
+      return false;
+    }
+    return true;
+  });
+  const matchedSensitive = SENSITIVE_FREEBIE_PATTERNS.filter(p => affirmativeKeys.has(p.key)).map(p => ({ key: p.key, label: p.label }));
+  const prohibitedSensitive = SENSITIVE_FREEBIE_PATTERNS.filter(p => prohibitedKeys.has(p.key) && !affirmativeKeys.has(p.key)).map(p => ({ key: p.key, label: p.label }));
+  const hasSensitiveFreebies = alertFlags.length > 0 || matchedSensitive.length > 0;
+  // A packing list cannot have been checked while the procurement line is still awaiting a 1688 quote.
+  const packingListChecked = ops.sensitive_freebie_checked === true && !hasSensitiveFreebies && !procurementQuotePending;
+  const freebieNeedsEvidence = !hasSensitiveFreebies && procurementQuotePending &&
+    (ops.sensitive_freebie_checked === true || prohibitedSensitive.length > 0);
+  const FREEBIE_SHORT = { oil: '润滑油／液体', glue: '胶水', battery: '电池', magnet: '强磁', powder: '粉末／化学品' };
+  const prohibitedText = prohibitedSensitive.length ? prohibitedSensitive.map(m => FREEBIE_SHORT[m.key] ?? m.key).join('、') : '';
+  const freebieDisclosure = {
+    id: 'sensitive_freebie_flags',
+    label: '1688 随箱赠品／敏感配件排雷',
+    status: hasSensitiveFreebies ? 'alert' : packingListChecked ? 'clear' : freebieNeedsEvidence ? 'needs_check' : 'unverified',
+    flags: rawFlags,
+    matched_categories: matchedSensitive,
+    prohibited_categories: prohibitedSensitive,
+    packing_list_checked: packingListChecked,
+    procurement_quote_pending: procurementQuotePending,
+    ...(freebieNeedsEvidence ? { evidence_state: 'needs_evidence' } : {}),
+    note: hasSensitiveFreebies
+      ? `识别到敏感赠品或配件风险：${(matchedSensitive.length ? matchedSensitive.map(m => m.label) : alertFlags).join('；')}（建议发运前要求工厂剔除或补齐合规文件）。`
+      : packingListChecked
+        ? `已核对 1688 装箱清单，无油／胶水／电池／强磁／粉末类敏感赠品${prohibitedText ? `（采购要求已明确排除 ${prohibitedText}）` : ''}。`
+        : freebieNeedsEvidence
+          ? `1688 报价尚未取得，装箱清单未经实测核对${prohibitedText ? `；已记录的排除要求（${prohibitedText}）仅为采购规格，不是已核清单` : ''}，报价时须向工厂确认不附带润滑油、胶水、电池、强磁等敏感赠品。`
+          : `下单前须向 1688 工厂确认是否默认附带润滑油、胶水、电池、强磁等敏感赠品${prohibitedText ? `（采购要求已明确排除 ${prohibitedText}）` : ''}。`,
+  };
+
+  // (5) US ADD/CVD HS clues
+  const hsCode = text(ops.hs_code) ? ops.hs_code.trim() : null;
+  const addCvdStatus = text(ops.add_cvd_status) ? ops.add_cvd_status.trim().toLowerCase() : null;
+  const addCvdFlagged = ops.us_add_cvd_risk === true || ['flagged', 'high', 'applicable', 'risk'].includes(addCvdStatus ?? '');
+  const addCvdClear = ops.us_add_cvd_risk === false || ['clear', 'none', 'not_applicable'].includes(addCvdStatus ?? '');
+  const addCvdDisclosure = {
+    id: 'us_add_cvd_hs_clues',
+    label: '美国反倾销／反补贴（ADD/CVD）与 HS 归类线索',
+    status: addCvdFlagged ? 'alert' : addCvdClear ? 'clear' : 'unverified',
+    hs_code: hsCode,
+    note: addCvdFlagged
+      ? `HS 归类${hsCode ? `（${hsCode}）` : ''}存在美国 ADD/CVD 倾销／补贴税风险提示${text(ops.add_cvd_note) ? `：${ops.add_cvd_note.trim()}` : '，发货前必须由报关行确认税号与范围豁免'}。`
+      : addCvdClear
+        ? `HS 归类${hsCode ? `（${hsCode}）` : ''}初查未命中美国 ADD/CVD 范围${text(ops.add_cvd_note) ? `（${ops.add_cvd_note.trim()}）` : ''}；以清关行最终归类为准。`
+        : `尚缺美国 HS 归类${hsCode ? `（已记录 ${hsCode}）` : ''}与 USITC ADD/CVD 核查记录（头程出货前确认）。`,
+  };
+
+  // (6) Package compatibility / micron tolerance + Amazon 2027-01-11 multi-SKU original-packaging bundle check
+  const pkgOps = ops.packaging && typeof ops.packaging === 'object' ? ops.packaging : {};
+  const bundleBasis = pkgOps.is_multi_sku_bundle === true ? 'declared'
+    : skuLines.length > 1 ? 'sku_lines'
+      : declaredPurchaseSkuCount !== null && declaredPurchaseSkuCount > 1 ? 'declared_purchase_skus'
+        : purchaseExceedsSets ? 'purchase_units_exceed_sets' : null;
+  const isMultiSkuBundle = bundleBasis !== null;
+  const origMfrPkg = pkgOps.original_manufacturer_packaging;
+  const bundle2027Compliant = pkgOps.fba_2027_01_11_bundle_compliant;
+  const toleranceNote = text(pkgOps.tolerance_note) ? pkgOps.tolerance_note.trim()
+    : (number(pkgOps.micron_tolerance) ? `公差 ±${pkgOps.micron_tolerance} μm` : number(pkgOps.tolerance_mm) ? `公差 ±${pkgOps.tolerance_mm} mm` : null);
+  const toleranceNotePending = toleranceNote !== null && PENDING_TOLERANCE_CUE.test(toleranceNote);
+  const bundleRisk = isMultiSkuBundle && (origMfrPkg === false || bundle2027Compliant === false);
+  const bundleVerifiedCompliant = isMultiSkuBundle && !procurementQuotePending && !toleranceNotePending &&
+    origMfrPkg === true && bundle2027Compliant === true;
+  const bundleNeedsCheck = isMultiSkuBundle && !bundleRisk && !bundleVerifiedCompliant;
+  const compatFlag = pkgOps.compatible_inner_pack === false;
+  const canClearPackaging = !procurementQuotePending && !toleranceNotePending &&
+    (bundleVerifiedCompliant || pkgOps.compatible_inner_pack === true || toleranceNote !== null);
+  const pkgIssues = [];
+  if (compatFlag) pkgIssues.push('内包装／配件接口兼容性存在冲突，需工厂打样确认');
+  if (bundleRisk) pkgIssues.push('多 SKU 组合套装不满足 Amazon 2027-01-11 原厂原始包装（original manufacturer packaging）新规');
+  else if (bundleNeedsCheck) pkgIssues.push(`多 SKU 组合套装${purchaseLineageNote}须核实 original_manufacturer_packaging 与 Amazon 2027-01-11 组合套装包装合规（当前尚缺两项显式确认，严禁非原厂简单混装）`);
+  const packagingDisclosure = {
+    id: 'packaging_and_2027_bundle_check',
+    label: '包装公差兼容性与 Amazon 2027-01-11 组合套装包装核查',
+    status: (compatFlag || bundleRisk) ? 'alert' : bundleNeedsCheck ? 'needs_check' : canClearPackaging ? 'clear' : 'unverified',
+    is_multi_sku_bundle: isMultiSkuBundle,
+    bundle_basis: bundleBasis,
+    original_manufacturer_packaging: typeof origMfrPkg === 'boolean' ? origMfrPkg : null,
+    fba_2027_01_11_bundle_compliant: typeof bundle2027Compliant === 'boolean' ? bundle2027Compliant : null,
+    tolerance_note: toleranceNote,
+    note: pkgIssues.length > 0
+      ? `${pkgIssues.join('；')}${toleranceNote ? `；${toleranceNote}` : ''}。`
+      : bundleVerifiedCompliant
+        ? `多 SKU 组合套装已显式确认满足原厂原始包装与 Amazon 2027-01-11 组合套装合规要求${toleranceNote ? `（${toleranceNote}）` : ''}。`
+        : toleranceNote || (pkgOps.compatible_inner_pack === true && !procurementQuotePending
+          ? '单品内包装与配件公差兼容性已核查。'
+          : '打样前须核对配件接口公差与内包装兼容性；如涉及多 SKU 组合须遵守 Amazon 2027-01-11 原厂原始包装规则。'),
+  };
+
+  return [
+    batchCashDisclosure,
+    amz1pDisclosure,
+    freightDisclosure,
+    freebieDisclosure,
+    addCvdDisclosure,
+    packagingDisclosure,
+  ];
+}
+
 export function scoreCandidate(candidate, profile, internal = null) {
   const defs = definitions(profile);
   const ctx = context(candidate);
   const isR58 = profile.revision >= 58;
+  const isR59 = profile.revision >= 59;
   const isOperatingPeriod = internal === INTERNAL_PERIOD_TOKEN;
   if (!isOperatingPeriod && candidate.economics && Object.hasOwn(candidate.economics, 'operating_periods')) {
     validateOperatingPeriods(candidate.economics, isR58);
@@ -2370,13 +3171,34 @@ export function scoreCandidate(candidate, profile, internal = null) {
         id: period.id, label: period.label, months: period.months,
       };
     });
+    const isPrivateMoldReserved = isR59 && candidate.sourcing_disposition === 'private_mold_reserved';
+    const qualR58 = isR58 ? buildSeasonalQualificationR58(evaluatedPeriods, isR59, isPrivateMoldReserved) : null;
+    const displayPeriodForOps = isR58
+      ? (evaluatedPeriods.find(p => p.id === qualR58?.display_period_id) ?? evaluatedPeriods[0] ?? null)
+      : null;
+    const seasonalOps = isR58
+      ? buildOperationalDisclosuresR58(candidate, displayPeriodForOps?.diagnostics?.economics?.scenarios ?? [])
+      : null;
+    const primaryOffPeak = evaluatedPeriods.find(p =>
+      p.months.length === PRIMARY_OFF_PEAK_MONTHS.length && PRIMARY_OFF_PEAK_MONTHS.every(m => p.months.includes(m)));
+    const seasonalDispR59 = !isR59 ? undefined
+      : isPrivateMoldReserved ? 'private_mold_reserved'
+        : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
+          : qualR58?.mode === 'crossing_30pct_interval' || primaryOffPeak?.diagnostics?.economics?.crossing_margin_floor === true ? 'crossing_30pct_interval'
+            : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
+              : primaryOffPeak?.queue === 'deferred' ? 'deferred'
+                : 'pending_evidence';
+    const allowShortlistSeasonal = !isR59 || seasonalDispR59 === 'hard_excluded';
     return {
       candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
       profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [],
       operating_periods: evaluatedPeriods,
       total: null, total_range: null, conditional_total_range: null, supported_score: null, supported_range: null,
       covered_weight: null, unscored_weight: null, scoring_complete: null, queue: 'seasonal_review',
-      ...(isR58 ? { qualification: buildSeasonalQualificationR58(evaluatedPeriods) } : {}),
+      ...(isR59 ? { effective_disposition: seasonalDispR59 } : {}),
+      ...(isR58 ? { qualification: qualR58, diagnostics: { operational_disclosures: seasonalOps } } : {}),
+      ...(isR58 && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
+      ...(isR58 && allowShortlistSeasonal && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
     };
   }
   const economicsInput = isR58 && !isOperatingPeriod && candidate.economics && Object.hasOwn(candidate.economics, 'operating_months')
@@ -2397,6 +3219,23 @@ export function scoreCandidate(candidate, profile, internal = null) {
       !['low_rating_sales_performance', 'natural_visibility_development'].includes(item.id)) return scoreMarket(item, candidate.market, ctx);
     return missing(item, 'Required evidence has not been supplied.');
   });
+  const bidsItem = items.find(item => item.id === 'relevant_purchase_entry_bid');
+  if (isR58) {
+    const refBidUsd = number(bidsItem?.reference_bid_usd) && bidsItem.reference_bid_usd > 0 ? bidsItem.reference_bid_usd : null;
+    profit.diagnostics.break_even_click_cvr = refBidUsd === null ? null : {
+      reference_bid_usd: refBidUsd,
+      denominator_basis: 'ad_orders / ad_clicks (clickConvRate — never compare against search purchaseRate)',
+      scenarios: profit.diagnostics.scenarios.map(sc => {
+        const calc = sc.input?.calculation;
+        const contrib = calc?.status === 'sensitivity_only' ? calc?.contribution_usd : sc.input?.contribution_usd?.value;
+        return {
+          id: sc.id,
+          contribution_usd: number(contrib) ? contrib : null,
+          break_even_click_cvr: number(contrib) && contrib > 0 ? Math.round((refBidUsd / contrib) * 1e6) / 1e6 : null,
+        };
+      }),
+    };
+  }
   const totals = aggregate(items, profile.group_budgets, profit);
   const screening = screenCandidate(candidate, ctx, profit, items, profile);
 
@@ -2407,20 +3246,40 @@ export function scoreCandidate(candidate, profile, internal = null) {
   const fullYearDatesOk = !isTopLevelFlatR58 || coversFullCalendarYearDates(profit.diagnostics.scenarios);
   const offPeakDatesOk = !isPrimaryOffPeakPeriodR58 || coversPrimaryOffPeakDates(profit.diagnostics.scenarios);
   const periodCoverageOk = fullYearDatesOk && offPeakDatesOk;
-  const complete = totals.covered_weight === 100 && screening.status === 'eligible' && periodCoverageOk;
-  const queue = ['excluded', 'deferred'].includes(screening.status) ? screening.status : complete ? 'comparable' : 'pending';
-  const conditional = queue === 'pending' && periodCoverageOk ? addRanges(items.filter(item => item.group !== 'profit')
+  const isPrivateMoldFlatR59 = isR59 && !isOperatingPeriod && candidate.sourcing_disposition === 'private_mold_reserved';
+  const strictComplete = !isPrivateMoldFlatR59 && totals.covered_weight === 100 && screening.status === 'eligible' && periodCoverageOk;
+  const crossingCompleteR59 = !isPrivateMoldFlatR59 && isR59 && totals.covered_weight === 100 && screening.status === 'crossing_eligible' && periodCoverageOk;
+  const hasFullTotalRange = strictComplete || crossingCompleteR59;
+  const queue = ['excluded', 'deferred'].includes(screening.status) ? screening.status : strictComplete ? 'comparable' : 'pending';
+  const conditional = queue === 'pending' && !crossingCompleteR59 && periodCoverageOk ? addRanges(items.filter(item => item.group !== 'profit')
     .reduce((sum, item) => addRanges(sum, item.score_range ?? item.conditional_range ?? [0, item.weight]), [0, 0]), profit.conditional_range ?? [0, 30]) : null;
 
   let qualification = null;
   if (isTopLevelFlatR58) {
-    if (queue === 'comparable') {
+    if (isPrivateMoldFlatR59) {
+      qualification = {
+        counts_toward_target: false,
+        mode: 'private_mold_reserved',
+        primary_period_id: null,
+        display_period_id: null,
+        reasons: ['Candidate is routed to private_mold_reserved (no open 1688 public mold verified) and never counts toward ready-stock qualifying target.'],
+      };
+    } else if (strictComplete) {
       qualification = {
         counts_toward_target: true,
         mode: 'comparable',
         primary_period_id: null,
         display_period_id: null,
         reasons: ['All 21 items supported and full 12-month target-year calendar coverage verified.'],
+      };
+    } else if (crossingCompleteR59) {
+      qualification = {
+        counts_toward_target: false,
+        crossing_30pct_actionable: true,
+        mode: 'crossing_30pct_interval',
+        primary_period_id: null,
+        display_period_id: null,
+        reasons: ['All 21 items scored across a crossing-30% scenario interval (held separate from strict all-scenario qualifying count).'],
       };
     } else {
       const reasons = [];
@@ -2437,14 +3296,31 @@ export function scoreCandidate(candidate, profile, internal = null) {
     }
   }
 
+  const flatDispR59 = !isR59 || isOperatingPeriod ? undefined
+    : candidate.sourcing_disposition === 'private_mold_reserved' ? 'private_mold_reserved'
+      : strictComplete ? 'full_annual_qualifying'
+        : crossingCompleteR59 || profit.diagnostics.crossing_margin_floor === true ? 'crossing_30pct_interval'
+          : queue === 'excluded' ? 'hard_excluded'
+            : queue === 'deferred' ? 'deferred'
+              : 'pending_evidence';
+
+  const allowShortlistFlat = !isR59 || flatDispR59 === 'hard_excluded';
   return {
     candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
     profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [], items, ...totals,
     supported_score: point(totals.supported_range), scoring_complete: totals.covered_weight === 100,
-    total: complete ? point(totals.supported_range) : null, total_range: complete ? totals.supported_range : null,
+    total: hasFullTotalRange ? point(totals.supported_range) : null, total_range: hasFullTotalRange ? totals.supported_range : null,
     conditional_total_range: conditional, queue, screening,
+    ...(flatDispR59 ? { effective_disposition: flatDispR59 } : {}),
     ...(qualification ? { qualification } : {}),
-    diagnostics: { bids: items.find(item => item.id === 'relevant_purchase_entry_bid'), newcomers: newcomers.diagnostics, economics: profit.diagnostics },
+    ...(isR58 && !isOperatingPeriod && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
+    ...(isR58 && !isOperatingPeriod && allowShortlistFlat && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
+    diagnostics: {
+      bids: bidsItem,
+      newcomers: newcomers.diagnostics,
+      economics: profit.diagnostics,
+      ...(isR58 && !isOperatingPeriod ? { operational_disclosures: buildOperationalDisclosuresR58(candidate, profit.diagnostics.scenarios) } : {}),
+    },
   };
 }
 
@@ -2518,11 +3394,22 @@ export function scoreBatch(batch, profile) {
   const orderedCandidates = profile.revision >= 57
     ? [...comparable, ...seasonalEligible, ...pending, ...seasonalRemaining, ...deferred, ...excluded]
     : Object.values(queues).flat();
+  const dispositionByCandId = new Map(orderedCandidates.map(c => [c.candidate_id, c.effective_disposition]));
+  const filteredNegotiationShortlist = isR58 && Array.isArray(batch.negotiation_shortlist)
+    ? (profile.revision >= 59
+        ? batch.negotiation_shortlist.filter(row => {
+            const fid = row?.form_id ?? row?.candidate_id ?? row?.id ?? null;
+            if (!fid || !dispositionByCandId.has(fid)) return true;
+            return dispositionByCandId.get(fid) === 'hard_excluded';
+          })
+        : batch.negotiation_shortlist)
+    : [];
   return {
     schema_version: 1, profile_revision: profile.revision, total_budget: 100,
     candidates: orderedCandidates,
     order: Object.fromEntries(Object.entries(queues).map(([key, values]) => [key, values.map(result => result.candidate_id)])),
     comparable_leader: leader ? { candidate_id: leader.candidate_id, total_range: leader.total_range, conservative_score: leader.total_range[0] } : null,
+    ...(filteredNegotiationShortlist.length > 0 ? { negotiation_shortlist: filteredNegotiationShortlist } : {}),
     summary: {
       candidates: results.length, complete: comparable.length,
       complete_points: comparable.filter(result => result.total !== null).length,
@@ -2533,6 +3420,17 @@ export function scoreBatch(batch, profile) {
       ...(seasonalReview.length ? { seasonal_review: seasonalReview.length,
         seasonal_eligible: seasonalEligible.length } : {}),
       ...(isR58 ? { qualifying: comparable.length + seasonalEligible.length } : {}),
+      ...(profile.revision >= 59 ? {
+        dispositions: {
+          full_annual_qualifying: results.filter(r => r.effective_disposition === 'full_annual_qualifying').length,
+          seasonal_off_peak_qualifying: results.filter(r => r.effective_disposition === 'seasonal_off_peak_qualifying').length,
+          crossing_30pct_interval: results.filter(r => r.effective_disposition === 'crossing_30pct_interval').length,
+          pending_evidence: results.filter(r => r.effective_disposition === 'pending_evidence').length,
+          private_mold_reserved: results.filter(r => r.effective_disposition === 'private_mold_reserved').length,
+          deferred: results.filter(r => r.effective_disposition === 'deferred').length,
+          hard_excluded: results.filter(r => r.effective_disposition === 'hard_excluded').length,
+        },
+      } : {}),
     },
   };
 }
