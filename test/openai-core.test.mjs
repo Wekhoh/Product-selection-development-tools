@@ -10,6 +10,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -4203,6 +4204,84 @@ test('Round 3 ledger & isolation: live/test separation, canonical inode replacem
       assert.equal(auditCount >= 1, true);
     } finally {
       replacedLedger.close();
+    }
+
+    // 6b) Same-inode reuse simulation (e.g. Linux ext4 LIFO inode allocator reusing freed inode on unlink+recreate)
+    //     + pre-upgrade registry migration without ledger_instance_id column:
+    const sameInodeLedgerPath = join(dir, 'canon-same-inode-sim.sqlite');
+    const preUpgradeRegPath = join(dir, 'pre-upgrade-canon-reg.sqlite');
+    const preRegDb = new DatabaseSync(preUpgradeRegPath);
+    preRegDb.exec(`
+      CREATE TABLE canonical_scope_bindings (
+        account_scope TEXT PRIMARY KEY,
+        canonical_path TEXT NOT NULL,
+        norm_path_key TEXT NOT NULL,
+        dev_id TEXT,
+        ino_id TEXT,
+        bound_at TEXT NOT NULL
+      );
+      CREATE TABLE canonical_credential_bindings (
+        credential_fingerprint_sha256 TEXT PRIMARY KEY,
+        account_scope TEXT NOT NULL,
+        canonical_path TEXT NOT NULL,
+        norm_path_key TEXT NOT NULL,
+        dev_id TEXT,
+        ino_id TEXT,
+        bound_at TEXT NOT NULL
+      );
+      CREATE TABLE canonical_binding_audit (
+        audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_scope TEXT NOT NULL,
+        action TEXT NOT NULL,
+        old_canonical_path TEXT,
+        new_canonical_path TEXT NOT NULL,
+        old_dev_id TEXT,
+        old_ino_id TEXT,
+        new_dev_id TEXT,
+        new_ino_id TEXT,
+        old_credential_fp TEXT,
+        new_credential_fp TEXT,
+        operator_note TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+      );
+    `);
+    preRegDb.close();
+
+    const firstSameInodeLedger = new OpenAiBudgetLedger(sameInodeLedgerPath, {
+      testMode: true,
+      canonicalRegistryPath: preUpgradeRegPath,
+    });
+    try {
+      firstSameInodeLedger.bindCredentialFingerprint('openai-default', fp1);
+    } finally {
+      firstSameInodeLedger.close();
+    }
+    rmSync(sameInodeLedgerPath, { force: true });
+    rmSync(`${sameInodeLedgerPath}-wal`, { force: true });
+    rmSync(`${sameInodeLedgerPath}-shm`, { force: true });
+
+    const recreatedSameInodeLedger = new OpenAiBudgetLedger(sameInodeLedgerPath, {
+      testMode: true,
+      canonicalRegistryPath: preUpgradeRegPath,
+    });
+    try {
+      // Force stored (dev_id, ino_id) in preUpgradeRegPath to match recreatedSameInodeLedger's exact physical (dev, ino)
+      const newSt = statSync(sameInodeLedgerPath, { bigint: true });
+      const forceRegDb = new DatabaseSync(preUpgradeRegPath);
+      forceRegDb.prepare(
+        "UPDATE canonical_scope_bindings SET dev_id = ?, ino_id = ? WHERE account_scope = 'openai-default'",
+      ).run(String(newSt.dev), String(newSt.ino));
+      forceRegDb.prepare(
+        "UPDATE canonical_credential_bindings SET dev_id = ?, ino_id = ? WHERE account_scope = 'openai-default'",
+      ).run(String(newSt.dev), String(newSt.ino));
+      forceRegDb.close();
+
+      assert.throws(
+        () => recreatedSameInodeLedger.bindCredentialFingerprint('openai-default', fp1),
+        err => err instanceof OpenAiPolicyError && err.code === 'CANONICAL_LEDGER_REPLACED_AT_PATH',
+      );
+    } finally {
+      recreatedSameInodeLedger.close();
     }
 
     // 7) P1: Pre-migration SQLite DB with settled_cents=12 & missing provider_response_id column:

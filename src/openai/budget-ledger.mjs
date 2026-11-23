@@ -598,6 +598,7 @@ CREATE TABLE IF NOT EXISTS canonical_scope_bindings (
   norm_path_key TEXT NOT NULL,
   dev_id TEXT,
   ino_id TEXT,
+  ledger_instance_id TEXT,
   bound_at TEXT NOT NULL
 );
 
@@ -608,6 +609,7 @@ CREATE TABLE IF NOT EXISTS canonical_credential_bindings (
   norm_path_key TEXT NOT NULL,
   dev_id TEXT,
   ino_id TEXT,
+  ledger_instance_id TEXT,
   bound_at TEXT NOT NULL
 );
 
@@ -621,6 +623,8 @@ CREATE TABLE IF NOT EXISTS canonical_binding_audit (
   old_ino_id TEXT,
   new_dev_id TEXT,
   new_ino_id TEXT,
+  old_ledger_instance_id TEXT,
+  new_ledger_instance_id TEXT,
   old_credential_fp TEXT,
   new_credential_fp TEXT,
   operator_note TEXT NOT NULL,
@@ -628,12 +632,42 @@ CREATE TABLE IF NOT EXISTS canonical_binding_audit (
 );
 `;
 
+function ensureCanonicalRegistryColumns(regDb) {
+  const scopeCols = new Set(
+    regDb.prepare('PRAGMA table_info("canonical_scope_bindings")').all().map(c => String(c.name)),
+  );
+  if (!scopeCols.has('ledger_instance_id')) {
+    regDb.exec('ALTER TABLE canonical_scope_bindings ADD COLUMN ledger_instance_id TEXT');
+  }
+  const credCols = new Set(
+    regDb.prepare('PRAGMA table_info("canonical_credential_bindings")').all().map(c => String(c.name)),
+  );
+  if (!credCols.has('ledger_instance_id')) {
+    regDb.exec('ALTER TABLE canonical_credential_bindings ADD COLUMN ledger_instance_id TEXT');
+  }
+  const auditCols = new Set(
+    regDb.prepare('PRAGMA table_info("canonical_binding_audit")').all().map(c => String(c.name)),
+  );
+  if (!auditCols.has('old_ledger_instance_id')) {
+    regDb.exec('ALTER TABLE canonical_binding_audit ADD COLUMN old_ledger_instance_id TEXT');
+  }
+  if (!auditCols.has('new_ledger_instance_id')) {
+    regDb.exec('ALTER TABLE canonical_binding_audit ADD COLUMN new_ledger_instance_id TEXT');
+  }
+}
+
 const SAME_MONTH_PENDING_BUFFER_SQL = `INTEGER NOT NULL DEFAULT 0
   CHECK(typeof(same_month_pending_buffer_cents) = 'integer'
     AND same_month_pending_buffer_cents BETWEEN 0 AND ${MAX_SAME_MONTH_PENDING_BUFFER_CENTS})`;
 const BACKGROUND_MODE_SQL = 'INTEGER NOT NULL DEFAULT 0 CHECK(background_mode IN (0, 1))';
 
 const OPENAI_LEDGER_TABLES_SQL = `
+CREATE TABLE IF NOT EXISTS openai_ledger_identity (
+  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+  ledger_instance_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS openai_budget_policy (
   account_scope TEXT PRIMARY KEY,
   enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
@@ -1357,7 +1391,7 @@ function inspectSnapshotDatabase(db, {
       const hasMonetaryCols = hasReservationSchema || hasProvisionalSchema || hasPostedSchema || hasUsageSchema;
 
       const isLockTable = /(?:lock|fence)/i.test(tableName) && !/(?:request|reservation|ledger)/i.test(tableName);
-      const isMetaOrConfigTable = /^(?:meta|metadata|config|settings|schema_version|schema_migrations|alembic_version|openai_budget_policy|budget_policy|openai_batch_uploads|openai_private_payloads)$/i.test(tableName);
+      const isMetaOrConfigTable = /^(?:meta|metadata|config|settings|schema_version|schema_migrations|alembic_version|openai_ledger_identity|openai_budget_policy|budget_policy|openai_batch_uploads|openai_private_payloads)$/i.test(tableName);
 
       const isCanonicalNamedLedger = /^(?:requests|reservations|openai_request_ledger|budget_reservations|budget_requests|request_ledger)$/i.test(tableName);
       if (isCanonicalNamedLedger && (!statusCol || !hasMonetaryCols)) {
@@ -2287,6 +2321,11 @@ export class OpenAiBudgetLedger {
 
   _migrateSchema() {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS openai_ledger_identity (
+        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+        ledger_instance_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS openai_legacy_carryover (
         account_scope TEXT NOT NULL,
         month_utc TEXT NOT NULL,
@@ -2321,6 +2360,14 @@ export class OpenAiBudgetLedger {
         PRIMARY KEY (attempt_id, stage)
       );
     `);
+    const existingIdentity = this.db.prepare(
+      'SELECT ledger_instance_id FROM openai_ledger_identity WHERE singleton = 1',
+    ).get();
+    if (!existingIdentity) {
+      this.db.prepare(
+        'INSERT INTO openai_ledger_identity (singleton, ledger_instance_id, created_at) VALUES (1, ?, ?)',
+      ).run(generatePiiSafeUuid(), this._nowIso());
+    }
 
     // 1. Add ALL missing openai_budget_policy columns BEFORE selecting policy rows!
     const policyCols = new Set(
@@ -2628,21 +2675,38 @@ export class OpenAiBudgetLedger {
   // Cross-Process Persistent Canonical Ledger Registry & Policy Management
   // ---------------------------------------------------------------------------
 
-  _assertCanonicalBindingMatchesCurrent(row, { normPathKey, devStr, inoStr }, scopeLabel) {
+  _getLedgerInstanceId() {
+    if (!this._hasTable('openai_ledger_identity')) return null;
+    const row = this.db.prepare(
+      'SELECT ledger_instance_id FROM openai_ledger_identity WHERE singleton = 1',
+    ).get();
+    return typeof row?.ledger_instance_id === 'string' && row.ledger_instance_id.trim()
+      ? row.ledger_instance_id.trim()
+      : null;
+  }
+
+  _assertCanonicalBindingMatchesCurrent(row, { normPathKey, devStr, inoStr, instanceId }, scopeLabel) {
     if (!row) return;
     if (row.norm_path_key === normPathKey) {
-      // P0-07: ALWAYS verify stored (dev_id, ino_id) even when canonical_path matches!
-      if (
+      // P0-07: ALWAYS verify stored (dev_id, ino_id) AND persistent ledger_instance_id even when
+      // canonical_path matches (catching both file swaps and unlink+recreate when ext4 reuses freed inodes)!
+      const inodeMismatch =
         devStr !== null &&
         inoStr !== null &&
         row.dev_id !== null &&
         row.dev_id !== undefined &&
         row.ino_id !== null &&
         row.ino_id !== undefined &&
-        (row.dev_id !== devStr || row.ino_id !== inoStr)
-      ) {
+        (row.dev_id !== devStr || row.ino_id !== inoStr);
+      const instanceMismatch =
+        typeof instanceId === 'string' &&
+        instanceId.length > 0 &&
+        typeof row.ledger_instance_id === 'string' &&
+        row.ledger_instance_id.length > 0 &&
+        row.ledger_instance_id !== instanceId;
+      if (inodeMismatch || instanceMismatch) {
         throw new OpenAiPolicyError(
-          `Canonical SQLite ledger for "${scopeLabel}" at the registered pathname was replaced with a different physical file (device/inode mismatch); use rotateOrRelocateCanonicalBinding with an operator note.`,
+          `Canonical SQLite ledger for "${scopeLabel}" at the registered pathname was replaced with a different physical or logical database file; use rotateOrRelocateCanonicalBinding with an operator note.`,
           { code: 'CANONICAL_LEDGER_REPLACED_AT_PATH', notDispatched: true },
         );
       }
@@ -2659,6 +2723,7 @@ export class OpenAiBudgetLedger {
       return null;
     }
     const { canonicalPath: canonPath, normPathKey, devStr, inoStr } = computePhysicalIdentityRecord(this._mainFile);
+    const instanceId = this._getLedgerInstanceId();
     const regPath = this._effectiveRegistryPath;
 
     if (areSamePhysicalSqliteFile(regPath, this._mainFile)) {
@@ -2687,18 +2752,28 @@ export class OpenAiBudgetLedger {
         regDb.exec('BEGIN IMMEDIATE');
         try {
           regDb.exec(CANONICAL_REGISTRY_SCHEMA_SQL);
+          ensureCanonicalRegistryColumns(regDb);
 
           const existingScope = regDb.prepare(
             'SELECT * FROM canonical_scope_bindings WHERE account_scope = ?',
           ).get(scope);
           if (existingScope) {
-            this._assertCanonicalBindingMatchesCurrent(existingScope, { normPathKey, devStr, inoStr }, scope);
+            this._assertCanonicalBindingMatchesCurrent(
+              existingScope,
+              { normPathKey, devStr, inoStr, instanceId },
+              scope,
+            );
+            if (!existingScope.ledger_instance_id && instanceId) {
+              regDb.prepare(
+                'UPDATE canonical_scope_bindings SET ledger_instance_id = ? WHERE account_scope = ? AND ledger_instance_id IS NULL',
+              ).run(instanceId, scope);
+            }
           } else {
             regDb.prepare(`
               INSERT INTO canonical_scope_bindings (
-                account_scope, canonical_path, norm_path_key, dev_id, ino_id, bound_at
-              ) VALUES (?, ?, ?, ?, ?, ?)
-            `).run(scope, canonPath, normPathKey, devStr, inoStr, nowIso);
+                account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            `).run(scope, canonPath, normPathKey, devStr, inoStr, instanceId, nowIso);
           }
 
           if (credentialFp !== null && credentialFp !== undefined) {
@@ -2712,13 +2787,22 @@ export class OpenAiBudgetLedger {
                   { code: 'CREDENTIAL_SCOPE_SPLIT_FORBIDDEN', notDispatched: true },
                 );
               }
-              this._assertCanonicalBindingMatchesCurrent(existingCred, { normPathKey, devStr, inoStr }, existingCred.account_scope);
+              this._assertCanonicalBindingMatchesCurrent(
+                existingCred,
+                { normPathKey, devStr, inoStr, instanceId },
+                existingCred.account_scope,
+              );
+              if (!existingCred.ledger_instance_id && instanceId) {
+                regDb.prepare(
+                  'UPDATE canonical_credential_bindings SET ledger_instance_id = ? WHERE credential_fingerprint_sha256 = ? AND ledger_instance_id IS NULL',
+                ).run(instanceId, credentialFp);
+              }
             } else {
               regDb.prepare(`
                 INSERT INTO canonical_credential_bindings (
-                  credential_fingerprint_sha256, account_scope, canonical_path, norm_path_key, dev_id, ino_id, bound_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-              `).run(credentialFp, scope, canonPath, normPathKey, devStr, inoStr, nowIso);
+                  credential_fingerprint_sha256, account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              `).run(credentialFp, scope, canonPath, normPathKey, devStr, inoStr, instanceId, nowIso);
             }
           }
 
@@ -2787,6 +2871,7 @@ export class OpenAiBudgetLedger {
     const now = this._nowIso();
 
     return this._withImmediateTx(() => {
+      const instanceId = this._getLedgerInstanceId();
       const existingPolicy = this.db.prepare('SELECT * FROM openai_budget_policy WHERE account_scope = ?').get(scope);
       if (!existingPolicy || existingPolicy.legacy_reconciled !== 1) {
         throw new OpenAiBudgetError(
@@ -2829,6 +2914,7 @@ export class OpenAiBudgetLedger {
         regDb.exec('BEGIN IMMEDIATE');
         try {
           regDb.exec(CANONICAL_REGISTRY_SCHEMA_SQL);
+          ensureCanonicalRegistryColumns(regDb);
           const prevScopeBind = regDb.prepare(
             'SELECT * FROM canonical_scope_bindings WHERE account_scope = ?',
           ).get(scope);
@@ -2847,15 +2933,16 @@ export class OpenAiBudgetLedger {
 
           regDb.prepare(`
             INSERT INTO canonical_scope_bindings (
-              account_scope, canonical_path, norm_path_key, dev_id, ino_id, bound_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+              account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_scope) DO UPDATE SET
               canonical_path = excluded.canonical_path,
               norm_path_key = excluded.norm_path_key,
               dev_id = excluded.dev_id,
               ino_id = excluded.ino_id,
+              ledger_instance_id = excluded.ledger_instance_id,
               bound_at = excluded.bound_at
-          `).run(scope, canonPath, normPathKey, devStr, inoStr, now);
+          `).run(scope, canonPath, normPathKey, devStr, inoStr, instanceId, now);
 
           if (nextFp !== null && existingPolicy.credential_fingerprint_sha256 && existingPolicy.credential_fingerprint_sha256 !== nextFp) {
             regDb.prepare(
@@ -2869,31 +2956,34 @@ export class OpenAiBudgetLedger {
                 norm_path_key = ?,
                 dev_id = ?,
                 ino_id = ?,
+                ledger_instance_id = ?,
                 bound_at = ?
             WHERE account_scope = ?
-          `).run(canonPath, normPathKey, devStr, inoStr, now, scope);
+          `).run(canonPath, normPathKey, devStr, inoStr, instanceId, now, scope);
 
           if (effectiveFp !== null) {
             regDb.prepare(`
               INSERT INTO canonical_credential_bindings (
-                credential_fingerprint_sha256, account_scope, canonical_path, norm_path_key, dev_id, ino_id, bound_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                credential_fingerprint_sha256, account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT(credential_fingerprint_sha256) DO UPDATE SET
                 account_scope = excluded.account_scope,
                 canonical_path = excluded.canonical_path,
                 norm_path_key = excluded.norm_path_key,
                 dev_id = excluded.dev_id,
                 ino_id = excluded.ino_id,
+                ledger_instance_id = excluded.ledger_instance_id,
                 bound_at = excluded.bound_at
-            `).run(effectiveFp, scope, canonPath, normPathKey, devStr, inoStr, now);
+            `).run(effectiveFp, scope, canonPath, normPathKey, devStr, inoStr, instanceId, now);
           }
 
           regDb.prepare(`
             INSERT INTO canonical_binding_audit (
               account_scope, action, old_canonical_path, new_canonical_path,
               old_dev_id, old_ino_id, new_dev_id, new_ino_id,
+              old_ledger_instance_id, new_ledger_instance_id,
               old_credential_fp, new_credential_fp, operator_note, recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
           `).run(
             scope,
             nextFp !== null ? 'rotate_or_relocate' : 'relocate',
@@ -2903,6 +2993,8 @@ export class OpenAiBudgetLedger {
             prevScopeBind?.ino_id ?? null,
             devStr,
             inoStr,
+            prevScopeBind?.ledger_instance_id ?? null,
+            instanceId,
             existingPolicy.credential_fingerprint_sha256 ?? null,
             effectiveFp,
             cleanNote,
