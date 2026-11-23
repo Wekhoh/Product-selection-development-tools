@@ -81,7 +81,7 @@ const FORWARD_FEE_INPUTS = [
   'collection_rate', 'other_applicable_usd', 'other_payee', 'sales_window',
   'storage_window', 'inbound_window', 'average_inventory_days', 'placement_usd',
   'placement_split_option', 'is_apparel', 'is_dangerous_goods', 'is_sipp',
-  'low_price_eligible', 'calculator_verified_override',
+  'low_price_eligible', 'allow_bulky_2027', 'requires_amazon_packaging', 'calculator_verified_override',
 ];
 const ALLOWED_GATE1B_ENTRY_STATUSES = new Set([
   'gate1a_passed',
@@ -1299,6 +1299,11 @@ export function runGate1AForForm(store, {
     fx_cny_per_usd: s.fx_cny_per_usd,
     headhaul_usd: s.headhaul_usd,
     fulfillment_usd: s.estimate?.components?.fulfillment?.total_usd ?? null,
+    ...(s.estimate?.components?.fulfillment?.packaging_service_status === 'charged_non_sipp'
+      ? { requires_amazon_packaging: true, packaging_service_fee_usd: s.estimate.components.fulfillment.packaging_service_fee_usd }
+      : (s.estimate?.components?.fulfillment?.packaging_service_status === 'own_compliant_box_exempt'
+        ? { requires_amazon_packaging: false, packaging_service_fee_usd: 0 }
+        : {})),
     placement_range_usd: s.estimate?.components?.placement?.range_usd ?? (
       finite(s.estimate?.components?.placement?.selected_usd)
         ? [s.estimate.components.placement.selected_usd, s.estimate.components.placement.selected_usd]
@@ -1859,21 +1864,58 @@ export async function runGate1BForForm(store, {
   const interiorFailPrices = [];
   const interiorMargins = [];
   if (interiorCliffProbePrices.length > 0 && rawScenarios.length > 0 && maxEvaluatedPrice > minEvaluatedPrice + 1e-9) {
-    for (const baseRaw of rawScenarios) {
+    const fwdById = new Map(
+      (gate1aRecord?.forward_pricing_scenarios ?? [])
+        .filter(s => nonemptyStr(s?.id))
+        .map(s => [s.id.trim(), s.fee_inputs ?? null]),
+    );
+    for (let idx = 0; idx < rawScenarios.length; idx++) {
+      const baseRaw = rawScenarios[idx];
+      const matchedDecl = matchedDeclList[idx] ?? null;
+      const declFeeInputs = matchedDecl?.id ? (fwdById.get(matchedDecl.id) ?? null) : null;
       for (const pCliff of interiorCliffProbePrices) {
         for (const activeQ of quotesToEvaluate) {
           const activeP = deriveOrderPlanFromPersistedQuote(activeQ);
           const qBind = bindSourcingQuotePricingInputs(activeQ, baseRaw);
           if (qBind.issue) continue;
-          const cliffFul = lookupBulkyFulfillmentFee2027({
-            pkg: activeQ.pkg ?? baseRaw.pkg,
-            price_usd: pCliff,
-            sales_window: baseRaw.fee_context?.sales ?? baseRaw.sales_window,
-            is_apparel: baseRaw.is_apparel_or_shoes,
-            is_dangerous_goods: baseRaw.is_dangerous_goods,
-            is_sipp: baseRaw.is_sipp,
-          });
+          const effAllowBulky = baseRaw.allow_bulky_2027 ?? declFeeInputs?.allow_bulky_2027;
+          const effSipp = baseRaw.is_sipp ?? activeQ.pkg?.is_sipp ?? baseRaw.pkg?.is_sipp ?? declFeeInputs?.is_sipp;
+          const effRequiresPackaging = activeQ.requires_amazon_packaging !== undefined
+            ? activeQ.requires_amazon_packaging
+            : (activeQ.pkg?.requires_amazon_packaging !== undefined
+              ? activeQ.pkg.requires_amazon_packaging
+              : (baseRaw.requires_amazon_packaging !== undefined
+                ? baseRaw.requires_amazon_packaging
+                : (baseRaw.pkg?.requires_amazon_packaging !== undefined
+                  ? baseRaw.pkg.requires_amazon_packaging
+                  : (declFeeInputs?.requires_amazon_packaging !== undefined
+                    ? declFeeInputs.requires_amazon_packaging
+                    : (declFeeInputs?.pkg?.requires_amazon_packaging !== undefined
+                      ? declFeeInputs.pkg.requires_amazon_packaging
+                      : matchedDecl?.requires_amazon_packaging)))));
+          const cliffFul = effAllowBulky === false
+            ? lookupFulfillmentFee2027({
+              pkg: activeQ.pkg ?? baseRaw.pkg,
+              price_usd: pCliff,
+              sales_window: baseRaw.fee_context?.sales ?? baseRaw.sales_window,
+              is_apparel: baseRaw.is_apparel_or_shoes,
+              is_dangerous_goods: baseRaw.is_dangerous_goods,
+              is_sipp: effSipp,
+            })
+            : lookupBulkyFulfillmentFee2027({
+              pkg: activeQ.pkg ?? baseRaw.pkg,
+              price_usd: pCliff,
+              sales_window: baseRaw.fee_context?.sales ?? baseRaw.sales_window,
+              is_apparel: baseRaw.is_apparel_or_shoes,
+              is_dangerous_goods: baseRaw.is_dangerous_goods,
+              is_sipp: effSipp,
+              requires_amazon_packaging: effRequiresPackaging,
+            });
           if (cliffFul.status !== 'verified') continue;
+          const isBulkyCliffTier = cliffFul.size_tier !== 'small_standard' && cliffFul.size_tier !== 'large_standard';
+          if (isBulkyCliffTier && effSipp !== true && typeof effRequiresPackaging !== 'boolean') {
+            continue;
+          }
           const cliffInput = applyAuthoritativeQuoteToScreenInput({
             ...structuredClone(baseRaw),
             price_usd: pCliff,

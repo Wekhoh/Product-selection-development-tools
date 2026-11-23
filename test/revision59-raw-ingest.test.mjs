@@ -57,7 +57,7 @@ test('Slice 3A: Raw ASIN provenance guard, avgReturnRatio extraction (never retu
   assert.doesNotThrow(() => assertRawAsinProvenance(['B0RAW00001', 'B0RAW00003'], rawPayloads));
   assert.throws(() => assertRawAsinProvenance(['B0RAW00001', 'B0PHANTOM9'], rawPayloads), /B0PHANTOM9/);
 
-  // avgReturnRatio = 3.25 -> 0.0325 (must NEVER pick returnRatio = 6.50!)
+  // r59 leaf-first priority: returnRatio = 6.50 -> 0.0650 (retaining avgReturnRatio = 3.25 -> 0.0325 separately)
   const metricsSynth = ingestRawCategoryAndDemandMetrics({
     demand365Raw: {
       structuredContent: {
@@ -71,10 +71,12 @@ test('Slice 3A: Raw ASIN provenance guard, avgReturnRatio extraction (never retu
       { asin: 'B0RAW00002', parent: 'B0PAR00001', monthlySales: 140 },
     ],
   });
-  assert.ok(Math.abs(metricsSynth.category_return.value - 0.0325) < 1e-8);
+  assert.ok(Math.abs(metricsSynth.category_return.value - 0.065) < 1e-8);
+  assert.ok(Math.abs(metricsSynth.category_return.department_average_value - 0.0325) < 1e-8);
+  assert.equal(metricsSynth.category_return.source_field, 'ratioComparison.returnRatio');
   assert.equal(metricsSynth.deduplicated_sales.total_parent_units, 140, 'Same parent monthlySales counted once');
 
-  // Leaf NO_DATA falls back to parent avgReturnRatio, never 0.05 or returnRatio
+  // Leaf NO_DATA falls back to parent department avgReturnRatio without adopting sibling-leaf returnRatio (7.10) or 0.05
   const metricsNoData = ingestRawCategoryAndDemandMetrics({
     demand365Raw: { structuredContent: { data: { ratioComparison: null } } },
     parentDemand365Raw: { structuredContent: { data: { ratioComparison: { avgReturnRatio: 4.20, returnRatio: 7.10 } } } },
@@ -1009,6 +1011,66 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       },
     }]);
     assert.equal(perRowCat.size, 0, 'Per-row error object must not enter verified ASIN catalog');
+
+    // Upstream API failure on category_demand_report (including nested structuredContent.data.error) throws instead of masquerading as NO_DATA fallback
+    assert.throws(() => ingestRawCategoryAndDemandMetrics({
+      demand365Raw: { isError: true, error: 'UPSTREAM_TIMEOUT' },
+      parentDemand365Raw: { structuredContent: { data: { ratioComparison: { avgReturnRatio: 4.10 } } } },
+    }), /Upstream leaf category_demand_report failed/i);
+    assert.throws(() => ingestRawCategoryAndDemandMetrics({
+      demand365Raw: { structuredContent: { data: { error: { code: 503, message: 'UPSTREAM_BUSY' }, ratioComparison: null } } },
+      parentDemand365Raw: { structuredContent: { data: { ratioComparison: { avgReturnRatio: 4.10 } } } },
+    }), /Upstream leaf category_demand_report failed/i);
+
+    // ingestTrialSpecification (r59) enforces leaf-first return-rate parity across single AND multi-receipt setups and on physical_return_fraction!
+    const demandReceiptFile = join(dir, 'synth-leaf-demand.json');
+    const secondDemandReceiptFile = join(dir, 'synth-other-demand.json');
+    const peerReceiptFile = join(dir, 'synth-peer-list.json');
+    writeFileSync(demandReceiptFile, JSON.stringify({
+      structuredContent: { data: { nodePath: 'Dept:Sub:99900101', ratioComparison: { avgReturnRatio: 3.10, returnRatio: 6.20 } } },
+    }), 'utf8');
+    writeFileSync(secondDemandReceiptFile, JSON.stringify({
+      structuredContent: { data: { nodePath: 'Dept:99900000', ratioComparison: { avgReturnRatio: 3.10, returnRatio: 3.10 } } },
+    }), 'utf8');
+    writeFileSync(peerReceiptFile, JSON.stringify({
+      structuredContent: { data: { items: [{ asin: 'B0TARG0040', price: 39.99, fulfillment: 'FBA', monthlySales: 120, availableDate: '2025-01-01' }] } },
+    }), 'utf8');
+
+    const cSmuggledDept = structuredClone(fixture.candidates[0]);
+    cSmuggledDept.id = 'cand-smuggled-dept-return';
+    cSmuggledDept.newcomer_cohort.relevant_bsr_node = '99900101';
+    cSmuggledDept.screening.reference_price_usd = {
+      ...cSmuggledDept.screening.reference_price_usd,
+      value: 39.99,
+      target_variant_asin: 'B0TARG0040',
+      matched_spec: true,
+    };
+    cSmuggledDept.economics.scenarios[0].cost_ledger.price_usd = 39.99;
+    cSmuggledDept.metrics.low_return_preference.value = 0.031; // smuggled avgReturnRatio instead of leaf 0.062!
+    assert.throws(() => ingestTrialSpecification({
+      profile_revision: 59,
+      raw_receipt_files: ['synth-leaf-demand.json', 'synth-peer-list.json'],
+      candidates: [{ candidate: cSmuggledDept, raw_receipt_files: ['synth-leaf-demand.json', 'synth-peer-list.json'] }],
+    }, r59Profile, { baseDir: dir }), /leaf-first return-rate parity violation/i);
+
+    // Binding a 2nd real demand receipt MUST NOT bypass leaf-first enforcement on candidate's own leaf 99900101!
+    assert.throws(() => ingestTrialSpecification({
+      profile_revision: 59,
+      raw_receipt_files: ['synth-leaf-demand.json', 'synth-other-demand.json', 'synth-peer-list.json'],
+      candidates: [{ candidate: cSmuggledDept, raw_receipt_files: ['synth-leaf-demand.json', 'synth-other-demand.json', 'synth-peer-list.json'] }],
+    }, r59Profile, { baseDir: dir }), /leaf-first return-rate parity violation/i);
+
+    // Setting low_return_preference & refund_fraction to 0.062 while smuggling 0.031 on physical_return_fraction MUST ALSO throw!
+    const cSmuggledPhysical = structuredClone(cSmuggledDept);
+    cSmuggledPhysical.id = 'cand-smuggled-physical-return';
+    cSmuggledPhysical.metrics.low_return_preference.value = 0.062;
+    cSmuggledPhysical.economics.scenarios[0].cost_ledger.refund_fraction = 0.062;
+    cSmuggledPhysical.economics.scenarios[0].cost_ledger.physical_return_fraction = 0.031;
+    assert.throws(() => ingestTrialSpecification({
+      profile_revision: 59,
+      raw_receipt_files: ['synth-leaf-demand.json', 'synth-other-demand.json', 'synth-peer-list.json'],
+      candidates: [{ candidate: cSmuggledPhysical, raw_receipt_files: ['synth-leaf-demand.json', 'synth-other-demand.json', 'synth-peer-list.json'] }],
+    }, r59Profile, { baseDir: dir }), /physical_return_fraction.*disagrees/i);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

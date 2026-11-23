@@ -24,40 +24,128 @@ export function categoryReturnObservation(ratioComparison) {
 }
 
 /**
- * Resolve category return fraction directly from SellerSprite `avgReturnRatio`, falling back ONLY to a verified
- * parent-category `avgReturnRatio` when a micro-leaf returns `NO_DATA` / null (never substituting `returnRatio`,
- * `0.05`, or low-star 2x multipliers).
+ * Resolve category return fraction under Revision 59 leaf-first priority (`preferLeafReturnRatio = true` by default):
+ *  1. Primary queried leaf sub-category `returnRatio` (`ratioComparison.returnRatio`) when finite in `[0, 100]`.
+ *  2. Same-report parent department benchmark `avgReturnRatio` (`ratioComparison.avgReturnRatio`) ONLY when leaf `returnRatio` is missing/null.
+ *  3. Verified ancestor/parent report (`parentFallbackComparison`): adopts ancestor sub-category `returnRatio` when
+ *     `is_ancestor_subcategory === true`, otherwise adopts parent department `avgReturnRatio` (never substituting an unrelated
+ *     sibling leaf's `returnRatio`, `0.05`, or low-star 2x multipliers).
+ * Passing `{ preferLeafReturnRatio: false }` preserves legacy `r50–r58` `avgReturnRatio`-only resolution.
  */
-export function resolveCategoryReturnWithFallback(primaryRatioComparison, parentFallbackComparison = null) {
-  const primary = categoryReturnObservation(primaryRatioComparison);
-  if (primary.value !== null) {
+export function resolveCategoryReturnWithFallback(primaryRatioComparison, parentFallbackComparison = null, {
+  preferLeafReturnRatio = true,
+} = {}) {
+  const valid = n => finite(n) && n >= 0 && n <= 100;
+  const toFrac = n => Number((n / 100).toFixed(10));
+
+  if (!preferLeafReturnRatio) {
+    const primary = categoryReturnObservation(primaryRatioComparison);
+    if (primary.value !== null) {
+      return {
+        ...primary,
+        fallback_used: false,
+        fallback_category_label: null,
+        tag: null,
+      };
+    }
+    const fallback = parentFallbackComparison ? categoryReturnObservation(parentFallbackComparison) : null;
+    if (fallback && fallback.value !== null) {
+      const parentLabel = typeof parentFallbackComparison?.category_label === 'string' && parentFallbackComparison.category_label.trim()
+        ? parentFallbackComparison.category_label.trim()
+        : '上级类目';
+      return {
+        ...fallback,
+        source_field: 'parent_category.ratioComparison.avgReturnRatio',
+        selected_market_value: primary.selected_market_value,
+        fallback_used: true,
+        fallback_category_label: parentLabel,
+        tag: `微叶退货率NO_DATA·回退上级类目均值（${parentLabel}）`,
+        reason: `Micro-leaf avgReturnRatio is NO_DATA; adopted verified parent category (${parentLabel}) avgReturnRatio once without selected-market substitution.`,
+      };
+    }
     return {
       ...primary,
       fallback_used: false,
       fallback_category_label: null,
-      tag: null,
+      tag: '类目退货率NO_DATA·待补上级类目均值',
     };
   }
-  const fallback = parentFallbackComparison ? categoryReturnObservation(parentFallbackComparison) : null;
-  if (fallback && fallback.value !== null) {
-    const parentLabel = typeof parentFallbackComparison?.category_label === 'string' && parentFallbackComparison.category_label.trim()
+
+  const leafReturn = primaryRatioComparison?.returnRatio;
+  const deptAvg = primaryRatioComparison?.avgReturnRatio;
+  const leafFrac = valid(leafReturn) ? toFrac(leafReturn) : null;
+  const deptFrac = valid(deptAvg) ? toFrac(deptAvg) : null;
+
+  // Tier 1: Queried leaf sub-category's own returnRatio
+  if (leafFrac !== null) {
+    return {
+      value: leafFrac,
+      unit: 'fraction',
+      source_field: 'ratioComparison.returnRatio',
+      selected_market_value: leafFrac,
+      selected_market_field: 'ratioComparison.returnRatio',
+      department_average_value: deptFrac,
+      department_average_field: 'ratioComparison.avgReturnRatio',
+      fallback_used: false,
+      fallback_category_label: null,
+      tag: null,
+      reason: 'Leaf sub-category returnRatio percentage converted once (r59 leaf-first priority; department avgReturnRatio retained separately).',
+    };
+  }
+
+  // Tier 2: Same-payload parent department avgReturnRatio when leaf returnRatio is missing/null
+  if (deptFrac !== null) {
+    return {
+      value: deptFrac,
+      unit: 'fraction',
+      source_field: 'ratioComparison.avgReturnRatio',
+      selected_market_value: null,
+      selected_market_field: 'ratioComparison.returnRatio',
+      department_average_value: deptFrac,
+      department_average_field: 'ratioComparison.avgReturnRatio',
+      fallback_used: true,
+      fallback_category_label: null,
+      tag: '小类退货率缺失·回退大类基准均值',
+      reason: 'Leaf sub-category returnRatio is unavailable; adopted verified department avgReturnRatio from the same report.',
+    };
+  }
+
+  // Tier 3: Micro-leaf NO_DATA -> fall back strictly to verified parent/ancestor department avgReturnRatio
+  if (parentFallbackComparison && typeof parentFallbackComparison === 'object') {
+    const parentLabel = typeof parentFallbackComparison.category_label === 'string' && parentFallbackComparison.category_label.trim()
       ? parentFallbackComparison.category_label.trim()
       : '上级类目';
-    return {
-      ...fallback,
-      source_field: 'parent_category.ratioComparison.avgReturnRatio',
-      selected_market_value: primary.selected_market_value,
-      fallback_used: true,
-      fallback_category_label: parentLabel,
-      tag: `微叶退货率NO_DATA·回退上级类目均值（${parentLabel}）`,
-      reason: `Micro-leaf avgReturnRatio is NO_DATA; adopted verified parent category (${parentLabel}) avgReturnRatio once without selected-market substitution.`,
-    };
+    const parentDeptFrac = valid(parentFallbackComparison.avgReturnRatio) ? toFrac(parentFallbackComparison.avgReturnRatio) : null;
+
+    if (parentDeptFrac !== null) {
+      return {
+        value: parentDeptFrac,
+        unit: 'fraction',
+        source_field: 'parent_category.ratioComparison.avgReturnRatio',
+        selected_market_value: null,
+        selected_market_field: 'ratioComparison.returnRatio',
+        department_average_value: parentDeptFrac,
+        department_average_field: 'parent_category.ratioComparison.avgReturnRatio',
+        fallback_used: true,
+        fallback_category_label: parentLabel,
+        tag: `微叶退货率NO_DATA·回退上级大类均值（${parentLabel}）`,
+        reason: `Micro-leaf return metrics are NO_DATA; adopted verified parent department (${parentLabel}) avgReturnRatio without sibling-leaf substitution.`,
+      };
+    }
   }
+
   return {
-    ...primary,
+    value: null,
+    unit: 'fraction',
+    source_field: 'ratioComparison.returnRatio',
+    selected_market_value: null,
+    selected_market_field: 'ratioComparison.returnRatio',
+    department_average_value: null,
+    department_average_field: 'ratioComparison.avgReturnRatio',
     fallback_used: false,
     fallback_category_label: null,
-    tag: '类目退货率NO_DATA·待补上级类目均值',
+    tag: '类目退货率NO_DATA·待补上级类目退货率',
+    reason: 'Leaf returnRatio and parent fallback return metrics are unavailable.',
   };
 }
 

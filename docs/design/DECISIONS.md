@@ -4,6 +4,13 @@
 
 Read [STATE](../STATE.md) for current authorization and progress, the revision58 profile plus its owning design documents and the 2026-11-21 consolidation/routing record below for current rules, and the earlier dated sections below for provenance. [CONTEXT-ROUTER](../CONTEXT-ROUTER.md) connects the background for takeover or refactoring. Later explicit decisions supersede only their stated scope. Keep 100 points, 21 items, all weights and curves. Ten qualifying cards means ten forms satisfying the established price, margin and initial-rights conditions with complete 21-item scores (full 12-month flat annual `comparable` or `seasonal_eligible` non-holiday forms whose primary 2027 Feb–Sep off-peak period is complete with a companion Oct–Dec peak panel while late-2027 holiday peak fulfillment remains unpublished by Amazon), without a new total-score cutoff; exclusions and unresolved forms are additional, not part of ten. Preserve price, interval, season and source-evidence boundaries.
 
+## Revision 59 leaf-first category return-rate priority — 2026-11-23
+
+Following empirical comparison of SellerSprite `category_demand_report` `ratioComparison` payloads across sub-categories, the owner confirmed leaf-first return-rate resolution under `Revision 59` (preserving `categoryReturnObservation` `avgReturnRatio` behavior unchanged for frozen `r50–r58` replay):
+
+1. **Leaf sub-category `returnRatio` primary (`ratioComparison.returnRatio`):** in SellerSprite `category_demand_report`, `returnRatio` is the queried leaf sub-category's own return rate while `avgReturnRatio` is the broad parent department benchmark average. Under `Revision 59` (`resolveCategoryReturnWithFallback`), prioritize the queried leaf sub-category's `returnRatio` for both initial unit-economics refund/excess-return calculations and item #15 (`low_return_preference`), retaining `avgReturnRatio` separately as department context.
+2. **Department `avgReturnRatio` fallback ONLY on missing / `NO_DATA` leaf:** fall back strictly to `avgReturnRatio` in the same report (`'小类退货率缺失·回退大类基准均值'`) or to the parent/ancestor department report's `avgReturnRatio` (`'微叶退货率NO_DATA·回退上级大类均值'`) ONLY when the queried leaf returns `NO_DATA` or null `returnRatio` (never adopting an ancestor sub-category's `returnRatio`, never substituting an unrelated sibling leaf's `returnRatio`, and never inventing a fixed `5%` default).
+
 ## Scheme A single-checkout consolidation, first-principles AI routing & Curatorial Studio report — 2026-11-21
 
 Following Phase 3 Batch 1 closure and Curatorial Studio (`01 视觉策展室`) report adoption, the owner approved three architectural, routing, and report decisions on 2026-11-21 (without altering the 100-point budget, 21 item weights/curves, or frozen `r50–57` replay):

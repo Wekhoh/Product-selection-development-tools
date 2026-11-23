@@ -11,10 +11,14 @@ import {
   lookupFulfillmentFee2027,
   lookupBulkyFulfillmentFee2027,
   lookupBulkyStorageFee2027,
+  lookupBulkyPlacementFee2027,
+  lookupBulkyReturnsProcessing2027,
+  lookupBulkyPackagingServiceFee2027,
   validateGuestRevcalReadback,
   computeMatchedPeerMedianPackage,
   checkMatureBandMarginFeasibility2027,
   estimateGate1A2027,
+  solveMinPriceForMargin2027,
 } from '../src/fba-rates-2027.mjs';
 import {
   resolveCategoryReturnWithFallback,
@@ -33,6 +37,7 @@ import {
   planDiscoveryBatch,
 } from '../src/discovery-channels.mjs';
 import { openSelectionStore } from '../src/store.mjs';
+import { runGate1AForForm, runGate1BForForm } from '../src/pipeline.mjs';
 import {
   buildStage1DecisionsRequests,
   buildRightsPreScreenRequest,
@@ -123,6 +128,26 @@ test('Seam 1: all 36 official US FBA return thresholds, 2027 Bulky 4 tiers, Gues
   const sbStorePeak = lookupBulkyStorageFee2027({ pkg: smallBulkyPkg, months: [10, 11, 12] });
   assert.equal(sbStoreOff.rate_usd_per_cuft_month, 0.56);
   assert.equal(sbStorePeak.rate_usd_per_cuft_month, 1.40);
+
+  // Small/Large Bulky 2027 Inbound Placement ($1.10-$1.60 <=5lb Small/Medium; $1.30-$1.80 <=5lb Large/XL) & Returns Processing ($6.74 + $0.32/lb over 1 lb)
+  const sbPlaceWest = lookupBulkyPlacementFee2027({
+    pkg: smallBulkyPkg,
+    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+    split_option: 'minimal_west_conservative',
+  });
+  assert.equal(sbPlaceWest.status, 'verified');
+  assert.deepEqual(sbPlaceWest.range_usd, [1.10, 1.60]);
+  assert.equal(sbPlaceWest.selected_usd, 1.60);
+
+  const sbRetExcess = lookupBulkyReturnsProcessing2027({
+    pkg: smallBulkyPkg, // 3.8 lb -> 3 extra lb steps -> $6.74 + 3 * $0.32 = $7.70 per excess return
+    physical_return_fraction: 0.062,
+    fee_category: 'Toys and Games', // threshold 0.047 -> excess = 0.015
+    sales_window: { from: '2027-02-01', through: '2027-09-30' },
+  });
+  assert.equal(sbRetExcess.status, 'verified');
+  assert.equal(sbRetExcess.per_return_fee_usd, 7.70);
+  assert.ok(Math.abs(sbRetExcess.expected_fee_per_shipped_unit_usd - 0.1155) < 1e-8);
 
   // 3) Guest revcalpublic anti-429 guard: rejects logged-in state, seller console URL, or empty right-hand FBA column
   const revcal429 = validateGuestRevcalReadback({
@@ -284,14 +309,41 @@ test('Seam 2: 3-tier target_child_units, parent sales dedup, category return fal
   assert.equal(dedupedSales.deduplicated_parent_count, 2);
   assert.equal(dedupedSales.total_parent_units, 280);
 
-  // 3) Category return NO_DATA fallback to parent category (never returnRatio or 0.05)
+  // 3) Revision 59 leaf-first category return priority: leaf returnRatio first, falling back strictly to department avgReturnRatio ONLY on missing/NO_DATA
+  const retLeafPrimary = resolveCategoryReturnWithFallback(
+    { avgReturnRatio: 3.10, returnRatio: 6.20 },
+  );
+  assert.equal(retLeafPrimary.value, 0.062);
+  assert.equal(retLeafPrimary.source_field, 'ratioComparison.returnRatio');
+  assert.equal(retLeafPrimary.department_average_value, 0.031);
+  assert.equal(retLeafPrimary.fallback_used, false);
+  assert.equal(retLeafPrimary.tag, null);
+
+  const retSameReportFallback = resolveCategoryReturnWithFallback(
+    { avgReturnRatio: 3.1, returnRatio: null },
+  );
+  assert.equal(retSameReportFallback.value, 0.031);
+  assert.equal(retSameReportFallback.source_field, 'ratioComparison.avgReturnRatio');
+  assert.equal(retSameReportFallback.fallback_used, true);
+  assert.match(retSameReportFallback.tag, /小类退货率缺失/);
+
+  // Micro-leaf NO_DATA falls back strictly to parent department avgReturnRatio (never adopting sibling or ancestor returnRatio)
   const retFallback = resolveCategoryReturnWithFallback(
-    { avgReturnRatio: null, returnRatio: 6.50 },
-    { avgReturnRatio: 4.2, category_label: 'Home & Kitchen' },
+    { avgReturnRatio: null, returnRatio: null },
+    { avgReturnRatio: 4.2, returnRatio: 7.9, category_label: 'Home & Kitchen', is_ancestor_subcategory: true },
   );
   assert.equal(retFallback.value, 0.042);
+  assert.equal(retFallback.source_field, 'parent_category.ratioComparison.avgReturnRatio');
   assert.equal(retFallback.fallback_used, true);
   assert.match(retFallback.tag, /NO_DATA/);
+
+  // Legacy preferLeafReturnRatio=false preserves r50-r58 avgReturnRatio behavior
+  const retLegacy = resolveCategoryReturnWithFallback(
+    { avgReturnRatio: 3.10, returnRatio: 6.20 },
+    null,
+    { preferLeafReturnRatio: false },
+  );
+  assert.equal(retLegacy.value, 0.031);
 
   // 4) Google Trends weekly point series validation (260 weeks / 1825 days = 14.25% is complete 5yr weekly, NOT truncated!)
   const weeks260 = Array.from({ length: 260 }, (_, i) => ({
@@ -934,4 +986,229 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
     { asin: 'B0MLT00002', price: 32.99, coupon: 'Save 10% on 2 or more items', fulfillment: 'FBA', monthlySales: 75, availableDate: '2025-01-01' },
   ], { as_of_date: '2026-11-22', strict_mature_only: true });
   assert.equal(multiTierPeersBand.mature_regular_band.p50_usd, 32.99, 'Multi-unit promo must NOT push $32.99 peers below $29.99');
+
+  // Synthetic Bulky 2027 checks: Medium Bulky flatness exemption, GFGVB6C7ZF38285W non-SIPP packaging service fee ($1.51–$4.04 by dim weight), and opt-in allow_bulky_2027
+  const medBulkyFlat = classifySizeTier2027({ length_in: 30, width_in: 25, height_in: 3.9, unit_weight_lb: 10 });
+  assert.equal(medBulkyFlat.status, 'verified', 'Medium Bulky (<=59x33x33) must not be blocked by Oversize-only flatness check');
+  assert.equal(medBulkyFlat.size_tier, 'medium_bulky');
+
+  const pkgFeeUnder5Dim = lookupBulkyPackagingServiceFee2027({
+    pkg: { length_in: 20, width_in: 8, height_in: 4, unit_weight_lb: 3.8 }, // dim = 640/139 = 4.60 lb <= 5 lb -> $1.51
+    requires_amazon_packaging: true,
+  });
+  assert.equal(pkgFeeUnder5Dim.status, 'verified');
+  assert.equal(pkgFeeUnder5Dim.fee_usd, 1.51);
+
+  const pkgFee8Dim = lookupBulkyPackagingServiceFee2027({
+    pkg: { length_in: 24, width_in: 12, height_in: 4, unit_weight_lb: 3.0 }, // dim = 1152/139 = 8.29 lb -> 5-10 lb -> $1.68
+    requires_amazon_packaging: true,
+  });
+  assert.equal(pkgFee8Dim.fee_usd, 1.68);
+
+  // Official GFGVB6C7ZF38285W "40 to <45 lb = $3.80" vs "45 lb or more = $4.04" exact boundary check
+  const pkgFeeBelow45 = lookupBulkyPackagingServiceFee2027({
+    pkg: { length_in: 44, width_in: 14, height_in: 10, unit_weight_lb: 12 }, // dim = 6160/139 = 44.3165 lb < 45 lb -> $3.80
+    requires_amazon_packaging: true,
+  });
+  assert.equal(pkgFeeBelow45.fee_usd, 3.80);
+  const pkgFeeExact45 = lookupBulkyPackagingServiceFee2027({
+    pkg: { length_in: 45, width_in: 13.9, height_in: 10, unit_weight_lb: 12 }, // dim = 6255/139 = exact 45.0000 lb -> $4.04!
+    requires_amazon_packaging: true,
+  });
+  assert.equal(pkgFeeExact45.dim_weight_lb, 45);
+  assert.equal(pkgFeeExact45.fee_usd, 4.04);
+
+  const synthBulkySpec = {
+    pkg: { length_in: 20.0, width_in: 8.0, height_in: 4.0, unit_weight_lb: 3.80 },
+    price_usd: 64.00,
+    fx_cny_per_usd: 7.00,
+    refund_fraction: 0.065,
+    fee_category: 'Home and Kitchen', // threshold 0.081 -> $0 excess return
+    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
+    headhaul_usd: 3.50,
+    collection_rate: 0.005,
+    sales_window: { from: '2027-02-01', through: '2027-09-30' },
+    storage_window: { from: '2027-02-01', through: '2027-09-30' },
+    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+  };
+  assert.equal(estimateGate1A2027(synthBulkySpec).status, 'needs_calculator_verification');
+  assert.equal(
+    estimateGate1A2027({ ...synthBulkySpec, allow_bulky_2027: true }).status,
+    'needs_calculator_verification',
+    'Non-SIPP Bulky without explicit requires_amazon_packaging boolean must return needs_calculator_verification',
+  );
+  const synthBulkyOwnBox = estimateGate1A2027({ ...synthBulkySpec, allow_bulky_2027: true, requires_amazon_packaging: false });
+  const synthBulkyAmzBox = estimateGate1A2027({ ...synthBulkySpec, allow_bulky_2027: true, requires_amazon_packaging: true });
+  assert.equal(synthBulkyOwnBox.status, 'verified');
+  assert.equal(synthBulkyAmzBox.status, 'verified');
+  assert.equal(synthBulkyAmzBox.components.fulfillment.packaging_service_fee_usd, 1.51);
+  assert.ok(synthBulkyOwnBox.landed_domestic_cap_usd > synthBulkyAmzBox.landed_domestic_cap_usd);
+  const synthBulkySolved = solveMinPriceForMargin2027({
+    ...synthBulkySpec,
+    allow_bulky_2027: true,
+    requires_amazon_packaging: false,
+    landed_domestic_cny: 140,
+  });
+  assert.equal(synthBulkySolved.status, 'verified');
+  assert.ok(synthBulkySolved.feasible_min_price_usd >= 68 && synthBulkySolved.feasible_min_price_usd <= 72);
+});
+
+test('Astra Round-2 H2 Regression: runGate1BForForm interior $50.00 cliff probe preserves non-SIPP Bulky packaging fee ($1.51)', async () => {
+  const store = openSelectionStore(':memory:');
+  try {
+    const bulkyPkg = { length_in: 20.0, width_in: 8.0, height_in: 4.0, unit_weight_lb: 3.80 }; // Small Bulky, dim 4.60 lb -> $1.51 packaging fee
+    store.upsertCandidateForm({
+      form_id: 'synth-bulky-cliff-50',
+      product_family_key: 'synth-bulky',
+      label: 'Synthetic Bulky Shelf',
+      buyer_task: 'Hold items',
+      saleable_set_composition: [{ component_id: 'shelf', qty_per_saleable_set: 1 }],
+    });
+    const baseCommon = {
+      pkg: bulkyPkg,
+      fx_cny_per_usd: 7.00,
+      refund_fraction: 0.04,
+      physical_return_fraction: 0.04,
+      fee_category: 'Home and Kitchen',
+      referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
+      headhaul_usd: 3.50,
+      collection_rate: 0.005,
+      sales_window: { from: '2027-02-01', through: '2027-09-30' },
+      storage_window: { from: '2027-02-01', through: '2027-09-30' },
+      inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+      allow_bulky_2027: true,
+      requires_amazon_packaging: true,
+    };
+    const est48 = estimateGate1A2027({ ...baseCommon, price_usd: 48.00 });
+    const est50 = estimateGate1A2027({ ...baseCommon, price_usd: 50.00 });
+    const est50WithoutPkg = estimateGate1A2027({ ...baseCommon, price_usd: 50.00, requires_amazon_packaging: false });
+    const est51 = estimateGate1A2027({ ...baseCommon, price_usd: 51.00 });
+    assert.equal(est50.status, 'verified');
+    assert.ok(est50WithoutPkg.landed_domestic_cap_cny > est50.landed_domestic_cap_cny + 5);
+
+    // Choose a synthetic quote that FAILS at $48, $50, and $51 WITH $1.51 packaging fee (~28.85% at $50),
+    // yet WOULD pass >30% at $50 (~31.98%) if $1.51 packaging fee were dropped!
+    const targetCnyPerUnit = Number(((est50.landed_domestic_cap_cny + est50WithoutPkg.landed_domestic_cap_cny) / 2).toFixed(2));
+    const g1a = runGate1AForForm(store, {
+      form_id: 'synth-bulky-cliff-50',
+      profile_revision: 59,
+      specific_rights_conflict: false,
+      strong_date_dependency: false,
+      scenarios: [
+        { ...baseCommon, id: 'sc-48', price_usd: 48.00, available_date: '2025-01-01' },
+        { ...baseCommon, id: 'sc-51', price_usd: 51.00, available_date: '2025-01-01' },
+      ],
+    });
+    assert.equal(g1a.proceed_to_gate1b, true);
+
+    store.recordSourcingQuote1688({
+      quote_id: 'q-synth-bulky-50',
+      form_id: 'synth-bulky-cliff-50',
+      observed_at: '2026-11-23T10:00:00Z',
+      redacted_destination: '广东深圳',
+      raw_readback_ref: 'synth-ref-1',
+      goods_first_order_promotion: false,
+      freight_first_order_promotion: false,
+      fx_cny_per_usd: 7.00,
+      pkg: bulkyPkg,
+      ui_readback: {
+        logged_in: true,
+        viewport_width_px: 1600,
+        selected_sku_row_visible: true,
+        settlement_bar_visible: true,
+        applied_quantity_confirmed: true,
+      },
+      sku_lines: [{
+        component_id: 'shelf',
+        offer_id: '900000001',
+        sku_id: '1',
+        pack_multiple: 1,
+        qty_per_saleable_set: 1,
+        moq_qty: 10,
+        ordered_qty: 100,
+        unit_price_cny: targetCnyPerUnit,
+        regular_goods_promo_false: true,
+      }],
+      goods_cny_total: Math.round(targetCnyPerUnit * 100),
+      domestic_freight_cny_total: 0,
+    });
+
+    const g1b = await runGate1BForForm(store, {
+      form_id: 'synth-bulky-cliff-50',
+      profile_revision: 59,
+      existing_quote_id: 'q-synth-bulky-50',
+      early_screen_builder: () => ([
+        {
+          id: 'sc-48',
+          saleable_unit: '1 shelf',
+          operating_period: 'off_peak',
+          price_usd: 48.00,
+          fx_cny_per_usd: 7.00,
+          refund_fraction: 0.04,
+          physical_return_fraction: 0.04,
+          fee_category: 'Home and Kitchen',
+          return_threshold: 0.081,
+          referral_terms: baseCommon.referral_terms,
+          headhaul: { usd_per_unit: 3.50, bond_included: true },
+          fulfillment_usd: est48.components.fulfillment.total_usd,
+          placement_usd: est48.components.placement.selected_usd,
+          storage: {
+            cubic_feet_per_unit: est48.components.storage.cubic_feet,
+            rate_usd_per_cuft_month: 0.56,
+            average_inventory_days: 45,
+          },
+          collection_rate: 0.005,
+          other_applicable_usd: 0,
+          specific_rights_conflict: false,
+          strong_date_dependency: false,
+          pkg: bulkyPkg,
+          fee_context: {
+            marketplace: 'US',
+            currency: 'USD',
+            package_ref: 'synth-bulky-pkg',
+            sales: baseCommon.sales_window,
+            storage: baseCommon.storage_window,
+            inbound: baseCommon.inbound_window,
+          },
+        },
+        {
+          id: 'sc-51',
+          saleable_unit: '1 shelf',
+          operating_period: 'off_peak',
+          price_usd: 51.00,
+          fx_cny_per_usd: 7.00,
+          refund_fraction: 0.04,
+          physical_return_fraction: 0.04,
+          fee_category: 'Home and Kitchen',
+          return_threshold: 0.081,
+          referral_terms: baseCommon.referral_terms,
+          headhaul: { usd_per_unit: 3.50, bond_included: true },
+          fulfillment_usd: est51.components.fulfillment.total_usd,
+          placement_usd: est51.components.placement.selected_usd,
+          storage: {
+            cubic_feet_per_unit: est51.components.storage.cubic_feet,
+            rate_usd_per_cuft_month: 0.56,
+            average_inventory_days: 45,
+          },
+          collection_rate: 0.005,
+          other_applicable_usd: 0,
+          specific_rights_conflict: false,
+          strong_date_dependency: false,
+          pkg: bulkyPkg,
+          fee_context: {
+            marketplace: 'US',
+            currency: 'USD',
+            package_ref: 'synth-bulky-pkg',
+            sales: baseCommon.sales_window,
+            storage: baseCommon.storage_window,
+            inbound: baseCommon.inbound_window,
+          },
+        },
+      ]),
+    });
+    assert.equal(g1b.status, 'gate1b_rejected', 'Must NOT omit $1.51 Bulky packaging fee at interior $50.00 cliff probe');
+    assert.equal(g1b.proceed_to_gate2_3, false);
+  } finally {
+    store.close();
+  }
 });

@@ -3,7 +3,7 @@
  *
  * Guarantees:
  *  1. 100% raw-receipt ASIN provenance (blocks phantom un-sourced ASINs before SpecMatcher/scoring).
- *  2. SellerSprite `avgReturnRatio` extraction with explicit parent-category fallback (never `returnRatio` or 0.05).
+ *  2. SellerSprite leaf-first `returnRatio` extraction with explicit fallback to department `avgReturnRatio` ONLY when the leaf is missing/`NO_DATA` (never 0.05 or sibling-leaf `returnRatio`).
  *  3. Parent-family `monthlySales` deduplication across child rows.
  *  4. 3-Tier Progressive Suggested Bid auto-extraction (mid-core vs 5+-word opportunistic long-tail, SIF `cpc_raise_exact` fallback).
  *  5. Stage-1 vs Stage-2 qualitative scoring unlock (#16/#17/#20/#21) + SP-API competitor-brand vs category gating classification.
@@ -39,22 +39,57 @@ const finite = v => typeof v === 'number' && Number.isFinite(v);
 const nonemptyStr = v => typeof v === 'string' && v.trim().length > 0;
 const round2 = v => Number(v.toFixed(2));
 
-function hasEnvelopeFailureMarkers(obj) {
+function hasUpstreamErrorMarkers(obj) {
   if (!obj || typeof obj !== 'object') return false;
   if (obj.isError === true) return true;
   if (obj.error !== undefined && obj.error !== null && obj.error !== false && obj.error !== '') return true;
   if (obj.status === 'failed' || obj.status === 'error') return true;
-  if (obj.dataStatus === 'NO_DATA') return true;
   if (obj.code !== undefined && obj.code !== null && !['OK', '0', 0, 200].includes(obj.code)) {
     return true;
   }
   return false;
 }
 
+function isPayloadUpstreamFailure(rawPayload, depth = 0, seen = new Set()) {
+  if (!rawPayload || typeof rawPayload !== 'object' || depth > 5 || seen.has(rawPayload)) return false;
+  seen.add(rawPayload);
+  if (hasUpstreamErrorMarkers(rawPayload)) return true;
+  for (const key of ['structuredContent', 'data', 'result', 'response', 'payload']) {
+    const child = rawPayload[key];
+    if (child && typeof child === 'object' && isPayloadUpstreamFailure(child, depth + 1, seen)) {
+      return true;
+    }
+  }
+  if (Array.isArray(rawPayload.content)) {
+    for (const block of rawPayload.content) {
+      if (block?.isError === true) return true;
+      if (typeof block?.text === 'string') {
+        const s = block.text.trim();
+        if (s.startsWith('{') && s.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(s);
+            if (isPayloadUpstreamFailure(parsed, depth + 1, seen)) return true;
+          } catch { /* ignore */ }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function hasEnvelopeFailureMarkers(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  if (hasUpstreamErrorMarkers(obj)) return true;
+  if (obj.dataStatus === 'NO_DATA') return true;
+  return false;
+}
+
 export function isFailedOrEmptyRawReceipt(rawPayload) {
   if (!rawPayload || typeof rawPayload !== 'object') return true;
+  if (isPayloadUpstreamFailure(rawPayload)) return true;
   if (hasEnvelopeFailureMarkers(rawPayload)) return true;
   if (hasEnvelopeFailureMarkers(rawPayload.structuredContent)) return true;
+  if (hasEnvelopeFailureMarkers(rawPayload.structuredContent?.data)) return true;
   if (hasEnvelopeFailureMarkers(rawPayload.data)) return true;
   return false;
 }
@@ -291,14 +326,26 @@ export function assertRawAsinProvenance(asins, rawPayloads = []) {
 }
 
 /**
- * Extract category return rate (`avgReturnRatio`, never `returnRatio`) and deduplicated parent sales from raw receipts.
+ * Extract category return rate under Revision 59 leaf-first priority (`returnRatio` first, falling back strictly to
+ * department `avgReturnRatio` ONLY when leaf `returnRatio` is missing/`NO_DATA`) and deduplicated parent sales from raw receipts.
  */
 export function ingestRawCategoryAndDemandMetrics({
   demand365Raw = null,
   parentDemand365Raw = null,
   parentCategoryLabel = null,
+  preferLeafReturnRatio = true,
   asinRows = [],
 } = {}) {
+  if (demand365Raw !== null && demand365Raw !== undefined && isPayloadUpstreamFailure(demand365Raw)) {
+    throw new TypeError(
+      'Upstream leaf category_demand_report failed with an error payload; cannot treat API/transport failure as NO_DATA fallback.',
+    );
+  }
+  if (parentDemand365Raw !== null && parentDemand365Raw !== undefined && isPayloadUpstreamFailure(parentDemand365Raw)) {
+    throw new TypeError(
+      'Upstream parent category_demand_report failed with an error payload; cannot adopt failed fallback metrics.',
+    );
+  }
   const leafData = unwrapMcpEnvelope(demand365Raw);
   const parentData = unwrapMcpEnvelope(parentDemand365Raw);
   const leafRatioObj = leafData?.ratioComparison ?? leafData?.stat ?? leafData ?? null;
@@ -308,7 +355,7 @@ export function ingestRawCategoryAndDemandMetrics({
       ...(parentCategoryLabel ? { category_label: parentCategoryLabel } : {}),
     }
     : null;
-  const categoryReturn = resolveCategoryReturnWithFallback(leafRatioObj, parentRatioObj);
+  const categoryReturn = resolveCategoryReturnWithFallback(leafRatioObj, parentRatioObj, { preferLeafReturnRatio });
   const deduplicatedSales = deduplicateParentSalesRows(asinRows);
   return {
     category_return: categoryReturn,
@@ -1597,6 +1644,133 @@ export function ingestTrialSpecification(spec, profile, {
         effectiveRev,
         fallbackAsOfDate: entry?.as_of_date ?? spec.as_of_date ?? null,
       });
+      if (effectiveRev >= 59) {
+        const candLeafNodeIds = new Set();
+        const rawRelBsr = String(cand?.newcomer_cohort?.relevant_bsr_node ?? '').trim();
+        for (const m of rawRelBsr.matchAll(/\b\d{5,15}\b/g)) candLeafNodeIds.add(m[0]);
+        const rawCatLabel = String(cand?.metrics?.low_return_preference?.category ?? '');
+        const leafTagMatch = rawCatLabel.match(/leaf\s+(\d{5,15})\b/i) ?? rawCatLabel.match(/\((\d{5,15})\)\s*$/);
+        if (leafTagMatch) candLeafNodeIds.add(leafTagMatch[1]);
+
+        const validDemandReceipts = [];
+        let hasNoDataDemandReceipt = false;
+        for (const item of candPayloads) {
+          const rawP = item?.payload;
+          let parsedTextObj = null;
+          if (Array.isArray(rawP?.content)) {
+            for (const block of rawP.content) {
+              if (typeof block?.text === 'string') {
+                const s = block.text.trim();
+                if (s.startsWith('{') && s.endsWith('}')) {
+                  try {
+                    const p = JSON.parse(s);
+                    if (p && typeof p === 'object' && ('ratioComparison' in p || 'ratioComparison' in (p.data ?? {}))) {
+                      parsedTextObj = p.data ?? p;
+                      break;
+                    }
+                  } catch { /* ignore */ }
+                }
+              }
+            }
+          }
+          const rawData = rawP?.structuredContent?.data ?? rawP?.structuredContent ?? rawP?.data ?? parsedTextObj ?? rawP;
+          const looksLikeDemand = /(?:demand|compass)/i.test(String(item?.source_id ?? '')) ||
+            Boolean(rawData && typeof rawData === 'object' && ('ratioComparison' in rawData || ('goodsTrendItems' in rawData && 'popularKeywordItems' in rawData)));
+          if (looksLikeDemand && isPayloadUpstreamFailure(rawP)) {
+            throw new TypeError(
+              `Candidate "${cand.id}" binds a failed category_demand_report receipt ("${item.source_id}"); upstream errors cannot be treated as NO_DATA fallback.`,
+            );
+          }
+          if (looksLikeDemand && (rawP?.dataStatus === 'NO_DATA' || rawData?.dataStatus === 'NO_DATA' || rawData?.ratioComparison === null)) {
+            hasNoDataDemandReceipt = true;
+          }
+          const unw = unwrapMcpEnvelope(rawP);
+          const rc = unw?.ratioComparison;
+          if (rc && typeof rc === 'object' && (finite(rc.returnRatio) || finite(rc.avgReturnRatio))) {
+            const np = String(unw?.nodePath ?? unw?.categoryId ?? '').trim();
+            const tailNode = np.match(/(\d{5,15})\s*$/)?.[1] ?? null;
+            validDemandReceipts.push({
+              source_id: item?.source_id ?? 'unknown',
+              rc,
+              leafNodeId: tailNode,
+            });
+          }
+        }
+
+        if (validDemandReceipts.length >= 1) {
+          const matchingLeafReceipts = validDemandReceipts.filter(r => r.leafNodeId && candLeafNodeIds.has(r.leafNodeId));
+          let expectedReturn = null;
+          if (matchingLeafReceipts.length >= 1) {
+            const leafVals = matchingLeafReceipts
+              .map(r => resolveCategoryReturnWithFallback(r.rc, null, { preferLeafReturnRatio: true }).value)
+              .filter(finite);
+            if (leafVals.some(v => Math.abs(v - leafVals[0]) > 1e-6)) {
+              throw new TypeError(
+                `Revision 59 leaf-first return-rate ambiguity on candidate "${cand.id}": multiple bound leaf category_demand_report receipts disagree (${leafVals.join(', ')}).`,
+              );
+            }
+            expectedReturn = leafVals[0] ?? null;
+          } else if (hasNoDataDemandReceipt) {
+            const hasDistinctLeafRate = validDemandReceipts.some(
+              r => finite(r.rc.returnRatio) && finite(r.rc.avgReturnRatio) && Math.abs(r.rc.returnRatio - r.rc.avgReturnRatio) > 1e-6,
+            );
+            if (hasDistinctLeafRate && (candLeafNodeIds.size === 0 || validDemandReceipts.some(r => !r.leafNodeId))) {
+              throw new TypeError(
+                `Revision 59 leaf-first return-rate check on candidate "${cand.id}": department NO_DATA fallback requires explicit candidate leaf node ID (relevant_bsr_node) and receipt nodePath to prove the valid receipt is not the candidate's own leaf.`,
+              );
+            }
+            const deptVals = validDemandReceipts
+              .map(r => resolveCategoryReturnWithFallback(null, r.rc, { preferLeafReturnRatio: true }).value)
+              .filter(finite);
+            if (deptVals.length === 0) {
+              throw new TypeError(
+                `Revision 59 leaf-first return-rate check on candidate "${cand.id}": NO_DATA fallback receipt lacks department avgReturnRatio.`,
+              );
+            }
+            if (deptVals.some(v => Math.abs(v - deptVals[0]) > 1e-6)) {
+              throw new TypeError(
+                `Revision 59 leaf-first return-rate ambiguity on candidate "${cand.id}": bound fallback category_demand_report receipts have conflicting avgReturnRatio values (${deptVals.join(', ')}).`,
+              );
+            }
+            expectedReturn = deptVals[0];
+          } else if (validDemandReceipts.length > 1) {
+            throw new TypeError(
+              `Revision 59 leaf-first return-rate ambiguity on candidate "${cand.id}": ${validDemandReceipts.length} category_demand_report receipts bound without matching candidate leaf node (${[...candLeafNodeIds].join(',') || 'none'}); set newcomer_cohort.relevant_bsr_node or bind only the candidate's leaf report.`,
+            );
+          } else {
+            const only = validDemandReceipts[0];
+            if (only.leafNodeId && candLeafNodeIds.size > 0 && !candLeafNodeIds.has(only.leafNodeId)) {
+              throw new TypeError(
+                `Revision 59 leaf-first return-rate mismatch on candidate "${cand.id}": bound category_demand_report node (${only.leafNodeId}) disagrees with candidate leaf node (${[...candLeafNodeIds].join(',')}) without a NO_DATA leaf receipt.`,
+              );
+            }
+            expectedReturn = resolveCategoryReturnWithFallback(only.rc, null, { preferLeafReturnRatio: true }).value;
+          }
+
+          if (expectedReturn !== null) {
+            const suppliedPref = cand?.metrics?.low_return_preference?.value;
+            if (cand?.metrics?.low_return_preference?.applicable !== false && (!finite(suppliedPref) || Math.abs(suppliedPref - expectedReturn) > 1e-6)) {
+              throw new TypeError(
+                `Revision 59 leaf-first return-rate parity violation on candidate "${cand.id}": metrics.low_return_preference.value (${suppliedPref}) disagrees with bound category_demand_report (${expectedReturn}); fix low_return_preference to match resolveCategoryReturnWithFallback.`,
+              );
+            }
+            for (const sc of collectPrimaryScenariosForPriceCheck(cand)) {
+              const scRef = sc?.cost_ledger?.refund_fraction;
+              if (finite(scRef) && Math.abs(scRef - expectedReturn) > 1e-6) {
+                throw new TypeError(
+                  `Revision 59 leaf-first return-rate parity violation on candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}": refund_fraction (${scRef}) disagrees with bound category_demand_report (${expectedReturn}).`,
+                );
+              }
+              const scPhys = sc?.cost_ledger?.physical_return_fraction;
+              if (finite(scPhys) && Math.abs(scPhys - expectedReturn) > 1e-6) {
+                throw new TypeError(
+                  `Revision 59 leaf-first return-rate parity violation on candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}": physical_return_fraction (${scPhys}) disagrees with bound category_demand_report (${expectedReturn}).`,
+                );
+              }
+            }
+          }
+        }
+      }
       perCandidateVerifiedAsinCounts[cand.id] = candAsins.size;
     } else {
       perCandidateVerifiedAsinCounts[cand.id] = 0;

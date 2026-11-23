@@ -549,7 +549,7 @@
             ],
             "formula": "Interpolate linearly between adjacent anchors; supported rates <= 0.02 earn 4 and rates >= 0.30 earn 0 within the valid input range.",
             "calibration_status": "pending_real_samples_across_categories_and_rounds",
-            "evidence_requirement": "Use the corresponding source-labeled category return-rate proxy already selected for initial economics, retaining node, window, units and applicability. Missing, invalid or materially inapplicable data leaves the score null. The proxy is not realized candidate returns. These are preference anchors, not fee thresholds, industry standards or exclusion rules. Monetary return losses remain counted once in economics; retain raw rates beyond the score boundaries."
+            "evidence_requirement": "Use the corresponding source-labeled category return-rate proxy already selected for initial economics, retaining node, window, units and applicability. Under Revision 59, prioritize the queried leaf sub-category returnRatio first, falling back strictly to department avgReturnRatio (same report or verified parent/ancestor department report) only when the leaf sub-category returnRatio is missing/NO_DATA (frozen revisions 50-58 retain avgReturnRatio). Missing, invalid or materially inapplicable data leaves the score null. The proxy is not realized candidate returns. These are preference anchors, not fee thresholds, industry standards or exclusion rules. Monetary return losses remain counted once in economics; retain raw rates beyond the score boundaries."
           }
         },
         {
