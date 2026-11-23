@@ -175,7 +175,7 @@ export function evaluateGate0CategoryBoundary(item, config = {}) {
   };
 }
 
-const MULTI_UNIT_COUPON_RE = /\b(?:buy|purchase|order|get)\s*(?:[2-9]\d*|1\d+|two|three|four|five)\b|\b(?:on|with|for|any)\s+(?:[2-9]\d*|1\d+|two|three|four|five)\s+(?:or\s+more\b|(?:select|qualifying|eligible)?\s*(?:items?|units?|pcs?|packs?|sets?|bottles?|boxes?)\b)|\b(?:[2-9]\d*|1\d+|two|three|four|five)\s*(?:\+|or\s+more)\s*(?:items?|units?|pcs?|packs?|sets?)?\b|\bwhen\s+you\s+(?:buy|purchase|spend\s+on)\s+(?:[2-9]\d*|1\d+|two|three|four|five)\b|满\s*[2-9二两三四五]\d*\s*件|[2-9二两三四五]\s*件(?:及以上|起|立减|折)|第\s*[2二两]\s*件|多件/i;
+const MULTI_UNIT_COUPON_RE = /\b(?:buy|purchase|order|get)\s*(?:[2-9]\d*|1\d+|two|three|four|five|six|seven|eight|nine|ten)\b|\b(?:on|with(?:\s+purchase\s+of)?|for|any)\s+(?:[2-9]\d*|1\d+|two|three|four|five|six|seven|eight|nine|ten)\s+(?:or\s+more\b|(?:select|qualifying|eligible)?\s*(?:items?|units?|pcs?|packs?|sets?|bottles?|boxes?)\b)|\b(?:[2-9]\d*|1\d+|two|three|four|five|six|seven|eight|nine|ten)\s*(?:\+|or\s+more)\s*(?:items?|units?|pcs?|packs?|sets?)?\b|\bwhen\s+(?:you\s+)?(?:buy(?:ing)?|purchas(?:e|ing)|order(?:ing)?|spend(?:ing)?\s+on)\s+(?:[2-9]\d*|1\d+|two|three|four|five|six|seven|eight|nine|ten)\b|买\s*[2-9二两三四五六七八九十]\d*\s*(?:件|个|套|盒)?\s*(?:送|减|立减|折|享)|满\s*[2-9二两三四五六七八九十]\d*\s*件|[2-9二两三四五六七八九十]\s*件(?:及以上|起|立减|折)|第\s*[2二两]\s*件|多件/i;
 const FOREIGN_CURRENCY_COUPON_RE = /(?:€|£|¥|￥|\b(?:EUR|GBP|CAD|AUD|CNY|RMB|JPY|MXN|INR|SEK|PLN|CHF|SGD|HKD)\b|(?:CA|C|A|HK|NT|SG|NZ|MX)\$)/i;
 
 /**

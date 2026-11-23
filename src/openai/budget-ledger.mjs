@@ -2698,12 +2698,10 @@ export class OpenAiBudgetLedger {
         row.ino_id !== null &&
         row.ino_id !== undefined &&
         (row.dev_id !== devStr || row.ino_id !== inoStr);
-      const instanceMismatch =
-        typeof instanceId === 'string' &&
-        instanceId.length > 0 &&
+      const hasBoundInstanceId =
         typeof row.ledger_instance_id === 'string' &&
-        row.ledger_instance_id.length > 0 &&
-        row.ledger_instance_id !== instanceId;
+        row.ledger_instance_id.length > 0;
+      const instanceMismatch = hasBoundInstanceId && instanceId !== row.ledger_instance_id;
       if (inodeMismatch || instanceMismatch) {
         throw new OpenAiPolicyError(
           `Canonical SQLite ledger for "${scopeLabel}" at the registered pathname was replaced with a different physical or logical database file; use rotateOrRelocateCanonicalBinding with an operator note.`,

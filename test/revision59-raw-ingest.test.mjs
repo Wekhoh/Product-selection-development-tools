@@ -849,6 +849,42 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       candidates: [{ candidate: cExpFresh, raw_receipt_files: ['mat-receipt.json'] }],
     }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath }), /expired as of 2027-01-10/i);
 
+    // Backdated spec.as_of_date CANNOT rewind past candidate observation_date to resurrect an expired SQLite quote,
+    // and SQLite Gate-1A accepted fx_cny_per_usd (7.2) blocks stale 7.4 even when quote.fx_cny_per_usd is null!
+    const stG1aFx = openSelectionStore(dbMatrixPath);
+    stG1aFx.upsertCandidateForm({ form_id: 'cand-g1afx-backdate', product_family_key: 'g1afx', label: 'G1AFX', buyer_task: 'T', saleable_set_composition: [{ component_id: 'item', qty_per_saleable_set: 1 }] });
+    const g1aFxForm = stG1aFx.getCandidateForm('cand-g1afx-backdate');
+    stG1aFx.updateFormLifecycle('cand-g1afx-backdate', 'gate1a_passed', {
+      gate1a_result: { spec_sha256: g1aFxForm.spec_sha256, proceed_to_gate1b: true, declared_scenarios: [{ id: 'sc-40', price_usd: 40, fx_cny_per_usd: 7.2 }] },
+    });
+    stG1aFx.recordSourcingQuote1688({
+      quote_id: 'q-null-fx-exp', form_id: 'cand-g1afx-backdate', observed_at: '2026-11-01T10:00:00Z', expires_at: '2026-12-22T10:00:00Z',
+      redacted_destination: '广东深圳', raw_readback_ref: 'ev-nf', goods_first_order_promotion: false, freight_first_order_promotion: false,
+      fx_cny_per_usd: null, pkg: pkgMat, ui_readback: uiMat,
+      sku_lines: [{ component_id: 'item', offer_id: 'o5', sku_id: 's5', pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 10, ordered_qty: 100, unit_price_cny: 40.32, regular_goods_promo_false: true }],
+      goods_cny_total: 4032, domestic_freight_cny_total: 576,
+    });
+    stG1aFx.close();
+
+    const cNullQuoteFx = structuredClone(cStaleFx);
+    cNullQuoteFx.id = 'cand-g1afx-backdate';
+    cNullQuoteFx.economics.scenarios[0].quote_id = 'q-null-fx-exp';
+    assert.throws(() => ingestTrialSpecification({
+      profile_revision: 59,
+      as_of_date: '2026-11-13',
+      raw_receipt_files: ['mat-receipt.json'],
+      candidates: [{ candidate: cNullQuoteFx, raw_receipt_files: ['mat-receipt.json'] }],
+    }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath }), /fx_cny_per_usd.*conflicts/i);
+
+    const cFutureObsBackdate = structuredClone(cExpFresh);
+    cFutureObsBackdate.evidence.push({ id: 'ev-jan-obs', source: 'Observed Jan 2027', observed_at: '2027-01-10' });
+    assert.throws(() => ingestTrialSpecification({
+      profile_revision: 59,
+      as_of_date: '2026-11-13', // backdated BEFORE 2027-01-10 evidence!
+      raw_receipt_files: ['mat-receipt.json'],
+      candidates: [{ candidate: cFutureObsBackdate, raw_receipt_files: ['mat-receipt.json'] }],
+    }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath }), /expired as of 2027-01-10/i);
+
     // Round-4 BLOCKER 4a-d:
     //  - Seasonal primary [2..9] period renamed id:'peak' + companion [10..12] renamed id:'holiday' STILL rejects $289.99;
     //  - Free-text prose in scenario.label ("Cross-check excluded wall-mount rack B0DIFF0049 at $49.99") CANNOT authorize $49.99;

@@ -1271,36 +1271,66 @@ function validateCalculatorVerifiedOverride(override, {
       reason: `calculator_verified_override fulfillment_usd ($${active.fulfillment_usd}) understates verified 2027 Standard-size fee ($${stdFulCheck.total_usd}).`,
     };
   }
-  const bulkyFulCheck = lookupBulkyFulfillmentFee2027({
-    pkg: active.pkg ?? pkg,
-    price_usd,
-    sales_window,
-    is_apparel: appScen.value,
-    is_dangerous_goods: dgScen.value,
-    is_sipp: sippScen.value,
-  });
-  if (bulkyFulCheck.status === 'verified' && String(bulkyFulCheck.size_tier || '').includes('bulky')) {
-    const isGuestRevcal = Boolean(active.guest_readback || nonEmpty(active.url) || active.verified_by === 'guest_revcalpublic');
-    const minBulkyFloorUsd = isGuestRevcal
-      ? bulkyFulCheck.total_usd
-      : (finite(bulkyFulCheck.tier_first_lb_total_usd) ? bulkyFulCheck.tier_first_lb_total_usd : bulkyFulCheck.total_usd);
-    if (active.fulfillment_usd + 0.01 < minBulkyFloorUsd) {
-      return {
-        valid: false,
-        reason: `calculator_verified_override fulfillment_usd ($${active.fulfillment_usd}) understates 2027 Bulky fee floor ($${minBulkyFloorUsd}).`,
-      };
+  if (!sippScen.value) {
+    const rawOverridePkg = active.pkg ?? pkg;
+    const floorPkg = rawOverridePkg && typeof rawOverridePkg === 'object'
+      ? {
+          ...rawOverridePkg,
+          is_apparel: undefined,
+          is_apparel_or_shoes: undefined,
+          is_dangerous_goods: undefined,
+          is_sipp: undefined,
+          is_oversize: undefined,
+        }
+      : rawOverridePkg;
+    if (stdFulCheck.status !== 'verified') {
+      const stdBaseFloorCheck = lookupFulfillmentFee2027({
+        pkg: floorPkg,
+        price_usd,
+        sales_window: null,
+        include_fuel_surcharge: false,
+        is_apparel: false,
+        is_dangerous_goods: false,
+        is_sipp: false,
+      });
+      if (stdBaseFloorCheck.status === 'verified' && active.fulfillment_usd + 0.01 < stdBaseFloorCheck.total_usd) {
+        return {
+          valid: false,
+          reason: `calculator_verified_override fulfillment_usd ($${active.fulfillment_usd}) understates 2027 Standard-size base fee floor ($${stdBaseFloorCheck.total_usd}).`,
+        };
+      }
     }
-  } else if (bulkyFulCheck.size_tier === 'oversize_beyond_bulky' || bulkyFulCheck.size_tier === 'bulky_special_handling') {
-    const computedFloor = computeOversizeOrSpecialHandlingFloor2027(active.pkg ?? pkg, targetBand);
-    const xlTier = BULKY_2027_TIERS[BULKY_2027_TIERS.length - 1];
-    const minOversizeFloorUsd = computedFloor
-      ? computedFloor.floor_usd
-      : round((xlTier[targetBand] ?? xlTier['10_to_50']) * (1 + FBA_2027_METADATA.fuel_surcharge_fraction));
-    if (active.fulfillment_usd + 0.01 < minOversizeFloorUsd) {
-      return {
-        valid: false,
-        reason: `calculator_verified_override fulfillment_usd ($${active.fulfillment_usd}) understates 2027 Extra-Large Bulky / Oversize fee floor ($${minOversizeFloorUsd} for ${computedFloor?.size_tier ?? bulkyFulCheck.size_tier}).`,
-      };
+    const bulkyFloorCheck = lookupBulkyFulfillmentFee2027({
+      pkg: floorPkg,
+      price_usd,
+      sales_window: null,
+      is_apparel: false,
+      is_dangerous_goods: false,
+      is_sipp: false,
+    });
+    if (bulkyFloorCheck.status === 'verified' && String(bulkyFloorCheck.size_tier || '').includes('bulky')) {
+      const isGuestRevcal = Boolean(active.guest_readback || nonEmpty(active.url) || active.verified_by === 'guest_revcalpublic');
+      const minBulkyFloorUsd = isGuestRevcal
+        ? bulkyFloorCheck.total_usd
+        : (finite(bulkyFloorCheck.tier_first_lb_total_usd) ? bulkyFloorCheck.tier_first_lb_total_usd : bulkyFloorCheck.total_usd);
+      if (active.fulfillment_usd + 0.01 < minBulkyFloorUsd) {
+        return {
+          valid: false,
+          reason: `calculator_verified_override fulfillment_usd ($${active.fulfillment_usd}) understates 2027 Bulky fee floor ($${minBulkyFloorUsd}).`,
+        };
+      }
+    } else if (bulkyFloorCheck.size_tier === 'oversize_beyond_bulky' || bulkyFloorCheck.size_tier === 'bulky_special_handling') {
+      const computedFloor = computeOversizeOrSpecialHandlingFloor2027(floorPkg, targetBand);
+      const xlTier = BULKY_2027_TIERS[BULKY_2027_TIERS.length - 1];
+      const minOversizeFloorUsd = computedFloor
+        ? computedFloor.floor_usd
+        : round((xlTier[targetBand] ?? xlTier['10_to_50']) * (1 + FBA_2027_METADATA.fuel_surcharge_fraction));
+      if (active.fulfillment_usd + 0.01 < minOversizeFloorUsd) {
+        return {
+          valid: false,
+          reason: `calculator_verified_override fulfillment_usd ($${active.fulfillment_usd}) understates 2027 Extra-Large Bulky / Oversize fee floor ($${minOversizeFloorUsd} for ${computedFloor?.size_tier ?? bulkyFloorCheck.size_tier}).`,
+        };
+      }
     }
   }
 

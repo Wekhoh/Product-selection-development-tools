@@ -948,19 +948,22 @@ function collectPrimaryScenariosForPriceCheck(cand) {
 }
 
 function resolveCandidateReferenceAsOfDate(cand, fallbackDate = null) {
-  if (nonemptyStr(fallbackDate) && /^\d{4}-\d{2}-\d{2}/.test(fallbackDate.trim())) {
-    return fallbackDate.trim().slice(0, 10);
-  }
-  if (nonemptyStr(cand?.newcomer_cohort?.observation_date) && /^\d{4}-\d{2}-\d{2}/.test(cand.newcomer_cohort.observation_date.trim())) {
-    return cand.newcomer_cohort.observation_date.trim().slice(0, 10);
-  }
+  const observedDates = [];
+  const pushIsoDate = raw => {
+    if (!nonemptyStr(raw)) return;
+    const trimmed = raw.trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(trimmed)) {
+      observedDates.push(trimmed.slice(0, 10));
+    }
+  };
+  pushIsoDate(fallbackDate);
+  pushIsoDate(cand?.newcomer_cohort?.observation_date);
   if (Array.isArray(cand?.evidence)) {
-    const evDate = cand.evidence
-      .map(e => e?.observed_at)
-      .find(d => /^\d{4}-\d{2}-\d{2}/.test(String(d || '')));
-    if (evDate) return String(evDate).slice(0, 10);
+    for (const e of cand.evidence) {
+      pushIsoDate(e?.observed_at);
+    }
   }
-  return null;
+  return observedDates.length > 0 ? observedDates.sort().at(-1) : null;
 }
 
 function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
@@ -968,6 +971,7 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
   extraVerifiedAsins = [],
   allowSyntheticIds = false,
   effectiveRev = 58,
+  fallbackAsOfDate = null,
 } = {}) {
   const allCandAsins = extractAllCandidateAsins(cand);
   for (const extraAsin of extraVerifiedAsins) {
@@ -1033,7 +1037,7 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
         ? (candCatalog.get(targetAsinNorm) ?? []).map(r => r.category_root).filter(Boolean)
         : [],
     );
-    const candObsDate = resolveCandidateReferenceAsOfDate(cand);
+    const candObsDate = resolveCandidateReferenceAsOfDate(cand, fallbackAsOfDate);
     const { quantilePrices, mainstreamMedians, rowFloorPrices } = extractQuantileSupportedPricesFromPayloads(candPayloads, {
       asOfDate: candObsDate,
       excludedAsins,
@@ -1275,22 +1279,34 @@ function enforceCandidateContainerMatrixAndDbParity(cand, {
         }
 
         const explicitLedgerFxs = [
+          procLine?.fx_cny_per_usd,
+          domLine?.fx_cny_per_usd,
           ledger.fx_cny_per_usd,
           ledger.source_inputs?.fx_cny_per_usd,
           ledger.source_inputs?.fx_usdcny,
         ].filter(v => finite(v) && v > 0);
-        if (finite(activeQuote.fx_cny_per_usd) && activeQuote.fx_cny_per_usd > 0 && (hasSourcedProc || hasSourcedDom)) {
+        const quoteFx = (finite(activeQuote.fx_cny_per_usd) && activeQuote.fx_cny_per_usd > 0)
+          ? activeQuote.fx_cny_per_usd
+          : null;
+        const gate1aFx = (finite(dbConstraints?.declaredFxCnyPerUsd) && dbConstraints.declaredFxCnyPerUsd > 0)
+          ? dbConstraints.declaredFxCnyPerUsd
+          : null;
+        if ((hasSourcedProc || hasSourcedDom) && quoteFx !== null && gate1aFx !== null && Math.abs(quoteFx - gate1aFx) > 1e-4) {
+          throw new TypeError(
+            `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" persisted SQLite 1688 quote "${activeQuote.quote_id}" fx_cny_per_usd (${quoteFx}) conflicts with SQLite Gate 1A accepted fx_cny_per_usd (${gate1aFx}).`,
+          );
+        }
+        const dbAuthoritativeFx = quoteFx ?? gate1aFx;
+        if (dbAuthoritativeFx !== null && (hasSourcedProc || hasSourcedDom)) {
           for (const lfx of explicitLedgerFxs) {
-            if (Math.abs(lfx - activeQuote.fx_cny_per_usd) > 1e-4) {
+            if (Math.abs(lfx - dbAuthoritativeFx) > 1e-4) {
               throw new TypeError(
-                `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" fx_cny_per_usd (${lfx}) conflicts with persisted SQLite 1688 quote "${activeQuote.quote_id}" fx_cny_per_usd (${activeQuote.fx_cny_per_usd}).`,
+                `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" fx_cny_per_usd (${lfx}) conflicts with persisted SQLite authoritative fx_cny_per_usd (${dbAuthoritativeFx} on quote "${activeQuote.quote_id}").`,
               );
             }
           }
         }
-        const effectiveFx = (finite(activeQuote.fx_cny_per_usd) && activeQuote.fx_cny_per_usd > 0)
-          ? activeQuote.fx_cny_per_usd
-          : (explicitLedgerFxs[0] ?? null);
+        const effectiveFx = dbAuthoritativeFx ?? (explicitLedgerFxs[0] ?? null);
 
         if (hasSourcedProc) {
           if (procLine.order_units !== undefined && procLine.order_units !== activeQuote.actual_sets) {
@@ -1466,10 +1482,18 @@ export function ingestTrialSpecification(spec, profile, {
         const dbForm = roStore.getCandidateForm(cid);
         if (!dbForm) continue;
         let declaredPricesUsd = [];
+        let declaredFxCnyPerUsd = null;
         try {
           const g1a = dbForm.gate1a_result_json ? JSON.parse(dbForm.gate1a_result_json) : null;
-          if (g1a && (!g1a.spec_sha256 || g1a.spec_sha256 === dbForm.spec_sha256) && g1a.proceed_to_gate1b === true && Array.isArray(g1a.declared_scenarios)) {
-            declaredPricesUsd = [...new Set(g1a.declared_scenarios.map(d => d?.price_usd).filter(finite).map(round2))];
+          if (g1a && (!g1a.spec_sha256 || g1a.spec_sha256 === dbForm.spec_sha256) && g1a.proceed_to_gate1b === true) {
+            if (Array.isArray(g1a.declared_scenarios)) {
+              declaredPricesUsd = [...new Set(g1a.declared_scenarios.map(d => d?.price_usd).filter(finite).map(round2))];
+            }
+            const g1aFxs = [
+              ...(Array.isArray(g1a.declared_scenarios) ? g1a.declared_scenarios.map(d => d?.fx_cny_per_usd) : []),
+              ...(Array.isArray(g1a.scenarios) ? g1a.scenarios.map(s => s?.estimate?.fx_cny_per_usd) : []),
+            ].filter(v => finite(v) && v > 0);
+            if (g1aFxs.length > 0) declaredFxCnyPerUsd = g1aFxs[0];
           }
         } catch { /* ignore malformed json */ }
         const candAsOf = resolveCandidateReferenceAsOfDate(rawCand, entry?.as_of_date ?? spec.as_of_date ?? null) ??
@@ -1485,6 +1509,7 @@ export function ingestTrialSpecification(spec, profile, {
           dbFormPresent: true,
           candAsOf,
           declaredPricesUsd,
+          declaredFxCnyPerUsd,
           usableQuotes,
           verifiedQuoteIds: usableQuotes.map(q => q.quote_id),
           expiredQuoteIds,
@@ -1570,6 +1595,7 @@ export function ingestTrialSpecification(spec, profile, {
         extraVerifiedAsins: entry.verified_asins ?? [],
         allowSyntheticIds: allowSynthetic,
         effectiveRev,
+        fallbackAsOfDate: entry?.as_of_date ?? spec.as_of_date ?? null,
       });
       perCandidateVerifiedAsinCounts[cand.id] = candAsins.size;
     } else {

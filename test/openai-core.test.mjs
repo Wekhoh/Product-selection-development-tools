@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
@@ -4280,8 +4281,90 @@ test('Round 3 ledger & isolation: live/test separation, canonical inode replacem
         () => recreatedSameInodeLedger.bindCredentialFingerprint('openai-default', fp1),
         err => err instanceof OpenAiPolicyError && err.code === 'CANONICAL_LEDGER_REPLACED_AT_PATH',
       );
+      // Clearing openai_ledger_identity on a same-inode replacement MUST ALSO be rejected (never skip when instanceId is null/empty)!
+      recreatedSameInodeLedger.db.exec('DELETE FROM openai_ledger_identity');
+      assert.throws(
+        () => recreatedSameInodeLedger.bindCredentialFingerprint('openai-default', fp1),
+        err => err instanceof OpenAiPolicyError && err.code === 'CANONICAL_LEDGER_REPLACED_AT_PATH',
+      );
     } finally {
       recreatedSameInodeLedger.close();
+    }
+
+    // 6c) Multi-process concurrent pre-upgrade canonicalRegistryPath migration contention
+    const mpRegPath = join(dir, 'mp-pre-upgrade-reg.sqlite');
+    const mpPreDb = new DatabaseSync(mpRegPath);
+    mpPreDb.exec(`
+      CREATE TABLE canonical_scope_bindings (
+        account_scope TEXT PRIMARY KEY,
+        canonical_path TEXT NOT NULL,
+        norm_path_key TEXT NOT NULL,
+        dev_id TEXT,
+        ino_id TEXT,
+        bound_at TEXT NOT NULL
+      );
+      CREATE TABLE canonical_credential_bindings (
+        credential_fingerprint_sha256 TEXT PRIMARY KEY,
+        account_scope TEXT NOT NULL,
+        canonical_path TEXT NOT NULL,
+        norm_path_key TEXT NOT NULL,
+        dev_id TEXT,
+        ino_id TEXT,
+        bound_at TEXT NOT NULL
+      );
+      CREATE TABLE canonical_binding_audit (
+        audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        account_scope TEXT NOT NULL,
+        action TEXT NOT NULL,
+        old_canonical_path TEXT,
+        new_canonical_path TEXT NOT NULL,
+        old_dev_id TEXT,
+        old_ino_id TEXT,
+        new_dev_id TEXT,
+        new_ino_id TEXT,
+        old_credential_fp TEXT,
+        new_credential_fp TEXT,
+        operator_note TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+      );
+    `);
+    mpPreDb.close();
+    const mpLedgerA = join(dir, 'mp-ledger-a.sqlite');
+    const mpLedgerB = join(dir, 'mp-ledger-b.sqlite');
+    const budgetModUrl = new URL('../src/openai/budget-ledger.mjs', import.meta.url).href;
+    const spawnRegWorker = (ledgerFile, scopeName, credFp) => new Promise((resolveWorker, rejectWorker) => {
+      const code = `
+        import { OpenAiBudgetLedger } from ${JSON.stringify(budgetModUrl)};
+        const l = new OpenAiBudgetLedger(${JSON.stringify(ledgerFile)}, {
+          testMode: true,
+          canonicalRegistryPath: ${JSON.stringify(mpRegPath)},
+        });
+        try {
+          l.bindCredentialFingerprint(${JSON.stringify(scopeName)}, ${JSON.stringify(credFp)});
+        } finally {
+          l.close();
+        }
+      `;
+      const child = spawn(process.execPath, ['--input-type=module', '-e', code], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stderr = '';
+      child.stderr.on('data', chunk => { stderr += chunk.toString('utf8'); });
+      child.on('error', rejectWorker);
+      child.on('close', exitCode => {
+        if (exitCode === 0) resolveWorker();
+        else rejectWorker(new Error(`Worker(${scopeName}) exited ${exitCode}: ${stderr}`));
+      });
+    });
+    await Promise.all([
+      spawnRegWorker(mpLedgerA, 'mp-scope-a', '1'.repeat(64)),
+      spawnRegWorker(mpLedgerB, 'mp-scope-b', '2'.repeat(64)),
+    ]);
+    const verifyMpReg = new DatabaseSync(mpRegPath, { readOnly: true });
+    try {
+      const mpRows = verifyMpReg.prepare('SELECT account_scope, ledger_instance_id FROM canonical_scope_bindings ORDER BY account_scope').all();
+      assert.equal(mpRows.length, 2);
+      assert.ok(mpRows.every(r => typeof r.ledger_instance_id === 'string' && r.ledger_instance_id.length > 10));
+    } finally {
+      verifyMpReg.close();
     }
 
     // 7) P1: Pre-migration SQLite DB with settled_cents=12 & missing provider_response_id column:

@@ -861,8 +861,72 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
   });
   assert.equal(medOversizeAcceptFull.status, 'verified');
 
+  // Dangerous-goods and Holiday-Peak non-SIPP overrides MUST ALSO enforce the 2027 non-peak Oversize/Bulky floor!
+  const medOversizeDgReject = estimateGate1A2027({
+    pkg: { ...oversizePkg, is_dangerous_goods: true },
+    price_usd: 45,
+    fx_cny_per_usd: 7.2,
+    headhaul_usd: 4.0,
+    refund_fraction: 0.04,
+    physical_return_fraction: 0.04,
+    fee_category: 'Home and Kitchen',
+    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
+    collection_rate: 0.005,
+    sales_window: { from: '2027-02-01', through: '2027-09-30' },
+    storage_window: { from: '2027-02-01', through: '2027-09-30' },
+    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+    calculator_verified_override: {
+      verified_by: 'amazon_fba_revenue_calculator',
+      observed_at: '2026-11-22',
+      evidence_ref: 'ev-med-oversize-dg-under',
+      verified_price_band: '10_to_50',
+      effective_from: '2027-01-15',
+      effective_through: '2027-10-14',
+      pkg: { ...oversizePkg, is_dangerous_goods: true },
+      is_dangerous_goods: true,
+      fulfillment_usd: 11.00,
+      placement_usd: 1.50,
+      storage_per_unit_usd: 0.90,
+      returns_processing_usd: 0,
+    },
+  });
+  assert.equal(medOversizeDgReject.status, 'needs_calculator_verification');
+  assert.match(medOversizeDgReject.reason, /medium_oversize/i);
+
+  const medOversizePeakReject = estimateGate1A2027({
+    pkg: oversizePkg,
+    price_usd: 45,
+    fx_cny_per_usd: 7.2,
+    headhaul_usd: 4.0,
+    refund_fraction: 0.04,
+    physical_return_fraction: 0.04,
+    fee_category: 'Home and Kitchen',
+    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
+    collection_rate: 0.005,
+    sales_window: { from: '2027-10-15', through: '2027-12-31' },
+    storage_window: { from: '2027-10-15', through: '2027-12-31' },
+    inbound_window: { from: '2027-10-01', through: '2027-10-10' },
+    calculator_verified_override: {
+      verified_by: 'amazon_fba_revenue_calculator',
+      observed_at: '2026-11-22',
+      evidence_ref: 'ev-med-oversize-peak-under',
+      verified_price_band: '10_to_50',
+      effective_from: '2027-10-15',
+      effective_through: '2027-12-31',
+      pkg: oversizePkg,
+      fulfillment_usd: 11.00,
+      placement_usd: 1.50,
+      storage_per_unit_usd: 2.00,
+      returns_processing_usd: 0,
+    },
+  });
+  assert.equal(medOversizePeakReject.status, 'needs_calculator_verification');
+  assert.match(medOversizePeakReject.reason, /medium_oversize/i);
+
   // Round-4 Coupon: "Save 10% on 2 or more items" ignored as multi-unit promo, "$ 5 off" parsed as $5.00 USD coupon
   assert.equal(parseSingleUnitUsdCoupon('Save 10% on 2 or more items').type, 'none');
+  assert.equal(parseSingleUnitUsdCoupon('Save 10% when buying 2 items').type, 'none');
+  assert.equal(parseSingleUnitUsdCoupon('Save 10% on six or more items').type, 'none');
   assert.equal(parseSingleUnitUsdCoupon('Save $5 on 2 select items').type, 'none');
   assert.deepEqual(parseSingleUnitUsdCoupon('$ 5 off'), { type: 'usd', pct: null, usd: 5 });
   const multiTierPeersBand = analyzeMainstreamPriceBand([

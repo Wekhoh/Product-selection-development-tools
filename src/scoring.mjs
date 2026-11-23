@@ -1253,8 +1253,8 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     if (!ev || typeof ev !== 'object') return false;
     if (text(ev.grain) && ev.grain.trim() !== 'target_child_units') return true;
     const prose = [ev.summary, ev.note, ev.source, ev.label, ev.locator].filter(Boolean).join(' ');
-    const hasMultiOrNegation = /(?:多变体|多个子体|多子体|非单变体|并非单变体|不是单变体|非唯一子体|并非唯一子体|不等于|不等同|不同于|大于目标子体|高于目标子体|超过目标子体|!=|≠|\b(?:multi[- ]variant|multiple\s+(?:child(?:ren)?|variants?)|not\s+(?:a\s+)?(?:single[- ]variant|sole\s+child)|does(?:n't|\s+not)\s+equal|do(?:n't|\s+not)\s+equal|not\s+equal\s+to|unequal)\b)/i.test(prose);
-    if (!hasMultiOrNegation && /(?<!不|非)(?:单变体|唯一子体|仅1个子体|只有一个子体|等于目标子体)|\b(?:single[- ]variant|sole\s+child|only\s+one\s+child|equals?\s+target\s+child)\b/i.test(prose)) {
+    const hasMultiOrNegation = /(?:多变体|多个子体|多子体|(?:并非|绝非|不是|非|不|未|未必|并不|绝不)(?:是|属于|算)?(?:单变体|唯一子体|仅\s*1\s*个子体|只有一个子体|等于|等同)|不等同|不同于|大于目标子体|高于目标子体|超过目标子体|小于目标子体|低于目标子体|包含(?:其余|其他|多个)子体|!=|≠|\b(?:multi[- ]variant|multiple\s+(?:child(?:ren)?|variants?)|(?:not|never|no|cannot|can't|hardly|rarely)\s+(?:a\s+|an\s+|strictly\s+)?(?:single[- ]variant|sole\s+child|only\s+one\s+child|equals?\b|equal\s+to\b)|does(?:n't|\s+not)\s+equal|do(?:n't|\s+not)\s+equal|is(?:n't|\s+not)\s+equal|unequal)\b)/i.test(prose);
+    if (!hasMultiOrNegation && /(?<!不|非|未|必|是)(?:单变体|唯一子体|仅1个子体|只有一个子体|等于目标子体)|\b(?:single[- ]variant|sole\s+child|only\s+one\s+child|equals?\s+target\s+child)\b/i.test(prose)) {
       return false;
     }
     return /parent_family_units|family_representative|父体销量|父体月销|父体汇总销量|\bparent\s+(?:family\s+)?(?:monthly\s*)?(?:sales|units)\b/i.test(prose);

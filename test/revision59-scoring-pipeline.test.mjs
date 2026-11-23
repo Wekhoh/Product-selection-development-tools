@@ -2160,13 +2160,19 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
     assert.equal(g1bLeg.status, 'gate1b_pending');
     assert.match(g1bLeg.reason, /ui_readback/i);
 
-    // HIGH 6: Negated prose "父体销量不等于目标子体销量" must NOT pass Q31 as single-variant!
-    const cNegQ31 = structuredClone(candSingleVar);
-    cNegQ31.evidence.find(e => e.id === 'ev-single-var-exact').source = '多变体同款：父体销量不等于目标子体销量';
-    const scoredNegQ31 = scoreCandidate(cNegQ31, r59Profile);
-    const q31ItemNeg = scoredNegQ31.items.find(i => i.id === 'low_rating_sales_performance');
-    assert.equal(q31ItemNeg.status, 'needs_evidence', 'Negated parent!=child prose must block Q31');
-    assert.equal(scoredNegQ31.qualification.counts_toward_target, false);
+    // HIGH 6: Negated prose ("父体销量不等于目标子体销量", "不是唯一子体，未等于", "never equals target child") must NOT pass Q31 as single-variant!
+    for (const negProse of [
+      '多变体同款：父体销量不等于目标子体销量',
+      '父体销量不是唯一子体，未等于目标子体销量',
+      'Parent family sales never equals target child',
+    ]) {
+      const cNegQ31 = structuredClone(candSingleVar);
+      cNegQ31.evidence.find(e => e.id === 'ev-single-var-exact').source = negProse;
+      const scoredNegQ31 = scoreCandidate(cNegQ31, r59Profile);
+      const q31ItemNeg = scoredNegQ31.items.find(i => i.id === 'low_rating_sales_performance');
+      assert.equal(q31ItemNeg.status, 'needs_evidence', `Negated prose (${negProse}) must block Q31`);
+      assert.equal(scoredNegQ31.qualification.counts_toward_target, false);
+    }
   } finally {
     store.close();
   }
