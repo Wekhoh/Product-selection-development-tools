@@ -183,3 +183,19 @@ _Avoid_: Missing observations, zero score, full score
 **Recorded selection decision (已记录选品判断)**:
 The owner's stated disposition and rationale for a candidate at a particular stage, retained with its evidence context. Continuing research or retaining a candidate does not itself authorize spending or establish commercial success.
 _Avoid_: Purchase approval, validated profitability
+
+**Private-mold reserved pool (私模潜力留存池 / `private_mold_reserved`)**:
+A dedicated disposition for forms whose Amazon demand and competitive structure are promising, but whose domestic 1688 ready-stock search confirms no open public mold is available (private/closed mold only). It separates later custom-tooling candidates from both missing-evidence `pending` forms and economically failed rejections.
+_Avoid_: Discarding high-demand private-mold leads, mixing tooling-only forms into active ready-stock `pending` queues
+
+**Opportunistic long-tail query (蓝海捡漏词 / `long_tail_opportunistic_terms`)**:
+An attribute-heavy or 5+-word search phrase with low or unquoted exact-match ad bidding where competitors have not built dedicated exact-match ad groups. Retained on the card as peripheral traffic context without vetoing or locking the 15-point main-entry suggested-bid item.
+_Avoid_: Treating an unbid 6-word query as a missing main-entry blocker, fabricating a zero CPC quote
+
+**Parent functional proxy bid (上位功能词参考竞价 / `parent_functional_proxy`)**:
+In Revision 59, a labeled suggested-bid reference drawn from the closest evidenced parent functional search terms when a domestic factory cold-start form has no dedicated US marketplace search query yet. Disclosed explicitly as a proxy reference rather than a direct product-specific bid.
+_Avoid_: Silent substitution as a literal product query, locking novel cold-start forms at unscored `null`
+
+**Target-child sales grain (目标子体销量口径 / `target_child_units`)**:
+A Revision 59 observation grain measuring latest-30-day unit sales for the matched specification child variant (using exact single-variant parent units, multi-variant `bought_in_past_month` badge bounds, or median same-spec pure-color variant units) rather than pooling unrelated multi-size parent totals or treating unbadged active sub-50/month variants as zero sales.
+_Avoid_: Attributing an entire multi-size parent's sales to one SKU, treating `<50/month` unbadged active children as dormant zeros

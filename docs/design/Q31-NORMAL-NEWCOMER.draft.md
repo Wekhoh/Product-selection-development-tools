@@ -2,7 +2,14 @@
 
 建立：2026-11-11；更新：2026-11-13。状态：3／2／4／1 分配与四项完整试评规则均已确认，具体真实样本、取数可得性、判断准确度和跨类目校准仍待验证。本稿不是正式算法实现或运行配置。原 2／2／3／3 未获采用。
 
-Current numerical source: [reference-profile.draft.json](reference-profile.draft.json), revision 58. Older dated sections preserve revision 50–57 history and exact replay. The single recovery entry is [STATE.md](../STATE.md).
+Current numerical source: [reference-profile.r59.draft.json](reference-profile.r59.draft.json) (`revision: 59`) alongside frozen [reference-profile.draft.json](reference-profile.draft.json) (`revision: 58`). Older dated sections preserve revision 50–58 history and exact replay. The single recovery entry is [STATE.md](../STATE.md).
+
+## Revision 59 `target_child_units` 3-tier grain & mature-only `T` option (2026-11-23)
+
+Revision 59 extends Q31 comparability and sales grain without changing any of the `3 / 2 / 4 / 1` weights or `r58` greedy/stratified formulas:
+
+- **3-tier `target_child_units` grain (`src/observations.mjs`, `src/scoring.mjs`):** supports `grain: "target_child_units"` alongside `family` / `parent` / `family_representative`: (Tier 1) exact `monthlySales` on single-variant parents (`1–49/mo` observable); (Tier 2) bounded `[B, nextTier - 1]` on multi-variant `bought_in_past_month` badges (`50+`, `100+`, ...); (Tier 3) distinguishes active `<50/mo` starters (positive child review growth, ranked BSR, or SIF child keyword signals) from dormant zeros and unqueried rows, and uses the median same-spec pure-color child when multiple colors share identical physical specs.
+- **Mature-only reference `T` (`current_relevant_bsr_top100_mature_only`) & `<120d` seed-merge guard:** allows `market_reference.scope = "current_relevant_bsr_top100_mature_only"` (`>= 120` days) so short-lived `<120d` launch spirals do not distort `T`, and isolates `<120d` listings carrying merged older reviews out of both Q31 normal-start exemplars and `strict_mature_only` price bands.
 
 ## Revision 58 exact-rational full-month mandatory + greedy ramp-up + 5-quintile stratification (2026-11-19)
 
