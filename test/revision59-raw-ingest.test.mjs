@@ -151,9 +151,11 @@ test('Slice 3B: Stage-1 vs Stage-2 qualitative judgments unlock & paired seasona
     reference_price_usd: 58.00,
   });
   assert.equal(unlocked.judgments.existing_solution_fit.anchor, 3);
-  assert.equal(unlocked.judgments.feasible_light_differentiation.anchor, 0);
+  assert.equal(unlocked.judgments.feasible_light_differentiation.anchor, null);
   assert.equal(unlocked.judgments.specific_design_rights.anchor, 3);
-  assert.equal(unlocked.judgments.applicable_public_requirements.anchor, 1);
+  assert.equal(unlocked.judgments.applicable_public_requirements.anchor, null);
+  assert.equal(unlocked.judgments.applicable_public_requirements.prescreen_completed, true);
+  assert.equal(unlocked.judgments.applicable_public_requirements.sample_check_required, true);
   assert.ok(unlocked.objective_tags.includes('寡头高利·二阶段专利预警'));
   assert.ok(unlocked.objective_tags.includes('留存后二阶段实物细节专利复核'));
 
@@ -385,15 +387,17 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       candidates: [{ candidate: cAlpha, raw_receipt_files: ['alpha-receipt.json'] }],
     }, r59Profile, { baseDir: dir, ledgerDbPath: join(dir, 'does-not-exist.sqlite') }), /Specified ledger_db_path does not exist/i);
 
-    // SQLite ledgerDbPath rejects receipts absent from completed api_request_ledger, and accepts once completed!
+    // SQLite ledgerDbPath tags receipts absent from completed api_request_ledger with ledger_provenance_verified: false (provenance tag, non-blocking), and flips to true once completed!
     const dbPath = join(dir, 'ledger-verify.sqlite');
     const st = openSelectionStore(dbPath);
     st.close();
-    assert.throws(() => ingestTrialSpecification({
+    const unloggedOut = ingestTrialSpecification({
       profile_revision: 59,
       raw_receipt_files: ['alpha-receipt.json'],
       candidates: [{ candidate: cAlpha, raw_receipt_files: ['alpha-receipt.json'] }],
-    }, r59Profile, { baseDir: dir, ledgerDbPath: dbPath }), /api_request_ledger/i);
+    }, r59Profile, { baseDir: dir, ledgerDbPath: dbPath });
+    assert.equal(unloggedOut.ledger_provenance_verified, false);
+    assert.deepEqual(unloggedOut.unmatched_ledger_receipt_files, ['alpha-receipt.json']);
 
     const stWrite = openSelectionStore(dbPath);
     const resAttempt = stWrite.reserveRequestAttempt({
@@ -416,6 +420,7 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       raw_receipt_files: ['alpha-receipt.json'],
       candidates: [{ candidate: cAlphaWithRaster, raw_receipt_files: ['alpha-receipt.json'] }],
     }, r59Profile, { baseDir: dir, ledgerDbPath: dbPath });
+    assert.equal(verifiedRasterOut.ledger_provenance_verified, true);
     assert.equal(verifiedRasterOut.per_candidate_verified_asin_counts['cand-alpha'], 1);
 
     // 3) BLOCKER 3b: buildPairedSeasonalOperatingPeriods rejects omitting a declared off-peak scenario, omitting a quote_id, OR submitting a 2x2 diagonal 2-cell matrix!
@@ -537,11 +542,25 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       evidence: cAlpha.screening.reference_price_usd.evidence,
     };
     cHijackBundleAnchor.economics.scenarios[0].cost_ledger.price_usd = 290.00;
+    const r58LegacyProfile = structuredClone(r59Profile);
+    r58LegacyProfile.revision = 58;
+    if (r58LegacyProfile.workflow?.scoring_and_ordering) r58LegacyProfile.workflow.scoring_and_ordering.revision = 58;
     assert.throws(() => ingestTrialSpecification({
+      profile_revision: 58,
+      raw_receipt_files: ['mixed-page-receipt.json'],
+      candidates: [{ candidate: structuredClone(cHijackBundleAnchor), raw_receipt_files: ['mixed-page-receipt.json'] }],
+    }, r58LegacyProfile, { baseDir: dir }), /Scenario price provenance violation/i);
+
+    const r59AmberBundleOut = ingestTrialSpecification({
       profile_revision: 59,
       raw_receipt_files: ['mixed-page-receipt.json'],
       candidates: [{ candidate: cHijackBundleAnchor, raw_receipt_files: ['mixed-page-receipt.json'] }],
-    }, r59Profile, { baseDir: dir }), /Scenario price provenance violation/i);
+    }, r59Profile, { baseDir: dir });
+    assert.equal(
+      r59AmberBundleOut.batch.candidates[0].review_notes.some(n => n.kind === 'AMBER_BUNDLE_PRICE_CHECK'),
+      true,
+      'r59 attaches amber multi-pack/bundle verification note instead of throwing TypeError',
+    );
 
     // 6) Round-3 BLOCKER 3b: ingestTrialSpecification with ledgerDbPath enforces SQLite Gate 1A declared prices [$40, $55] x quotes ['q-1', 'q-2']!
     const dbMatrixPath = join(dir, 'matrix-verify.sqlite');
@@ -674,10 +693,19 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
     };
     cValRangeHijack.economics.scenarios[0].cost_ledger.price_usd = 290.00;
     assert.throws(() => ingestTrialSpecification({
+      profile_revision: 58,
+      raw_receipt_files: ['small-page-bundle.json'],
+      candidates: [{ candidate: structuredClone(cValRangeHijack), raw_receipt_files: ['small-page-bundle.json'] }],
+    }, r58LegacyProfile, { baseDir: dir }), /Scenario price provenance violation/i);
+    const r59ValRangeAmber = ingestTrialSpecification({
       profile_revision: 59,
       raw_receipt_files: ['small-page-bundle.json'],
       candidates: [{ candidate: cValRangeHijack, raw_receipt_files: ['small-page-bundle.json'] }],
-    }, r59Profile, { baseDir: dir }), /Scenario price provenance violation/i);
+    }, r59Profile, { baseDir: dir });
+    assert.equal(
+      r59ValRangeAmber.batch.candidates[0].review_notes.some(n => n.kind === 'AMBER_BUNDLE_PRICE_CHECK'),
+      true,
+    );
 
     const cExclTaskHijack = structuredClone(fixture.candidates[0]);
     cExclTaskHijack.id = 'cand-excl-task-hijack';
@@ -844,12 +872,16 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       candidates: [{ candidate: cStaleFx, raw_receipt_files: ['mat-receipt.json'] }],
     }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath }), /fx_cny_per_usd.*conflicts/i);
 
-    assert.throws(() => ingestTrialSpecification({
+    const expOut1 = ingestTrialSpecification({
       profile_revision: 59,
-      as_of_date: '2027-01-10', // AFTER q-now-fresh expires_at (2026-12-22)!
+      as_of_date: '2027-01-10', // AFTER q-now-fresh expires_at (2026-12-22) -> isolated to pending!
       raw_receipt_files: ['mat-receipt.json'],
       candidates: [{ candidate: cExpFresh, raw_receipt_files: ['mat-receipt.json'] }],
-    }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath }), /expired as of 2027-01-10/i);
+    }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath });
+    assert.equal(expOut1.isolated_candidates.length, 1);
+    assert.match(expOut1.isolated_candidates[0].reason, /expired as of 2027-01-10/i);
+    assert.equal(expOut1.scored.candidates[0].qualification.counts_toward_target, false);
+    assert.equal(expOut1.scored.candidates[0].queue, 'pending');
 
     // Backdated spec.as_of_date CANNOT rewind past candidate observation_date to resurrect an expired SQLite quote,
     // and SQLite Gate-1A accepted fx_cny_per_usd (7.2) blocks stale 7.4 even when quote.fx_cny_per_usd is null!
@@ -880,12 +912,15 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
 
     const cFutureObsBackdate = structuredClone(cExpFresh);
     cFutureObsBackdate.evidence.push({ id: 'ev-jan-obs', source: 'Observed Jan 2027', observed_at: '2027-01-10' });
-    assert.throws(() => ingestTrialSpecification({
+    const expOut2 = ingestTrialSpecification({
       profile_revision: 59,
-      as_of_date: '2026-11-13', // backdated BEFORE 2027-01-10 evidence!
+      as_of_date: '2026-11-13', // backdated BEFORE 2027-01-10 evidence -> still isolated as expired!
       raw_receipt_files: ['mat-receipt.json'],
       candidates: [{ candidate: cFutureObsBackdate, raw_receipt_files: ['mat-receipt.json'] }],
-    }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath }), /expired as of 2027-01-10/i);
+    }, r59Profile, { baseDir: dir, ledgerDbPath: dbMatrixPath });
+    assert.equal(expOut2.isolated_candidates.length, 1);
+    assert.match(expOut2.isolated_candidates[0].reason, /expired as of 2027-01-10/i);
+    assert.equal(expOut2.scored.candidates[0].qualification.counts_toward_target, false);
 
     // Round-4 BLOCKER 4a-d:
     //  - Seasonal primary [2..9] period renamed id:'peak' + companion [10..12] renamed id:'holiday' STILL rejects $289.99;

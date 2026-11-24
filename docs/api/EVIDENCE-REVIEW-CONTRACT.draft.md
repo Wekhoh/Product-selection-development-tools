@@ -1,7 +1,9 @@
 # Optional evidence review contract
 
-Version: `evidence-review-draft-v1`. Prepared: 2026-11-14. Updated: 2026-11-21.
-Status: **transport-agnostic contract & offline validator implemented in Node.js 24 ESM (`src/openai/evidence-review.mjs`, `src/openai/codex-runner.mjs`, `src/openai/client.mjs`)**; primary Gate-4 execution routes through local subscription-backed `Codex CLI` (`gpt-6.2-astra`) at `$0` API spend, while paid HTTP API execution remains disabled by default (`enabled: false`).
+Version: `evidence-review-draft-v1`. Prepared: 2026-11-14. Updated: 2026-11-24.
+Status: **transport-agnostic contract & offline validator implemented in Node.js 24 ESM (`src/openai/evidence-review.mjs`, `src/openai/codex-runner.mjs`, `src/openai/client.mjs`)**; primary Gate-4 execution routes through local subscription-backed `Codex CLI` (`gpt-6.2-astra`, running strictly on qualifying cards where `counts_toward_target === true`) at `$0` API spend, while paid HTTP API execution remains disabled by default (`enabled: false`).
+
+> **2026-11-24 Revision 59 Unshackling Update (superseding historical 2026-11-21 sandbox/URL/size caps below):** `src/openai/codex-runner.mjs` and `src/openai/evidence-review.mjs` inherit the host `~/.codex/config.toml` toolchain directly via `codex exec --ephemeral` (without `--ignore-user-config`, `-s read-only`, or `-c mcp_servers={}` locks), defaulting to `web_search="live"`, `timeoutMs = null`, full `process.env` inheritance stripping ONLY `OPENAI_(API_KEY|BASE_URL|ORG_ID|PROJECT_ID|API_BASE)` and `CODEX_API_KEY`, `2 MiB` output / `8 MiB` receipt / `200 subjects` / `100 questions` / `1,000 evidence` bounds, free-form `runCodexExecMarkdown` for code/architecture audits, external URL/repo/MCP citations allowed in `evidence_ids` & explanations, `.local/` checking `containsSecretToken` only (with `redactShareableReviewTree` / `sanitizeDiagnosticText` still applied on rendered HTML/CLI display), and prompts governed by **"目标 + 验收标准 + 两条边界（禁写主工作区/账本、禁写亚马逊真实店铺且走本地订阅 `$0` API 费）+ 自由发挥"**. The 2026-11-21 clauses below are retained as historical Phase-4 provenance.
 
 ## Recommendation, caller and 2026-11-21 transport routing
 

@@ -1,4 +1,12 @@
-# Offline trial input (revision 58, with revision-50–57 replay)
+# Offline trial input (revision 58–59, with revision-50–57 replay)
+
+## Revision 59 contract additions (2026-11-24)
+
+All revision-50–58 frozen replays remain 100% byte-identical on [reference-profile.draft.json](reference-profile.draft.json) (`revision: 58`). Under runtime-default `profile_revision: 59` ([reference-profile.r59.draft.json](reference-profile.r59.draft.json)):
+
+- **2027 off-peak window separation & Q4 peak blank:** default 2027 off-peak sales/fulfillment covers `2027-02-01..2027-10-14` (`months: [2..10]`) while off-peak monthly storage remains independently bounded to `2027-02-01..2027-09-30` (and companion peak sales `2027-10-15..2028-01-14` / peak storage `2027-10-01..2027-12-31` keep peak margin `null` with `"待亚马逊公布 2027 旺季费率后补充"`, rejecting 2026 peak uplift extrapolation).
+- **`sample_pending_qualifying` & crossing-`30%` linear slope:** when all 14 core items (`85` pts) pass at `>= 30%` single-factory complete-kit margin and public IP/compliance pre-screens show zero proven conflict, post-sample/supplier-inquiry items remain `null` while `qualification` emits `counts_toward_target: true` (`mode: "sample_pending_qualifying"` or `"seasonal_sample_pending_qualifying"`). Crossing-`30%` primary intervals evaluate `< 30%` scenario endpoints along `min(22, max(0, 11 + 55*(m - 0.30)))` (`effective_disposition: "crossing_30pct_interval"`, `counts_toward_target: false`).
+- **4 hard kill lines, `#4` total demand & 3-tier age priority:** hard eliminations are limited to price `>= $29.99`, single-factory complete-kit margin upper bound `>= 30%`, CPSC `<= 12y` children's product or proven IP conflict, and time/date dependency; `#4 purchase_demand_scale` rejects `single_color_child_median`; Q31 accepts `NEAR_30_DAYS` rolling SellerSprite windows and `target_child_units` intervals; and `src/raw-ingest.mjs` isolates single-candidate faults without crashing the batch.
 
 ## Revision 58 contract additions (2026-11-19)
 

@@ -14,11 +14,27 @@ import { resolve } from 'node:path';
 import {
   resolveCategoryReturnWithFallback,
   deduplicateParentSalesRows,
+  extractNewcomerReviewOriginBreakdown,
 } from './observations.mjs';
 import { scoreBatch } from './scoring.mjs';
+import { calculateEconomics } from './economics.mjs';
 import { assertNoRawPii, containsSecretToken } from './contracts.mjs';
 import { analyzeMainstreamPriceBand, parseSingleUnitUsdCoupon } from './price-band.mjs';
-import { resolveEffectivePricing } from './fee-basis.mjs';
+import { resolveEffectivePricing, computeHeadhaulWithA4Rules } from './fee-basis.mjs';
+import {
+  FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+  FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
+  FBA_2027_COMPANION_PEAK_STORAGE_WINDOW,
+  FBA_2027_DEFAULT_INBOUND_WINDOW,
+  FBA_2027_UNPUBLISHED_PEAK_WINDOW,
+  UNPUBLISHED_2027_PEAK_MARGIN_NOTE,
+  classifySizeTier2027,
+  lookupUnifiedFulfillmentFee2027,
+  lookupUnifiedStorageFee2027,
+  lookupUnifiedPlacementFee2027,
+  lookupUnifiedReturnsProcessing2027,
+  computeMatchedPeerMedianPackage,
+} from './fba-rates-2027.mjs';
 import { canonicalJson, openSelectionStore, sha256Hex } from './store.mjs';
 
 const ASIN_EXACT_RE = /^B0[A-Z0-9]{8}$/;
@@ -43,6 +59,7 @@ function hasUpstreamErrorMarkers(obj) {
   if (!obj || typeof obj !== 'object') return false;
   if (obj.isError === true) return true;
   if (obj.error !== undefined && obj.error !== null && obj.error !== false && obj.error !== '') return true;
+  if (Array.isArray(obj.errors) && obj.errors.length > 0) return true;
   if (obj.status === 'failed' || obj.status === 'error') return true;
   if (obj.code !== undefined && obj.code !== null && !['OK', '0', 0, 200].includes(obj.code)) {
     return true;
@@ -153,9 +170,7 @@ function extractStructuredPricesFromObject(obj) {
       addPrice(baseListPrice - parsedCoupon.usd);
     }
   }
-  // SP-API fee estimate / pricing summary structures
-  addPrice(obj?.PriceToEstimateFees?.ListingPrice?.Amount);
-  addPrice(obj?.FeesEstimateIdentifier?.PriceToEstimateFees?.ListingPrice?.Amount);
+  // SP-API competitive pricing summary structures (do NOT treat PriceToEstimateFees input query price as observed market price)
   for (const lp of obj?.Summary?.LowestPrices ?? []) {
     addPrice(lp?.LandedPrice?.Amount);
     addPrice(lp?.ListingPrice?.Amount);
@@ -509,6 +524,482 @@ export function classifySpApiRestrictionReasons(reasons = [], { target_is_own_wh
   };
 }
 
+function spApiMeasureToInches(measure) {
+  if (!measure || typeof measure !== 'object' || !finite(measure.value) || measure.value <= 0) return null;
+  const u = String(measure.unit ?? '').trim().toLowerCase();
+  if (u === 'inches' || u === 'inch' || u === 'in') return Number(measure.value.toFixed(6));
+  if (u === 'centimeters' || u === 'centimeter' || u === 'cm') return Number((measure.value / 2.54).toFixed(6));
+  if (u === 'millimeters' || u === 'millimeter' || u === 'mm') return Number((measure.value / 25.4).toFixed(6));
+  if (u === 'feet' || u === 'foot' || u === 'ft') return Number((measure.value * 12).toFixed(6));
+  return null;
+}
+
+function spApiWeightToPounds(measure) {
+  if (!measure || typeof measure !== 'object' || !finite(measure.value) || measure.value <= 0) return null;
+  const u = String(measure.unit ?? '').trim().toLowerCase();
+  if (u === 'pounds' || u === 'pound' || u === 'lbs' || u === 'lb') return Number(measure.value.toFixed(6));
+  if (u === 'ounces' || u === 'ounce' || u === 'oz') return Number((measure.value / 16).toFixed(6));
+  if (u === 'kilograms' || u === 'kilogram' || u === 'kg') return Number((measure.value / 0.45359237).toFixed(6));
+  if (u === 'grams' || u === 'gram' || u === 'g') return Number((measure.value / 453.59237).toFixed(6));
+  return null;
+}
+
+/**
+ * Extract official Amazon packaged dimensions/weight, exact category referral rate, real-time FBA fee calibration,
+ * and listing restriction status from read-only SP-API finalist receipts (`catalogItems_getCatalogItem`,
+ * `productFees_getMyFeesEstimateForASIN/Estimates`, `listingsRestrictions_getListingsRestrictions`).
+ * Automatically detects and overrides stale SellerSprite cached dimensions/weights.
+ */
+export function extractSpApiFinalistCalibration({
+  asin: requestedAsin = null,
+  marketplace_id = 'ATVPDKIKX0DER',
+  currency = 'USD',
+  catalogItemRaw = null,
+  feesEstimateRaw = null,
+  restrictionsRaw = null,
+  sellerSpriteCachedRow = null,
+  price_usd = null,
+  target_is_own_white_label = true,
+} = {}) {
+  if (catalogItemRaw && isPayloadUpstreamFailure(catalogItemRaw)) {
+    throw new TypeError('SP-API catalogItems_getCatalogItem receipt contains an upstream error.');
+  }
+  if (feesEstimateRaw && isPayloadUpstreamFailure(feesEstimateRaw)) {
+    throw new TypeError('SP-API productFees receipt contains an upstream error.');
+  }
+  if (restrictionsRaw && isPayloadUpstreamFailure(restrictionsRaw)) {
+    throw new TypeError('SP-API listingsRestrictions receipt contains an upstream error.');
+  }
+
+  const reqAsin = nonemptyStr(requestedAsin) ? requestedAsin.trim().toUpperCase() : null;
+  const targetMkt = nonemptyStr(marketplace_id) ? marketplace_id.trim() : 'ATVPDKIKX0DER';
+  const targetCur = nonemptyStr(currency) ? currency.trim().toUpperCase() : 'USD';
+
+  const catBody = catalogItemRaw ? unwrapMcpEnvelope(catalogItemRaw) : null;
+  const feesBody = feesEstimateRaw ? unwrapMcpEnvelope(feesEstimateRaw) : null;
+  const restBody = restrictionsRaw ? unwrapMcpEnvelope(restrictionsRaw) : null;
+
+  let asin = reqAsin;
+  let officialPkg = null;
+  if (catBody && typeof catBody === 'object') {
+    const catAsin = nonemptyStr(catBody.asin) ? catBody.asin.trim().toUpperCase() : null;
+    if (reqAsin && catAsin && catAsin !== reqAsin) {
+      throw new TypeError(`SP-API catalogItems ASIN ("${catAsin}") conflicts with requested ASIN ("${reqAsin}").`);
+    }
+    if (catAsin) asin = catAsin;
+    const dimArr = Array.isArray(catBody.dimensions) ? catBody.dimensions : [];
+    const matchedDimRow = dimArr.find(d => !d?.marketplaceId || d.marketplaceId === targetMkt)
+      ?? (dimArr.length === 1 && !dimArr[0]?.marketplaceId ? dimArr[0] : null);
+    const dimEntry = matchedDimRow?.package ?? null;
+    const attrPkgDimArr = Array.isArray(catBody.attributes?.item_package_dimensions)
+      ? catBody.attributes.item_package_dimensions
+      : [];
+    const attrPkgDim = attrPkgDimArr.find(d => !d?.marketplace_id || d.marketplace_id === targetMkt) ?? null;
+    const attrPkgWtArr = Array.isArray(catBody.attributes?.item_package_weight)
+      ? catBody.attributes.item_package_weight
+      : [];
+    const attrPkgWt = attrPkgWtArr.find(w => !w?.marketplace_id || w.marketplace_id === targetMkt) ?? null;
+    const lengthIn = spApiMeasureToInches(dimEntry?.length ?? attrPkgDim?.length);
+    const widthIn = spApiMeasureToInches(dimEntry?.width ?? attrPkgDim?.width);
+    const heightIn = spApiMeasureToInches(dimEntry?.height ?? attrPkgDim?.height);
+    const weightLb = spApiWeightToPounds(dimEntry?.weight ?? attrPkgWt);
+    if (lengthIn !== null && widthIn !== null && heightIn !== null && weightLb !== null) {
+      officialPkg = {
+        ...(asin ? { asin } : {}),
+        length_in: lengthIn,
+        width_in: widthIn,
+        height_in: heightIn,
+        unit_weight_lb: weightLb,
+        is_sp_api_official: true,
+        source: 'sp_api_catalog_items',
+      };
+    }
+  }
+
+  let feeCalibration = null;
+  let feeCalibrationStatus = null;
+  if (feesBody && typeof feesBody === 'object') {
+    const rawList = Array.isArray(feesBody)
+      ? feesBody
+      : (Array.isArray(feesBody.FeesEstimateResultList)
+        ? feesBody.FeesEstimateResultList
+        : (Array.isArray(feesBody.payload?.FeesEstimateResultList)
+          ? feesBody.payload.FeesEstimateResultList
+          : (Array.isArray(feesBody.payload)
+            ? feesBody.payload
+            : [feesBody.FeesEstimateResult ?? feesBody.payload?.FeesEstimateResult ?? feesBody])));
+    const candidateNodes = rawList
+      .map(n => (n && typeof n === 'object' ? (n.FeesEstimateResult ?? n) : null))
+      .filter(Boolean);
+
+    const hasRealErrorObj = errObj => Boolean(
+      errObj && typeof errObj === 'object' && (
+        nonemptyStr(errObj.Code) || nonemptyStr(errObj.Message) ||
+        nonemptyStr(errObj.code) || nonemptyStr(errObj.message)
+      ),
+    );
+    const asinScopedNodes = candidateNodes.filter(node => {
+      const ident = node?.FeesEstimateIdentifier ?? node?.feesEstimateIdentifier ?? null;
+      const idVal = nonemptyStr(ident?.IdValue) ? ident.IdValue.trim().toUpperCase() : null;
+      const mktId = nonemptyStr(ident?.MarketplaceId) ? ident.MarketplaceId.trim() : null;
+      const curCode = nonemptyStr(ident?.PriceToEstimateFees?.ListingPrice?.CurrencyCode)
+        ? ident.PriceToEstimateFees.ListingPrice.CurrencyCode.trim().toUpperCase()
+        : null;
+      const isFba = ident?.IsAmazonFulfilled;
+      const lp = ident?.PriceToEstimateFees?.ListingPrice?.Amount;
+      if (asin && idVal && idVal !== asin) return false;
+      if (asin && !idVal && candidateNodes.length > 1) return false;
+      if (!asin && candidateNodes.length > 1) return false;
+      if (mktId && mktId !== targetMkt) return false;
+      if (curCode && curCode !== targetCur) return false;
+      if (isFba === false) return false;
+      if (finite(price_usd) && price_usd > 0 && finite(lp) && Math.round(lp * 100) !== Math.round(price_usd * 100)) return false;
+      return true;
+    });
+
+    for (const node of asinScopedNodes) {
+      const st = nonemptyStr(node?.Status) ? node.Status.trim().toLowerCase() : null;
+      if ((st && st !== 'success') || hasRealErrorObj(node?.Error ?? node?.error)) {
+        throw new TypeError(`SP-API productFees FeesEstimateResult failed (${node?.Error?.Code ?? node?.Status ?? 'error'}).`);
+      }
+    }
+
+    const matchedNodes = asinScopedNodes.filter(node => {
+      const est = node?.FeesEstimate ?? node?.feesEstimate ?? null;
+      return Boolean(est && typeof est === 'object');
+    });
+
+    if (matchedNodes.length === 1) {
+      const resNode = matchedNodes[0];
+      const est = resNode?.FeesEstimate ?? resNode?.feesEstimate ?? null;
+      const ident = resNode?.FeesEstimateIdentifier ?? resNode?.feesEstimateIdentifier ?? null;
+      if (!asin && nonemptyStr(ident?.IdValue)) asin = ident.IdValue.trim().toUpperCase();
+      const listingPriceAmt = ident?.PriceToEstimateFees?.ListingPrice?.Amount ?? price_usd ?? null;
+      const details = Array.isArray(est.FeeDetailList) ? est.FeeDetailList : [];
+      const findFee = type => details.find(d => String(d?.FeeType || '').toLowerCase() === type.toLowerCase());
+      const refRow = findFee('ReferralFee');
+      const fbaRow = findFee('FBAFees');
+      const vcfRow = findFee('VariableClosingFee');
+      const referralUsd = finite(refRow?.FinalFee?.Amount) ? refRow.FinalFee.Amount : (finite(refRow?.FeeAmount?.Amount) ? refRow.FeeAmount.Amount : null);
+      const fbaLiveUsd = finite(fbaRow?.FinalFee?.Amount) ? fbaRow.FinalFee.Amount : (finite(fbaRow?.FeeAmount?.Amount) ? fbaRow.FeeAmount.Amount : null);
+      const vcfUsd = finite(vcfRow?.FinalFee?.Amount) ? vcfRow.FinalFee.Amount : 0;
+      const totalFeesUsd = finite(est.TotalFeesEstimate?.Amount) ? est.TotalFeesEstimate.Amount : null;
+      const referralFraction = (referralUsd !== null && finite(listingPriceAmt) && listingPriceAmt > 0)
+        ? Number((referralUsd / listingPriceAmt).toFixed(6))
+        : null;
+      feeCalibration = {
+        listing_price_usd: listingPriceAmt,
+        referral_fee_usd: referralUsd,
+        referral_fraction: referralFraction,
+        live_fba_fulfillment_usd: fbaLiveUsd,
+        variable_closing_fee_usd: vcfUsd,
+        total_fees_estimate_usd: totalFeesUsd,
+        source: 'sp_api_product_fees',
+      };
+      feeCalibrationStatus = 'verified';
+    } else {
+      feeCalibrationStatus = matchedNodes.length === 0 ? 'unmatched' : 'ambiguous_multiple_estimates';
+    }
+  }
+
+  let restrictions = null;
+  if (restBody !== null) {
+    if (!restBody || typeof restBody !== 'object' || (!Array.isArray(restBody.restrictions) && !Array.isArray(restBody))) {
+      throw new TypeError('SP-API listingsRestrictions payload is missing a valid restrictions[] array.');
+    }
+    if (asin && nonemptyStr(restBody.asin) && restBody.asin.trim().toUpperCase() !== asin) {
+      throw new TypeError(`SP-API listingsRestrictions ASIN ("${restBody.asin.trim().toUpperCase()}") conflicts with target ASIN ("${asin}").`);
+    }
+    const restArr = Array.isArray(restBody.restrictions) ? restBody.restrictions : restBody;
+    const asinFilteredRest = restArr.filter(r => {
+      if (asin && nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() !== asin) return false;
+      if (nonemptyStr(r?.marketplaceId) && r.marketplaceId.trim() !== targetMkt) return false;
+      if (nonemptyStr(r?.conditionType) && r.conditionType.trim().toLowerCase() !== 'new_new') return false;
+      return true;
+    });
+    const allReasons = asinFilteredRest.flatMap(r => Array.isArray(r?.reasons) ? r.reasons : []);
+    restrictions = {
+      restriction_count: asinFilteredRest.length,
+      ...classifySpApiRestrictionReasons(allReasons, { target_is_own_white_label }),
+    };
+  }
+
+  const evalPrice = finite(price_usd) && price_usd > 0
+    ? price_usd
+    : (finite(feeCalibration?.listing_price_usd) && feeCalibration.listing_price_usd > 0 ? feeCalibration.listing_price_usd : 39.99);
+  const local2027 = officialPkg
+    ? lookupUnifiedFulfillmentFee2027({
+      pkg: officialPkg,
+      price_usd: evalPrice,
+      sales_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+    })
+    : null;
+
+  let staleCacheAudit = null;
+  if (officialPkg && sellerSpriteCachedRow && typeof sellerSpriteCachedRow === 'object') {
+    const ssPkg = {
+      length_in: sellerSpriteCachedRow.length_in ?? sellerSpriteCachedRow.pkgLength,
+      width_in: sellerSpriteCachedRow.width_in ?? sellerSpriteCachedRow.pkgWidth,
+      height_in: sellerSpriteCachedRow.height_in ?? sellerSpriteCachedRow.pkgHeight,
+      unit_weight_lb: sellerSpriteCachedRow.unit_weight_lb ?? sellerSpriteCachedRow.weight_lb ?? sellerSpriteCachedRow.pkgWeight,
+      length_cm: sellerSpriteCachedRow.length_cm,
+      width_cm: sellerSpriteCachedRow.width_cm,
+      height_cm: sellerSpriteCachedRow.height_cm,
+      unit_weight_kg: sellerSpriteCachedRow.unit_weight_kg ?? sellerSpriteCachedRow.weight_kg,
+    };
+    const ssTier = classifySizeTier2027(ssPkg);
+    if (ssTier.status === 'verified') {
+      const ssFul2027 = lookupUnifiedFulfillmentFee2027({
+        pkg: ssPkg,
+        price_usd: evalPrice,
+        sales_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+      });
+      const weightDeltaLb = Number((officialPkg.unit_weight_lb - ssTier.unit_weight_lb).toFixed(4));
+      const fbaDeltaUsd = (local2027?.status === 'verified' && ssFul2027.status === 'verified')
+        ? Number((local2027.total_usd - ssFul2027.total_usd).toFixed(4))
+        : null;
+      staleCacheAudit = {
+        stale_sellersprite_cache_corrected:
+          Math.abs(weightDeltaLb) >= 0.05 ||
+          ssTier.size_tier !== local2027?.size_tier ||
+          (fbaDeltaUsd !== null && Math.abs(fbaDeltaUsd) >= 0.05),
+        sellersprite_cached_size_tier: ssTier.size_tier,
+        sp_api_official_size_tier: local2027?.size_tier ?? null,
+        sellersprite_cached_weight_lb: ssTier.unit_weight_lb,
+        sp_api_official_weight_lb: officialPkg.unit_weight_lb,
+        weight_delta_lb: weightDeltaLb,
+        sellersprite_cached_fba_2027_usd: ssFul2027.status === 'verified' ? ssFul2027.total_usd : null,
+        sp_api_official_fba_2027_usd: local2027?.status === 'verified' ? local2027.total_usd : null,
+        fba_2027_delta_usd: fbaDeltaUsd,
+      };
+    }
+  }
+
+  return {
+    asin,
+    official_pkg: officialPkg,
+    local_2027_off_peak_fulfillment: local2027?.status === 'verified' ? local2027 : null,
+    fee_calibration: feeCalibration,
+    ...(feeCalibrationStatus ? { fee_calibration_status: feeCalibrationStatus } : {}),
+    restrictions,
+    stale_sellersprite_audit: staleCacheAudit,
+    calibration_source: 'sp_api_readonly_finalist',
+  };
+}
+
+/**
+ * Scan raw payloads for SP-API `catalogItems_getCatalogItem` receipts and return official peer package specs.
+ */
+export function extractSpApiPeerPackagesFromRawPayloads(rawPayloads = []) {
+  const peers = [];
+  for (const entry of rawPayloads) {
+    const raw = entry?.payload ?? entry;
+    if (isFailedOrEmptyRawReceipt(raw)) continue;
+    try {
+      const cal = extractSpApiFinalistCalibration({ catalogItemRaw: raw });
+      if (cal.official_pkg) peers.push(cal.official_pkg);
+    } catch { /* ignore non-catalog payloads */ }
+  }
+  return peers;
+}
+
+/**
+ * Normalize SellerSprite latest monthly archive macro metrics (`category_report_detail` / `category_stats_list`)
+ * directly into `candidate.market` under Revision 59+ (accepting monthly archive directly for macro structure).
+ */
+export function ingestSellerSpriteMonthlyArchiveMarket(archiveRaw, {
+  evidence = [],
+  report_id = 'sellersprite-monthly-archive',
+  population = '卖家精灵最新月度归档类目宏观样本',
+  family_basis = '卖家精灵月度归档父体/Listing 口径',
+} = {}) {
+  if (!archiveRaw || isPayloadUpstreamFailure(archiveRaw)) {
+    throw new TypeError('Valid SellerSprite monthly archive receipt is required.');
+  }
+  const body = unwrapMcpEnvelope(archiveRaw);
+  if (Array.isArray(body?.items) && body.items.length === 0 && !body?.stat && !body?.detail) {
+    throw new TypeError('SellerSprite monthly archive items[] is empty; required category record is missing.');
+  }
+  const row = Array.isArray(body?.items) ? body.items[0] : (body?.stat ?? body?.detail ?? body);
+  if (!row || typeof row !== 'object' || Array.isArray(row)) {
+    throw new TypeError('SellerSprite monthly archive payload contains no structured category record.');
+  }
+  const normFrac = v => {
+    if (!finite(v) || v < 0) return null;
+    return v > 1 ? Number((v / 100).toFixed(6)) : Number(v.toFixed(6));
+  };
+  const rawMonth = String(row.dataMonth ?? row.month ?? body?.dataMonth ?? '').trim();
+  const archiveMonth = /^\d{6}$/.test(rawMonth)
+    ? `${rawMonth.slice(0, 4)}-${rawMonth.slice(4, 6)}`
+    : (nonemptyStr(rawMonth) ? rawMonth : null);
+
+  const countShare = normFrac(row.newProductRatio ?? row.newProductsRatio ?? row.newcomer_count_share);
+  const salesShare = normFrac(row.newProductSalesRatio ?? row.newProductsSalesRatio ?? row.newcomer_sales_share);
+  const prodConc = normFrac(row.commodityConcentration ?? row.top10ProductSalesRatio ?? row.product_concentration_top10);
+  const brandConc = normFrac(row.brandConcentration ?? row.top10BrandSalesRatio ?? row.brand_concentration_top10);
+  const sellerConc = normFrac(row.sellerConcentration ?? row.top10SellerSalesRatio ?? row.seller_concentration_top10);
+  const amzSalesShare = normFrac(row.amzSalesRatio ?? row.amzUnitRatio ?? row.amz_sales_share ?? body?.stat?.amzSalesRatio);
+  const rawSellerCount = row.sellers ?? row.sellerCount ?? row.seller_count ?? body?.stat?.sellers;
+  const sellerCount = finite(rawSellerCount) && rawSellerCount >= 0 ? Math.round(rawSellerCount) : null;
+
+  let top10MedianReviews = finite(row.top10_median_reviews ?? row.top10MedianReviews ?? row.medianReviews)
+    ? Number(row.top10_median_reviews ?? row.top10MedianReviews ?? row.medianReviews)
+    : null;
+  const categoryAvgReviews = finite(row.avgReviews ?? row.average_reviews ?? row.category_avg_reviews)
+    ? Number(row.avgReviews ?? row.average_reviews ?? row.category_avg_reviews)
+    : null;
+  let top10ReviewSampleCount = finite(row.top10_review_sample_count ?? row.top10ReviewSampleCount)
+    ? Math.round(Number(row.top10_review_sample_count ?? row.top10ReviewSampleCount))
+    : null;
+  if (top10MedianReviews === null && Array.isArray(body?.items) && body.items.length > 0) {
+    const revNums = body.items
+      .slice(0, 10)
+      .map(it => it?.ratings ?? it?.reviews ?? it?.reviewCount)
+      .filter(v => finite(v) && v >= 0)
+      .sort((a, b) => a - b);
+    top10ReviewSampleCount = revNums.length;
+    if (revNums.length >= 2) {
+      const mid = Math.floor(revNums.length / 2);
+      top10MedianReviews = revNums.length % 2 === 1 ? revNums[mid] : (revNums[mid - 1] + revNums[mid]) / 2;
+    }
+  }
+  const avgStarRef = Array.isArray(body?.items) && body.items.length > 0
+    ? extractNicheAverageStarReference(body.items)
+    : (finite(row.avgRating ?? row.average_star_rating) && Number(row.avgRating ?? row.average_star_rating) > 0 && Number(row.avgRating ?? row.average_star_rating) <= 5
+      ? Number(Number(row.avgRating ?? row.average_star_rating).toFixed(2))
+      : null);
+
+  const mkMetric = val => (val !== null ? { value: val, unit: 'fraction', evidence } : null);
+  const concentrations = {};
+  if (mkMetric(prodConc)) concentrations.product = mkMetric(prodConc);
+  if (mkMetric(brandConc)) concentrations.brand = mkMetric(brandConc);
+  if (mkMetric(sellerConc)) concentrations.seller = mkMetric(sellerConc);
+  const newcomer = {};
+  if (mkMetric(countShare)) newcomer.count_share = mkMetric(countShare);
+  if (mkMetric(salesShare)) {
+    newcomer.unit_sales_share = {
+      ...mkMetric(salesShare),
+      window: 'latest_monthly_archive',
+    };
+  }
+  return {
+    provider: 'sellersprite',
+    report_id,
+    relevant: true,
+    archive_basis: 'sellersprite_latest_monthly_archive',
+    ...(archiveMonth ? { period: archiveMonth, archive_month: archiveMonth } : {}),
+    population,
+    family_basis,
+    head_group: 'top10',
+    newcomer_age_months: 3,
+    newcomer_sales_window: 'latest_monthly_archive',
+    evidence,
+    ...(Object.keys(concentrations).length > 0 ? { concentrations } : {}),
+    ...(Object.keys(newcomer).length > 0 ? { newcomer } : {}),
+    ...(mkMetric(countShare) ? { newcomer_count_share: mkMetric(countShare) } : {}),
+    ...(mkMetric(salesShare) ? {
+      newcomer_sales_share: {
+        ...mkMetric(salesShare),
+        window: 'latest_monthly_archive',
+      },
+    } : {}),
+    ...(mkMetric(prodConc) ? { product_concentration_top10: mkMetric(prodConc) } : {}),
+    ...(mkMetric(brandConc) ? { brand_concentration_top10: mkMetric(brandConc) } : {}),
+    ...(mkMetric(sellerConc) ? { seller_concentration_top10: mkMetric(sellerConc) } : {}),
+    ...(top10MedianReviews !== null ? { top10_median_reviews: top10MedianReviews } : {}),
+    ...(top10ReviewSampleCount !== null ? { top10_review_sample_count: top10ReviewSampleCount } : {}),
+    ...(categoryAvgReviews !== null ? { avg_reviews: categoryAvgReviews, category_avg_reviews: categoryAvgReviews } : {}),
+    ...(amzSalesShare !== null ? { amz_sales_share: amzSalesShare } : {}),
+    ...(sellerCount !== null ? { seller_count: sellerCount } : {}),
+    ...(avgStarRef !== null ? { average_star_rating: typeof avgStarRef === 'object' ? avgStarRef.value : avgStarRef, niche_average_star_reference: avgStarRef } : {}),
+  };
+}
+
+/**
+ * Compute equal-weight niche average star reference (`r20`) across parent-deduplicated comparable listings (`(0, 5]`).
+ */
+export function extractNicheAverageStarReference(rows = [], {
+  scope = '去重同款父体等权均星',
+  period = null,
+} = {}) {
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const flatRows = rows.flatMap(entry => {
+    if (!entry || typeof entry !== 'object') return [];
+    const unwrapped = unwrapMcpEnvelope(entry);
+    if (Array.isArray(unwrapped?.items)) return unwrapped.items;
+    if (Array.isArray(unwrapped?.list)) return unwrapped.list;
+    return [unwrapped];
+  });
+  if (flatRows.length === 0) return null;
+  const rowByAsin = new Map();
+  for (const r of flatRows) {
+    const a = typeof r?.asin === 'string' && r.asin.trim() ? r.asin.trim().toUpperCase() : null;
+    if (a && !rowByAsin.has(a)) rowByAsin.set(a, r);
+  }
+  const dedupRes = deduplicateParentSalesRows(flatRows);
+  const repRows = dedupRes.families.length > 0
+    ? dedupRes.families.map(f => rowByAsin.get(f.representative_asin) ?? f)
+    : flatRows;
+  const stars = repRows
+    .map(r => r?.rating ?? r?.stars ?? r?.star_rating ?? r?.avgRating ?? r?.representative?.rating)
+    .map(v => Number(v))
+    .filter(v => Number.isFinite(v) && v > 0 && v <= 5);
+  if (stars.length === 0) return null;
+  const mean = Number((stars.reduce((a, b) => a + b, 0) / stars.length).toFixed(2));
+  return {
+    value: mean,
+    family_count: stars.length,
+    scope: `${scope}（${stars.length} 款）`,
+    ...(period ? { period } : {}),
+    note: '仅作细分市场口碑与差评预期参考，不纳入 100 分评分。',
+  };
+}
+
+/**
+ * Extract Q31 dual-source organic/ad keyword counts (`r48/r50`: SellerSprite + SIF).
+ */
+export function extractQ31DualSourceKeywordCounts({
+  sellerspriteRaw = null,
+  sifRaw = null,
+} = {}) {
+  const readCounts = (raw, isSif = false) => {
+    if (!raw || typeof raw !== 'object') return null;
+    const body = unwrapMcpEnvelope(raw);
+    if (!body || typeof body !== 'object') return null;
+    if (finite(body.organic) && finite(body.ad)) {
+      return { organic: Math.max(0, Math.round(body.organic)), ad: Math.max(0, Math.round(body.ad)) };
+    }
+    const orgDirect = body.organic_keywords ?? body.organicKeywords ?? body.naturalKeywordCount ?? body.organicCount ?? body.natural_count;
+    const adDirect = body.ad_keywords ?? body.adKeywords ?? body.sponsoredKeywordCount ?? body.adCount ?? body.sponsored_count;
+    if (finite(orgDirect) && finite(adDirect)) {
+      return { organic: Math.max(0, Math.round(orgDirect)), ad: Math.max(0, Math.round(adDirect)) };
+    }
+    const items = Array.isArray(body.items) ? body.items : (Array.isArray(body.list) ? body.list : null);
+    if (items) {
+      let org = 0;
+      let ad = 0;
+      for (const it of items) {
+        if (!it || typeof it !== 'object') continue;
+        const hasOrg = isSif
+          ? Boolean(finite(it.naturalRank ?? it.organic_rank) && Number(it.naturalRank ?? it.organic_rank) > 0)
+          : Boolean(finite(it.naturalRank ?? it.rankPosition ?? it.organic_rank) && Number(it.naturalRank ?? it.rankPosition ?? it.organic_rank) > 0);
+        const hasAd = Boolean(finite(it.adRank ?? it.sponsoredRank ?? it.ad_rank) && Number(it.adRank ?? it.sponsoredRank ?? it.ad_rank) > 0);
+        if (hasOrg) org += 1;
+        if (hasAd) ad += 1;
+      }
+      return { organic: org, ad };
+    }
+    return null;
+  };
+  const ss = readCounts(sellerspriteRaw, false);
+  const sif = readCounts(sifRaw, true);
+  if (!ss && !sif) return null;
+  return {
+    ...(ss ? { sellersprite: ss } : {}),
+    ...(sif ? { sif } : {}),
+  };
+}
+
 /**
  * Resolve Stage-1 qualitative rubric judgments (#16/#17/#20/#21) from public/listing evidence,
  * reserving physical tolerance/compliance lab checks for Stage-2 sample tags rather than blocking Stage-1 scoring.
@@ -528,45 +1019,110 @@ export function resolveStage1QualitativeJudgments({
   if (spec_verification?.complete_set_verified === true && Number.isInteger(spec_verification.anchor)) {
     existingSolutionFit = {
       anchor: spec_verification.anchor,
+      complete_set_verified: true,
       reason: spec_verification.reason || '1688 公开规格与齐套配件覆盖核心买家任务，实物公差留待二阶段拿样核对。',
+      evidence,
+    };
+  } else if (spec_verification?.complete_set_verified === true) {
+    existingSolutionFit = {
+      anchor: null,
+      complete_set_verified: true,
+      sample_check_required: true,
+      reason: spec_verification.reason || spec_verification.spec_conflict_reason || '1688 齐套现货已核实，英文说明书／配件编码细节留待拿样或向工厂确认。',
       evidence,
     };
   } else {
     existingSolutionFit = {
       anchor: null,
+      ...(spec_verification?.complete_set_verified === false ? { complete_set_verified: false } : {}),
       reason: spec_verification?.spec_conflict_reason || '1688 报价存在规格缺件、尺寸矛盾或未入镜，待补核齐套规格后评定。',
       evidence,
     };
   }
 
-  // #17 feasible_light_differentiation (0..1)
+  // #17 feasible_light_differentiation (0..1): uninspected reviews MUST remain null (never 0)
   let lightDiff;
+  const targetReviewAsin = nonemptyStr(review_judge?.target_variant_asin)
+    ? review_judge.target_variant_asin.trim().toUpperCase()
+    : null;
   const hasSkuVerifiedReview = Array.isArray(review_judge?.review_citations) &&
-    review_judge.review_citations.some(c => c?.sku_verified === true);
-  if (review_judge?.status === 'supported' && hasSkuVerifiedReview && review_judge?.proposed_score === 1) {
+    review_judge.review_citations.some(
+      c => c?.sku_verified === true && (!targetReviewAsin || !nonemptyStr(c?.asin) || c.asin.trim().toUpperCase() === targetReviewAsin),
+    );
+  const reviewsInspected = Boolean(
+    review_judge &&
+    review_judge.reviews_inspected !== false &&
+    ['supported', 'not_supported', 'no_actionable_flaw', 'inspected_none'].includes(review_judge.status),
+  );
+  const deferLightDiffToSample = Boolean(
+    review_judge?.sample_check_required === true || review_judge?.defer_to_sample === true,
+  );
+  const supportLevel = typeof review_judge?.support_level === 'string'
+    ? review_judge.support_level.trim().toLowerCase()
+    : null;
+  const isStrongSupported = reviewsInspected && review_judge?.status === 'supported' && hasSkuVerifiedReview &&
+    (supportLevel === 'strong' || (supportLevel === null && review_judge?.proposed_score === 1));
+  const isModerateSupported = reviewsInspected && review_judge?.status === 'supported' && hasSkuVerifiedReview &&
+    (supportLevel === 'moderate' || (supportLevel === null && review_judge?.proposed_score === 0.5));
+
+  if (isStrongSupported) {
     lightDiff = {
       anchor: 1,
-      reason: review_judge.reason || '已验证子体差评痛点可通过低成本现货微改解决。',
+      reason: review_judge.reason || '已验证子体差评痛点可通过低成本现货微改明确解决（strong -> 1/1）。',
+      evidence,
+    };
+  } else if (isModerateSupported) {
+    lightDiff = {
+      anchor: 0.5,
+      reason: review_judge.reason || '已验证子体差评存在部分可低成本微改空间（moderate -> 0.5/1）。',
+      evidence,
+    };
+  } else if (reviewsInspected && (
+    review_judge?.status !== 'supported' ||
+    supportLevel === 'weak' ||
+    supportLevel === 'none' ||
+    review_judge?.proposed_score === 0
+  )) {
+    lightDiff = {
+      anchor: 0,
+      reason: review_judge.reason || '已抽检子体差评，现成公模现货无需额外改模或未见低成本可微改痛点，记 0/1。',
       evidence,
     };
   } else {
     lightDiff = {
-      anchor: 0,
-      reason: '现成公模现货无需额外改模即可销售（或尚未发现需微改的子体差评痛点），初筛按 0/1 计入。',
+      anchor: null,
+      ...(deferLightDiffToSample ? { sample_check_required: true } : {}),
+      reason: review_judge?.reason || '尚未完成 Gate 1B 后子体差评抽检（未查差评须保持待定 null，不得默认记 0）。',
       evidence,
     };
   }
 
-  // #20 specific_design_rights (0..3)
+  const PRESCREEN_ACCESS_FAILURE_RE = /(?:registry\s+unavailable|access\s+failed|connection\s+failed|unreachable|search\s+(?:failed|unavailable|not\s+completed|incomplete)|http\s+[45]\d\d|could\s+not\s+(?:access|reach|query|search|verify)|timeout|未完成公开|连接失败|访问失败|检索失败|无法访问|未能查验|查询失败|暂不可用)/i;
+  const isPrescreenCompletedCleanly = sec => Boolean(
+    sec &&
+    sec.prescreen_completed !== false &&
+    sec.registry_unavailable !== true &&
+    !PRESCREEN_ACCESS_FAILURE_RE.test(String(sec.summary ?? '')),
+  );
+
+  // #20 specific_design_rights (0..3) (+ target-spec trademark conflict check)
   let specificRights;
-  const sdrStatus = rights_prescreen?.specific_design_rights?.status ?? 'unknown';
-  if (sdrStatus === 'proven_conflict') {
+  const sdrSec = rights_prescreen?.specific_design_rights;
+  const tmSec = rights_prescreen?.trademark_conflicts;
+  const sdrStatus = sdrSec?.status ?? 'unknown';
+  const tmProvenTargetConflict = Boolean(
+    tmSec?.status === 'proven_conflict' && tmSec?.applies_to_target_spec !== false,
+  );
+  if (sdrStatus === 'proven_conflict' || tmProvenTargetConflict) {
     specificRights = {
       anchor: 0,
-      reason: rights_prescreen.specific_design_rights.summary || '公开专利检索命中具体外观／结构冲突，直接一票否决。',
+      proven_conflict: true,
+      reason: sdrStatus === 'proven_conflict'
+        ? (sdrSec.summary || '公开专利检索命中具体外观／结构冲突，直接一票否决。')
+        : (tmSec.summary || '公开商标检索命中目标规格／词条冲突，直接一票否决。'),
       evidence,
     };
-  } else if (sdrStatus === 'no_public_hit_observed') {
+  } else if (sdrStatus === 'no_public_hit_observed' && isPrescreenCompletedCleanly(sdrSec)) {
     objectiveTags.push('留存后二阶段实物细节专利复核');
     if (finite(market_seller_count) && market_seller_count >= 1 && market_seller_count <= 3 &&
       finite(reference_price_usd) && reference_price_usd >= 45) {
@@ -574,34 +1130,59 @@ export function resolveStage1QualitativeJudgments({
     }
     specificRights = {
       anchor: 3,
-      reason: `${rights_prescreen.specific_design_rights.summary || '有界公开专利初查未见同结构冲突。'}（初筛记 3/3，留存后复核实物细节权利要求）。`,
+      prescreen_completed: true,
+      reason: `${sdrSec.summary || '有界公开专利初查未见同结构冲突。'}（初筛记 3/3，留存后复核实物细节权利要求）。`,
+      evidence,
+    };
+  } else if ((sdrStatus === 'needs_sample_comparison' || sdrStatus === 'needs_verification') && isPrescreenCompletedCleanly(sdrSec)) {
+    objectiveTags.push('留存后拿样比对近似专利结构细节');
+    specificRights = {
+      anchor: null,
+      prescreen_completed: true,
+      sample_check_required: true,
+      reason: sdrSec?.summary || '公开专利初筛无实锤侵权冲突；1–2 件近似专利号待拿样与实物结构比对。',
       evidence,
     };
   } else {
     specificRights = {
       anchor: null,
-      reason: rights_prescreen?.specific_design_rights?.summary || '具体款式公开专利初查尚未完成或存在待排冲突。',
+      prescreen_completed: false,
+      reason: sdrSec?.summary || '具体款式公开专利初查尚未完成或存在待排冲突。',
       evidence,
     };
   }
 
-  // #21 applicable_public_requirements (0..2)
+  // #21 applicable_public_requirements (0..2): needs_verification MUST remain null (never 2/2 or 1/2)
   let publicReq;
   const apr = rights_prescreen?.applicable_public_requirements;
-  const fws = Array.isArray(apr?.frameworks_checked) ? apr.frameworks_checked : [];
+  const fws = Array.isArray(apr?.frameworks_checked)
+    ? apr.frameworks_checked.filter(fw => nonemptyStr(fw) && fw !== 'NONE_IDENTIFIED')
+    : [];
   if (apr?.status === 'proven_conflict') {
     publicReq = {
       anchor: 0,
+      proven_conflict: true,
+      hard_ban: true,
       reason: apr.summary || '命中强制禁售或个人卖家不可行的准入限制。',
       evidence,
     };
-  } else if (apr && ['no_public_hit_observed', 'needs_verification'].includes(apr.status)) {
-    const nonRoutineOnly = fws.length === 0 || (fws.length === 1 && fws[0] === 'NONE_IDENTIFIED');
+  } else if (apr?.status === 'needs_verification' && isPrescreenCompletedCleanly(apr)) {
+    for (const fw of fws) objectiveTags.push(`合规路径标签:${fw}`);
+    publicReq = {
+      anchor: null,
+      prescreen_completed: true,
+      sample_check_required: true,
+      reason: apr.summary || '公开合规初筛无禁售冲突；具体材料申报／检测细节（如木头拉丁学名）待拿样问工厂核实。',
+      evidence,
+    };
+  } else if (apr?.status === 'no_public_hit_observed' && isPrescreenCompletedCleanly(apr)) {
+    const nonRoutineOnly = fws.length === 0;
     if (!nonRoutineOnly) {
       for (const fw of fws) objectiveTags.push(`合规路径标签:${fw}`);
     }
     publicReq = {
       anchor: nonRoutineOnly ? 2 : 1,
+      prescreen_completed: true,
       reason: nonRoutineOnly
         ? (apr.summary || '普通非带电非食品现货，初查无特殊法规认证门槛。')
         : `${apr.summary || '识别到适用常规合规路径（如 Lacey Act / 16 CFR 1262 / TSCA / 食品接触检测）且可常规办理。'}（初筛记 1/2 并挂合规标签）。`,
@@ -627,11 +1208,14 @@ export function resolveStage1QualitativeJudgments({
 }
 
 /**
- * Build paired 2027 `off_peak` ([2..9]) + companion `peak` ([10..12]) operating periods from verified off-peak ledgers:
+ * Build paired 2027 `off_peak` + companion `peak` operating periods from verified off-peak ledgers:
+ *  - Defaults under `r59+` to the unified 2027 off-peak fulfillment window (`2027-02-01` through `2027-10-14`),
+ *    while keeping off-peak monthly storage independently at `2027-02-01..2027-09-30` (`[2..9]`) and companion
+ *    peak monthly storage at `2027-10-01..2027-12-31` (`[10..12]`), never mixing Oct 1–14 into Jan–Sep storage!
+ *  - Preserves `r58` `2027-02-01..2027-09-30` (`[2..9]`) replay when `profile_revision < 59` or `off_peak_window` is explicitly set.
  *  - Keeps `expected_primary_scenarios` strictly period-scoped (NEVER placed on root `economics` where off-peak IDs would break `peak`!).
- *  - Sets peak storage to verified 2027 Oct–Dec rate ($2.40/cu ft Standard or $1.40/cu ft Bulky).
- *  - Marks peak fulfillment `pending` with `fee_basis: { status: 'unavailable', version: 'Unpublished 2027 US Holiday Peak FBA fulfillment schedule' }`
- *    so `isValidCompanionPeakPanelR58` passes cleanly without fabricating unpublished late-2027 holiday fulfillment fees.
+ *  - Leaves 2027 Q4 peak margin blank (`null`) with explicit `UNPUBLISHED_2027_PEAK_MARGIN_NOTE` (`"待亚马逊公布 2027 旺季费率后补充"`),
+ *    forbidding 2026 peak uplift extrapolation.
  *  - Enforces strict uniqueness on `stress_scenarios[].id`.
  */
 export function buildPairedSeasonalOperatingPeriods({
@@ -644,8 +1228,11 @@ export function buildPairedSeasonalOperatingPeriods({
   cubic_feet_per_unit,
   average_inventory_days = 45,
   size_tier = 'large_standard',
+  is_dangerous_goods = false,
   storage_evidence = [],
   stress_scenarios = undefined,
+  profile_revision = 59,
+  off_peak_window = null,
 } = {}) {
   if (!nonemptyStr(saleable_unit)) throw new TypeError('saleable_unit is required.');
   if (!Array.isArray(off_peak_scenarios) || off_peak_scenarios.length === 0) {
@@ -667,16 +1254,49 @@ export function buildPairedSeasonalOperatingPeriods({
     }
   }
 
-  const isBulky = /bulky/i.test(String(size_tier || ''));
-  const peakStorageRate = isBulky ? 1.40 : 2.40;
+  const useLegacyR58Window = Boolean(
+    (profile_revision ?? 59) < 59 ||
+    (off_peak_window && off_peak_window.from === '2027-02-01' && off_peak_window.through === '2027-09-30'),
+  );
+  const activeOffPeakSalesWin = useLegacyR58Window
+    ? { from: '2027-02-01', through: '2027-09-30' }
+    : (off_peak_window ?? FBA_2027_DEFAULT_OFF_PEAK_WINDOW);
+  const activeOffPeakStorageWin = { ...FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW };
+  const activeOffPeakMonths = [2, 3, 4, 5, 6, 7, 8, 9];
+
+  const isBulkyOrOversize = /(?:bulky|oversize)/i.test(String(size_tier || ''));
+  const peakStorageRate = is_dangerous_goods
+    ? (isBulkyOrOversize ? 2.43 : 3.63)
+    : (isBulkyOrOversize ? 1.40 : 2.40);
   const peakStorageUsd = Number((cubic_feet_per_unit * peakStorageRate * (average_inventory_days / 30)).toFixed(6));
 
   const normalizedOffPeak = off_peak_scenarios.map(sc => {
     const clone = structuredClone(sc);
-    clone.cost_ledger.fee_context.sales = { from: '2027-02-01', through: '2027-09-30' };
-    clone.cost_ledger.fee_context.storage = { from: '2027-02-01', through: '2027-09-30' };
+    clone.cost_ledger.fee_context.sales = { ...activeOffPeakSalesWin };
+    clone.cost_ledger.fee_context.storage = { ...activeOffPeakStorageWin };
     if (!clone.cost_ledger.fee_context.inbound || clone.cost_ledger.fee_context.inbound.from < '2027-01-15') {
-      clone.cost_ledger.fee_context.inbound = { from: '2027-01-15', through: '2027-02-01' };
+      clone.cost_ledger.fee_context.inbound = { ...FBA_2027_DEFAULT_INBOUND_WINDOW };
+    }
+    if (!useLegacyR58Window && Array.isArray(clone.cost_ledger.lines)) {
+      for (const l of clone.cost_ledger.lines) {
+        if (l?.fee_basis && typeof l.fee_basis === 'object') {
+          if (l.id === 'storage') {
+            if (l.fee_basis.effective_through && l.fee_basis.effective_through > '2027-09-30') {
+              l.fee_basis.effective_through = '2027-09-30';
+            }
+            if (Array.isArray(l.fee_basis.months)) {
+              l.fee_basis.months = l.fee_basis.months.filter(m => m <= 9);
+            }
+          } else {
+            if (Array.isArray(l.fee_basis.months)) {
+              const allowedMaxMonth = l.fee_basis.effective_through
+                ? Number(l.fee_basis.effective_through.slice(5, 7))
+                : 10;
+              l.fee_basis.months = l.fee_basis.months.filter(m => m <= Math.min(10, allowedMaxMonth));
+            }
+          }
+        }
+      }
     }
     return clone;
   });
@@ -770,19 +1390,42 @@ export function buildPairedSeasonalOperatingPeriods({
     const pk = structuredClone(offSc);
     delete pk.margin;
     delete pk.contribution_usd;
+    if (!useLegacyR58Window) {
+      pk.unpublished_peak_note = UNPUBLISHED_2027_PEAK_MARGIN_NOTE;
+    }
     const pkId = `${offSc.id}-peak`;
     pk.id = pkId;
-    pk.label = `${offSc.label ?? offSc.id}（10–12月旺季伴随面板）`;
+    pk.label = useLegacyR58Window
+      ? `${offSc.label ?? offSc.id}（10–12月旺季伴随面板）`
+      : `${offSc.label ?? offSc.id}（${UNPUBLISHED_2027_PEAK_MARGIN_NOTE}）`;
     pk.cost_ledger.id = pkId;
-    pk.cost_ledger.fee_context.sales = { from: '2027-10-01', through: '2027-12-31' };
-    pk.cost_ledger.fee_context.storage = { from: '2027-10-01', through: '2027-12-31' };
-    pk.cost_ledger.fee_context.inbound = { from: '2027-09-01', through: '2027-10-01' };
+    pk.cost_ledger.fee_context.sales = useLegacyR58Window
+      ? { from: '2027-10-01', through: '2027-12-31' }
+      : { ...FBA_2027_UNPUBLISHED_PEAK_WINDOW };
+    pk.cost_ledger.fee_context.storage = { ...FBA_2027_COMPANION_PEAK_STORAGE_WINDOW };
+    pk.cost_ledger.fee_context.inbound = useLegacyR58Window
+      ? { from: '2027-09-01', through: '2027-10-01' }
+      : { from: '2027-09-15', through: '2027-10-15' };
+    if (!useLegacyR58Window) {
+      for (const l of pk.cost_ledger.lines ?? []) {
+        if (l?.fee_basis && typeof l.fee_basis === 'object' && l.id !== 'fulfillment' && l.id !== 'storage') {
+          if (l.fee_basis.effective_through === '2027-12-31') {
+            l.fee_basis.effective_through = '2028-01-14';
+          }
+          if (Array.isArray(l.fee_basis.months)) {
+            l.fee_basis.months = [10, 11, 12, 1];
+          }
+        }
+      }
+    }
 
     const fulLine = pk.cost_ledger.lines.find(l => l?.id === 'fulfillment');
     if (fulLine) {
       fulLine.status = 'pending';
       fulLine.amount_usd = null;
-      fulLine.basis = 'Amazon 2027 US Holiday Peak FBA fulfillment schedule not yet published; held pending per seasonal companion rule.';
+      fulLine.basis = useLegacyR58Window
+        ? 'Amazon 2027 US Holiday Peak FBA fulfillment schedule not yet published; held pending per seasonal companion rule.'
+        : `${UNPUBLISHED_2027_PEAK_MARGIN_NOTE}（严禁用 2026 旺季涨幅估算替代）`;
       fulLine.fee_basis = {
         status: 'unavailable',
         version: 'Unpublished 2027 US Holiday Peak FBA fulfillment schedule',
@@ -790,7 +1433,7 @@ export function buildPairedSeasonalOperatingPeriods({
         currency: 'USD',
         package_ref: pk.cost_ledger.fee_context.package_ref,
         year: 2027,
-        months: [10, 11, 12],
+        months: useLegacyR58Window ? [10, 11, 12] : [10, 11, 12, 1],
       };
     }
 
@@ -806,7 +1449,10 @@ export function buildPairedSeasonalOperatingPeriods({
         storLine.fee_basis = {
           ...storLine.fee_basis,
           status: 'published',
-          effective_from: '2027-02-01',
+          rate_usd_per_cuft_month: peakStorageRate,
+          cubic_feet_per_unit,
+          average_inventory_days,
+          effective_from: '2027-10-01',
           effective_through: '2027-12-31',
           months: [10, 11, 12],
         };
@@ -834,15 +1480,16 @@ export function buildPairedSeasonalOperatingPeriods({
     operating_periods: [
       {
         id: 'off_peak',
-        label: '2027年2–9月主营淡季',
-        months: [2, 3, 4, 5, 6, 7, 8, 9],
+        label: useLegacyR58Window ? '2027年2–9月主营淡季' : '2027年2月1日–10月14日主营淡季',
+        months: activeOffPeakMonths,
         expected_primary_scenarios: offPeakExpectedPrimary,
         scenarios: normalizedOffPeak,
       },
       {
         id: 'peak',
-        label: '2027年10–12月假日旺季',
-        months: [10, 11, 12],
+        label: useLegacyR58Window ? '2027年10–12月假日旺季' : `2027年Q4旺季（${UNPUBLISHED_2027_PEAK_MARGIN_NOTE}）`,
+        months: useLegacyR58Window ? [10, 11, 12] : [10, 11, 12, 1],
+        ...(!useLegacyR58Window ? { unpublished_peak_note: UNPUBLISHED_2027_PEAK_MARGIN_NOTE } : {}),
         expected_primary_scenarios: peakExpectedPrimary,
         scenarios: peakScenarios,
       },
@@ -965,7 +1612,11 @@ function collectReferencedComparableAsinsForPricing(cand, primaryScenarios = [],
 }
 
 function isCompanionHolidayPeakOnlyPeriod(p) {
-  return Array.isArray(p?.months) && p.months.length > 0 && p.months.every(m => m === 10 || m === 11 || m === 12);
+  return Array.isArray(p?.months) &&
+    p.months.length > 0 &&
+    p.months.length <= 4 &&
+    [10, 11, 12].every(m => p.months.includes(m)) &&
+    p.months.every(m => m === 10 || m === 11 || m === 12 || m === 1);
 }
 
 function collectPrimaryContainersForChecks(cand) {
@@ -1017,7 +1668,7 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
   candPayloads = [],
   extraVerifiedAsins = [],
   allowSyntheticIds = false,
-  effectiveRev = 58,
+  effectiveRev = 59,
   fallbackAsOfDate = null,
 } = {}) {
   const allCandAsins = extractAllCandidateAsins(cand);
@@ -1118,20 +1769,37 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
     const maxMainstreamMedian = mainstreamMedians.length > 0 ? Math.max(...mainstreamMedians) : null;
     const minRowFloor = rowFloorPrices.length >= 2 ? Math.min(...rowFloorPrices) : null;
 
+    const recordBundleAmberWarningOrThrow = (hardMessage, amberMessage) => {
+      if (effectiveRev >= 59) {
+        const currentNotes = Array.isArray(cand.review_notes) ? cand.review_notes : [];
+        const alreadyRecorded = currentNotes.some(
+          n => (typeof n === 'string' && n === amberMessage) || (n && typeof n === 'object' && n.kind === 'AMBER_BUNDLE_PRICE_CHECK' && n.note === amberMessage),
+        );
+        if (!alreadyRecorded) {
+          cand.review_notes = [...currentNotes, { kind: 'AMBER_BUNDLE_PRICE_CHECK', note: amberMessage }];
+        }
+      } else {
+        throw new TypeError(hardMessage);
+      }
+    };
+
     if (refPrice?.matched_spec === true && refAnchorBaseline !== null) {
       if (maxMainstreamMedian !== null && refAnchorBaseline > maxMainstreamMedian * 2.5 + 0.05) {
-        throw new TypeError(
+        recordBundleAmberWarningOrThrow(
           `Scenario price provenance violation on candidate "${cand.id}": reference_price_usd ($${refAnchorBaseline}) exceeds 2.5x denoised search-page median ($${round2(maxMainstreamMedian)}); split distinct sub-forms instead of adopting mega-bundle outliers.`,
+          `【琥珀核对提醒 · AMBER_BUNDLE_PRICE_CHECK】参考售价 ($${refAnchorBaseline}) 高于去噪中位价 ($${round2(maxMainstreamMedian)}) 2.5 倍以上，请核对是否属于正经多只装／豪华套装。`,
         );
       }
       if (maxMainstreamMedian === null && minRowFloor !== null && refAnchorBaseline > minRowFloor * 2.5 + 0.05) {
-        throw new TypeError(
+        recordBundleAmberWarningOrThrow(
           `Scenario price provenance violation on candidate "${cand.id}": reference_price_usd ($${refAnchorBaseline}) exceeds 2.5x observed page baseline ($${round2(minRowFloor)}); 2-row mega-bundle hijacking is prohibited.`,
+          `【琥珀核对提醒 · AMBER_BUNDLE_PRICE_CHECK】参考售价 ($${refAnchorBaseline}) 高于页面基准低价 ($${round2(minRowFloor)}) 2.5 倍以上，请核对是否属于正经多只装／豪华套装。`,
         );
       }
       if (effectiveRangeBounds && effectiveRangeBounds[1] > refAnchorBaseline * 2.25 + 0.05) {
-        throw new TypeError(
+        recordBundleAmberWarningOrThrow(
           `Scenario price provenance violation on candidate "${cand.id}": reference price upper bound ($${effectiveRangeBounds[1]}) exceeds 2.25x baseline ($${refAnchorBaseline}); split distinct sub-forms instead of pooling unrelated bundle ASINs.`,
+          `【琥珀核对提醒 · AMBER_BUNDLE_PRICE_CHECK】参考价区间上限 ($${effectiveRangeBounds[1]}) 高于基准价 ($${refAnchorBaseline}) 2.25 倍以上，请核对单只与多只套装是否混组。`,
         );
       }
     }
@@ -1153,18 +1821,21 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
 
       if (refPrice?.matched_spec === true) {
         if (refAnchorBaseline !== null && effectiveScPrice > refAnchorBaseline * 2.25 + 0.05) {
-          throw new TypeError(
+          recordBundleAmberWarningOrThrow(
             `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) exceeds 2.25x reference_price_usd ($${refAnchorBaseline}); cross-ASIN bundle price hijacking is prohibited.`,
+            `【琥珀核对提醒 · AMBER_BUNDLE_PRICE_CHECK】情景 "${sc?.id ?? 'unknown'}" 售价 ($${effectiveScPrice}) 高于基准参考价 ($${refAnchorBaseline}) 2.25 倍以上，请核对是否为正经多只装／豪华套装。`,
           );
         }
         if (maxMainstreamMedian !== null && effectiveScPrice > maxMainstreamMedian * 2.5 + 0.05) {
-          throw new TypeError(
+          recordBundleAmberWarningOrThrow(
             `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) exceeds 2.5x denoised search-page median ($${round2(maxMainstreamMedian)}).`,
+            `【琥珀核对提醒 · AMBER_BUNDLE_PRICE_CHECK】情景 "${sc?.id ?? 'unknown'}" 售价 ($${effectiveScPrice}) 高于搜索页去噪中位价 ($${round2(maxMainstreamMedian)}) 2.5 倍以上，请核对是否为正经多只装／豪华套装。`,
           );
         }
         if (maxMainstreamMedian === null && minRowFloor !== null && effectiveScPrice > minRowFloor * 2.5 + 0.05) {
-          throw new TypeError(
+          recordBundleAmberWarningOrThrow(
             `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) exceeds 2.5x observed page baseline ($${round2(minRowFloor)}).`,
+            `【琥珀核对提醒 · AMBER_BUNDLE_PRICE_CHECK】情景 "${sc?.id ?? 'unknown'}" 售价 ($${effectiveScPrice}) 高于页面基准低价 ($${round2(minRowFloor)}) 2.5 倍以上，请核对是否为正经多只装／豪华套装。`,
           );
         }
       }
@@ -1257,6 +1928,7 @@ function enforceCandidateContainerMatrixAndDbParity(cand, {
     : allImplicitQuotes;
 
   let unverifiedUiQuoteUsed = false;
+  let expiredIsolatedReason = null;
 
   for (const container of containers) {
     const scens = container.scenarios;
@@ -1270,22 +1942,24 @@ function enforceCandidateContainerMatrixAndDbParity(cand, {
       }
     }
 
-    // Block sourced 1688 costs when all SQLite quotes on this spec expired, or prevent unpersisted SQLite quotes from qualifying!
+    // Isolate expired quotes per candidate (downgrade sourced 1688 costs to pending) instead of crashing the batch!
     if (usableQuotes.length === 0 && dbConstraints?.dbFormPresent === true) {
       for (const sc of scens) {
         const ledger = sc?.cost_ledger ?? {};
         const lines = Array.isArray(ledger.lines) ? ledger.lines : [];
         const procLine = lines.find(l => l?.id === 'procurement');
         const domLine = lines.find(l => l?.id === 'domestic_freight');
+        const colLine = lines.find(l => l?.id === 'collection');
         const hasSourcedProc = Boolean(procLine && procLine.status !== 'pending' && finite(procLine.amount_usd));
         const hasSourcedDom = Boolean(domLine && domLine.status !== 'pending' && domLine.status !== 'deferred' && finite(domLine.amount_usd));
         if (hasSourcedProc || hasSourcedDom) {
           if ((dbConstraints.expiredQuoteIds?.length ?? 0) > 0) {
-            throw new TypeError(
-              `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" cannot score sourced 1688 cost when persisted SQLite quote(s) [${dbConstraints.expiredQuoteIds.join(', ')}] have expired as of ${dbConstraints.candAsOf}.`,
-            );
-          }
-          if (effectiveRev >= 59) {
+            if (procLine) { procLine.status = 'pending'; procLine.amount_usd = null; }
+            if (domLine) { domLine.status = 'pending'; domLine.amount_usd = null; }
+            if (colLine) { colLine.status = 'pending'; colLine.amount_usd = null; }
+            expiredIsolatedReason =
+              `Candidate "${cand.id}" persisted SQLite 1688 quote(s) [${dbConstraints.expiredQuoteIds.join(', ')}] have expired as of ${dbConstraints.candAsOf}; isolated to pending without aborting batch.`;
+          } else if (effectiveRev >= 59) {
             unverifiedUiQuoteUsed = true;
           }
         }
@@ -1425,7 +2099,48 @@ function enforceCandidateContainerMatrixAndDbParity(cand, {
     }
   }
 
-  return { unverifiedUiQuoteUsed };
+  if (expiredIsolatedReason) {
+    cand.ingest_isolated_pending = true;
+    cand.review_notes = [...new Set([...(Array.isArray(cand.review_notes) ? cand.review_notes : []), expiredIsolatedReason])];
+    cand.presentation = {
+      ...(cand.presentation ?? {}),
+      blockers: [
+        ...(Array.isArray(cand.presentation?.blockers) ? cand.presentation.blockers : []),
+        { problem: expiredIsolatedReason, next_step: '重新获取最新 1688 齐套现货含运报价后再复算。' },
+      ],
+    };
+  }
+
+  return { unverifiedUiQuoteUsed, isolatedReason: expiredIsolatedReason };
+}
+
+function ensureCandidatePendingShellOnMissingFields(cand, reason) {
+  cand.ingest_isolated_pending = true;
+  cand.review_notes = [...new Set([...(Array.isArray(cand.review_notes) ? cand.review_notes : []), reason])];
+  cand.presentation = {
+    ...(cand.presentation ?? {}),
+    blockers: [
+      ...(Array.isArray(cand.presentation?.blockers) ? cand.presentation.blockers : []),
+      { problem: reason, next_step: '补齐该候选品缺失字段或有效报价后重新入库评分。' },
+    ],
+  };
+  const hasValidFlat = Array.isArray(cand?.economics?.scenarios) && cand.economics.scenarios.length > 0 && nonemptyStr(cand.economics.saleable_unit);
+  const hasValidPeriods = Array.isArray(cand?.economics?.operating_periods) && cand.economics.operating_periods.length > 0 && nonemptyStr(cand.economics.saleable_unit);
+  if (!hasValidFlat && !hasValidPeriods) {
+    const unit = nonemptyStr(cand?.economics?.saleable_unit) ? cand.economics.saleable_unit : '1 unit';
+    cand.economics = {
+      saleable_unit: unit,
+      scenarios: [
+        {
+          id: `sc-isolated-pending-${cand.id}`,
+          label: '单品缺失字段隔离待补证',
+          saleable_unit: unit,
+          coherent: false,
+          assumptions: [reason],
+        },
+      ],
+    };
+  }
 }
 
 /**
@@ -1456,7 +2171,7 @@ export function ingestTrialSpecification(spec, profile, {
     throw new TypeError('ingest_trial_spec contains a secret or token; redact before ingesting.');
   }
 
-  const effectiveRev = spec.profile_revision ?? profile?.revision ?? 58;
+  const effectiveRev = spec.profile_revision ?? profile?.revision ?? 59;
   const allowSynthetic = allowSyntheticWithoutReceipts === true || spec.allow_synthetic_without_receipts === true;
   const rawFiles = Array.isArray(rawFilesField) ? rawFilesField : [];
   if (!allowSynthetic && rawFiles.length === 0) {
@@ -1501,6 +2216,7 @@ export function ingestTrialSpecification(spec, profile, {
 
   const resolvedLedgerDb = ledgerDbPath ?? (nonemptyStr(specLedgerDbField) ? resolve(baseDir, String(specLedgerDbField)) : null);
   const dbFormConstraintsById = new Map();
+  const unmatchedLedgerReceiptFiles = [];
   if (resolvedLedgerDb) {
     if (!existsSync(resolvedLedgerDb)) {
       throw new TypeError(`Specified ledger_db_path does not exist: "${resolvedLedgerDb}".`);
@@ -1515,11 +2231,9 @@ export function ingestTrialSpecification(spec, profile, {
         for (const fp of rawFiles) {
           const absPath = resolve(baseDir, String(fp));
           const item = rawPayloadByResolvedPath.get(absPath);
-          if (!completedHashes.has(item.canonical_payload_sha256) && !completedHashes.has(item.source_sha256)) {
-            throw new TypeError(
-              `Raw receipt "${fp}" does not match any status='completed' api_request_ledger payload_sha256 in SQLite ledger.`,
-            );
-          }
+          const matched = completedHashes.has(item.canonical_payload_sha256) || completedHashes.has(item.source_sha256);
+          verifiedReceiptSha256s[String(fp)].ledger_provenance_verified = matched;
+          if (!matched) unmatchedLedgerReceiptFiles.push(String(fp));
         }
       }
       for (const entry of Array.isArray(spec.candidates) ? spec.candidates : []) {
@@ -1570,11 +2284,311 @@ export function ingestTrialSpecification(spec, profile, {
   const globalCatalog = extractVerifiedAsinCatalogFromRawPayloads(rawPayloads);
   const perCandidateVerifiedAsinCounts = {};
   const unverifiedUiQuoteCandidateIds = new Set();
+  const isolatedCandidates = [];
   const rawCandidateEntries = Array.isArray(spec.candidates) ? spec.candidates : [];
+
+  const isMissingFieldIngestError = (err) => {
+    const msg = String(err?.message ?? '');
+    return /(?:is required|must be a nonempty array|must be a positive finite number|requires? (?:a )?nonempty|is empty|contains no structured|At least one matched FBA peer with valid positive dimensions|upstream SP-API error)/i.test(msg) &&
+      !/(?:provenance|disagrees|conflicts|mismatch|smuggl|ui_readback|Cartesian|omitted|excluded_different_task|disjoint|Duplicate|unknown or expired quote_id|failed category_demand_report)/i.test(msg);
+  };
+
+  const applySpApiCalibrationToScenario = (sc, spCal, rawFeesForLookup = null) => {
+    if (!sc || typeof sc !== 'object' || !sc.cost_ledger || typeof sc.cost_ledger !== 'object') return;
+    const isFactoryPkg = sc.package_source === 'factory_quote';
+    const ledger = sc.cost_ledger;
+    const lines = Array.isArray(ledger.lines) ? ledger.lines : [];
+    const pricing = resolveEffectivePricing(ledger);
+    const netP = pricing.valid && finite(pricing.net_effective_price_usd) ? pricing.net_effective_price_usd : ledger.price_usd;
+    const listP = pricing.valid && finite(pricing.list_price_usd) ? pricing.list_price_usd : ledger.price_usd;
+    if (!finite(netP) || netP <= 0) return;
+
+    let mutated = false;
+    let effectiveFeeCal = spCal?.fee_calibration ?? null;
+    if (rawFeesForLookup && (!effectiveFeeCal || !finite(effectiveFeeCal.listing_price_usd) || Math.round(netP * 100) !== Math.round(effectiveFeeCal.listing_price_usd * 100))) {
+      try {
+        const perScCal = extractSpApiFinalistCalibration({
+          asin: spCal?.asin ?? null,
+          price_usd: netP,
+          feesEstimateRaw: rawFeesForLookup,
+        });
+        if (perScCal.fee_calibration_status === 'verified' && perScCal.fee_calibration) {
+          effectiveFeeCal = perScCal.fee_calibration;
+        }
+      } catch { /* ignore */ }
+    }
+    const refFrac = effectiveFeeCal?.referral_fraction;
+    const calPrice = effectiveFeeCal?.listing_price_usd;
+    const priceMatchesCalibratedTier = !finite(calPrice) || Math.round(netP * 100) === Math.round(calPrice * 100);
+    if (finite(refFrac) && refFrac > 0 && refFrac < 1 && priceMatchesCalibratedTier) {
+      ledger.referral_terms = {
+        refund_admin_fraction: 0.20,
+        refund_admin_cap_usd: 5.00,
+        minimum_referral_usd: 0.30,
+        ...(ledger.referral_terms ?? {}),
+        referral_fraction: refFrac,
+      };
+      const refLine = lines.find(l => l?.id === 'referral');
+      if (refLine && refLine.status !== 'pending') {
+        const minRef = finite(ledger.referral_terms.minimum_referral_usd) ? ledger.referral_terms.minimum_referral_usd : 0.30;
+        refLine.amount_usd = Math.max(minRef, Number((netP * refFrac).toFixed(6)));
+        mutated = true;
+      }
+    }
+
+    const officialPkg = !isFactoryPkg ? spCal?.official_pkg : null;
+    if (officialPkg && typeof officialPkg === 'object') {
+      ledger.pkg = { ...officialPkg };
+      if (ledger.unit_weight_lb !== undefined) ledger.unit_weight_lb = officialPkg.unit_weight_lb;
+      const salesWin = ledger.fee_context?.sales;
+      const storWin = ledger.fee_context?.storage;
+      const inbWin = ledger.fee_context?.inbound;
+      const isApparel = ledger.is_apparel_or_shoes === true;
+      const isDg = ledger.is_dangerous_goods === true;
+      const isSipp = ledger.is_sipp === true;
+
+      const fulLine = lines.find(l => l?.id === 'fulfillment');
+      if (fulLine && fulLine.status !== 'pending') {
+        const effSalesWin = (salesWin?.from >= '2027-01-15' && salesWin?.through <= '2027-10-14')
+          ? salesWin
+          : FBA_2027_DEFAULT_OFF_PEAK_WINDOW;
+        const ful = lookupUnifiedFulfillmentFee2027({
+          pkg: officialPkg,
+          price_usd: netP,
+          list_price_usd: listP,
+          has_ongoing_coupon: Boolean((pricing.ongoing_coupon_usd ?? 0) > 0 || (pricing.ongoing_coupon_pct ?? 0) > 0),
+          has_prime_discount: Boolean((pricing.prime_exclusive_discount_usd ?? 0) > 0 || (pricing.prime_exclusive_discount_pct ?? 0) > 0),
+          is_sipp: isSipp,
+          is_apparel: isApparel,
+          is_dangerous_goods: isDg,
+          fee_category: ledger.fee_category ?? null,
+          sales_window: effSalesWin,
+        });
+        if (ful.status === 'verified') {
+          fulLine.amount_usd = ful.total_usd;
+          fulLine.basis = `SP-API official pkg (${officialPkg.length_in}x${officialPkg.width_in}x${officialPkg.height_in} in, ${officialPkg.unit_weight_lb} lb) -> 2027 ${ful.size_tier} $${ful.total_usd}`;
+          if (fulLine.fee_basis && typeof fulLine.fee_basis === 'object') {
+            if (fulLine.fee_basis.price_band !== undefined) fulLine.fee_basis.price_band = ful.price_band;
+            if (fulLine.fee_basis.pkg && typeof fulLine.fee_basis.pkg === 'object') fulLine.fee_basis.pkg = { ...officialPkg };
+          }
+          mutated = true;
+        }
+      }
+
+      const placeLine = lines.find(l => l?.id === 'placement');
+      if (placeLine && placeLine.status !== 'pending') {
+        const effInbWin = (inbWin?.from >= '2027-01-15') ? inbWin : FBA_2027_DEFAULT_INBOUND_WINDOW;
+        const pl = lookupUnifiedPlacementFee2027({
+          pkg: officialPkg,
+          inbound_window: effInbWin,
+          split_option: placeLine.split_option ?? 'minimal_west_conservative',
+          is_apparel: isApparel,
+          is_dangerous_goods: isDg,
+        });
+        if (pl.status === 'verified') {
+          placeLine.amount_usd = pl.selected_usd;
+          if (placeLine.fee_basis?.pkg && typeof placeLine.fee_basis.pkg === 'object') {
+            placeLine.fee_basis.pkg = { ...officialPkg };
+          }
+          mutated = true;
+        }
+      }
+
+      const storLine = lines.find(l => l?.id === 'storage');
+      if (storLine && storLine.status !== 'pending') {
+        const invDays = storLine.fee_basis?.average_inventory_days ?? storLine.average_inventory_days ?? 45;
+        const mixesOffAndPeak = Boolean(storWin?.from && storWin?.through && storWin.from <= '2027-09-30' && storWin.through >= '2027-10-01');
+        const isPeakStor = !mixesOffAndPeak && (
+          (Array.isArray(storLine.fee_basis?.months) && storLine.fee_basis.months.length > 0 && storLine.fee_basis.months.every(m => m >= 10)) ||
+          Boolean(storWin?.from && storWin.from >= '2027-10-01')
+        );
+        const effStorWin = isPeakStor
+          ? FBA_2027_COMPANION_PEAK_STORAGE_WINDOW
+          : ((storWin?.from >= '2027-02-01' && storWin?.through <= '2027-09-30') ? storWin : FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW);
+        const st = lookupUnifiedStorageFee2027({
+          pkg: officialPkg,
+          storage_window: effStorWin,
+          average_inventory_days: invDays,
+          is_apparel: isApparel,
+          is_dangerous_goods: isDg,
+        });
+        if (st.status === 'verified') {
+          if (mixesOffAndPeak) {
+            const stPeak = lookupUnifiedStorageFee2027({
+              pkg: officialPkg,
+              storage_window: FBA_2027_COMPANION_PEAK_STORAGE_WINDOW,
+              average_inventory_days: invDays,
+              is_apparel: isApparel,
+              is_dangerous_goods: isDg,
+            });
+            storLine.amount_usd = stPeak.status === 'verified' ? stPeak.per_unit_usd : st.per_unit_usd;
+            delete ledger.pkg;
+          } else {
+            storLine.amount_usd = st.per_unit_usd;
+            if (storLine.fee_basis && typeof storLine.fee_basis === 'object') {
+              storLine.fee_basis.cubic_feet_per_unit = st.cubic_feet;
+              storLine.fee_basis.rate_usd_per_cuft_month = st.rate_usd_per_cuft_month;
+              storLine.fee_basis.average_inventory_days = invDays;
+              if (storLine.fee_basis.size_tier !== undefined) storLine.fee_basis.size_tier = st.size_tier;
+              if (storLine.fee_basis.pkg && typeof storLine.fee_basis.pkg === 'object') storLine.fee_basis.pkg = { ...officialPkg };
+            }
+          }
+          mutated = true;
+        }
+      }
+
+      const retLine = lines.find(l => l?.id === 'returns_processing');
+      if (retLine && retLine.status !== 'pending') {
+        const rPhys = finite(ledger.physical_return_fraction) ? ledger.physical_return_fraction : (ledger.refund_fraction ?? 0);
+        const catName = retLine.fee_basis?.fee_category ?? retLine.fee_category ?? ledger.fee_category ?? 'Everything Else';
+        const ret = lookupUnifiedReturnsProcessing2027({
+          pkg: officialPkg,
+          physical_return_fraction: rPhys,
+          fee_category: catName,
+          is_apparel_or_shoes: isApparel,
+          is_dangerous_goods: isDg,
+        });
+        if (ret.status === 'verified') {
+          retLine.amount_usd = ret.expected_fee_per_shipped_unit_usd;
+          if (ret.return_threshold !== null) {
+            retLine.return_threshold = ret.return_threshold;
+            if (retLine.fee_basis && typeof retLine.fee_basis === 'object' && retLine.fee_basis.return_threshold !== undefined) {
+              retLine.fee_basis.return_threshold = ret.return_threshold;
+            }
+          }
+          if (ret.per_return_fee_usd !== null) {
+            if (retLine.per_return_fee_usd !== undefined || ret.expected_fee_per_shipped_unit_usd > 0) {
+              retLine.per_return_fee_usd = ret.per_return_fee_usd;
+            }
+            if (retLine.fee_basis && typeof retLine.fee_basis === 'object') {
+              if (retLine.fee_basis.per_return_fee_usd !== undefined || ret.expected_fee_per_shipped_unit_usd > 0) {
+                retLine.fee_basis.per_return_fee_usd = ret.per_return_fee_usd;
+              }
+              if (retLine.fee_basis.pkg && typeof retLine.fee_basis.pkg === 'object') {
+                retLine.fee_basis.pkg = { ...officialPkg };
+              }
+            }
+          }
+          mutated = true;
+        }
+      }
+
+      const hhLine = lines.find(l => l?.id === 'headhaul');
+      if (hhLine && hhLine.status !== 'pending') {
+        const rawHh = hhLine.cny_derivation ?? ledger.headhaul ?? ledger.source_inputs?.headhaul ?? null;
+        if (rawHh && typeof rawHh === 'object' && finite(rawHh.rate_cny_per_kg)) {
+          const actualKg = Number((officialPkg.unit_weight_lb * 0.45359237).toFixed(6));
+          const volKg = Number(((officialPkg.length_in * 2.54 * officialPkg.width_in * 2.54 * officialPkg.height_in * 2.54) / (rawHh.volumetric_divisor ?? 6000)).toFixed(6));
+          const updatedHh = {
+            ...rawHh,
+            actual_weight_kg_per_unit: actualKg,
+            chargeable_kg_per_unit: Math.max(rawHh.chargeable_kg_per_unit ?? 0, actualKg, volKg),
+          };
+          const procLine = lines.find(l => l?.id === 'procurement');
+          const effFx = updatedHh.fx ?? updatedHh.fx_cny_per_usd ?? ledger.fx_cny_per_usd ?? ledger.source_inputs?.fx_cny_per_usd ?? procLine?.fx_cny_per_usd;
+          const effUnits = updatedHh.order_units ?? ledger.order_units ?? procLine?.order_units ?? 100;
+          const hhCalc = computeHeadhaulWithA4Rules(updatedHh, effFx, effUnits, { isR58: true, isR59: effectiveRev >= 59 });
+          if (hhCalc.amount_usd !== null && !hhCalc.missing_surcharge_quote) {
+            hhLine.amount_usd = hhCalc.amount_usd;
+            if (hhLine.cny_derivation) hhLine.cny_derivation = updatedHh;
+            if (ledger.headhaul) ledger.headhaul = updatedHh;
+            if (ledger.source_inputs?.headhaul) ledger.source_inputs.headhaul = updatedHh;
+            mutated = true;
+          }
+        }
+      }
+    }
+
+    if (mutated) {
+      const colLine = lines.find(l => l?.id === 'collection');
+      if (colLine && colLine.status !== 'pending' && finite(ledger.collection_rate) && ledger.collection_rate >= 0) {
+        const r = finite(ledger.refund_fraction) ? ledger.refund_fraction : 0;
+        const refAmt = lines.find(l => l?.id === 'referral' && l.status !== 'pending')?.amount_usd ?? 0;
+        const adminFrac = ledger.referral_terms?.refund_admin_fraction ?? 0.20;
+        const adminCap = ledger.referral_terms?.refund_admin_cap_usd ?? 5.00;
+        const adminExpected = r * Math.min(adminCap, refAmt * adminFrac);
+        const fbaSum = ['fulfillment', 'placement', 'storage', 'returns_processing', 'return_disposition']
+          .reduce((acc, k) => {
+            const ln = lines.find(x => x?.id === k);
+            return (ln && ln.status !== 'pending' && ln.status !== 'deferred' && finite(ln.amount_usd)) ? acc + ln.amount_usd : acc;
+          }, 0);
+        const otherAmz = lines
+          .filter(x => x?.id === 'other_applicable' && x.payee !== 'external' && x.status !== 'pending' && finite(x.amount_usd))
+          .reduce((acc, x) => acc + x.amount_usd, 0);
+        const payout = netP * (1 - r) - refAmt * (1 - r) - adminExpected - fbaSum - otherAmz;
+        colLine.amount_usd = Number((Math.max(0, payout) * ledger.collection_rate).toFixed(6));
+      }
+      try {
+        const recalc = calculateEconomics(ledger, { requireFeeBasis: false, profileRevision: effectiveRev });
+        if (recalc.margin !== null && sc.margin && typeof sc.margin === 'object') {
+          sc.margin = { ...sc.margin, value: recalc.margin };
+        }
+        if (recalc.contribution_usd !== null && sc.contribution_usd && typeof sc.contribution_usd === 'object') {
+          sc.contribution_usd = { ...sc.contribution_usd, value: recalc.contribution_usd };
+        }
+      } catch {
+        delete sc.margin;
+        delete sc.contribution_usd;
+      }
+    }
+  };
 
   const builtCandidates = rawCandidateEntries.map((entry, idx) => {
     const cand = structuredClone(entry.candidate ?? entry);
     if (!nonemptyStr(cand?.id)) throw new TypeError(`Candidate #${idx + 1} requires a nonempty id.`);
+
+    // Enforce #4 purchase_demand_scale total comparable sales rule (never single-color / single-child / median).
+    const demandScaleMetric = cand?.metrics?.purchase_demand_scale;
+    if (demandScaleMetric && typeof demandScaleMetric === 'object') {
+      const dsTags = [
+        demandScaleMetric.grain,
+        demandScaleMetric.scope,
+        demandScaleMetric.basis,
+        demandScaleMetric.statistic,
+        demandScaleMetric.aggregation,
+      ].filter(v => typeof v === 'string').map(v => v.trim().toLowerCase());
+      const hasForbiddenSingleOrMedian = dsTags.some(t =>
+        t === 'single_color_child_median' ||
+        t === 'single_child' ||
+        t === 'single_variant' ||
+        t === 'child_median' ||
+        t === 'median' ||
+        t.includes('single_color') ||
+        t.includes('median'),
+      );
+      if (hasForbiddenSingleOrMedian) {
+        throw new TypeError(
+          `Candidate "${cand.id}" metrics.purchase_demand_scale cannot use single-variant or median statistics (${dsTags.join(', ')}); #4 purchase_demand_scale requires category comparable total/parent sales.`,
+        );
+      }
+      if (demandScaleMetric.grain === 'target_child_units' && !Array.isArray(demandScaleMetric.value_range)) {
+        throw new TypeError(
+          `Candidate "${cand.id}" metrics.purchase_demand_scale cannot use point target_child_units without a coherent niche value_range; single-child metrics belong only to Q31.`,
+        );
+      }
+    }
+
+    // Wire niche_average_star_reference (r20), Q31 dual-source keyword_counts (r48/r50), and Q31 Vine/VP/直评 breakdown when raw inputs are supplied.
+    if (Array.isArray(entry.niche_comparable_rows) && entry.niche_comparable_rows.length > 0) {
+      const starRef = extractNicheAverageStarReference(entry.niche_comparable_rows);
+      if (starRef && !cand?.presentation?.niche_average_star_reference) {
+        cand.presentation = { ...(cand.presentation ?? {}), niche_average_star_reference: starRef };
+      }
+    }
+    if (Array.isArray(cand?.newcomer_cohort?.members)) {
+      for (const member of cand.newcomer_cohort.members) {
+        if (!member || typeof member !== 'object') continue;
+        if (!member.review_origin_breakdown) {
+          const rob = extractNewcomerReviewOriginBreakdown(member);
+          if (rob) member.review_origin_breakdown = rob;
+        }
+        const nat = member.natural_visibility ?? member.natural;
+        if (nat && typeof nat === 'object' && !nat.keyword_counts && entry.q31_keyword_sources?.[member.asin]) {
+          const kc = extractQ31DualSourceKeywordCounts(entry.q31_keyword_sources[member.asin]);
+          if (kc) nat.keyword_counts = kc;
+        }
+      }
+    }
 
     if (entry.qualitative_inputs) {
       const qual = resolveStage1QualitativeJudgments(entry.qualitative_inputs);
@@ -1588,24 +2602,261 @@ export function ingestTrialSpecification(spec, profile, {
     }
 
     if (entry.bid_plan_inputs) {
-      cand.bids = extractSifThreeTierBidPlan(entry.bid_plan_inputs);
+      try {
+        cand.bids = extractSifThreeTierBidPlan(entry.bid_plan_inputs);
+      } catch (err) {
+        if (!isMissingFieldIngestError(err)) throw err;
+        const reason = `Candidate "${cand.id}" bid_plan_inputs missing required field (${err.message}); isolated to pending.`;
+        ensureCandidatePendingShellOnMissingFields(cand, reason);
+        isolatedCandidates.push({ candidate_id: cand.id, reason });
+      }
+    }
+
+    if (entry.monthly_archive_market_raw) {
+      try {
+        cand.market = {
+          ...(cand.market ?? {}),
+          ...ingestSellerSpriteMonthlyArchiveMarket(entry.monthly_archive_market_raw, entry.monthly_archive_market_options ?? {}),
+        };
+      } catch (err) {
+        if (!isMissingFieldIngestError(err)) throw err;
+        const reason = `Candidate "${cand.id}" monthly_archive_market_raw missing required field (${err.message}); isolated to pending.`;
+        ensureCandidatePendingShellOnMissingFields(cand, reason);
+        isolatedCandidates.push({ candidate_id: cand.id, reason });
+      }
+    }
+
+    const entryCandPayloads = rawPayloads.length > 0
+      ? (Array.isArray(entry.raw_receipt_files) && entry.raw_receipt_files.length > 0
+        ? entry.raw_receipt_files.map(fp => rawPayloadByResolvedPath.get(resolve(baseDir, String(fp)))).filter(Boolean)
+        : rawPayloads)
+      : [];
+    const targetVariantAsin = nonemptyStr(entry.sp_api_calibration_inputs?.asin)
+      ? entry.sp_api_calibration_inputs.asin.trim().toUpperCase()
+      : (nonemptyStr(cand?.screening?.reference_price_usd?.target_variant_asin)
+        ? cand.screening.reference_price_usd.target_variant_asin.trim().toUpperCase()
+        : null);
+    let autoSpCatalogRaw = null;
+    const autoSpFeesCandidates = [];
+    let autoSpRestrictionsRaw = null;
+    const findSpApiErrorsDeep = (obj, depth = 0) => {
+      if (!obj || typeof obj !== 'object' || depth > 5) return null;
+      if (Array.isArray(obj.errors) && obj.errors.length > 0 && obj.code === undefined && !Array.isArray(obj.items)) {
+        return obj.errors[0];
+      }
+      for (const k of ['structuredContent', 'data', 'result', 'response', 'payload']) {
+        const hit = findSpApiErrorsDeep(obj[k], depth + 1);
+        if (hit) return hit;
+      }
+      if (Array.isArray(obj.content)) {
+        for (const blk of obj.content) {
+          if (typeof blk?.text === 'string' && blk.text.trim().startsWith('{')) {
+            try {
+              const hit = findSpApiErrorsDeep(JSON.parse(blk.text), depth + 1);
+              if (hit) return hit;
+            } catch { /* ignore */ }
+          }
+        }
+      }
+      return null;
+    };
+    let hasUpstreamSpApiError = false;
+    if (entryCandPayloads.length > 0) {
+      for (const item of entryCandPayloads) {
+        const rawP = item?.payload ?? item;
+        if (!rawP || typeof rawP !== 'object') continue;
+        const spErr = findSpApiErrorsDeep(rawP);
+        if (spErr) {
+          const reason = `Candidate "${cand.id}" includes an upstream SP-API error receipt (${spErr?.code ?? spErr?.message ?? 'SP_API_ERROR'}); finalist calibration isolated to pending.`;
+          ensureCandidatePendingShellOnMissingFields(cand, reason);
+          isolatedCandidates.push({ candidate_id: cand.id, reason });
+          hasUpstreamSpApiError = true;
+          break;
+        }
+        const unw = unwrapMcpEnvelope(rawP);
+        if (!unw || typeof unw !== 'object') continue;
+        if (targetVariantAsin) {
+          if (!autoSpCatalogRaw && nonemptyStr(unw.asin) && unw.asin.trim().toUpperCase() === targetVariantAsin &&
+            (Array.isArray(unw.dimensions) || unw.attributes?.item_package_dimensions || unw.attributes?.item_package_weight)) {
+            autoSpCatalogRaw = rawP;
+          }
+          const isNativeFeesArray = Array.isArray(unw) && unw.some(x => x && typeof x === 'object' && (x.FeesEstimateResult || x.FeesEstimateIdentifier || x.FeesEstimate));
+          if (isNativeFeesArray || unw.FeesEstimateResult || unw.FeesEstimateResultList || unw.payload?.FeesEstimateResult || unw.payload?.FeesEstimateResultList) {
+            autoSpFeesCandidates.push(rawP);
+          }
+          if (!autoSpRestrictionsRaw && Array.isArray(unw.restrictions)) {
+            if (!nonemptyStr(unw.asin) || unw.asin.trim().toUpperCase() === targetVariantAsin) {
+              autoSpRestrictionsRaw = rawP;
+            }
+          }
+        }
+      }
+    }
+    const autoSpFeesRaw = autoSpFeesCandidates.length === 0
+      ? null
+      : (autoSpFeesCandidates.length === 1
+        ? autoSpFeesCandidates[0]
+        : {
+            FeesEstimateResultList: autoSpFeesCandidates.flatMap(fp => {
+              const u = unwrapMcpEnvelope(fp);
+              if (Array.isArray(u)) return u;
+              if (Array.isArray(u?.FeesEstimateResultList)) return u.FeesEstimateResultList;
+              if (Array.isArray(u?.payload?.FeesEstimateResultList)) return u.payload.FeesEstimateResultList;
+              return [u?.FeesEstimateResult ?? u?.payload?.FeesEstimateResult ?? u];
+            }),
+          });
+    const mergedSpInputs = (entry.sp_api_calibration_inputs && typeof entry.sp_api_calibration_inputs === 'object')
+      ? {
+          asin: targetVariantAsin,
+          price_usd: cand?.screening?.reference_price_usd?.value ?? null,
+          ...(autoSpCatalogRaw ? { catalogItemRaw: autoSpCatalogRaw } : {}),
+          ...(autoSpFeesRaw ? { feesEstimateRaw: autoSpFeesRaw } : {}),
+          ...(autoSpRestrictionsRaw ? { restrictionsRaw: autoSpRestrictionsRaw } : {}),
+          ...entry.sp_api_calibration_inputs,
+        }
+      : ((autoSpCatalogRaw || autoSpFeesRaw || autoSpRestrictionsRaw)
+        ? {
+            asin: targetVariantAsin,
+            price_usd: cand?.screening?.reference_price_usd?.value ?? null,
+            catalogItemRaw: autoSpCatalogRaw,
+            feesEstimateRaw: autoSpFeesRaw,
+            restrictionsRaw: autoSpRestrictionsRaw,
+          }
+        : null);
+
+    let activePairedSeasonal = entry.paired_seasonal ? structuredClone(entry.paired_seasonal) : null;
+    if (mergedSpInputs && !hasUpstreamSpApiError) {
+      let spCal = null;
+      try {
+        spCal = extractSpApiFinalistCalibration(mergedSpInputs);
+      } catch (err) {
+        if (!isMissingFieldIngestError(err)) throw err;
+        const reason = `Candidate "${cand.id}" SP-API calibration error (${err.message}); isolated to pending.`;
+        ensureCandidatePendingShellOnMissingFields(cand, reason);
+        isolatedCandidates.push({ candidate_id: cand.id, reason });
+      }
+      if (spCal) {
+        cand.sp_api_calibration = spCal;
+      if (spCal.stale_sellersprite_audit?.stale_sellersprite_cache_corrected === true) {
+        const noteStr = `SP-API 官方包装尺寸纠偏：${spCal.asin ? `${spCal.asin} ` : ''}卖家精灵旧缓存重 ${spCal.stale_sellersprite_audit.sellersprite_cached_weight_lb} lb（2027 FBA $${spCal.stale_sellersprite_audit.sellersprite_cached_fba_2027_usd}），SP-API 官方库实测为 ${spCal.stale_sellersprite_audit.sp_api_official_weight_lb} lb（2027 FBA $${spCal.stale_sellersprite_audit.sp_api_official_fba_2027_usd}）。`;
+        cand.review_notes = [...(Array.isArray(cand.review_notes) ? cand.review_notes : []), noteStr];
+      }
+      if (spCal.restrictions?.hard_category_ban === true) {
+        cand.presentation = {
+          ...(cand.presentation ?? {}),
+          risks: [...new Set([...(cand.presentation?.risks ?? []), 'SP-API 命中强制禁售限制'])],
+        };
+        const fallbackEv = cand.judgments?.applicable_public_requirements?.evidence
+          ?? cand?.screening?.reference_price_usd?.evidence
+          ?? [];
+        cand.judgments = {
+          ...(cand.judgments ?? {}),
+          applicable_public_requirements: {
+            ...(cand.judgments?.applicable_public_requirements ?? {}),
+            anchor: 0,
+            proven_conflict: true,
+            hard_ban: true,
+            reason: 'SP-API listingsRestrictions 命中我方自有白牌强制类目/法规禁售限制。',
+            evidence: fallbackEv,
+          },
+        };
+      } else if (spCal.restrictions?.white_label_note) {
+        cand.review_notes = [...(Array.isArray(cand.review_notes) ? cand.review_notes : []), spCal.restrictions.white_label_note];
+      }
+
+      if (spCal.official_pkg || spCal.fee_calibration?.referral_fraction || mergedSpInputs.feesEstimateRaw) {
+        const rawFeesForLookup = mergedSpInputs.feesEstimateRaw ?? null;
+        if (activePairedSeasonal) {
+          if (spCal.official_pkg) {
+            activePairedSeasonal.cubic_feet_per_unit = Number(
+              ((spCal.official_pkg.length_in * spCal.official_pkg.width_in * spCal.official_pkg.height_in) / 1728).toFixed(6),
+            );
+            const offTier = spCal.local_2027_off_peak_fulfillment?.size_tier ?? classifySizeTier2027(spCal.official_pkg)?.size_tier;
+            if (offTier) activePairedSeasonal.size_tier = offTier;
+          }
+          if (Array.isArray(activePairedSeasonal.off_peak_scenarios)) {
+            for (const sc of activePairedSeasonal.off_peak_scenarios) {
+              applySpApiCalibrationToScenario(sc, spCal, rawFeesForLookup);
+            }
+          }
+        }
+        if (Array.isArray(cand?.economics?.scenarios)) {
+          for (const sc of cand.economics.scenarios) {
+            applySpApiCalibrationToScenario(sc, spCal, rawFeesForLookup);
+          }
+        }
+        if (Array.isArray(cand?.economics?.operating_periods)) {
+          for (const op of cand.economics.operating_periods) {
+            if (Array.isArray(op?.scenarios)) {
+              for (const sc of op.scenarios) {
+                applySpApiCalibrationToScenario(sc, spCal, rawFeesForLookup);
+              }
+            }
+          }
+        }
+      }
+      }
+    }
+
+    const rawAutoSpPeers = entryCandPayloads.length > 0
+      ? extractSpApiPeerPackagesFromRawPayloads(entryCandPayloads)
+      : [];
+    const combinedPeerList = [
+      ...rawAutoSpPeers,
+      ...(cand.sp_api_calibration?.official_pkg ? [cand.sp_api_calibration.official_pkg] : []),
+      ...(Array.isArray(entry.peer_package_inputs?.peers) ? entry.peer_package_inputs.peers : []),
+    ];
+    if (combinedPeerList.length > 0 && (entry.peer_package_inputs || rawAutoSpPeers.length > 0 || cand.sp_api_calibration?.official_pkg)) {
+      try {
+        const peerPkgSummary = computeMatchedPeerMedianPackage(combinedPeerList, {
+          supplier_nominal_pkg: entry.peer_package_inputs?.supplier_nominal_pkg ?? null,
+        });
+        cand.peer_package_calibration = peerPkgSummary;
+        if (peerPkgSummary.sample_warning_tag) {
+          cand.presentation = {
+            ...(cand.presentation ?? {}),
+            risks: [...new Set([...(cand.presentation?.risks ?? []), peerPkgSummary.sample_warning_tag])],
+          };
+        }
+      } catch (err) {
+        if (!isMissingFieldIngestError(err)) throw err;
+        const reason = `Candidate "${cand.id}" peer_package_inputs missing valid package dimensions (${err.message}); isolated to pending.`;
+        ensureCandidatePendingShellOnMissingFields(cand, reason);
+        isolatedCandidates.push({ candidate_id: cand.id, reason });
+      }
     }
 
     const dbConstraints = dbFormConstraintsById.get(cand.id) ?? null;
-    if (entry.paired_seasonal) {
+    if (activePairedSeasonal) {
       const mergedReqQuotes = [
-        ...(Array.isArray(entry.paired_seasonal.required_quote_ids) ? entry.paired_seasonal.required_quote_ids : []),
+        ...(Array.isArray(activePairedSeasonal.required_quote_ids) ? activePairedSeasonal.required_quote_ids : []),
         ...((dbConstraints?.verifiedQuoteIds?.length ?? 0) > 1 ? dbConstraints.verifiedQuoteIds : []),
       ];
       const mergedReqPrices = [
-        ...(Array.isArray(entry.paired_seasonal.required_prices_usd) ? entry.paired_seasonal.required_prices_usd : []),
+        ...(Array.isArray(activePairedSeasonal.required_prices_usd) ? activePairedSeasonal.required_prices_usd : []),
         ...(dbConstraints?.declaredPricesUsd ?? []),
       ];
-      cand.economics = buildPairedSeasonalOperatingPeriods({
-        ...entry.paired_seasonal,
-        ...(mergedReqQuotes.length > 0 ? { required_quote_ids: mergedReqQuotes } : {}),
-        ...(mergedReqPrices.length > 0 ? { required_prices_usd: mergedReqPrices } : {}),
-      });
+      try {
+        cand.economics = buildPairedSeasonalOperatingPeriods({
+          profile_revision: effectiveRev,
+          ...activePairedSeasonal,
+          ...(mergedReqQuotes.length > 0 ? { required_quote_ids: mergedReqQuotes } : {}),
+          ...(mergedReqPrices.length > 0 ? { required_prices_usd: mergedReqPrices } : {}),
+        });
+      } catch (err) {
+        if (!isMissingFieldIngestError(err)) throw err;
+        const reason = `Candidate "${cand.id}" paired_seasonal missing required field (${err.message}); isolated to pending.`;
+        ensureCandidatePendingShellOnMissingFields(cand, reason);
+        isolatedCandidates.push({ candidate_id: cand.id, reason });
+      }
+    }
+
+    if (!cand.economics || (!Array.isArray(cand.economics.scenarios) && !Array.isArray(cand.economics.operating_periods)) ||
+      (Array.isArray(cand.economics.scenarios) && cand.economics.scenarios.length === 0 && !cand.economics.expected_primary_scenarios) ||
+      !nonemptyStr(cand.economics.saleable_unit)) {
+      const reason = `Candidate "${cand.id}" is missing required economics/scenarios fields; isolated to pending without aborting batch.`;
+      ensureCandidatePendingShellOnMissingFields(cand, reason);
+      isolatedCandidates.push({ candidate_id: cand.id, reason });
     }
 
     const parityCheck = enforceCandidateContainerMatrixAndDbParity(cand, {
@@ -1614,6 +2865,9 @@ export function ingestTrialSpecification(spec, profile, {
     });
     if (parityCheck.unverifiedUiQuoteUsed) {
       unverifiedUiQuoteCandidateIds.add(cand.id);
+    }
+    if (parityCheck.isolatedReason) {
+      isolatedCandidates.push({ candidate_id: cand.id, reason: parityCheck.isolatedReason });
     }
 
     if (rawPayloads.length > 0) {
@@ -1630,20 +2884,24 @@ export function ingestTrialSpecification(spec, profile, {
           return found;
         });
       } else if (!allowSynthetic && rawCandidateEntries.length > 1) {
-        throw new TypeError(
-          `Multi-candidate ingestTrialSpecification requires per-candidate raw_receipt_files on "${cand.id}" to prevent cross-product ASIN substitution.`,
-        );
+        const reason = `Candidate "${cand.id}" is missing per-candidate raw_receipt_files in multi-candidate batch; isolated to pending.`;
+        ensureCandidatePendingShellOnMissingFields(cand, reason);
+        isolatedCandidates.push({ candidate_id: cand.id, reason });
+        perCandidateVerifiedAsinCounts[cand.id] = 0;
+        return cand;
       }
       const candCatalog = candPayloads === rawPayloads
         ? globalCatalog
         : extractVerifiedAsinCatalogFromRawPayloads(candPayloads);
-      const candAsins = assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
-        candPayloads,
-        extraVerifiedAsins: entry.verified_asins ?? [],
-        allowSyntheticIds: allowSynthetic,
-        effectiveRev,
-        fallbackAsOfDate: entry?.as_of_date ?? spec.as_of_date ?? null,
-      });
+      const candAsins = cand.ingest_isolated_pending === true && !cand?.screening?.reference_price_usd
+        ? new Set()
+        : assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
+            candPayloads,
+            extraVerifiedAsins: entry.verified_asins ?? [],
+            allowSyntheticIds: allowSynthetic,
+            effectiveRev,
+            fallbackAsOfDate: entry?.as_of_date ?? spec.as_of_date ?? null,
+          });
       if (effectiveRev >= 59) {
         const candLeafNodeIds = new Set();
         const rawRelBsr = String(cand?.newcomer_cohort?.relevant_bsr_node ?? '').trim();
@@ -1783,7 +3041,8 @@ export function ingestTrialSpecification(spec, profile, {
     schema_version: 1,
     profile_revision: spec.profile_revision ?? profile.revision,
     ...(spec.presentation ? { presentation: spec.presentation } : {}),
-    ...(Array.isArray(spec.negotiation_shortlist) ? { negotiation_shortlist: spec.negotiation_shortlist } : {}),
+    ...(effectiveRev < 59 && Array.isArray(spec.negotiation_shortlist) ? { negotiation_shortlist: spec.negotiation_shortlist } : {}),
+    ...(Array.isArray(spec.packaging_redesign_shortlist) ? { packaging_redesign_shortlist: spec.packaging_redesign_shortlist } : {}),
     candidates: builtCandidates,
   };
 
@@ -1804,5 +3063,8 @@ export function ingestTrialSpecification(spec, profile, {
     verified_raw_asin_count: globalCatalog.size,
     per_candidate_verified_asin_counts: perCandidateVerifiedAsinCounts,
     verified_receipt_sha256s: verifiedReceiptSha256s,
+    ledger_provenance_verified: resolvedLedgerDb ? unmatchedLedgerReceiptFiles.length === 0 : null,
+    unmatched_ledger_receipt_files: unmatchedLedgerReceiptFiles,
+    isolated_candidates: isolatedCandidates,
   };
 }

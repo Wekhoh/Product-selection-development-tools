@@ -16,8 +16,15 @@ import {
   resolvePackageDimsRat,
   resolveEffectivePricing,
   isOfficial2027ScheduleWindowValid,
+  isCanonical2027OffPeakWin,
+  isCanonical2027OffPeakStorageWin,
+  isCanonical2027PeakWin,
+  isCanonical2027PeakStorageWin,
+  hasProhibited2026PeakExtrapolation,
   lookupVerified2027ReturnThreshold,
   lookupVerified2027PerReturnFee,
+  computeHeadhaulWithA4Rules,
+  computeAmazonCouponRedemptionFee2027,
   toBigRat,
   gcdBig,
   addBigRat,
@@ -26,7 +33,11 @@ import {
   ratCmp,
   roundBigRat,
 } from './fee-basis.mjs';
-import { computeOrderPlan, computeNegotiationShortlist } from './fba-rates-2027.mjs';
+import {
+  computeOrderPlan,
+  computeNegotiationShortlist,
+  computePackagingRedesignShortlist2027,
+} from './fba-rates-2027.mjs';
 
 const finite = value => typeof value === 'number' && Number.isFinite(value);
 const round = value => Math.round((value + Number.EPSILON) * 1e10) / 1e10;
@@ -45,7 +56,18 @@ const isoDate = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test
   Number.isFinite(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 const validWindow = value => isoDate(value?.from) && isoDate(value?.through) && value.from <= value.through;
 
-const PER_KG_KEYS = ['chargeable_kg_per_unit', 'rate_cny_per_kg', 'surcharge_cny_per_kg', 'bond_cny_per_kg', 'bond_cny_per_shipment'];
+const PER_KG_KEYS = [
+  'chargeable_kg_per_unit',
+  'rate_cny_per_kg',
+  'surcharge_cny_per_kg',
+  'bond_cny_per_kg',
+  'bond_cny_per_shipment',
+  'carton_cm',
+  'carton_count',
+  'actual_weight_kg_total',
+  'actual_weight_kg_per_unit',
+  'weight_per_carton_kg',
+];
 const STORAGE_CALC_KEYS = ['cubic_feet_per_unit', 'rate_usd_per_cuft_month', 'average_inventory_days'];
 
 function monthsIn(window) {
@@ -66,56 +88,19 @@ function parseTriState(value, fieldName) {
   throw new TypeError(`${fieldName} must be boolean true, false, or 'unknown' under revision 58.`);
 }
 
-function resolveHeadhaul(headhaul, fx, orderUnits, isR58 = false) {
-  if (!headhaul || typeof headhaul !== 'object') return { amount_usd: null, cny_derivation: null };
+function resolveHeadhaul(headhaul, fx, orderUnits, isR58 = false, isR59 = false) {
+  if (!headhaul || typeof headhaul !== 'object') return { amount_usd: null, cny_derivation: null, a4_applied: null };
   const hasPerKgField = PER_KG_KEYS.some(key => Object.hasOwn(headhaul, key));
   if (!hasPerKgField) {
     return headhaul.bond_included === true && finite(headhaul.usd_per_unit) && headhaul.usd_per_unit > 0
-      ? { amount_usd: isR58 ? headhaul.usd_per_unit : round(headhaul.usd_per_unit), cny_derivation: null }
-      : { amount_usd: null, cny_derivation: null };
+      ? { amount_usd: isR58 ? headhaul.usd_per_unit : round(headhaul.usd_per_unit), cny_derivation: null, a4_applied: null }
+      : { amount_usd: null, cny_derivation: null, a4_applied: null };
   }
-  if (Object.hasOwn(headhaul, 'usd_per_unit')) return { amount_usd: null, cny_derivation: null };
-  const {
-    chargeable_kg_per_unit: kg,
-    rate_cny_per_kg: rate,
-    surcharge_cny_per_kg: surcharge,
-    bond_cny_per_kg: bondPerKg,
-    bond_cny_per_shipment: bondPerShipment,
-  } = headhaul;
-  const hasPerKgBond = finite(bondPerKg) && bondPerKg >= 0;
-  const hasShipmentBond = finite(bondPerShipment) && bondPerShipment >= 0;
-  const needsOrderUnits = !isR58 || hasShipmentBond;
-  if (!finite(kg) || kg <= 0 || ![rate, surcharge].every(value => finite(value) && value >= 0) ||
-    (!hasPerKgBond && !hasShipmentBond) || (hasPerKgBond && hasShipmentBond) ||
-    !finite(fx) || fx <= 0 || (needsOrderUnits && (!finite(orderUnits) || orderUnits <= 0))) {
-    return { amount_usd: null, cny_derivation: null };
-  }
-  if (isR58) {
-    const kgR = toBigRat(kg);
-    const baseR = mulBigRat(kgR, addBigRat(toBigRat(rate), toBigRat(surcharge)));
-    const bondR = hasPerKgBond
-      ? mulBigRat(kgR, toBigRat(bondPerKg))
-      : divBigRat(toBigRat(bondPerShipment), toBigRat(orderUnits));
-    const cnyPerUnitR = addBigRat(baseR, bondR);
-    if (cnyPerUnitR.n <= 0n) return { amount_usd: null, cny_derivation: null };
-    const usdR = divBigRat(cnyPerUnitR, toBigRat(fx));
-    return {
-      amount_usd: roundBigRat(usdR.n, usdR.d, 10),
-      cny_derivation: {
-        fx,
-        chargeable_kg_per_unit: kg,
-        rate_cny_per_kg: rate,
-        surcharge_cny_per_kg: surcharge,
-        ...(hasPerKgBond ? { bond_cny_per_kg: bondPerKg } : { bond_cny_per_shipment: bondPerShipment, order_units: orderUnits }),
-      },
-    };
-  }
-  const bondCnyPerUnit = hasPerKgBond ? kg * bondPerKg : bondPerShipment / orderUnits;
-  const cnyPerUnit = kg * (rate + surcharge) + bondCnyPerUnit;
-  return { amount_usd: cnyPerUnit > 0 ? round(cnyPerUnit / fx) : null, cny_derivation: null };
+  if (Object.hasOwn(headhaul, 'usd_per_unit')) return { amount_usd: null, cny_derivation: null, a4_applied: null };
+  return computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58, isR59 });
 }
 
-function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58) {
+function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58, isR59 = false, feeContext = null) {
   let months = null;
   if (operatingMonths !== undefined) {
     if (!Array.isArray(operatingMonths) || !operatingMonths.length ||
@@ -124,16 +109,22 @@ function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58) {
     }
     months = [...new Set(operatingMonths)];
   }
+  const canonicalR59OffPeak = isR59 &&
+    isCanonical2027OffPeakWin(feeContext?.sales) &&
+    isCanonical2027OffPeakStorageWin(feeContext?.storage);
+  const canonicalR59Peak = isR59 && isCanonical2027PeakWin(feeContext?.sales);
   let explicitFullPeriod = null;
   if (operatingPeriod !== undefined) {
     if (operatingPeriod === 'peak') {
-      if (months && ([10, 11, 12].some(month => !months.includes(month)) || months.some(month => ![10, 11, 12].includes(month)))) {
+      const allowedPeak = canonicalR59Peak ? [10, 11, 12, 1] : [10, 11, 12];
+      if (months && ([10, 11, 12].some(month => !months.includes(month)) || months.some(month => !allowedPeak.includes(month)))) {
         return { valid: false, months: null, explicitFullPeriod: null };
       }
       months = months ?? [10, 11, 12];
       explicitFullPeriod = 'peak';
     } else if (operatingPeriod === 'off_peak') {
-      if (months && months.some(month => [10, 11, 12].includes(month))) {
+      const forbiddenOffPeak = canonicalR59OffPeak ? [11, 12] : [10, 11, 12];
+      if (months && months.some(month => forbiddenOffPeak.includes(month))) {
         return { valid: false, months: null, explicitFullPeriod: null };
       }
       if (!months) explicitFullPeriod = 'off_peak';
@@ -150,11 +141,11 @@ function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58) {
     }
   }
   if (isR58 && months === null) return { valid: false, months: null, explicitFullPeriod: null };
-  return { valid: true, months, explicitFullPeriod };
+  return { valid: true, months, explicitFullPeriod, canonicalR59OffPeak, canonicalR59Peak };
 }
 
-function resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context }) {
-  const periodSpec = resolveRequiredMonths(operating_period, operating_months, true);
+function resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context }, isR59 = false) {
+  const periodSpec = resolveRequiredMonths(operating_period, operating_months, true, isR59, fee_context);
   if (!periodSpec.valid) return { valid: false, reason: 'Revision 58 requires explicit valid operating_period or operating_months.' };
   if (!fee_context || typeof fee_context !== 'object' ||
     !text(fee_context.package_ref) ||
@@ -175,15 +166,24 @@ function resolveDateContextR58({ operating_period, operating_months, sales_windo
   if (inboundWin.from > salesWin.through) {
     return { valid: false, reason: 'Inbound plan window cannot start after the sales window ends.' };
   }
+  const canonicalR59Peak = Boolean(periodSpec.canonicalR59Peak && isCanonical2027PeakStorageWin(storageWin));
   const year = salesWin.from.slice(0, 4);
-  if (salesWin.through.slice(0, 4) !== year || storageWin.from.slice(0, 4) !== year || storageWin.through.slice(0, 4) !== year) {
+  if (!canonicalR59Peak && (salesWin.through.slice(0, 4) !== year || storageWin.from.slice(0, 4) !== year || storageWin.through.slice(0, 4) !== year)) {
     return { valid: false, reason: 'Sales and storage windows must fall within one target calendar year.' };
   }
   const salesMonths = monthsIn(salesWin);
   const storageMonths = monthsIn(storageWin);
   const required = periodSpec.months;
-  if (salesMonths.some(m => !required.includes(m)) || required.some(m => !salesMonths.includes(m)) ||
-    storageMonths.some(m => !required.includes(m)) || required.some(m => !storageMonths.includes(m))) {
+  const r59OffPeakMonthsOk = Boolean(periodSpec.canonicalR59OffPeak &&
+    [2, 3, 4, 5, 6, 7, 8, 9].every(m => required.includes(m)) &&
+    required.every(m => m >= 2 && m <= 10));
+  const r59PeakMonthsOk = Boolean(canonicalR59Peak &&
+    [10, 11, 12].every(m => required.includes(m)) &&
+    required.every(m => [10, 11, 12, 1].includes(m)));
+  if (!r59OffPeakMonthsOk && !r59PeakMonthsOk && (
+    salesMonths.some(m => !required.includes(m)) || required.some(m => !salesMonths.includes(m)) ||
+    storageMonths.some(m => !required.includes(m)) || required.some(m => !storageMonths.includes(m))
+  )) {
     return { valid: false, reason: 'Sales and storage windows must exactly cover every month declared in the operating period.' };
   }
   if (periodSpec.explicitFullPeriod === 'annual') {
@@ -192,9 +192,16 @@ function resolveDateContextR58({ operating_period, operating_months, sales_windo
       return { valid: false, reason: 'Annual operating period must cover all days of the target calendar year (YYYY-01-01..YYYY-12-31).' };
     }
   } else if (periodSpec.explicitFullPeriod === 'off_peak') {
-    if (salesWin.from !== `${year}-02-01` || salesWin.through !== `${year}-09-30` ||
-      storageWin.from !== `${year}-02-01` || storageWin.through !== `${year}-09-30`) {
-      return { valid: false, reason: 'Default off_peak operating period must cover full Feb 1 through Sep 30.' };
+    const validLegacyOffPeak = salesWin.from === `${year}-02-01` && salesWin.through === `${year}-09-30` &&
+      storageWin.from === `${year}-02-01` && storageWin.through === `${year}-09-30`;
+    const validR59OffPeak = isR59 && periodSpec.canonicalR59OffPeak;
+    if (!validLegacyOffPeak && !validR59OffPeak) {
+      return {
+        valid: false,
+        reason: isR59
+          ? 'Default off_peak operating period requires sales 2027-02-01..2027-10-14 with storage 2027-02-01..2027-09-30 (or historical YYYY-02-01..YYYY-09-30).'
+          : 'Default off_peak operating period must cover full Feb 1 through Sep 30.',
+      };
     }
   }
   return { valid: true, periodSpec, salesWin, storageWin, inboundWin };
@@ -216,7 +223,8 @@ function basisCoversWindow(basis, win, requireBoundedThrough = false, registered
   if (basis.months !== undefined) {
     if (!Array.isArray(basis.months) || !basis.months.length ||
       basis.months.some(m => !Number.isInteger(m) || m < 1 || m > 12)) return false;
-    if (monthsIn(win).some(m => !basis.months.includes(m))) return false;
+    const effectiveMonths = monthsIn(win);
+    if (effectiveMonths.some(m => !basis.months.includes(m))) return false;
   }
   return true;
 }
@@ -300,11 +308,14 @@ function resolvePlacementUsd(placementUsd, dateCtxR58, placementFeeBasis, regist
   return round(placementUsd);
 }
 
-function resolveFulfillmentUsd(fulfillmentUsd, { sales_window, fee_context, fulfillment_fee_basis, operating_period, operating_months }, dateCtxR58, registeredIds = null, expectedPackageRef = null) {
+function resolveFulfillmentUsd(fulfillmentUsd, { sales_window, fee_context, fulfillment_fee_basis, operating_period, operating_months, rawInput }, dateCtxR58, registeredIds = null, expectedPackageRef = null) {
   if (!finite(fulfillmentUsd) || fulfillmentUsd <= 0) return null;
   if (dateCtxR58) {
     if (!dateCtxR58.valid) return null;
     const salesWin = dateCtxR58.salesWin;
+    if (salesWin.through > '2027-10-14' && hasProhibited2026PeakExtrapolation({ fee_basis: fulfillment_fee_basis }, rawInput)) {
+      return null;
+    }
     if (fulfillment_fee_basis !== undefined) {
       return basisCoversWindow(fulfillment_fee_basis, salesWin, true, registeredIds, expectedPackageRef, 'fulfillment') ? round(fulfillmentUsd) : null;
     }
@@ -372,9 +383,10 @@ export function evaluateEarlyScreen(input, options = {}) {
     input.profile_revision !== options.profileRevision) {
     throw new TypeError('Conflicting input.profile_revision and options.profileRevision.');
   }
-  const rev = input.profile_revision ?? options.profileRevision ?? 57;
+  const rev = input.profile_revision ?? options.profileRevision ?? 59;
   if (!Number.isInteger(rev) || rev < 57) throw new TypeError('profileRevision must be an integer >= 57.');
   const isR58 = rev >= 58;
+  const isR59 = rev >= 59;
 
   const {
     id = 'early-screen',
@@ -651,7 +663,7 @@ export function evaluateEarlyScreen(input, options = {}) {
   const domesticQuoteValid = goodsPromoClear && freightPromoClear && orderUnitsValid && procurementUsd !== null && domesticUsd !== null;
 
   const expectedPackageRef = text(fee_context?.package_ref) ? fee_context.package_ref : null;
-  const dateCtxR58 = isR58 ? resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context }) : null;
+  const dateCtxR58 = isR58 ? resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context }, isR59) : null;
   const pkgResR58 = isR58 ? resolveUniquePackageByRef(input.packages, expectedPackageRef) : { present: false, valid: true, pkg: null };
   let badPackagesR58 = isR58 && pkgResR58.present && !pkgResR58.valid;
   const effectivePkg = pkg ?? pkgResR58.pkg;
@@ -684,7 +696,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     effectivePkg?.is_oversize, pkgResR58.pkg?.is_oversize,
   ]);
 
-  const headhaulRes = resolveHeadhaul(headhaul, fx, order_units, isR58);
+  const headhaulRes = resolveHeadhaul(headhaul, fx, order_units, isR58, isR59);
   const headhaulUsd = headhaulRes.amount_usd;
   const storageUsd = resolveStorageUsd(storage, dateCtxR58, storage_fee_basis, registeredIds, expectedPackageRef, effectivePkg, {
     is_oversize: input.is_oversize, is_dangerous_goods: input.is_dangerous_goods, packages: input.packages,
@@ -692,7 +704,7 @@ export function evaluateEarlyScreen(input, options = {}) {
   });
   const resolvedPlacementUsd = resolvePlacementUsd(placement_usd, dateCtxR58, placement_fee_basis, registeredIds, expectedPackageRef);
   const resolvedFulfillmentUsd = resolveFulfillmentUsd(fulfillment_usd, {
-    sales_window, fee_context, fulfillment_fee_basis, operating_period, operating_months,
+    sales_window, fee_context, fulfillment_fee_basis, operating_period, operating_months, rawInput: input,
   }, dateCtxR58, registeredIds, expectedPackageRef);
 
   const rightsCheck = rightsState === true ? 'fail' : rightsState === false ? 'pass' : 'rights_unsearched';
@@ -769,8 +781,12 @@ export function evaluateEarlyScreen(input, options = {}) {
     const wtCheck = resolveConsistentPkgWeightLb(effectivePkg);
     const isOfficial2027RetVersion = /^US-FBA-2027/i.test(String(returns_processing_fee_basis?.version ?? '').trim());
     const backdatedOfficial2027Ret = !isOfficial2027ScheduleWindowValid('returns_processing', returns_processing_fee_basis, is_apparel_or_shoes);
-    const in2027RetWindow = Boolean(dateCtxR58?.valid && dateCtxR58.salesWin.from >= '2027-02-01' && dateCtxR58.salesWin.through <= '2027-12-31');
-    const verifiedPerRet = !is_apparel_or_shoes && (in2027RetWindow || isOfficial2027RetVersion) ? lookupVerified2027PerReturnFee(effectivePkg) : null;
+    const minRetStart = is_apparel_or_shoes && isR59 ? '2027-01-15' : '2027-02-01';
+    const maxRetEnd = isR59 ? '2028-01-14' : '2027-12-31';
+    const in2027RetWindow = Boolean(dateCtxR58?.valid && dateCtxR58.salesWin.from >= minRetStart && dateCtxR58.salesWin.through <= maxRetEnd);
+    const verifiedPerRet = (!is_apparel_or_shoes || isR59) && (in2027RetWindow || isOfficial2027RetVersion)
+      ? lookupVerified2027PerReturnFee(effectivePkg, { isApparelOrShoes: is_apparel_or_shoes, allowAll2027Tiers: isR59 })
+      : null;
     const catThreshMismatch = Boolean(verifiedCat && hasThreshold && effectiveThreshold !== verifiedCat.threshold);
     const perRetMismatch = Boolean(verifiedPerRet !== null && hasPerReturn && Math.abs(effectivePerReturn - verifiedPerRet) > 1e-9);
     const preFeb2027NoBasis = Boolean(returns_processing_fee_basis === undefined && !is_apparel_or_shoes && !hasExemption && rPhysical > 0 &&
@@ -908,6 +924,21 @@ export function evaluateEarlyScreen(input, options = {}) {
     }
   }
 
+  const couponFeeR59 = isR59 && input.include_coupon_fee !== false && input.coupon_fee_already_in_other !== true
+    ? computeAmazonCouponRedemptionFee2027({
+      net_effective_price_usd: price_usd,
+      ongoing_coupon_usd,
+      ongoing_coupon_pct,
+      coupon_redemption_share: input.coupon_redemption_share ?? 1,
+      coupon_campaign_units: input.coupon_campaign_units ?? (Number.isSafeInteger(order_units) && order_units >= 100 ? order_units : 100),
+      include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
+    })
+    : { applicable: false, per_unit_usd: 0 };
+  const couponFeeUsd = couponFeeR59.applicable && couponFeeR59.per_unit_usd > 0 ? couponFeeR59.per_unit_usd : 0;
+  const effectiveOtherWithCoupon = resolvedOtherApplicable === null
+    ? null
+    : round(resolvedOtherApplicable + couponFeeUsd);
+
   const amazonKnown = referral !== null && collectionRateValid &&
     [resolvedFulfillmentUsd, resolvedPlacementUsd, storageUsd, resolvedReturnsProcessing,
       other_payee === 'amazon' ? resolvedOtherApplicable : 0]
@@ -916,6 +947,7 @@ export function evaluateEarlyScreen(input, options = {}) {
   const amazonDeductions = amazonKnown
     ? [referral.net_usd, resolvedFulfillmentUsd, resolvedPlacementUsd, storageUsd, resolvedReturnsProcessing,
       ...(defer_return_outcomes ? [] : [returns_disposal_usd]),
+      ...(couponFeeUsd > 0 ? [couponFeeUsd] : []),
       ...(other_payee === 'amazon' && resolvedOtherApplicable > 0 ? [resolvedOtherApplicable] : [])]
     : null;
   const payout = amazonDeductions
@@ -957,9 +989,12 @@ export function evaluateEarlyScreen(input, options = {}) {
       ? { id: 'returns_disposal', amount_usd: null, status: 'deferred', basis: 'Paired return disposition and recovery deferred in initial screen' }
       : line('returns_disposal', finite(returns_disposal_usd) && returns_disposal_usd >= 0 ? round(returns_disposal_usd) : null, 'Return disposition cost'),
     line('collection', payout ? payout.collection_usd : null, collectionRateValid ? 'Collection fee on estimated Amazon disbursement' : 'Missing collection rate'),
-    line('other_applicable', resolvedOtherApplicable,
-      resolvedOtherApplicable === 0 ? 'Declared ordinary scenario has no extra conditional charge' : resolvedOtherApplicable === null ? 'Missing other_applicable_usd declaration' : 'Additional applicable charge',
-      resolvedOtherApplicable === 0 ? 'not_applicable' : resolvedOtherApplicable === null ? 'pending' : 'estimated'),
+    {
+      ...line('other_applicable', effectiveOtherWithCoupon,
+        effectiveOtherWithCoupon === 0 ? 'Declared ordinary scenario has no extra conditional charge' : effectiveOtherWithCoupon === null ? 'Missing other_applicable_usd declaration' : (couponFeeUsd > 0 ? 'Amazon ongoing coupon redemption fee ($5/100 + 2.5%) plus declared conditional charges' : 'Additional applicable charge'),
+        effectiveOtherWithCoupon === 0 ? 'not_applicable' : effectiveOtherWithCoupon === null ? 'pending' : 'estimated'),
+      ...(couponFeeUsd > 0 ? { coupon_fee_included: true, payee: 'amazon' } : {}),
+    },
     defer_return_outcomes
       ? { id: 'recovery_credit', amount_usd: null, status: 'deferred', basis: 'Paired return disposition and recovery deferred in initial screen' }
       : line('recovery_credit', finite(recovery_credit_usd) && recovery_credit_usd >= 0 ? round(recovery_credit_usd) : null, 'Salvage recovery credit',
@@ -1044,7 +1079,7 @@ export function evaluateEarlyScreen(input, options = {}) {
   }
 
   let negotiationShortlist = null;
-  if (isR58 && pricePass && rightsState !== true && marginComplete && !marginPass && procurementUsd !== null && domesticUsd !== null) {
+  if (isR58 && !isR59 && pricePass && rightsState !== true && marginComplete && !marginPass && procurementUsd !== null && domesticUsd !== null) {
     const negotiableCostUsd = procurementUsd > 0 ? procurementUsd : 0;
     if (negotiableCostUsd > 0) {
       // Exact unrounded BigInt rational shortlist check: max(0, floor*R - G) / C <= 0.12
@@ -1085,6 +1120,49 @@ export function evaluateEarlyScreen(input, options = {}) {
     }
   }
 
+  let packagingRedesignShortlist = null;
+  if (isR59 && pricePass && rightsState !== true && marginComplete && !marginPass &&
+    procurementUsd !== null && domesticUsd !== null && effectivePkg && referral !== null &&
+    collectionRateValid && headhaulUsd !== null && finite(fx) && fx > 0 && dateCtxR58?.valid &&
+    dateCtxR58.salesWin.from >= '2027-01-15' && dateCtxR58.salesWin.through <= '2027-10-14') {
+    const pkgCheck = computePackagingRedesignShortlist2027({
+      pkg: effectivePkg,
+      price_usd,
+      list_price_usd: input.list_price_usd,
+      net_effective_price_usd: input.net_effective_price_usd,
+      ongoing_coupon_usd: input.ongoing_coupon_usd,
+      ongoing_coupon_pct: input.ongoing_coupon_pct,
+      prime_exclusive_discount_usd: input.prime_exclusive_discount_usd,
+      prime_exclusive_discount_pct: input.prime_exclusive_discount_pct,
+      promo_basis_already_net: input.promo_basis_already_net,
+      fx_cny_per_usd: fx,
+      landed_domestic_usd: round(procurementUsd + domesticUsd),
+      refund_fraction,
+      physical_return_fraction: rPhysical,
+      fee_category: catCheck.present && catCheck.valid ? catCheck.value : fee_category,
+      return_threshold: hasThreshold ? effectiveThreshold : null,
+      referral_terms,
+      headhaul_usd: headhaulUsd,
+      collection_rate,
+      other_applicable_usd: resolvedOtherApplicable ?? 0,
+      other_payee,
+      sales_window: dateCtxR58.salesWin,
+      storage_window: dateCtxR58.storageWin,
+      inbound_window: dateCtxR58.inboundWin,
+      average_inventory_days: storage && typeof storage === 'object' && finite(storage.average_inventory_days) ? storage.average_inventory_days : 45,
+      is_apparel: input.is_apparel,
+      is_shoes: input.is_shoes,
+      is_apparel_or_shoes,
+      is_dangerous_goods: dgCheckR58.value === true,
+      is_sipp: input.is_sipp,
+      requires_amazon_packaging: input.requires_amazon_packaging,
+      minimum_price_usd,
+      min_retail_price_usd: minimum_price_usd,
+      margin_floor,
+    });
+    packagingRedesignShortlist = pkgCheck;
+  }
+
   return {
     gate_status: gateStatus,
     proceed_to_21_items: gateStatus === 'pass',
@@ -1093,7 +1171,18 @@ export function evaluateEarlyScreen(input, options = {}) {
       profile_revision: rev,
       order_plan: orderPlan,
       returns_processing_components: returnsComponents,
-      negotiation_shortlist: negotiationShortlist,
+      ...(!isR59 ? { negotiation_shortlist: negotiationShortlist } : {}),
+      ...(isR59 ? {
+        ...(headhaulRes.a4_applied ? { headhaul_a4_applied: headhaulRes.a4_applied } : {}),
+        packaging_redesign_shortlist: packagingRedesignShortlist,
+        target_goods_cny_for_30pct: procurementCap !== null && finite(fx) && fx > 0 ? Math.max(0, Math.round(procurementCap * fx * 100) / 100) : null,
+        second_factory_quote_needed: !marginComplete ? null : !marginPass,
+        second_factory_quote_note: !marginComplete
+          ? null
+          : marginPass
+            ? '首家齐套 1688 报价毛利已过 30% 红线，直接停手过关，无需再多刷工厂防撞滑块。'
+            : '当前工厂报价毛利 < 30%，建议补查更便宜的第 2 家（最多第 3 家）靠谱齐套厂。',
+      } : {}),
     } : {}),
     reasons,
     checks: {

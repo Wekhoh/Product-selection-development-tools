@@ -231,7 +231,7 @@ test('Slice 2C: r59 target_child_units grain on demand & Q31 newcomer cohort + m
   candChild.newcomer_cohort.grain = 'target_child_units';
   candChild.newcomer_cohort.market_reference.grain = 'target_child_units';
   candChild.newcomer_cohort.market_reference.scope = 'current_relevant_bsr_top100_mature_only';
-  candChild.newcomer_cohort.market_reference.mature_age_floor_days = 120;
+  candChild.newcomer_cohort.market_reference.mature_age_floor_days = 90;
 
   // Ensure member/reference units_30d explicitly declare target_child_units and natural visibility uses child-level SIF
   for (const m of candChild.newcomer_cohort.members) {
@@ -1431,7 +1431,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
   candSingleVar.newcomer_cohort.grain = 'target_child_units';
   candSingleVar.newcomer_cohort.market_reference.grain = 'target_child_units';
   candSingleVar.newcomer_cohort.market_reference.scope = 'current_relevant_bsr_top100_mature_only';
-  candSingleVar.newcomer_cohort.market_reference.mature_age_floor_days = 120;
+  candSingleVar.newcomer_cohort.market_reference.mature_age_floor_days = 90;
   candSingleVar.evidence.push({
     id: 'ev-single-var-exact',
     source: '单变体同款核实：该链接仅1个子体，父体销量等于目标子体销量',
@@ -1915,7 +1915,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
     assert.match(mixedHtml, /未过 30% 红线：factory-beta-low/);
 
     // 7) Round-4 Regressions:
-    //    (a) HIGH 3: spiral_max_age_days < 120 rejected under Revision 59;
+    //    (a) HIGH 3: spiral_max_age_days < 90 rejected under Revision 59;
     //    (b) HIGH 2: interior $50.00 peak included when endpoints already cross AND interior $50.01 dip prevents false all_ge_30pct;
     //    (c) HIGH 4: legacy 6d8069d SQLite row with bare order_plan_json.ui_readback_verified=true (no 5-field ui_readback) rejected in r59 Gate 1B;
     //    (d) HIGH 6: negated prose "父体销量不等于目标子体销量" blocks Q31 scoring.
@@ -1953,7 +1953,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
         storage_window: { from: '2027-02-01', through: '2027-09-30' },
         inbound_window: { from: '2027-01-15', through: '2027-01-25' },
       }],
-    }), /spiral_max_age_days >= 120/i);
+    }), /spiral_max_age_days >= 90/i);
 
     // HIGH 2: [$49.99, $52.00] where both endpoints >=30% while interior $50.01 dips <30% MUST be crosses_30pct (never all_ge_30pct)!
     // Also [$48.00, $51.00] where endpoints already cross raises margin_range[1] to the $50.00 pre-cliff peak!

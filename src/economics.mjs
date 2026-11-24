@@ -10,9 +10,12 @@ import {
   resolveEffectivePricing,
   collectLedgerFlag,
   isOfficial2027ScheduleWindowValid,
+  hasProhibited2026PeakExtrapolation,
   lookupVerified2027ReturnThreshold,
   lookupVerified2027PerReturnFee,
   storageMeets2027Floor,
+  computeHeadhaulWithA4Rules,
+  computeAmazonCouponRedemptionFee2027,
   toBigRat,
   addBigRat,
   mulBigRat,
@@ -78,7 +81,7 @@ export function ledgerMeetsMarginFloor(ledger, floor) {
   return lhsNum * costDen >= costNum * lhsDen;
 }
 
-function deriveExactCnyLineRat(lineId, deriv) {
+function deriveExactCnyLineRat(lineId, deriv, isR59 = false) {
   if (!deriv || typeof deriv !== 'object' || !finite(deriv.fx) || deriv.fx <= 0) return null;
   const fxR = toBigRat(deriv.fx);
   if (lineId === 'procurement' && finite(deriv.cny_per_unit) && deriv.cny_per_unit >= 0) {
@@ -92,21 +95,9 @@ function deriveExactCnyLineRat(lineId, deriv) {
       return divBigRat(toBigRat(deriv.cny_total), mulBigRat(toBigRat(deriv.order_units), fxR));
     }
   }
-  if (lineId === 'headhaul' && finite(deriv.chargeable_kg_per_unit) && deriv.chargeable_kg_per_unit > 0 &&
-    finite(deriv.rate_cny_per_kg) && deriv.rate_cny_per_kg >= 0 &&
-    finite(deriv.surcharge_cny_per_kg) && deriv.surcharge_cny_per_kg >= 0) {
-    const kgR = toBigRat(deriv.chargeable_kg_per_unit);
-    const baseR = mulBigRat(kgR, addBigRat(toBigRat(deriv.rate_cny_per_kg), toBigRat(deriv.surcharge_cny_per_kg)));
-    let bondR = null;
-    if (finite(deriv.bond_cny_per_kg) && deriv.bond_cny_per_kg >= 0) {
-      bondR = mulBigRat(kgR, toBigRat(deriv.bond_cny_per_kg));
-    } else if (finite(deriv.bond_cny_per_shipment) && deriv.bond_cny_per_shipment >= 0 &&
-      Number.isSafeInteger(deriv.order_units) && deriv.order_units > 0) {
-      bondR = divBigRat(toBigRat(deriv.bond_cny_per_shipment), toBigRat(deriv.order_units));
-    }
-    if (!bondR) return null;
-    const totalCnyR = addBigRat(baseR, bondR);
-    return totalCnyR.n > 0n ? divBigRat(totalCnyR, fxR) : null;
+  if (lineId === 'headhaul') {
+    const hh = computeHeadhaulWithA4Rules(deriv, deriv.fx, deriv.order_units ?? null, { isR58: true, isR59 });
+    return hh.exact_usd_rational;
   }
   return null;
 }
@@ -141,6 +132,7 @@ export function collectionFromDisbursement({ net_revenue_usd, amazon_deductions_
 export function calculateEconomics(input, options = {}) {
   const isR57Plus = (options.profileRevision ?? 0) >= 57;
   const isR58Plus = (options.profileRevision ?? 0) >= 58;
+  const isR59Plus = (options.profileRevision ?? 0) >= 59;
   const pricing = isR58Plus ? resolveEffectivePricing(input) : null;
   if (isR58Plus && !pricing.valid && (input?.list_price_usd !== undefined || input?.net_effective_price_usd !== undefined ||
     input?.ongoing_coupon_usd !== undefined || input?.ongoing_coupon_pct !== undefined ||
@@ -178,7 +170,9 @@ export function calculateEconomics(input, options = {}) {
 
   let r58ReturnsInvalid = false;
   let r58ProcInvalid = false;
+  let r58HeadhaulInvalid = false;
   let r58StorageInvalid = false;
+  let r58FulfillmentInvalid = false;
   const consistentNum = (values, predicate) => {
     const present = values.filter(v => v !== undefined && v !== null);
     if (present.length === 0) return { present: false, valid: true, value: null };
@@ -213,11 +207,37 @@ export function calculateEconomics(input, options = {}) {
       for (const [lineId, deriv] of cnyDerivations.entries()) {
         const targetLine = map.get(lineId);
         if (!targetLine || targetLine.status === 'pending' || VERIFIED_LINE_RATIONALS.has(targetLine)) continue;
-        const derivedRat = deriveExactCnyLineRat(lineId, deriv);
+        const derivedRat = deriveExactCnyLineRat(lineId, deriv, isR59Plus);
         if (derivedRat) {
           targetLine.amount_usd = roundBigRat(derivedRat.n, derivedRat.d, 10);
           targetLine.exact_usd_rational = { num: derivedRat.n.toString(), den: derivedRat.d.toString() };
           VERIFIED_LINE_RATIONALS.set(targetLine, derivedRat);
+        }
+      }
+    } else if (isR59Plus) {
+      // H11: In formal r59 scoring (`requireFeeBasis: true`), recompute/cross-check A4 headhaul when tariff inputs exist!
+      const hhLine = map.get('headhaul');
+      const rawHhSpec = cnyDerivations.get('headhaul')
+        ?? (input.headhaul && typeof input.headhaul === 'object' ? input.headhaul : null)
+        ?? (input.source_inputs?.headhaul && typeof input.source_inputs.headhaul === 'object' ? input.source_inputs.headhaul : null);
+      if (hhLine && hhLine.status !== 'pending' && rawHhSpec && typeof rawHhSpec === 'object' && rawHhSpec.rate_cny_per_kg !== undefined) {
+        const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
+        const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
+        const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
+        if (hhCalc.missing_surcharge_quote || !hhCalc.exact_usd_rational) {
+          r58HeadhaulInvalid = true;
+        } else {
+          const expectedHhUsd = roundBigRat(hhCalc.exact_usd_rational.n, hhCalc.exact_usd_rational.d, 10);
+          if (finite(hhLine.amount_usd) && Math.abs(hhLine.amount_usd - expectedHhUsd) > 0.005) {
+            r58HeadhaulInvalid = true;
+          } else {
+            hhLine.amount_usd = expectedHhUsd;
+            hhLine.exact_usd_rational = {
+              num: hhCalc.exact_usd_rational.n.toString(),
+              den: hhCalc.exact_usd_rational.d.toString(),
+            };
+            VERIFIED_LINE_RATIONALS.set(hhLine, hhCalc.exact_usd_rational);
+          }
         }
       }
     }
@@ -247,6 +267,12 @@ export function calculateEconomics(input, options = {}) {
     if (storageLine && !storageMeets2027Floor(input, storageLine, storageMonths)) {
       r58StorageInvalid = true;
     }
+    const fulLine = map.get('fulfillment');
+    const salesWinForFul = input.fee_context?.sales;
+    if (fulLine && fulLine.status !== 'pending' && salesWinForFul?.through > '2027-10-14' &&
+      hasProhibited2026PeakExtrapolation(fulLine, input)) {
+      r58FulfillmentInvalid = true;
+    }
 
     const retLine = map.get('returns_processing');
     const hasExplicitPhys = input.physical_return_fraction !== undefined && input.physical_return_fraction !== null;
@@ -260,8 +286,11 @@ export function calculateEconomics(input, options = {}) {
     const salesWin = input?.fee_context?.sales;
     const isOfficial2027RetVersion = /^US-FBA-2027/i.test(String(retLine?.fee_basis?.version ?? '').trim());
     const backdatedOfficial2027Ret = !isOfficial2027ScheduleWindowValid('returns_processing', retLine?.fee_basis, isApparel);
-    const in2027RetSchedule = Boolean(salesWin?.from && salesWin?.through && salesWin.from >= '2027-02-01' && salesWin.through <= '2027-12-31');
-    const verifiedPerRet = !isApparel && (in2027RetSchedule || isOfficial2027RetVersion) ? lookupVerified2027PerReturnFee(matchedPkg) : null;
+    const maxRetEndEcon = isR59Plus ? '2028-01-14' : '2027-12-31';
+    const in2027RetSchedule = Boolean(salesWin?.from && salesWin?.through && salesWin.from >= (isApparel ? '2027-01-15' : '2027-02-01') && salesWin.through <= maxRetEndEcon);
+    const verifiedPerRet = (!isApparel || isR59Plus) && (in2027RetSchedule || isOfficial2027RetVersion)
+      ? lookupVerified2027PerReturnFee(matchedPkg, { isApparelOrShoes: isApparel, allowAll2027Tiers: isR59Plus })
+      : null;
     const catCheck = resolveConsistentFeeCategory([retLine?.fee_basis?.fee_category, retLine?.fee_category, input.fee_category]);
     const verifiedCat = catCheck.valid && catCheck.present ? lookupVerified2027ReturnThreshold(catCheck.value) : null;
     const threshCheck = consistentNum(
@@ -345,6 +374,69 @@ export function calculateEconomics(input, options = {}) {
     }
   }
 
+  const couponFeeR59 = isR59Plus && input.include_coupon_fee !== false
+    ? computeAmazonCouponRedemptionFee2027({
+      net_effective_price_usd: p,
+      ongoing_coupon_usd: input.ongoing_coupon_usd,
+      ongoing_coupon_pct: input.ongoing_coupon_pct,
+      coupon_redemption_share: input.coupon_redemption_share ?? 1,
+      coupon_campaign_units: input.coupon_campaign_units ?? (Number.isSafeInteger(input.order_units) && input.order_units > 0 ? input.order_units : 100),
+      include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
+    })
+    : { applicable: false, per_unit_usd: 0, exact_usd_rational: { n: 0n, d: 1n } };
+  let extraCouponAmazonDeductionUsd = 0;
+  if (couponFeeR59.applicable && couponFeeR59.per_unit_usd > 0) {
+    const otherLine = map.get('other_applicable');
+    const alreadyHasCoupon = Boolean(
+      input.coupon_fee_already_in_other === true ||
+      otherLine?.coupon_fee_included === true ||
+      (Array.isArray(otherLine?.components) && otherLine.components.includes('coupon_redemption')) ||
+      (typeof otherLine?.basis === 'string' && /coupon/i.test(otherLine.basis) && finite(otherLine.amount_usd) && otherLine.amount_usd >= couponFeeR59.per_unit_usd - 1e-6),
+    );
+    if (!alreadyHasCoupon && otherLine && otherLine.status !== 'pending' && finite(otherLine.amount_usd)) {
+      const priorExternalAmt = otherLine.payee === 'external' && otherLine.amount_usd > 0 ? otherLine.amount_usd : 0;
+      const prevAmt = otherLine.amount_usd;
+      otherLine.amount_usd = round(prevAmt + couponFeeR59.per_unit_usd);
+      otherLine.status = 'estimated';
+      otherLine.coupon_fee_included = true;
+      otherLine.basis = prevAmt > 0
+        ? `${otherLine.basis}; plus Amazon ongoing coupon redemption fee ($5/100 + 2.5%)`
+        : 'Amazon ongoing coupon redemption fee ($5/100 + 2.5%)';
+      otherLine.components = [...new Set([...(Array.isArray(otherLine.components) ? otherLine.components : []), 'coupon_redemption'])];
+      if (priorExternalAmt === 0) {
+        otherLine.payee = 'amazon';
+        if (options.requireFeeBasis && !otherLine.fee_basis) {
+          const refBasis = map.get('referral')?.fee_basis ?? map.get('fulfillment')?.fee_basis ?? null;
+          if (refBasis) otherLine.fee_basis = { ...refBasis };
+        }
+      } else {
+        extraCouponAmazonDeductionUsd = couponFeeR59.per_unit_usd;
+      }
+      if (prevAmt === 0 && couponFeeR59.exact_usd_rational) {
+        otherLine.exact_usd_rational = {
+          num: couponFeeR59.exact_usd_rational.n.toString(),
+          den: couponFeeR59.exact_usd_rational.d.toString(),
+        };
+        VERIFIED_LINE_RATIONALS.set(otherLine, couponFeeR59.exact_usd_rational);
+      }
+      if (!options.requireFeeBasis && map.has('collection') && finite(input.collection_rate) && input.collection_rate >= 0 && input.collection_rate < 1) {
+        const colLine = map.get('collection');
+        const nonDeferredAmz = amazonDeductions
+          .filter(k => map.get(k)?.status !== 'deferred')
+          .map(k => map.get(k)?.amount_usd);
+        if (colLine && colLine.status !== 'pending' && nonDeferredAmz.every(v => finite(v) && v >= 0)) {
+          const amzList = [...nonDeferredAmz, ...(otherLine.payee === 'amazon' ? [otherLine.amount_usd] : [extraCouponAmazonDeductionUsd])];
+          const recomputedPayout = collectionFromDisbursement({
+            net_revenue_usd: p * (1 - r),
+            rate: input.collection_rate,
+            amazon_deductions_usd: amzList,
+          });
+          colLine.amount_usd = recomputedPayout.collection_usd;
+        }
+      }
+    }
+  }
+
   if (options.requireFeeBasis) {
     refundComponents = netReferral({ ...input.referral_terms,
       minimum_referral_usd: isR57Plus ? input.referral_terms?.minimum_referral_usd : 0,
@@ -376,7 +468,10 @@ export function calculateEconomics(input, options = {}) {
   if (options.requireFeeBasis && map.has('collection') && !r58ReturnsInvalid &&
     amazonDeductions.every(key => deferred.includes(key) || (map.has(key) && finite(map.get(key).amount_usd) && map.get(key).status !== 'pending'))) {
     payoutComponents = collectionFromDisbursement({ net_revenue_usd: p * (1 - r), rate: input.collection_rate,
-      amazon_deductions_usd: amazonDeductions.filter(key => !deferred.includes(key)).map(key => map.get(key).amount_usd) });
+      amazon_deductions_usd: [
+        ...amazonDeductions.filter(key => !deferred.includes(key)).map(key => map.get(key).amount_usd),
+        ...(extraCouponAmazonDeductionUsd > 0 ? [extraCouponAmazonDeductionUsd] : []),
+      ] });
     const collection = map.get('collection');
     if (collection.status === 'not_applicable' && payoutComponents.collection_usd !== 0) throw new TypeError('Collection rate contradicts a not-applicable collection line.');
     collection.amount_usd = payoutComponents.collection_usd;
@@ -384,15 +479,20 @@ export function calculateEconomics(input, options = {}) {
       collection.components = [...new Set([...(Array.isArray(collection.components) ? collection.components : []), 'payment_collection'])];
     }
   }
+  const validationLines = isR59Plus && cnyDerivations.has('headhaul')
+    ? lines.map(l => l.id === 'headhaul' ? { ...l, cny_derivation: cnyDerivations.get('headhaul') } : l)
+    : lines;
   const validation = options.requireFeeBasis
-    ? validateFeeBasis({ ...input, lines }, { ...options, requireRegularRepeatOrder: Boolean(options.requireRegularRepeatOrder || isR57Plus) })
+    ? validateFeeBasis({ ...input, lines: validationLines }, { ...options, requireRegularRepeatOrder: Boolean(options.requireRegularRepeatOrder || isR57Plus) })
     : null;
   const invalid = new Set(validation?.issues.map(issue => issue.line) ?? []);
   const pending = REQUIRED_COSTS.filter(k => !deferred.includes(k) &&
     (!map.has(k) || map.get(k).amount_usd === null || map.get(k).status === 'pending'));
   if (r58ProcInvalid && !pending.includes('procurement')) pending.push('procurement');
+  if (r58HeadhaulInvalid && !pending.includes('headhaul')) pending.push('headhaul');
   if (r58StorageInvalid && !pending.includes('storage')) pending.push('storage');
   if (r58ReturnsInvalid && !pending.includes('returns_processing')) pending.push('returns_processing');
+  if (r58FulfillmentInvalid && !pending.includes('fulfillment')) pending.push('fulfillment');
   for (const key of REQUIRED_COSTS) {
     if (invalid.has(key) && !pending.includes(key)) pending.push(key);
   }

@@ -109,20 +109,31 @@ test('Seam 1: all 36 official US FBA return thresholds, 2027 Bulky 4 tiers, Gues
   const xlBulky = classifySizeTier2027({ length_in: 55, width_in: 12, height_in: 8, unit_weight_lb: 22 });
   assert.equal(xlBulky.size_tier, 'extra_large_bulky');
   const dimWeightOver50 = classifySizeTier2027({ length_in: 48, width_in: 22, height_in: 12, unit_weight_lb: 18 });
-  assert.equal(dimWeightOver50.status, 'needs_calculator_verification');
-  assert.equal(dimWeightOver50.size_tier, 'oversize_beyond_bulky');
+  assert.equal(dimWeightOver50.status, 'verified');
+  assert.equal(dimWeightOver50.size_tier, 'large_oversize');
   const oversizeBeyond = classifySizeTier2027({ length_in: 65, width_in: 30, height_in: 12, unit_weight_lb: 25 });
-  assert.equal(oversizeBeyond.status, 'needs_calculator_verification');
+  assert.equal(oversizeBeyond.status, 'verified');
+  const exceedMaxHeavy = classifySizeTier2027({ length_in: 150, width_in: 30, height_in: 12, unit_weight_lb: 160 });
+  assert.equal(exceedMaxHeavy.status, 'verified');
+  assert.equal(exceedMaxHeavy.size_tier, 'special_oversize_heavy');
 
-  // Small Bulky fulfillment ($7.51 + 3 * $0.39 = $8.68 base -> * 1.035 = $8.9838) and storage ($0.56 off-peak / $1.40 peak)
+  // Small Bulky fulfillment ($7.51 + 3 * $0.39 = $8.68 base -> * 1.035 = $8.9838 + $1.51 non-SIPP packaging [2.32 lb dim wt <= 5 lb] = $10.4938 default; $8.9838 when is_sipp: true)
   const sbFul = lookupBulkyFulfillmentFee2027({
     pkg: smallBulkyPkg,
     price_usd: 59.99,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
+    sales_window: { from: '2027-02-01', through: '2027-10-14' },
   });
   assert.equal(sbFul.status, 'verified');
   assert.equal(sbFul.base_usd, 8.68);
-  assert.equal(sbFul.total_usd, 8.9838);
+  assert.equal(sbFul.packaging_service_fee_usd, 1.51);
+  assert.equal(sbFul.total_usd, 10.4938);
+  const sbFulSipp = lookupBulkyFulfillmentFee2027({
+    pkg: smallBulkyPkg,
+    price_usd: 59.99,
+    is_sipp: true,
+    sales_window: { from: '2027-02-01', through: '2027-10-14' },
+  });
+  assert.equal(sbFulSipp.total_usd, 8.9838);
 
   const sbStoreOff = lookupBulkyStorageFee2027({ pkg: smallBulkyPkg, months: [2, 3, 4, 5, 6, 7, 8, 9] });
   const sbStorePeak = lookupBulkyStorageFee2027({ pkg: smallBulkyPkg, months: [10, 11, 12] });
@@ -379,7 +390,13 @@ test('Seam 2: 3-tier target_child_units, parent sales dedup, category return fal
     { date: '2026-10-01', reviews: 5 },
     { date: '2026-10-03', reviews: 245 },
   ]);
-  assert.equal(spikeCurve.classification, 'sharp_nonlinear_step_jump');
+  assert.equal(spikeCurve.classification, 'steady_organic_accumulation');
+  assert.equal(spikeCurve.observed_facts.max_positive_step, 240);
+  const aiFlaggedCurve = classifyKeepaReviewTrajectory([
+    { date: '2026-10-01', reviews: 5 },
+    { date: '2026-10-03', reviews: 245 },
+  ], { ai_review_anomaly: true });
+  assert.equal(aiFlaggedCurve.classification, 'qualitative_review_anomaly_watch');
 
   // 6) Full-page sub-form splitting without .slice(0,16) truncation + dual price bands + seed-merge guard
   const pageItems = Array.from({ length: 20 }, (_, i) => ({
@@ -479,14 +496,15 @@ test('Seam 3: Luna triage preserves physical dimensions/weight/coupon, RightsPre
 });
 
 test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gate 1A Bulky wiring + anti-429 override, coupon no-double-deduct, child sales bounds, Trends ISO weeks, powered no-battery FCC, and station_verification subrole', () => {
-  // HIGH 1a: Official Amazon US Bulky 2-inch minimum width & height (26 x 20 x 1 in, 2 lb -> 26*20*2/139 = 7.482 lb -> ceil 8 lb = $9.62 + 2*$0.39 = $10.40 * 1.035 = $10.5984)
+  // HIGH 1a: Official Amazon US Bulky 2-inch minimum width & height (26 x 20 x 1 in, 2 lb -> 26*20*2/139 = 7.482 lb -> ceil 8 lb = $9.62 + 2*$0.39 = $10.24 * 1.035 = $10.5984 + $1.68 non-SIPP packaging = $12.2784)
   const flatBulky = lookupBulkyFulfillmentFee2027({
     pkg: { length_in: 26, width_in: 20, height_in: 1, unit_weight_lb: 2 },
     price_usd: 45,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
+    sales_window: { from: '2027-02-01', through: '2027-10-14' },
   });
   assert.equal(flatBulky.status, 'verified');
-  assert.ok(Math.abs(flatBulky.total_usd - 10.5984) < 1e-4, `Expected $10.5984 with 2-in min height, got ${flatBulky.total_usd}`);
+  assert.ok(Math.abs(flatBulky.fulfillment_with_fuel_usd - 10.5984) < 1e-4, `Expected $10.5984 base+fuel with 2-in min height, got ${flatBulky.fulfillment_with_fuel_usd}`);
+  assert.ok(Math.abs(flatBulky.total_usd - 12.2784) < 1e-4, `Expected $12.2784 merged non-SIPP total, got ${flatBulky.total_usd}`);
 
   // HIGH 1b: estimateGate1A2027 verifies ordinary Small Bulky when placement_usd is provided and r_physical <= threshold
   const g1aBulky = estimateGate1A2027({
@@ -1031,16 +1049,15 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
     storage_window: { from: '2027-02-01', through: '2027-09-30' },
     inbound_window: { from: '2027-01-15', through: '2027-01-25' },
   };
-  assert.equal(estimateGate1A2027(synthBulkySpec).status, 'needs_calculator_verification');
-  assert.equal(
-    estimateGate1A2027({ ...synthBulkySpec, allow_bulky_2027: true }).status,
-    'needs_calculator_verification',
-    'Non-SIPP Bulky without explicit requires_amazon_packaging boolean must return needs_calculator_verification',
-  );
+  assert.equal(estimateGate1A2027({ ...synthBulkySpec, profile_revision: 58 }).status, 'needs_calculator_verification');
+  const synthBulkyDefaultMerged = estimateGate1A2027(synthBulkySpec);
+  assert.equal(synthBulkyDefaultMerged.status, 'verified', 'Non-SIPP Bulky defaults to merged base*1.035 + $1.51 non-SIPP packaging fee');
+  assert.equal(synthBulkyDefaultMerged.components.fulfillment.packaging_service_fee_usd, 1.51);
   const synthBulkyOwnBox = estimateGate1A2027({ ...synthBulkySpec, allow_bulky_2027: true, requires_amazon_packaging: false });
   const synthBulkyAmzBox = estimateGate1A2027({ ...synthBulkySpec, allow_bulky_2027: true, requires_amazon_packaging: true });
   assert.equal(synthBulkyOwnBox.status, 'verified');
   assert.equal(synthBulkyAmzBox.status, 'verified');
+  assert.equal(synthBulkyDefaultMerged.landed_domestic_cap_usd, synthBulkyAmzBox.landed_domestic_cap_usd);
   assert.equal(synthBulkyAmzBox.components.fulfillment.packaging_service_fee_usd, 1.51);
   assert.ok(synthBulkyOwnBox.landed_domestic_cap_usd > synthBulkyAmzBox.landed_domestic_cap_usd);
   const synthBulkySolved = solveMinPriceForMargin2027({

@@ -7,6 +7,46 @@ const windowValid = value => date(value?.from) && date(value?.through) && value.
 const FEE_WINDOWS = Object.freeze({ referral: 'sales', fulfillment: 'sales', placement: 'inbound',
   storage: 'storage', returns_processing: 'sales', other_applicable: 'sales' });
 
+export function isCanonical2027OffPeakWin(w) {
+  return Boolean(windowValid(w) && w.from === '2027-02-01' && w.through === '2027-10-14');
+}
+
+export function isCanonical2027OffPeakStorageWin(w) {
+  return Boolean(windowValid(w) && w.from === '2027-02-01' && w.through === '2027-09-30');
+}
+
+export function isCanonical2027PeakWin(w) {
+  return Boolean(windowValid(w) && w.from === '2027-10-15' && (w.through === '2028-01-14' || w.through === '2027-12-31'));
+}
+
+export function isCanonical2027PeakStorageWin(w) {
+  return Boolean(windowValid(w) && w.from === '2027-10-01' && w.through === '2027-12-31');
+}
+
+export function hasProhibited2026PeakExtrapolation(line, input = null) {
+  if (!line || typeof line !== 'object') return false;
+  const basis = line.fee_basis;
+  if (
+    line.extrapolated_from_2026 === true ||
+    line.estimated_from_2026 === true ||
+    line.peak_2026_uplift_estimate === true ||
+    basis?.extrapolated_from_2026 === true ||
+    basis?.estimated_from_2026 === true ||
+    basis?.peak_2026_uplift_estimate === true ||
+    input?.extrapolated_from_2026 === true ||
+    input?.estimated_from_2026 === true
+  ) {
+    return true;
+  }
+  if (line.status === 'pending' && line.amount_usd === null && basis?.status === 'unavailable') {
+    return false;
+  }
+  const combined = `${line.basis ?? ''} ${basis?.version ?? ''} ${basis?.notes ?? ''} ${basis?.source ?? ''}`
+    .replace(/(?:严禁|禁止|不得|切勿|不准|未|不)(?:使?用|按|拿)?\s*2026[^。；;)\n]{0,24}/gi, ' ')
+    .replace(/\b(?:never|do\s+not|must\s+not|without|forbid\w*|prohibit\w*)\s+[^.;)\n]{0,32}\b2026\b/gi, ' ');
+  return /2026[-_ ]?peak|2026\s*旺季|extrapolat.*2026|2026.*extrapolat|按\s*2026.*估算/i.test(combined);
+}
+
 function monthsIn(window) {
   const result = new Set();
   let year = Number(window.from.slice(0, 4)), month = Number(window.from.slice(5, 7));
@@ -483,7 +523,16 @@ const LARGE_STD_RETURN_FEE_LB = Object.freeze([
   { max_lb: 2.25, fee: 4.66 }, { max_lb: 2.50, fee: 4.68 }, { max_lb: 2.75, fee: 4.71 }, { max_lb: 3.00, fee: 4.73 },
 ]);
 
-export function lookupVerified2027PerReturnFee(pkg) {
+const SMALL_STD_APPAREL_RETURN_FEE_OZ = Object.freeze([
+  { max_oz: 4, fee: 1.65 }, { max_oz: 8, fee: 1.75 }, { max_oz: 12, fee: 1.85 }, { max_oz: 16, fee: 1.95 },
+]);
+
+const LARGE_STD_APPAREL_RETURN_FEE_LB = Object.freeze([
+  { max_lb: 0.25, fee: 2.04 }, { max_lb: 0.50, fee: 2.12 }, { max_lb: 0.75, fee: 2.19 }, { max_lb: 1.00, fee: 2.27 },
+  { max_lb: 1.50, fee: 2.62 }, { max_lb: 2.00, fee: 2.98 }, { max_lb: 2.50, fee: 3.33 }, { max_lb: 3.00, fee: 3.69 },
+]);
+
+export function lookupVerified2027PerReturnFee(pkg, { isApparelOrShoes = false, allowAll2027Tiers = false } = {}) {
   const dims = resolvePackageDimsRat(pkg);
   if (!dims || !dims.wtLbRat || !dims.shipLbRat) return null;
   const { s1Rat, s2Rat, s3Rat, wtLbRat, ozRat, shipLbRat } = dims;
@@ -492,6 +541,11 @@ export function lookupVerified2027PerReturnFee(pkg) {
     ratCmp(s2Rat, { n: 12n, d: 1n }) <= 0 &&
     ratCmp(s3Rat, { n: 3n, d: 4n }) <= 0;
   if (isSmall) {
+    if (isApparelOrShoes) {
+      return allowAll2027Tiers
+        ? (SMALL_STD_APPAREL_RETURN_FEE_OZ.find(r => ratCmp(ozRat, toBigRat(r.max_oz)) <= 0)?.fee ?? null)
+        : null;
+    }
     return SMALL_STD_RETURN_FEE_OZ.find(r => ratCmp(ozRat, toBigRat(r.max_oz)) <= 0)?.fee ?? null;
   }
   const isLarge = ratCmp(wtLbRat, { n: 20n, d: 1n }) <= 0 &&
@@ -499,13 +553,63 @@ export function lookupVerified2027PerReturnFee(pkg) {
     ratCmp(s1Rat, { n: 18n, d: 1n }) <= 0 &&
     ratCmp(s2Rat, { n: 14n, d: 1n }) <= 0 &&
     ratCmp(s3Rat, { n: 8n, d: 1n }) <= 0;
-  if (!isLarge) return null;
-  if (ratCmp(shipLbRat, { n: 3n, d: 1n }) <= 0) {
-    return LARGE_STD_RETURN_FEE_LB.find(r => ratCmp(shipLbRat, toBigRat(r.max_lb)) <= 0)?.fee ?? null;
+  if (isLarge) {
+    if (isApparelOrShoes) {
+      if (!allowAll2027Tiers) return null;
+      if (ratCmp(shipLbRat, { n: 3n, d: 1n }) <= 0) {
+        return LARGE_STD_APPAREL_RETURN_FEE_LB.find(r => ratCmp(shipLbRat, toBigRat(r.max_lb)) <= 0)?.fee ?? null;
+      }
+      const num2 = 2n * (shipLbRat.n - 3n * shipLbRat.d);
+      const halfSteps = num2 <= 0n ? 0 : Number((num2 + shipLbRat.d - 1n) / shipLbRat.d);
+      return Math.round((3.89 + halfSteps * 0.10 + Number.EPSILON) * 100) / 100;
+    }
+    if (ratCmp(shipLbRat, { n: 3n, d: 1n }) <= 0) {
+      return LARGE_STD_RETURN_FEE_LB.find(r => ratCmp(shipLbRat, toBigRat(r.max_lb)) <= 0)?.fee ?? null;
+    }
+    const num4 = 4n * (shipLbRat.n - 3n * shipLbRat.d);
+    const steps = num4 <= 0n ? 0 : Number((num4 + shipLbRat.d - 1n) / shipLbRat.d);
+    return Math.round((5.00 + steps * 0.05 + Number.EPSILON) * 100) / 100;
   }
-  const num4 = 4n * (shipLbRat.n - 3n * shipLbRat.d);
-  const steps = num4 <= 0n ? 0 : Number((num4 + shipLbRat.d - 1n) / shipLbRat.d);
-  return Math.round((5.00 + steps * 0.05 + Number.EPSILON) * 100) / 100;
+  if (!allowAll2027Tiers) return null;
+
+  const bulkyS2Rat = ratCmp(s2Rat, { n: 2n, d: 1n }) >= 0 ? s2Rat : { n: 2n, d: 1n };
+  const bulkyS3Rat = ratCmp(s3Rat, { n: 2n, d: 1n }) >= 0 ? s3Rat : { n: 2n, d: 1n };
+  const bulkyCubicInRat = mulBigRat(mulBigRat(s1Rat, bulkyS2Rat), bulkyS3Rat);
+  const bulkyDimLbRat = divBigRat(bulkyCubicInRat, { n: 139n, d: 1n });
+  const bulkyShipLbRat = ratCmp(bulkyDimLbRat, wtLbRat) >= 0 ? bulkyDimLbRat : wtLbRat;
+  const girthPlusLenRat = addBigRat(s1Rat, mulBigRat({ n: 2n, d: 1n }, addBigRat(s2Rat, s3Rat)));
+  const ceilWholeExcess = (r, baseLb) => {
+    const excess = r.n - BigInt(baseLb) * r.d;
+    return excess > 0n ? Number((excess + r.d - 1n) / r.d) : 0;
+  };
+
+  // Official 2027 Bulky 4 tiers (<= 59 x 33 x 33 in, L+G <= 130 in, unit & shipping weight <= 50 lb): $6.74 + $0.32/lb over 1 lb
+  const fitsAnyBulky =
+    ratCmp(wtLbRat, { n: 50n, d: 1n }) <= 0 &&
+    ratCmp(bulkyShipLbRat, { n: 50n, d: 1n }) <= 0 &&
+    ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0 && (
+      (ratCmp(s1Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 24n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 20n, d: 1n }) <= 0) ||
+      (ratCmp(s1Rat, { n: 37n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 20n, d: 1n }) <= 0) ||
+      (ratCmp(s1Rat, { n: 52n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 28n, d: 1n }) <= 0) ||
+      (ratCmp(s1Rat, { n: 59n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 33n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 33n, d: 1n }) <= 0)
+    );
+  if (fitsAnyBulky) {
+    return Math.round((6.74 + ceilWholeExcess(bulkyShipLbRat, 1) * 0.32 + Number.EPSILON) * 100) / 100;
+  }
+
+  // Official 2027 Oversize 6 tiers returns processing (GZGEQLTM3RZXUV6T)
+  if (ratCmp(wtLbRat, { n: 50n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 50n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 72n, d: 1n }) <= 0 && ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0) {
+    return Math.round((26.33 + ceilWholeExcess(bulkyShipLbRat, 1) * 0.38 + Number.EPSILON) * 100) / 100;
+  }
+  if (ratCmp(wtLbRat, { n: 70n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 70n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 78n, d: 1n }) <= 0 && ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0) {
+    return Math.round((40.12 + ceilWholeExcess(bulkyShipLbRat, 51) * 0.75 + Number.EPSILON) * 100) / 100;
+  }
+  if (ratCmp(wtLbRat, { n: 150n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 150n, d: 1n }) <= 0) {
+    return Math.round((52.45 + ceilWholeExcess(bulkyShipLbRat, 71) * 0.75 + Number.EPSILON) * 100) / 100;
+  }
+  return Math.round((157.35 + ceilWholeExcess(wtLbRat, 151) * 0.19 + Number.EPSILON) * 100) / 100;
 }
 
 function canonicalValue(val) {
@@ -634,15 +738,18 @@ export function storageMeets2027Floor(input, storageLine, storageMonths) {
     v => finite(v) && v > 0,
   );
   if (!rateCheck.valid) return false;
-  const hasOffPeak = storageMonths.some(m => m <= 9);
-  const hasPeak = storageMonths.some(m => m >= 10);
+  const storageWinCtx = input?.fee_context?.storage;
+  const effectiveStorageMonths = windowValid(storageWinCtx) ? monthsIn(storageWinCtx) : storageMonths;
+  const hasOffPeak = effectiveStorageMonths.some(m => m <= 9);
+  const hasPeak = effectiveStorageMonths.some(m => m >= 10);
   if (rateCheck.present) {
     if (hasOffPeak && hasPeak) return false;
     if (hasPeak && rateCheck.value < peakFloor) return false;
     if (hasOffPeak && rateCheck.value < offPeakFloor) return false;
   }
   if (cuft !== null) {
-    const minRate = storageMonths.reduce((sum, m) => sum + (m >= 10 ? peakFloor : offPeakFloor), 0) / storageMonths.length;
+    if (hasOffPeak && hasPeak) return false;
+    const minRate = effectiveStorageMonths.reduce((sum, m) => sum + (m >= 10 ? peakFloor : offPeakFloor), 0) / effectiveStorageMonths.length;
     const minUsd = cuft * minRate * (days / 30);
     if (storageLine.amount_usd < minUsd - 1e-6) return false;
   }
@@ -652,6 +759,7 @@ export function storageMeets2027Floor(input, storageLine, storageMonths) {
 export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, requireRegularRepeatOrder = false, profileRevision = 0 } = {}) {
   const strictR57 = Boolean(requireRegularRepeatOrder || profileRevision >= 57);
   const isR58 = profileRevision >= 58;
+  const isR59 = profileRevision >= 59;
   const context = input.fee_context;
   const sources = new Set(evidenceIds);
   const evidenced = refs => Array.isArray(refs) && refs.length > 0 && refs.every(id => text(id) && sources.has(id));
@@ -668,15 +776,27 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
     if (operatingMonths) {
       const salesMonths = monthsIn(context.sales);
       const storageMonths = monthsIn(context.storage);
-      const yearMismatch = isR58 && (
+      const canonicalR59OffPeak = isR59 && isCanonical2027OffPeakWin(context.sales) && isCanonical2027OffPeakStorageWin(context.storage);
+      const canonicalR59Peak = isR59 && isCanonical2027PeakWin(context.sales) && isCanonical2027PeakStorageWin(context.storage);
+      const yearMismatch = isR58 && !canonicalR59Peak && (
         context.sales.from.slice(0, 4) !== context.sales.through.slice(0, 4) ||
         context.storage.from.slice(0, 4) !== context.storage.through.slice(0, 4) ||
         context.sales.from.slice(0, 4) !== context.storage.from.slice(0, 4)
       );
-      if (yearMismatch || salesMonths.some(month => !operatingMonths.includes(month)) ||
+      const r59OffPeakMonthsOk = canonicalR59OffPeak && (
+        ([2, 3, 4, 5, 6, 7, 8, 9].every(m => operatingMonths.includes(m)) &&
+          operatingMonths.every(m => m >= 2 && m <= 10))
+      );
+      const r59PeakMonthsOk = canonicalR59Peak && (
+        ([10, 11, 12].every(m => operatingMonths.includes(m)) &&
+          operatingMonths.every(m => [10, 11, 12, 1].includes(m)))
+      );
+      if (yearMismatch || (!r59OffPeakMonthsOk && !r59PeakMonthsOk && (
+        salesMonths.some(month => !operatingMonths.includes(month)) ||
         (strictR57 && (storageMonths.some(month => !operatingMonths.includes(month)) ||
           operatingMonths.some(month => !salesMonths.includes(month)) ||
-          operatingMonths.some(month => !storageMonths.includes(month))))) {
+          operatingMonths.some(month => !storageMonths.includes(month))))
+      ))) {
         add('context', 'operating_period_mismatch', strictR57
           ? 'The dated sales and storage windows must match one target year and cover every month declared in the operating period.'
           : 'The dated sales window extends beyond the displayed operating-period months.');
@@ -751,6 +871,26 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         ? 'Revision 58 requires explicit integer order_units >= 100 (matching across procurement, domestic delivery, source_inputs, and any sku_lines[]) plus first_order_promotion: false.'
         : 'Revision 57 requires explicit order_units: 100 and first_order_promotion: false on both regular repeat-order procurement and domestic delivery.');
     }
+    if (isR59 && line.id === 'headhaul' && line.status !== 'pending') {
+      const rawHhSpec = line.cny_derivation
+        ?? (input.headhaul && typeof input.headhaul === 'object' ? input.headhaul : null)
+        ?? (input.source_inputs?.headhaul && typeof input.source_inputs.headhaul === 'object' ? input.source_inputs.headhaul : null);
+      if (rawHhSpec && typeof rawHhSpec === 'object' && rawHhSpec.rate_cny_per_kg !== undefined) {
+        const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
+        const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
+        const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
+        if (hhCalc.missing_surcharge_quote) {
+          add('headhaul', 'headhaul_surcharge_quote_required', `Freight A4 surcharge triggered (${hhCalc.a4_applied?.missing_surcharge_quote ?? 'small shipment / carton'}) without an explicit surcharge quote.`);
+        } else if (!hhCalc.exact_usd_rational) {
+          add('headhaul', 'invalid_headhaul_tariff', 'Supplied Freight A4 headhaul tariff inputs are incomplete or invalid.');
+        } else {
+          const expectedHhUsd = roundBigRat(hhCalc.exact_usd_rational.n, hhCalc.exact_usd_rational.d, 10);
+          if (finite(line.amount_usd) && Math.abs(line.amount_usd - expectedHhUsd) > 0.005) {
+            add('headhaul', 'headhaul_tariff_mismatch', `Supplied headhaul amount_usd (${line.amount_usd}) conflicts with recomputed Freight A4 tariff (${expectedHhUsd}).`);
+          }
+        }
+      }
+    }
     if (isR58 && line.id === 'returns_processing' && line.status !== 'pending') {
       if (invalidPhysicalReturn) {
         add('returns_processing', 'invalid_return_rate', 'Supplied physical_return_fraction must be a finite fraction in [0, 1).');
@@ -761,8 +901,12 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         const isApparel = ledgerApparelCheck.value === true;
         const isOfficial2027RetVersion = /^US-FBA-2027/i.test(String(line.fee_basis?.version ?? '').trim());
         const backdatedOfficial2027Ret = !isOfficial2027ScheduleWindowValid('returns_processing', line.fee_basis, isApparel);
-        const in2027RetSchedule = validContext && context.sales.from >= '2027-02-01' && context.sales.through <= '2027-12-31';
-        const verifiedPerRet = !isApparel && (in2027RetSchedule || isOfficial2027RetVersion) ? lookupVerified2027PerReturnFee(matchedPkgR58) : null;
+        const minRetStart = isApparel && isR59 ? '2027-01-15' : '2027-02-01';
+        const maxRetEnd = isR59 ? '2028-01-14' : '2027-12-31';
+        const in2027RetSchedule = validContext && context.sales.from >= minRetStart && context.sales.through <= maxRetEnd;
+        const verifiedPerRet = (!isApparel || isR59) && (in2027RetSchedule || isOfficial2027RetVersion)
+          ? lookupVerified2027PerReturnFee(matchedPkgR58, { isApparelOrShoes: isApparel, allowAll2027Tiers: isR59 })
+          : null;
         const catCheck = resolveConsistentFeeCategory([line.fee_basis?.fee_category, line.fee_category, input.fee_category]);
         const verifiedCat = catCheck.valid && catCheck.present ? lookupVerified2027ReturnThreshold(catCheck.value) : null;
         const threshCheck = resolveConsistentNumeric(
@@ -787,7 +931,7 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         } else if (!perRetCheck.valid) {
           add('returns_processing', 'returns_processing_required', 'Conflicting or invalid per_return_fee_usd across line, fee_basis, and ledger.');
         } else if (verifiedPerRet !== null && perRetCheck.present && Math.abs(perRetCheck.value - verifiedPerRet) > 1e-9) {
-          add('returns_processing', 'returns_processing_required', `Supplied per_return_fee_usd (${perRetCheck.value}) conflicts with verified 2027 Standard-size return fee (${verifiedPerRet}).`);
+          add('returns_processing', 'returns_processing_required', `Supplied per_return_fee_usd (${perRetCheck.value}) conflicts with verified 2027 FBA return fee (${verifiedPerRet}).`);
         } else if (isApparel) {
           if (rPhysical > 0 && !hasExemption) {
             if (line.amount_usd === 0 || line.status === 'not_applicable') {
@@ -833,6 +977,12 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
       }
     }
     if (!Object.hasOwn(FEE_WINDOWS, line.id) || (line.id === 'other_applicable' && line.payee === 'external')) continue;
+    if (isR58 && line.id === 'fulfillment' && validContext && context.sales.through > '2027-10-14' &&
+      (line.status !== 'pending' || line.fee_basis?.status === 'published') &&
+      hasProhibited2026PeakExtrapolation(line, input)) {
+      add('fulfillment', 'prohibited_2026_peak_extrapolation', '2027 Q4 peak fulfillment fees cannot be estimated from 2026 peak uplifts; keep 2027 Q4 peak margin blank/pending until Amazon publishes official 2027 peak rates.');
+      continue;
+    }
     const basis = line.fee_basis;
     if (basis?.status !== 'published') {
       add(line.id, 'unpublished_fee', 'A published applicable fee basis is missing; a hypothetical or unavailable rate cannot support this period.');
@@ -858,10 +1008,11 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
       add(line.id, 'fee_outside_dates', `${line.id}: target ${target.from}..${target.through} is outside ${basis.version} (${basis.effective_from}..${basis.effective_through ?? 'open'}).`);
     }
     if (basis.months !== undefined) {
+      const targetMonthsForSeason = monthsIn(target);
       if (!Array.isArray(basis.months) || !basis.months.length ||
         basis.months.some(month => !Number.isInteger(month) || month < 1 || month > 12)) {
         add(line.id, isR58 ? 'invalid_fee_basis' : 'fee_season_mismatch', `${line.id}: declared fee_basis.months must be a nonempty array of integers 1..12.`);
-      } else if (monthsIn(target).some(month => !basis.months.includes(month))) {
+      } else if (targetMonthsForSeason.some(month => !basis.months.includes(month))) {
         add(line.id, 'fee_season_mismatch', `${line.id}: the target months are not covered by the declared seasonal rate.`);
       }
     }
@@ -872,11 +1023,17 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         const listBand = bandOf(pricingRes.list_price_usd);
         const netBand = bandOf(pricingRes.net_effective_price_usd);
         const declaredBand = text(basis?.price_band) ? basis.price_band.trim() : null;
-        const promoVerified = line.fulfillment_promo_tier_verified === true || input.fulfillment_promo_tier_verified === true;
-        if (pricingRes.has_ongoing_discount && listBand !== netBand && !promoVerified) {
+        const hasCouponOnly = Boolean(
+          ((pricingRes.ongoing_coupon_usd ?? 0) > 0 || (pricingRes.ongoing_coupon_pct ?? 0) > 0) &&
+          !((input?.prime_exclusive_discount_usd ?? 0) > 0 || (input?.prime_exclusive_discount_pct ?? 0) > 0),
+        );
+        const r59CouponListTierVerified = isR59 && hasCouponOnly && (declaredBand === null || declaredBand === listBand);
+        const promoVerified = line.fulfillment_promo_tier_verified === true || input.fulfillment_promo_tier_verified === true || r59CouponListTierVerified;
+        if (isR59 && hasCouponOnly && listBand !== netBand && declaredBand && declaredBand !== listBand) {
+          add('fulfillment', 'fee_scope_mismatch', `Fulfillment fee_basis.price_band (${declaredBand}) under ongoing coupon must match list_price_usd band (${listBand}), not net band (${netBand}).`);
+        } else if (pricingRes.has_ongoing_discount && listBand !== netBand && !promoVerified) {
           add('fulfillment', 'invalid_fee_basis', `Ongoing discount crosses FBA price tier (${listBand} -> ${netBand}) without fulfillment_promo_tier_verified: true; verify exact Amazon promo tier fee before scoring.`);
-        }
-        if (declaredBand && declaredBand !== netBand && !(pricingRes.has_ongoing_discount && promoVerified)) {
+        } else if (declaredBand && declaredBand !== netBand && !(pricingRes.has_ongoing_discount && promoVerified)) {
           add('fulfillment', 'fee_scope_mismatch', `Fulfillment fee_basis.price_band (${declaredBand}) conflicts with payable net price band (${netBand}).`);
         }
       }
@@ -911,4 +1068,309 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
     }
   }
   return { status: issues.length ? 'needs_evidence' : 'validated', context: context ?? null, issues };
+}
+
+/**
+ * Official Amazon US Coupon Fee (June 2025 onward, carried into 2027):
+ * $5.00 upfront per coupon campaign + 2.5% of coupon-attributed sales.
+ * Allocates the $5.00 campaign flat fee across `coupon_campaign_units` (default 100 units)
+ * plus 2.5% of `net_effective_price_usd * coupon_redemption_share`.
+ */
+export function computeAmazonCouponRedemptionFee2027({
+  net_effective_price_usd,
+  ongoing_coupon_usd = 0,
+  ongoing_coupon_pct = 0,
+  coupon_redemption_share = 1,
+  coupon_campaign_units = 100,
+  include_campaign_flat_usd = true,
+} = {}) {
+  const hasCoupon = (finite(ongoing_coupon_usd) && ongoing_coupon_usd > 0) ||
+    (finite(ongoing_coupon_pct) && ongoing_coupon_pct > 0);
+  if (!hasCoupon || !finite(net_effective_price_usd) || net_effective_price_usd <= 0) {
+    return {
+      applicable: false,
+      per_unit_usd: 0,
+      variable_2_5pct_usd: 0,
+      campaign_flat_per_unit_usd: 0,
+      exact_usd_rational: { n: 0n, d: 1n },
+    };
+  }
+  const share = finite(coupon_redemption_share) && coupon_redemption_share >= 0 && coupon_redemption_share <= 1
+    ? coupon_redemption_share
+    : 1;
+  const units = Number.isSafeInteger(coupon_campaign_units) && coupon_campaign_units > 0
+    ? coupon_campaign_units
+    : 100;
+  const netR = toBigRat(net_effective_price_usd);
+  const shareR = toBigRat(share);
+  // 2.5% = 25 / 1000 = 1 / 40
+  const varR = mulBigRat(mulBigRat(netR, { n: 1n, d: 40n }), shareR);
+  const flatR = include_campaign_flat_usd !== false
+    ? divBigRat({ n: 5n, d: 1n }, toBigRat(units))
+    : { n: 0n, d: 1n };
+  const totalR = addBigRat(varR, flatR);
+  return {
+    applicable: true,
+    per_unit_usd: roundBigRat(totalR.n, totalR.d, 10),
+    variable_2_5pct_usd: roundBigRat(varR.n, varR.d, 10),
+    campaign_flat_per_unit_usd: roundBigRat(flatR.n, flatR.d, 10),
+    coupon_campaign_units: units,
+    coupon_redemption_share: share,
+    exact_usd_rational: totalR,
+  };
+}
+
+const A4_HEADHAUL_EXTRA_KEYS = [
+  'carton_cm',
+  'carton_count',
+  'actual_weight_kg_total',
+  'actual_weight_kg_per_unit',
+  'weight_per_carton_kg',
+  'volumetric_divisor',
+  'min_shipment_billable_kg',
+  'small_shipment_threshold_kg',
+  'small_shipment_surcharge_cny_per_kg',
+  'small_carton_threshold_kg',
+  'small_carton_surcharge_cny_per_carton',
+  'small_carton_surcharge_cny_per_kg',
+];
+
+/**
+ * Shared exact BigInt rational headhaul calculator incorporating freight-forwarder A4 rules:
+ *  - Volumetric weight: carton_cm[0]*carton_cm[1]*carton_cm[2] / volumetric_divisor (default 6000) * carton_count
+ *  - Minimum shipment billable weight: <10 kg billed at 10 kg minimum (enabled in r59 or when A4 fields supplied)
+ *  - <50 kg small-shipment surcharge (`small_shipment_surcharge_cny_per_kg`)
+ *  - <8 kg outer-carton surcharge (`small_carton_surcharge_cny_per_carton` / `small_carton_surcharge_cny_per_kg`)
+ *  - Base rate + product surcharge + per-kg or per-shipment carrier bond
+ */
+export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = false, isR59 = false } = {}) {
+  if (!headhaul || typeof headhaul !== 'object') {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
+  }
+  const {
+    chargeable_kg_per_unit: kgPerUnit,
+    rate_cny_per_kg: rate,
+    surcharge_cny_per_kg: surcharge = 0,
+    bond_cny_per_kg: bondPerKg,
+    bond_cny_per_shipment: bondPerShipment,
+    carton_cm,
+    carton_count,
+    actual_weight_kg_total,
+    actual_weight_kg_per_unit,
+    weight_per_carton_kg,
+    volumetric_divisor,
+    min_shipment_billable_kg,
+    small_shipment_threshold_kg,
+    small_shipment_surcharge_cny_per_kg,
+    small_carton_threshold_kg,
+    small_carton_surcharge_cny_per_carton,
+    small_carton_surcharge_cny_per_kg,
+  } = headhaul;
+
+  const hasA4Extras = A4_HEADHAUL_EXTRA_KEYS.some(k => headhaul[k] !== undefined && headhaul[k] !== null);
+  const hasPerKgBond = finite(bondPerKg) && bondPerKg >= 0;
+  const hasShipmentBond = finite(bondPerShipment) && bondPerShipment >= 0;
+  const effectiveUnits = finite(orderUnits) && orderUnits > 0
+    ? orderUnits
+    : (finite(headhaul.order_units) && headhaul.order_units > 0 ? headhaul.order_units : null);
+  const needsUnits = !isR58 || hasShipmentBond || hasA4Extras || isR59;
+
+  const hasValidCartonCm = Array.isArray(carton_cm) && carton_cm.length === 3 && carton_cm.every(v => finite(v) && v > 0);
+  const canDeriveWeight = (finite(kgPerUnit) && kgPerUnit > 0) ||
+    (finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0) ||
+    (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) ||
+    hasValidCartonCm;
+
+  if (!canDeriveWeight || ![rate, surcharge].every(v => finite(v) && v >= 0) ||
+    (!hasPerKgBond && !hasShipmentBond) || (hasPerKgBond && hasShipmentBond) ||
+    !finite(fx) || fx <= 0 || (needsUnits && (!finite(effectiveUnits) || effectiveUnits <= 0))) {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
+  }
+
+  const unitsR = effectiveUnits !== null ? toBigRat(effectiveUnits) : { n: 100n, d: 1n };
+  const divisorVal = finite(volumetric_divisor) && volumetric_divisor > 0 ? volumetric_divisor : 6000;
+  const cartonCountInt = Number.isSafeInteger(carton_count) && carton_count > 0 ? carton_count : null;
+
+  let actualTotalR = null;
+  if (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) {
+    actualTotalR = toBigRat(actual_weight_kg_total);
+  } else if (finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0) {
+    actualTotalR = mulBigRat(toBigRat(actual_weight_kg_per_unit), unitsR);
+  } else if (finite(kgPerUnit) && kgPerUnit > 0) {
+    actualTotalR = mulBigRat(toBigRat(kgPerUnit), unitsR);
+  }
+
+  let volTotalR = null;
+  if (hasValidCartonCm) {
+    if (isR59 && cartonCountInt === null && headhaul.single_carton_verified !== true) {
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        missing_surcharge_quote: true,
+        a4_applied: {
+          volumetric_dimensions_present: true,
+          missing_surcharge_quote: 'carton_count_required_for_volumetric_weight',
+        },
+      };
+    }
+    const volOneR = divBigRat(
+      mulBigRat(mulBigRat(toBigRat(carton_cm[0]), toBigRat(carton_cm[1])), toBigRat(carton_cm[2])),
+      toBigRat(divisorVal),
+    );
+    volTotalR = mulBigRat(volOneR, toBigRat(cartonCountInt ?? 1));
+  }
+
+  let rawTotalKgR = actualTotalR ?? volTotalR;
+  let volumetricExceedsActual = false;
+  if (actualTotalR && volTotalR && ratCmp(volTotalR, actualTotalR) > 0) {
+    rawTotalKgR = volTotalR;
+    volumetricExceedsActual = true;
+  }
+
+  const applyA4Rules = Boolean(isR59 || hasA4Extras);
+  const minBillVal = finite(min_shipment_billable_kg) && min_shipment_billable_kg >= 0
+    ? min_shipment_billable_kg
+    : (applyA4Rules ? 10 : 0);
+  const minBillR = toBigRat(minBillVal);
+  const below10kgMinBill = minBillVal > 0 && ratCmp(rawTotalKgR, minBillR) < 0;
+  const billedTotalKgR = below10kgMinBill ? minBillR : rawTotalKgR;
+
+  const smallShipThreshR = toBigRat(finite(small_shipment_threshold_kg) && small_shipment_threshold_kg > 0 ? small_shipment_threshold_kg : 50);
+  const below50kg = applyA4Rules && ratCmp(rawTotalKgR, smallShipThreshR) < 0;
+  const hasExplicitA4ShipmentInputs = Boolean(
+    isR59 ||
+    actual_weight_kg_total !== undefined ||
+    actual_weight_kg_per_unit !== undefined ||
+    weight_per_carton_kg !== undefined ||
+    carton_count !== undefined ||
+    hasValidCartonCm ||
+    small_shipment_threshold_kg !== undefined ||
+    small_carton_threshold_kg !== undefined,
+  );
+  if (
+    below50kg &&
+    hasExplicitA4ShipmentInputs &&
+    headhaul.small_shipment_surcharge_exempt !== true &&
+    !(finite(small_shipment_surcharge_cny_per_kg) && small_shipment_surcharge_cny_per_kg >= 0)
+  ) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      missing_surcharge_quote: true,
+      a4_applied: {
+        below_50kg_small_shipment: true,
+        missing_surcharge_quote: 'small_shipment_surcharge_cny_per_kg',
+      },
+    };
+  }
+  const smallShipRateR = below50kg && finite(small_shipment_surcharge_cny_per_kg) && small_shipment_surcharge_cny_per_kg > 0
+    ? toBigRat(small_shipment_surcharge_cny_per_kg)
+    : { n: 0n, d: 1n };
+
+  let perCartonKgR = null;
+  if (finite(weight_per_carton_kg) && weight_per_carton_kg > 0) {
+    perCartonKgR = toBigRat(weight_per_carton_kg);
+  } else if (actualTotalR && cartonCountInt !== null) {
+    perCartonKgR = divBigRat(actualTotalR, toBigRat(cartonCountInt));
+  }
+  const smallCartonThreshR = toBigRat(finite(small_carton_threshold_kg) && small_carton_threshold_kg > 0 ? small_carton_threshold_kg : 8);
+  const below8kgCarton = applyA4Rules && perCartonKgR !== null && ratCmp(perCartonKgR, smallCartonThreshR) < 0;
+  const hasExplicitSmallCartonRate =
+    (finite(small_carton_surcharge_cny_per_carton) && small_carton_surcharge_cny_per_carton >= 0) ||
+    (finite(small_carton_surcharge_cny_per_kg) && small_carton_surcharge_cny_per_kg >= 0);
+  if (below8kgCarton && headhaul.small_carton_surcharge_exempt !== true && !hasExplicitSmallCartonRate) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      missing_surcharge_quote: true,
+      a4_applied: {
+        below_8kg_carton: true,
+        missing_surcharge_quote: 'small_carton_surcharge_cny_per_carton_or_per_kg',
+      },
+    };
+  }
+  if (
+    below8kgCarton &&
+    headhaul.small_carton_surcharge_exempt !== true &&
+    finite(small_carton_surcharge_cny_per_carton) &&
+    small_carton_surcharge_cny_per_carton > 0 &&
+    cartonCountInt === null
+  ) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      missing_surcharge_quote: true,
+      a4_applied: {
+        below_8kg_carton: true,
+        missing_surcharge_quote: 'carton_count_required_for_per_carton_surcharge',
+      },
+    };
+  }
+  const smallCartonPerCartonCnyR = below8kgCarton && cartonCountInt !== null &&
+    finite(small_carton_surcharge_cny_per_carton) && small_carton_surcharge_cny_per_carton > 0
+    ? mulBigRat(toBigRat(cartonCountInt), toBigRat(small_carton_surcharge_cny_per_carton))
+    : { n: 0n, d: 1n };
+  const smallCartonPerKgRateR = below8kgCarton && finite(small_carton_surcharge_cny_per_kg) && small_carton_surcharge_cny_per_kg > 0
+    ? toBigRat(small_carton_surcharge_cny_per_kg)
+    : { n: 0n, d: 1n };
+
+  const combinedPerKgRateR = addBigRat(
+    addBigRat(toBigRat(rate), toBigRat(surcharge)),
+    addBigRat(smallShipRateR, smallCartonPerKgRateR),
+  );
+  const totalBaseAndSurchargeCnyR = addBigRat(
+    mulBigRat(billedTotalKgR, combinedPerKgRateR),
+    smallCartonPerCartonCnyR,
+  );
+  const totalBondCnyR = hasPerKgBond
+    ? mulBigRat(billedTotalKgR, toBigRat(bondPerKg))
+    : toBigRat(bondPerShipment);
+  const totalShipmentCnyR = addBigRat(totalBaseAndSurchargeCnyR, totalBondCnyR);
+  const cnyPerUnitR = divBigRat(totalShipmentCnyR, unitsR);
+  if (cnyPerUnitR.n <= 0n) {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
+  }
+  const usdPerUnitR = divBigRat(cnyPerUnitR, toBigRat(fx));
+  const effKgPerUnit = roundBigRat(divBigRat(billedTotalKgR, unitsR).n, divBigRat(billedTotalKgR, unitsR).d, 10);
+
+  const cnyDerivation = {
+    fx,
+    chargeable_kg_per_unit: finite(kgPerUnit) && kgPerUnit > 0 ? kgPerUnit : effKgPerUnit,
+    rate_cny_per_kg: rate,
+    surcharge_cny_per_kg: surcharge,
+    ...(hasPerKgBond ? { bond_cny_per_kg: bondPerKg } : { bond_cny_per_shipment: bondPerShipment, order_units: effectiveUnits }),
+    ...((applyA4Rules && (below10kgMinBill || below50kg || below8kgCarton || volumetricExceedsActual || hasA4Extras)) ? {
+      order_units: effectiveUnits,
+      ...(hasValidCartonCm ? { carton_cm } : {}),
+      ...(cartonCountInt !== null ? { carton_count: cartonCountInt } : {}),
+      ...(finite(actual_weight_kg_total) ? { actual_weight_kg_total } : {}),
+      ...(finite(actual_weight_kg_per_unit) ? { actual_weight_kg_per_unit } : {}),
+      ...(finite(weight_per_carton_kg) ? { weight_per_carton_kg } : {}),
+      ...(finite(volumetric_divisor) ? { volumetric_divisor } : {}),
+      ...(minBillVal > 0 ? { min_shipment_billable_kg: minBillVal } : {}),
+      ...(finite(small_shipment_threshold_kg) ? { small_shipment_threshold_kg } : {}),
+      ...(finite(small_shipment_surcharge_cny_per_kg) ? { small_shipment_surcharge_cny_per_kg } : {}),
+      ...(finite(small_carton_threshold_kg) ? { small_carton_threshold_kg } : {}),
+      ...(finite(small_carton_surcharge_cny_per_carton) ? { small_carton_surcharge_cny_per_carton } : {}),
+      ...(finite(small_carton_surcharge_cny_per_kg) ? { small_carton_surcharge_cny_per_kg } : {}),
+    } : {}),
+  };
+
+  return {
+    amount_usd: roundBigRat(usdPerUnitR.n, usdPerUnitR.d, 10),
+    exact_usd_rational: usdPerUnitR,
+    cny_derivation: isR58 ? cnyDerivation : null,
+    a4_applied: {
+      below_10kg_min_bill: below10kgMinBill,
+      below_50kg_small_shipment: below50kg,
+      below_8kg_outer_carton: below8kgCarton,
+      volumetric_exceeds_actual: volumetricExceedsActual,
+      billed_total_kg: roundBigRat(billedTotalKgR.n, billedTotalKgR.d, 6),
+      effective_billed_kg_per_unit: effKgPerUnit,
+    },
+  };
 }

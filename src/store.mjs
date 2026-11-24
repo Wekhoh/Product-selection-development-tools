@@ -30,7 +30,7 @@ import {
   PROMOTION_TRACKS,
   resolveChannelMeta,
 } from './discovery-channels.mjs';
-import { validateProviderCall } from './provider-guards.mjs';
+import { canonicalizeConnectorToolName, validateProviderCall } from './provider-guards.mjs';
 import { bindSourcingQuotePricingInputs } from './fba-rates-2027.mjs';
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -55,7 +55,7 @@ const LIFECYCLE_STATUSES = Object.freeze([
   'excluded',
 ]);
 
-const PROVIDERS = Object.freeze(['sellersprite', 'sif', 'exa', '1688_browser', 'other']);
+const PROVIDERS = Object.freeze(['sellersprite', 'sif', 'exa', 'sp_api', '1688_browser', 'other']);
 const REQUEST_MODES = Object.freeze(['historical_replay', 'fresh_observation']);
 
 const finite = v => typeof v === 'number' && Number.isFinite(v);
@@ -96,8 +96,15 @@ function assertAccountScope(scope) {
 
 export function normalizeProvider(provider, toolName = '') {
   const raw = String(provider || '').trim().toLowerCase();
+  if (raw === 'sp-api' || raw === 'amazon_sp_api') return 'sp_api';
   if (PROVIDERS.includes(raw)) return raw;
   const tool = String(toolName || '').trim().toLowerCase();
+  if (tool.includes('sp_api') || tool.includes('sp-api') || tool.startsWith('catalogitems_') ||
+    tool.startsWith('productfees_') || tool.startsWith('listingsrestrictions_') ||
+    tool.startsWith('listingsitems_') || tool.startsWith('definitionsproducttypes_') ||
+    tool === 'getdefinitionsproducttype' || tool === 'putlistingsitem') {
+    return 'sp_api';
+  }
   if (tool.includes('sellersprite') || tool.startsWith('asin_') || tool.startsWith('category_') || tool.startsWith('keyword_') || tool.startsWith('keepa_') || tool.startsWith('bsr_') || tool.startsWith('ads_insights') || tool === 'product_research' || tool === 'keyword_research') {
     return 'sellersprite';
   }
@@ -113,14 +120,7 @@ export function normalizeProvider(provider, toolName = '') {
 
 export function normalizeCanonicalTool(toolName) {
   if (!nonemptyStr(toolName)) throw new TypeError('tool_name must be a nonempty string.');
-  let bare = toolName.trim();
-  bare = bare.replace(/^mcp__codex_apps__[a-z0-9]+_mcp_/i, '');
-  bare = bare.replace(/^mcp__codex_apps__(?:sellersprite|sif|exa)_/i, '');
-  bare = bare.replace(/^mcp__codex_apps__/i, '');
-  bare = bare.replace(/^mcp__[a-z0-9_-]+__/i, '');
-  bare = bare.replace(/^(?:sellersprite|sif|exa)[:.]/i, '');
-  bare = bare.replace(/_[0-9a-f]{8}$/i, '');
-  return bare.trim().toLowerCase();
+  return canonicalizeConnectorToolName(toolName);
 }
 
 function normalizeStringToken(value) {
@@ -196,7 +196,7 @@ function canonicalizeToolParams(normProvider, canonicalTool, params, { defaultMa
     }
   }
 
-  if (core.marketplace === undefined && (normProvider === 'sif' || normProvider === 'sellersprite')) {
+  if (core.marketplace === undefined && (normProvider === 'sif' || normProvider === 'sellersprite' || normProvider === 'sp_api')) {
     core.marketplace = String(defaultMarketplace || 'US').trim().toUpperCase();
   }
 
@@ -335,7 +335,7 @@ CREATE TABLE IF NOT EXISTS api_request_ledger (
   logical_request_key TEXT NOT NULL,
   semantic_lock_key TEXT NOT NULL,
   account_scope TEXT NOT NULL,
-  provider TEXT NOT NULL CHECK(provider IN ('sellersprite', 'sif', 'exa', '1688_browser', 'other')),
+  provider TEXT NOT NULL CHECK(provider IN ('sellersprite', 'sif', 'exa', 'sp_api', '1688_browser', 'other')),
   tool_name TEXT NOT NULL,
   canonical_tool TEXT NOT NULL,
   tool_version TEXT NOT NULL DEFAULT 'v1',
@@ -424,6 +424,7 @@ CREATE TABLE IF NOT EXISTS candidate_forms (
   gate1a_result_json TEXT,
   gate1b_result_json TEXT,
   negotiation_shortlist_json TEXT,
+  packaging_redesign_shortlist_json TEXT,
   landed_domestic_cap_cny REAL,
   cooldown_until TEXT,
   cooldown_reason TEXT,
@@ -459,10 +460,12 @@ CREATE TABLE IF NOT EXISTS sourcing_quotes_1688 (
   moq_sets INTEGER NOT NULL CHECK(moq_sets >= 1),
   actual_sets INTEGER NOT NULL CHECK(actual_sets >= 1),
   actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
-  goods_cny_total REAL CHECK((quote_status = 'pending' AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status != 'pending' AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
-  domestic_freight_cny_total REAL CHECK((quote_status = 'pending' AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status != 'pending' AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
+  goods_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
+  domestic_freight_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
   pkg_json TEXT,
   fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
+  spec_variant_key TEXT,
+  kit_note TEXT,
   goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
   freight_first_order_promotion INTEGER NOT NULL CHECK(freight_first_order_promotion IN (0, 1)),
   lead_time_days INTEGER CHECK(lead_time_days IS NULL OR lead_time_days >= 0),
@@ -473,7 +476,7 @@ CREATE TABLE IF NOT EXISTS sourcing_quotes_1688 (
   raw_readback_ref TEXT,
   observed_at TEXT NOT NULL,
   expires_at TEXT,
-  quote_status TEXT NOT NULL CHECK(quote_status IN ('verified', 'rejected_promo', 'rejected_spec', 'expired', 'pending')),
+  quote_status TEXT NOT NULL CHECK(quote_status IN ('verified', 'superseded_uncompetitive', 'incomplete_cross_factory_kit', 'rejected_promo', 'rejected_spec', 'expired', 'pending')),
   created_at TEXT NOT NULL
 );
 
@@ -711,6 +714,8 @@ export class SelectionStore {
           }
           this.db.exec('PRAGMA synchronous = FULL;');
         }
+        this._migrateApiLedgerProviderCheckIfNeeded();
+        this._migrateSourcingQuotesCheckIfNeeded();
         this._withImmediateTx(() => {
           this.db.exec(SCHEMA_SQL);
           this._migrateSchema();
@@ -734,6 +739,165 @@ export class SelectionStore {
 
   _tableColumns(tableName) {
     return new Set(this.db.prepare(`PRAGMA table_info(${tableName})`).all().map(c => c.name));
+  }
+
+  _migrateApiLedgerProviderCheckIfNeeded() {
+    const master = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_request_ledger'",
+    ).get();
+    if (!master?.sql || master.sql.includes("'sp_api'")) return;
+    this.db.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      this._withImmediateTx(() => {
+        const existing = this._tableColumns('api_request_ledger');
+        for (const [colName, colDef] of [
+          ['estimated_ss_mcp_units', 'REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_mcp_units >= 0)'],
+          ['estimated_ss_web_realtime_tasks', 'REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_web_realtime_tasks >= 0)'],
+          ['estimated_exa_calls', 'REAL NOT NULL DEFAULT 0 CHECK(estimated_exa_calls >= 0)'],
+          ['unknown_reserved_ss_mcp_units', 'REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_mcp_units >= 0)'],
+          ['unknown_reserved_ss_web_realtime_tasks', 'REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_web_realtime_tasks >= 0)'],
+          ['unknown_reserved_exa_calls', 'REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_exa_calls >= 0)'],
+        ]) {
+          if (!existing.has(colName)) {
+            this.db.exec(`ALTER TABLE api_request_ledger ADD COLUMN ${colName} ${colDef};`);
+          }
+        }
+        const cols = [
+          'attempt_id', 'logical_request_key', 'semantic_lock_key', 'account_scope', 'provider',
+          'tool_name', 'canonical_tool', 'tool_version', 'marketplace', 'mode', 'observation_cutoff_date',
+          'page_or_cursor', 'normalized_params_json', 'form_id', 'stage', 'status', 'repeat_submission_allowed',
+          'billing_status', 'ss_mcp_units', 'ss_web_realtime_tasks', 'sif_units', 'exa_calls',
+          'estimated_ss_mcp_units', 'estimated_ss_web_realtime_tasks', 'estimated_sif_units', 'estimated_exa_calls',
+          'unknown_reserved_ss_mcp_units', 'unknown_reserved_ss_web_realtime_tasks',
+          'unknown_reserved_sif_units', 'unknown_reserved_exa_calls',
+          'payload_sha256', 'response_payload_json', 'raw_artifact_path', 'pagination_complete',
+          'source_ledger_ref', 'reconciliation_note', 'created_at', 'updated_at', 'finished_at',
+        ];
+        const colList = cols.join(', ');
+        this.db.exec(`
+          CREATE TABLE api_request_ledger_v2 (
+            attempt_id TEXT PRIMARY KEY,
+            logical_request_key TEXT NOT NULL,
+            semantic_lock_key TEXT NOT NULL,
+            account_scope TEXT NOT NULL,
+            provider TEXT NOT NULL CHECK(provider IN ('sellersprite', 'sif', 'exa', 'sp_api', '1688_browser', 'other')),
+            tool_name TEXT NOT NULL,
+            canonical_tool TEXT NOT NULL,
+            tool_version TEXT NOT NULL DEFAULT 'v1',
+            marketplace TEXT NOT NULL DEFAULT 'US',
+            mode TEXT NOT NULL CHECK(mode IN ('historical_replay', 'fresh_observation')),
+            observation_cutoff_date TEXT NOT NULL,
+            page_or_cursor TEXT NOT NULL DEFAULT '',
+            normalized_params_json TEXT NOT NULL,
+            form_id TEXT,
+            stage TEXT NOT NULL DEFAULT 'general' CHECK(stage IN ('discovery', 'gate1a', 'gate1b', 'gate2_3', 'replay', 'general')),
+            status TEXT NOT NULL CHECK(status IN ('reserved', 'in_flight', 'completed', 'failed', 'unknown_needs_reconciliation', 'permanently_locked')),
+            repeat_submission_allowed INTEGER NOT NULL DEFAULT 1 CHECK(repeat_submission_allowed IN (0, 1)),
+            billing_status TEXT NOT NULL DEFAULT 'known' CHECK(billing_status IN ('known', 'unknown_not_exposed')),
+            ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(ss_mcp_units >= 0),
+            ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(ss_web_realtime_tasks >= 0),
+            sif_units REAL NOT NULL DEFAULT 0 CHECK(sif_units >= 0),
+            exa_calls REAL NOT NULL DEFAULT 0 CHECK(exa_calls >= 0),
+            estimated_ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_mcp_units >= 0),
+            estimated_ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_web_realtime_tasks >= 0),
+            estimated_sif_units REAL NOT NULL DEFAULT 0 CHECK(estimated_sif_units >= 0),
+            estimated_exa_calls REAL NOT NULL DEFAULT 0 CHECK(estimated_exa_calls >= 0),
+            unknown_reserved_ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_mcp_units >= 0),
+            unknown_reserved_ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_web_realtime_tasks >= 0),
+            unknown_reserved_sif_units REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_sif_units >= 0),
+            unknown_reserved_exa_calls REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_exa_calls >= 0),
+            payload_sha256 TEXT,
+            response_payload_json TEXT,
+            raw_artifact_path TEXT,
+            pagination_complete INTEGER CHECK(pagination_complete IN (0, 1)),
+            source_ledger_ref TEXT,
+            reconciliation_note TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            finished_at TEXT
+          );
+          INSERT INTO api_request_ledger_v2 (${colList}) SELECT ${colList} FROM api_request_ledger;
+          DROP TABLE api_request_ledger;
+          ALTER TABLE api_request_ledger_v2 RENAME TO api_request_ledger;
+          CREATE INDEX IF NOT EXISTS idx_ledger_logical_key ON api_request_ledger(logical_request_key);
+          CREATE INDEX IF NOT EXISTS idx_ledger_semantic_lock ON api_request_ledger(semantic_lock_key, status);
+          CREATE INDEX IF NOT EXISTS idx_ledger_form_stage ON api_request_ledger(form_id, stage);
+          CREATE INDEX IF NOT EXISTS idx_ledger_status ON api_request_ledger(status);
+        `);
+      });
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON;');
+    }
+  }
+
+  _migrateSourcingQuotesCheckIfNeeded() {
+    const master = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sourcing_quotes_1688'",
+    ).get();
+    if (!master?.sql || master.sql.includes("'superseded_uncompetitive'")) return;
+    this.db.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      this._withImmediateTx(() => {
+        const existing = this._tableColumns('sourcing_quotes_1688');
+        for (const [colName, colDef] of [
+          ['pkg_json', 'TEXT'],
+          ['fx_cny_per_usd', 'REAL CHECK(fx_cny_per_usd > 0)'],
+          ['spec_variant_key', 'TEXT'],
+          ['kit_note', 'TEXT'],
+        ]) {
+          if (!existing.has(colName)) {
+            this.db.exec(`ALTER TABLE sourcing_quotes_1688 ADD COLUMN ${colName} ${colDef};`);
+          }
+        }
+        const cols = [
+          'quote_id', 'form_id', 'spec_version', 'sku_lines_json', 'order_plan_json',
+          'pack_multiple', 'moq_sets', 'actual_sets', 'actual_complete_sets',
+          'goods_cny_total', 'domestic_freight_cny_total', 'pkg_json', 'fx_cny_per_usd',
+          'spec_variant_key', 'kit_note',
+          'goods_first_order_promotion', 'freight_first_order_promotion', 'lead_time_days',
+          'sensitive_freebie_flags_json', 'redacted_destination', 'redacted_screenshot_path',
+          'redacted_webp_sha256', 'raw_readback_ref', 'observed_at', 'expires_at', 'quote_status', 'created_at',
+        ];
+        const colList = cols.join(', ');
+        this.db.exec(`
+          CREATE TABLE sourcing_quotes_1688_v2 (
+            quote_id TEXT PRIMARY KEY,
+            form_id TEXT NOT NULL REFERENCES candidate_forms(form_id),
+            spec_version INTEGER NOT NULL CHECK(spec_version >= 1),
+            sku_lines_json TEXT NOT NULL,
+            order_plan_json TEXT,
+            pack_multiple INTEGER NOT NULL CHECK(pack_multiple >= 1),
+            moq_sets INTEGER NOT NULL CHECK(moq_sets >= 1),
+            actual_sets INTEGER NOT NULL CHECK(actual_sets >= 1),
+            actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
+            goods_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
+            domestic_freight_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
+            pkg_json TEXT,
+            fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
+            spec_variant_key TEXT,
+            kit_note TEXT,
+            goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
+            freight_first_order_promotion INTEGER NOT NULL CHECK(freight_first_order_promotion IN (0, 1)),
+            lead_time_days INTEGER CHECK(lead_time_days IS NULL OR lead_time_days >= 0),
+            sensitive_freebie_flags_json TEXT NOT NULL,
+            redacted_destination TEXT NOT NULL,
+            redacted_screenshot_path TEXT,
+            redacted_webp_sha256 TEXT,
+            raw_readback_ref TEXT,
+            observed_at TEXT NOT NULL,
+            expires_at TEXT,
+            quote_status TEXT NOT NULL CHECK(quote_status IN ('verified', 'superseded_uncompetitive', 'incomplete_cross_factory_kit', 'rejected_promo', 'rejected_spec', 'expired', 'pending')),
+            created_at TEXT NOT NULL
+          );
+          INSERT INTO sourcing_quotes_1688_v2 (${colList}) SELECT ${colList} FROM sourcing_quotes_1688;
+          DROP TABLE sourcing_quotes_1688;
+          ALTER TABLE sourcing_quotes_1688_v2 RENAME TO sourcing_quotes_1688;
+          CREATE INDEX IF NOT EXISTS idx_quotes_form ON sourcing_quotes_1688(form_id, quote_status);
+        `);
+      });
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON;');
+    }
   }
 
   _migrateSchema() {
@@ -763,6 +927,7 @@ export class SelectionStore {
       ['cooldown_reason', 'TEXT'],
       ['promotion_track', 'TEXT'],
       ['sourcing_disposition', 'TEXT'],
+      ['packaging_redesign_shortlist_json', 'TEXT'],
     ]);
     ensureColumns('lead_form_links', [
       ['verification_subrole', 'TEXT'],
@@ -770,6 +935,8 @@ export class SelectionStore {
     ensureColumns('sourcing_quotes_1688', [
       ['pkg_json', 'TEXT'],
       ['fx_cny_per_usd', 'REAL CHECK(fx_cny_per_usd > 0)'],
+      ['spec_variant_key', 'TEXT'],
+      ['kit_note', 'TEXT'],
     ]);
     ensureColumns('evaluations', [
       ['review_notes_json', 'TEXT'],
@@ -1567,10 +1734,13 @@ export class SelectionStore {
     }
 
     if (typeof executor !== 'function') throw new TypeError('executor function is required.');
-    // Enforce SellerSprite/SIF connector guards BEFORE reservation by default on every paid dispatch.
+    // Enforce SellerSprite/SIF/SP-API connector guards BEFORE reservation by default on every dispatch.
     if (spec.enforce_provider_guards !== false) {
-      const prov = normalizeProvider(spec.provider, spec.tool_name);
-      if (prov === 'sellersprite' || prov === 'sif') {
+      const rawProv = String(spec.provider || '').trim().toLowerCase();
+      const isSpApi = rawProv === 'sp_api' || rawProv === 'sp-api' || rawProv === 'amazon_sp_api' ||
+        /^(?:sp_api_|catalogitems_|productfees_|listingsrestrictions_|listingsitems_|definitionsproducttypes_)/i.test(String(spec.tool_name || '').trim());
+      const prov = isSpApi ? 'sp_api' : normalizeProvider(spec.provider, spec.tool_name);
+      if (prov === 'sellersprite' || prov === 'sif' || prov === 'sp_api') {
         validateProviderCall(prov, spec.tool_name, spec.params ?? {}, {
           ...(spec.provider_guard_context ?? {}),
           throwOnError: true,
@@ -2267,6 +2437,7 @@ export class SelectionStore {
     gate1a_result = undefined,
     gate1b_result = undefined,
     negotiation_shortlist = undefined,
+    packaging_redesign_shortlist = undefined,
     landed_domestic_cap_cny = undefined,
     sourcing_disposition = undefined,
   } = {}) {
@@ -2276,6 +2447,7 @@ export class SelectionStore {
     }
     const formsSql = String(this.db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='candidate_forms'").get()?.sql || '');
     const supportsPrivateMoldInCheck = formsSql.includes('private_mold_reserved');
+    const hasPkgShortlistCol = this._tableColumns('candidate_forms').has('packaging_redesign_shortlist_json');
     const storedStatus = lifecycleStatus === 'private_mold_reserved' && !supportsPrivateMoldInCheck
       ? 'deferred'
       : lifecycleStatus;
@@ -2283,31 +2455,60 @@ export class SelectionStore {
       ? sourcing_disposition
       : (lifecycleStatus === 'private_mold_reserved' ? 'private_mold_reserved' : undefined);
     const now = this._now();
-    const res = this.db.prepare(`
-      UPDATE candidate_forms
-      SET lifecycle_status = ?,
-          sourcing_disposition = CASE WHEN ? = 1 THEN ? ELSE sourcing_disposition END,
-          gate1a_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1a_result_json END,
-          gate1b_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1b_result_json END,
-          negotiation_shortlist_json = CASE WHEN ? = 1 THEN ? ELSE negotiation_shortlist_json END,
-          landed_domestic_cap_cny = CASE WHEN ? = 1 THEN ? ELSE landed_domestic_cap_cny END,
-          updated_at = ?
-      WHERE form_id = ?
-    `).run(
-      storedStatus,
-      effectiveSourcingDisp !== undefined ? 1 : 0,
-      effectiveSourcingDisp ?? null,
-      gate1a_result !== undefined ? 1 : 0,
-      gate1a_result !== undefined ? canonicalJson(gate1a_result) : null,
-      gate1b_result !== undefined ? 1 : 0,
-      gate1b_result !== undefined ? canonicalJson(gate1b_result) : null,
-      negotiation_shortlist !== undefined ? 1 : 0,
-      negotiation_shortlist !== undefined ? canonicalJson(negotiation_shortlist) : null,
-      landed_domestic_cap_cny !== undefined ? 1 : 0,
-      landed_domestic_cap_cny ?? null,
-      now,
-      formId,
-    );
+    const res = hasPkgShortlistCol
+      ? this.db.prepare(`
+          UPDATE candidate_forms
+          SET lifecycle_status = ?,
+              sourcing_disposition = CASE WHEN ? = 1 THEN ? ELSE sourcing_disposition END,
+              gate1a_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1a_result_json END,
+              gate1b_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1b_result_json END,
+              negotiation_shortlist_json = CASE WHEN ? = 1 THEN ? ELSE negotiation_shortlist_json END,
+              packaging_redesign_shortlist_json = CASE WHEN ? = 1 THEN ? ELSE packaging_redesign_shortlist_json END,
+              landed_domestic_cap_cny = CASE WHEN ? = 1 THEN ? ELSE landed_domestic_cap_cny END,
+              updated_at = ?
+          WHERE form_id = ?
+        `).run(
+          storedStatus,
+          effectiveSourcingDisp !== undefined ? 1 : 0,
+          effectiveSourcingDisp ?? null,
+          gate1a_result !== undefined ? 1 : 0,
+          gate1a_result !== undefined ? canonicalJson(gate1a_result) : null,
+          gate1b_result !== undefined ? 1 : 0,
+          gate1b_result !== undefined ? canonicalJson(gate1b_result) : null,
+          negotiation_shortlist !== undefined ? 1 : 0,
+          negotiation_shortlist !== undefined ? canonicalJson(negotiation_shortlist) : null,
+          packaging_redesign_shortlist !== undefined ? 1 : 0,
+          packaging_redesign_shortlist !== undefined ? canonicalJson(packaging_redesign_shortlist) : null,
+          landed_domestic_cap_cny !== undefined ? 1 : 0,
+          landed_domestic_cap_cny ?? null,
+          now,
+          formId,
+        )
+      : this.db.prepare(`
+          UPDATE candidate_forms
+          SET lifecycle_status = ?,
+              sourcing_disposition = CASE WHEN ? = 1 THEN ? ELSE sourcing_disposition END,
+              gate1a_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1a_result_json END,
+              gate1b_result_json = CASE WHEN ? = 1 THEN ? ELSE gate1b_result_json END,
+              negotiation_shortlist_json = CASE WHEN ? = 1 THEN ? ELSE negotiation_shortlist_json END,
+              landed_domestic_cap_cny = CASE WHEN ? = 1 THEN ? ELSE landed_domestic_cap_cny END,
+              updated_at = ?
+          WHERE form_id = ?
+        `).run(
+          storedStatus,
+          effectiveSourcingDisp !== undefined ? 1 : 0,
+          effectiveSourcingDisp ?? null,
+          gate1a_result !== undefined ? 1 : 0,
+          gate1a_result !== undefined ? canonicalJson(gate1a_result) : null,
+          gate1b_result !== undefined ? 1 : 0,
+          gate1b_result !== undefined ? canonicalJson(gate1b_result) : null,
+          negotiation_shortlist !== undefined ? 1 : 0,
+          negotiation_shortlist !== undefined ? canonicalJson(negotiation_shortlist) : null,
+          landed_domestic_cap_cny !== undefined ? 1 : 0,
+          landed_domestic_cap_cny ?? null,
+          now,
+          formId,
+        );
     if (res.changes !== 1) throw new Error(`Form ${formId} not found.`);
     return this.getCandidateForm(formId);
   }
@@ -2342,8 +2543,36 @@ export class SelectionStore {
           ? [composition]
           : null));
 
-    const quoteStatus = quote.quote_status ?? 'verified';
-    const contractStatus = quoteStatus === 'verified' ? 'verified' : (quoteStatus === 'pending' ? 'unknown' : 'rejected');
+    const rawLinesForFactoryCheck = Array.isArray(quote.sku_lines) ? quote.sku_lines : [];
+    const distinctFactoryIds = new Set(
+      rawLinesForFactoryCheck
+        .map(l => String(l?.supplier_id ?? l?.factory_id ?? '').trim())
+        .filter(Boolean),
+    );
+    const isCrossFactoryOrBarePart = Boolean(
+      quote.single_factory_complete_kit === false ||
+      quote.requires_cross_factory_packaging === true ||
+      quote.bare_parts_incomplete === true ||
+      distinctFactoryIds.size > 1,
+    );
+
+    const quoteStatus = isCrossFactoryOrBarePart
+      ? 'incomplete_cross_factory_kit'
+      : (quote.quote_status ?? 'verified');
+    const kitNote = nonemptyStr(quote.kit_note)
+      ? sanitizeDiagnosticText(quote.kit_note.trim())
+      : (quoteStatus === 'incomplete_cross_factory_kit'
+        ? '初筛仅认单一工厂一站齐套；只卖裸件或需跨两家厂另配标准袋/盒暂置归档'
+        : null);
+    const specVariantKey = nonemptyStr(quote.spec_variant_key)
+      ? quote.spec_variant_key.trim()
+      : null;
+
+    const contractStatus = quoteStatus === 'verified'
+      ? 'verified'
+      : (quoteStatus === 'pending' || quoteStatus === 'incomplete_cross_factory_kit' ? 'unknown' : 'rejected');
+    // Keep expires_at null unless explicitly supplied (never auto-invent a 30-day expiry date).
+    const explicitExpiresAt = quote.expires_at ?? null;
     const verified = validateSourcingVerifier1688Output({
       schema_version: 1,
       contract: 'SourcingVerifier1688',
@@ -2352,7 +2581,7 @@ export class SelectionStore {
       require_ui_readback: quote.require_ui_readback ?? false,
       status: contractStatus,
       observed_at: quote.observed_at,
-      expires_at: quote.expires_at ?? null,
+      expires_at: explicitExpiresAt,
       redacted_destination: quote.redacted_destination,
       redacted_screenshot_path: quote.redacted_screenshot_path ?? null,
       redacted_webp_sha256: quote.redacted_webp_sha256 ?? null,
@@ -2407,10 +2636,11 @@ export class SelectionStore {
       INSERT INTO sourcing_quotes_1688 (
         quote_id, form_id, spec_version, sku_lines_json, order_plan_json, pack_multiple, moq_sets,
         actual_sets, actual_complete_sets, goods_cny_total, domestic_freight_cny_total, pkg_json, fx_cny_per_usd,
+        spec_variant_key, kit_note,
         goods_first_order_promotion, freight_first_order_promotion, lead_time_days,
         sensitive_freebie_flags_json, redacted_destination, redacted_screenshot_path,
         redacted_webp_sha256, raw_readback_ref, observed_at, expires_at, quote_status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       quoteId,
       form.form_id,
@@ -2425,6 +2655,8 @@ export class SelectionStore {
       quote.domestic_freight_cny_total ?? null,
       pricingInputs.pkg ? canonicalJson(pricingInputs.pkg) : null,
       pricingInputs.fx_cny_per_usd ?? null,
+      specVariantKey,
+      kitNote,
       quote.goods_first_order_promotion ? 1 : 0,
       quote.freight_first_order_promotion ? 1 : 0,
       quote.lead_time_days ?? null,
@@ -2434,15 +2666,87 @@ export class SelectionStore {
       quote.redacted_webp_sha256 ?? null,
       quote.raw_readback_ref ?? null,
       quote.observed_at,
-      quote.expires_at ?? null,
+      explicitExpiresAt,
       quoteStatus,
       now,
     );
+
+    // 1688 "先贵后便宜" same-spec archival: when a cheaper verified complete-kit quote is found for the same
+    // explicit spec_variant_key (or supersede_same_spec: true), archive earlier strictly more expensive same-spec quotes
+    // as 'superseded_uncompetitive' so they remain auditable without locking Gate 1B into crosses_30pct.
+    const shouldAutoSupersedeSameSpec = Boolean(
+      quoteStatus === 'verified' &&
+      quote.keep_parallel_spec !== true &&
+      (specVariantKey !== null || quote.supersede_same_spec === true || quote.supersede_expensive_same_spec === true),
+    );
+    if (shouldAutoSupersedeSameSpec) {
+      const newUnitLandedCny = ((quote.goods_cny_total ?? 0) + (quote.domestic_freight_cny_total ?? 0)) / actualSets;
+      if (Number.isFinite(newUnitLandedCny) && newUnitLandedCny > 0) {
+        const existingVerified = this.db.prepare(`
+          SELECT quote_id, actual_sets, goods_cny_total, domestic_freight_cny_total, spec_variant_key
+          FROM sourcing_quotes_1688
+          WHERE form_id = ? AND spec_version = ? AND quote_status = 'verified' AND quote_id != ?
+        `).all(form.form_id, specVersion, quoteId);
+        for (const prev of existingVerified) {
+          const prevSpecKey = prev.spec_variant_key ?? null;
+          if (specVariantKey !== null && prevSpecKey !== null && prevSpecKey !== specVariantKey) continue;
+          if (specVariantKey !== null && prevSpecKey === null && quote.supersede_same_spec !== true) continue;
+          const prevUnitLanded = ((prev.goods_cny_total ?? 0) + (prev.domestic_freight_cny_total ?? 0)) / Math.max(1, prev.actual_sets || 100);
+          if (prevUnitLanded > newUnitLandedCny + 1e-6) {
+            this.db.prepare(`
+              UPDATE sourcing_quotes_1688
+              SET quote_status = 'superseded_uncompetitive'
+              WHERE quote_id = ?
+            `).run(prev.quote_id);
+          } else if ((quote.supersede_same_spec === true || quote.supersede_expensive_same_spec === true || specVariantKey !== null) && newUnitLandedCny > prevUnitLanded + 1e-6) {
+            this.db.prepare(`
+              UPDATE sourcing_quotes_1688
+              SET quote_status = 'superseded_uncompetitive'
+              WHERE quote_id = ?
+            `).run(quoteId);
+          }
+        }
+      }
+    }
 
     return {
       quote: this.getQuoteById(quoteId),
       order_plan: orderPlan,
     };
+  }
+
+  supersedeUncompetitiveQuotesForForm(formId, { spec_version = null, spec_variant_key = undefined } = {}) {
+    this._assertWritable();
+    const allVerified = this.db.prepare(`
+      SELECT * FROM sourcing_quotes_1688
+      WHERE form_id = ? AND quote_status = 'verified'
+      ORDER BY created_at ASC
+    `).all(formId);
+    const byGroup = new Map();
+    for (const row of allVerified) {
+      if (spec_version !== null && row.spec_version !== spec_version) continue;
+      if (spec_variant_key !== undefined && (row.spec_variant_key ?? null) !== (spec_variant_key ?? null)) continue;
+      const key = `${row.spec_version}::${row.spec_variant_key ?? ''}`;
+      if (!byGroup.has(key)) byGroup.set(key, []);
+      byGroup.get(key).push(row);
+    }
+    const supersededIds = [];
+    for (const rows of byGroup.values()) {
+      if (rows.length < 2) continue;
+      let minUnit = Number.POSITIVE_INFINITY;
+      for (const r of rows) {
+        const u = ((r.goods_cny_total ?? 0) + (r.domestic_freight_cny_total ?? 0)) / Math.max(1, r.actual_sets || 100);
+        if (u < minUnit) minUnit = u;
+      }
+      for (const r of rows) {
+        const u = ((r.goods_cny_total ?? 0) + (r.domestic_freight_cny_total ?? 0)) / Math.max(1, r.actual_sets || 100);
+        if (u > minUnit + 1e-6) {
+          this.db.prepare("UPDATE sourcing_quotes_1688 SET quote_status = 'superseded_uncompetitive' WHERE quote_id = ?").run(r.quote_id);
+          supersededIds.push(r.quote_id);
+        }
+      }
+    }
+    return supersededIds;
   }
 
   recordSourcingQuotesBatch1688(quotes) {
@@ -2623,7 +2927,11 @@ export class SelectionStore {
         return { inserted: false, identical: true, evaluation: { ...updated } };
       }
 
-      const initialReceipt = { ...(ev.receipt ?? {}) };
+      const initialReceipt = {
+        form_spec_sha256: form.spec_sha256,
+        spec_version: form.spec_version,
+        ...(ev.receipt ?? {}),
+      };
       if (initialReceipt.batch_result_sha256) {
         initialReceipt.batch_receipts = [{
           batch_result_sha256: initialReceipt.batch_result_sha256,

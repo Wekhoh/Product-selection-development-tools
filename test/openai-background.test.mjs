@@ -97,7 +97,8 @@ test('uncapped Responses and Batch reserve configurable estimates while sending 
   assert.ok(wires.every(wire => !Object.hasOwn(wire.tools[0], 'max_tool_calls')));
   assert.deepEqual([def, custom, explicit].map(result =>
     client.ledger.getAttemptById(result.attempt_id).max_web_search_calls), [25, 32, 7]);
-  assert.ok(custom.reserved_cents > def.reserved_cents);
+  assert.equal(def.reserved_cents, 0);
+  assert.equal(custom.reserved_cents, 0);
   for (const maxToolCalls of [0, '8', 2.5, Number.MAX_SAFE_INTEGER + 1]) {
     await assert.rejects(client.createResponse({ ...request, max_tool_calls: maxToolCalls }), { code: 'INVALID_WEB_SEARCH_MAX_TOOL_CALLS' });
   }
@@ -305,7 +306,7 @@ test('zero and finite local waits detach without cancelling or changing the dura
   assert.equal(beforeResume.diagnostic_reason, null);
   assert.equal(beforeResume.provider_response_id, id);
   assert.equal(beforeResume.background_cancel_dispatched_at, null);
-  assert.equal(client.ledger.getMonthlySummary().effective_committed_cents, submitted.reserved_cents);
+  assert.equal(client.ledger.getMonthlySummary().effective_committed_cents, 0);
 
   const settled = await client.pollBackgroundResponse(submitted.attempt_id, { maxWaitMs: null, ...defaultOptions });
   assert.equal(settled.status, 'completed');
@@ -354,14 +355,15 @@ async function verifyActiveCostFence(t, partialCounters) {
   assert.equal(attempt.status, 'pending_recovery');
   assert.equal(attempt.usage_cost_micros, null);
   assert.equal(attempt.background_usage_floor_micros, activeMicros);
-  assert.ok(attempt.reserved_cents < 90);
+  assert.equal(attempt.reserved_cents, 0);
   const heldCents = Math.ceil(activeMicros / 10_000);
   assert.equal(client.ledger.getMonthlySummary().same_month_pending_recovery_cents, heldCents);
   assert.equal(client.ledger.getMonthlySummary().effective_committed_cents, heldCents);
+  client.ledger.configurePolicy({ monthlyLimitCents: heldCents });
   await assert.rejects(client.createResponse({ input: 'Inspect a distinct fixture.' }), {
-    code: 'ACCOUNT_FENCED_PENDING_RECOVERY',
-    blocking_reserved_cents: heldCents,
+    code: 'MONTHLY_BUDGET_EXCEEDED',
   });
+  client.ledger.configurePolicy({ monthlyLimitCents: 20_000 });
   assert.equal(posts, 1);
   const settled = await client.pollBackgroundResponse(attemptId, defaultOptions);
   assert.equal(settled.status, 'completed');
@@ -541,7 +543,7 @@ test('background cleanup keeps concurrent terminal evidence and recovers a lost 
     releaseDelete.resolve();
   }
   const cancelled = await cancelling;
-  assert.equal(cancelled.status, 'pending_recovery');
+  assert.equal(cancelled.status, 'failed_known');
   assert.equal(cancelled.cleanup.status, 'delete_failed');
   assert.equal(cancels, 1);
   assert.equal(deletes, 1);
@@ -561,7 +563,7 @@ test('background cleanup keeps concurrent terminal evidence and recovers a lost 
   assert.equal(gets, 3);
 });
 
-test('an ambiguous background DELETE remains claimed and preserves the terminal receipt', async t => {
+test('an ambiguous background DELETE remains claimed and preserves the terminal receipt without locking out', async t => {
   const id = 'resp_cleanup_ambiguous';
   const methods = [];
   const client = makeClient(t, (_path, init) => {
@@ -574,14 +576,15 @@ test('an ambiguous background DELETE remains claimed and preserves the terminal 
     ...defaultOptions, background: true, deleteAfterPersist: true,
   });
   assert.deepEqual(methods, ['POST', 'GET', 'DELETE']);
-  assert.equal(result.status, 'pending_recovery');
+  assert.equal(result.status, 'completed');
+  assert.equal(result.usable, true);
   const attempt = client.ledger.getAttemptById(result.attempt_id);
   assert.equal(attempt.raw_receipt.status, 'completed');
   assert.ok(attempt.background_delete_dispatched_at);
   assert.equal(attempt.delete_ack_at, null);
   assert.equal((await client.pollBackgroundResponse(result.attempt_id, defaultOptions)).response_status, 'completed');
   assert.equal((await client.cancelResponse(result.attempt_id)).response_status, 'completed');
-  assert.equal((await client.recoverPendingResponse(result.attempt_id)).fenced, true);
+  assert.equal((await client.recoverPendingResponse(result.attempt_id)).fenced, false);
   await assert.rejects(client.deleteResponse(id, { attemptId: result.attempt_id }), { code: 'BACKGROUND_DELETE_OUTCOME_UNKNOWN' });
   assert.deepEqual(methods, ['POST', 'GET', 'DELETE']);
   assert.equal(client.ledger.getAttemptById(result.attempt_id).raw_receipt_sha256, attempt.raw_receipt_sha256);

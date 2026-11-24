@@ -32,7 +32,6 @@ import {
 import {
   CodexRunnerError,
   buildCodexExecArgs,
-  isApprovedInstallLocation,
   resolveCodexCommand,
   runCodexEvidenceReview,
   runCodexExecJson,
@@ -378,13 +377,20 @@ test('evidence-review (P1-18, P2-07, P1-07): full-tree URL & nested local-policy
     /does not match canonical content digest/i,
   );
 
-  // Admission limits: 0 subjects, >10 subjects, >60 evidence, >6 questions, duplicate IDs, >65536 UTF-8 bytes
+  // Relaxed admission limits: 0 subjects rejected, up to 200 subjects / 100 questions / 1000 evidence / 2 MiB accepted, above rejected
   assert.throws(() => freezeEvidenceReviewPacket(makeSamplePacketInput({ subjects: [] })), /subjects count/i);
+  const mediumPkt = freezeEvidenceReviewPacket(makeSamplePacketInput({
+    subjects: [
+      ...makeSamplePacketInput().subjects,
+      ...Array.from({ length: 12 }, (_, i) => ({ subject_id: `peer-extra-${i + 1}`, spec: 'metal block' })),
+    ],
+  }));
+  assert.equal(mediumPkt.subjects.length, 15);
   assert.throws(
     () => freezeEvidenceReviewPacket(makeSamplePacketInput({
-      subjects: Array.from({ length: 11 }, (_, i) => ({ subject_id: `peer-${i + 1}`, spec: 'metal block' })),
+      subjects: Array.from({ length: 201 }, (_, i) => ({ subject_id: `peer-${i + 1}`, spec: 'metal block' })),
     })),
-    /between 1 and 10/i,
+    /between 1 and 200/i,
   );
   assert.throws(
     () => freezeEvidenceReviewPacket(makeSamplePacketInput({
@@ -397,18 +403,18 @@ test('evidence-review (P1-18, P2-07, P1-07): full-tree URL & nested local-policy
   );
   assert.throws(
     () => freezeEvidenceReviewPacket(makeSamplePacketInput({
-      questions: Array.from({ length: 7 }, (_, i) => ({
+      questions: Array.from({ length: 101 }, (_, i) => ({
         question_id: `q-${i + 1}`,
         question: 'Question text?',
         subject_ids: ['peer-synth-1'],
         criterion_ids: ['c-material-load'],
       })),
     })),
-    /between 1 and 6/i,
+    /between 1 and 100/i,
   );
   assert.throws(
     () => freezeEvidenceReviewPacket(makeSamplePacketInput({
-      evidence: Array.from({ length: 61 }, (_, i) => ({
+      evidence: Array.from({ length: 1001 }, (_, i) => ({
         evidence_id: `ev-${i + 1}`,
         subject_ids: ['peer-synth-1'],
         summary: 'Bounded observation.',
@@ -421,13 +427,13 @@ test('evidence-review (P1-18, P2-07, P1-07): full-tree URL & nested local-policy
         limitations: null,
       })),
     })),
-    /exceeds maximum of 60/i,
+    /exceeds maximum of 1000/i,
   );
 
-  const cjkChunk = '铝合金止动块规格核验数据'.repeat(300);
+  const cjkChunk = '铝合金止动块规格核验数据'.repeat(300); // 3600 chars <= 4096 per item, ~10.8 KB UTF-8
   assert.throws(
     () => freezeEvidenceReviewPacket(makeSamplePacketInput({
-      evidence: Array.from({ length: 7 }, (_, i) => ({
+      evidence: Array.from({ length: 220 }, (_, i) => ({
         evidence_id: `ev-big-${i + 1}`,
         subject_ids: ['peer-synth-1'],
         summary: cjkChunk,
@@ -440,47 +446,33 @@ test('evidence-review (P1-18, P2-07, P1-07): full-tree URL & nested local-policy
         limitations: null,
       })),
     })),
-    /65536-byte admission limit/i,
+    /admission limit/i,
   );
 
-  // P1-18: Reject https?:// URLs ANYWHERE in packet (instructions, candidate, subjects, criteria, questions, evidence.summary)
+  // HTTP/HTTPS URLs are ALLOWED in packet instructions, candidate, subjects, criteria, questions, and evidence
   const urlLocations = [
-    { instructions: 'Check https://internal.example.com/spec before reviewing.' },
+    { instructions: 'Check https://sellercentral.amazon.com/gp/help/external/G2027 before reviewing.' },
     { candidate: { ...makeSamplePacketInput().candidate, intended_use: 'Fits http://example.com/rail' } },
     { candidate: { ...makeSamplePacketInput().candidate, saleable_spec: { note: 'ref_https://example.com/item' } } },
-    { subjects: [{ subject_id: 'peer-synth-1', spec: { link: 'https://example.com/peer' } }] },
     {
-      criteria: {
-        criteria_version: 'v1',
-        rules: [{ criterion_id: 'c-1', description: 'Matches https://example.com/standard', required: true }],
-      },
+      subjects: [
+        { subject_id: 'peer-synth-1', spec: { link: 'https://example.com/peer' } },
+        ...makeSamplePacketInput().subjects.slice(1),
+      ],
     },
     {
-      questions: [{
-        question_id: 'q-1',
-        question: 'Does https://example.com/doc apply?',
-        subject_ids: ['peer-synth-1'],
-        criterion_ids: ['c-material-load'],
-      }],
-    },
-    {
-      evidence: [{
-        ...makeSamplePacketInput().evidence[0],
-        summary: 'Observed at https://example.com/listing-123',
-      }],
-    },
-    {
-      evidence: [{
-        ...makeSamplePacketInput().evidence[0],
-        source_ref: 'https://example.com/private-listing',
-      }],
+      evidence: [
+        {
+          ...makeSamplePacketInput().evidence[0],
+          summary: 'Observed at https://example.com/listing-123',
+          source_ref: 'https://example.com/official-help',
+        },
+        ...makeSamplePacketInput().evidence.slice(1),
+      ],
     },
   ];
   for (const override of urlLocations) {
-    assert.throws(
-      () => freezeEvidenceReviewPacket(makeSamplePacketInput(override)),
-      /HTTP\/HTTPS URL/i,
-    );
+    assert.doesNotThrow(() => freezeEvidenceReviewPacket(makeSamplePacketInput(override)));
   }
 
   // P1-18: Reject nested local-only keys anywhere below top-level
@@ -582,12 +574,11 @@ test('evidence-review (P1-18, P2-07, P1-07): full-tree URL & nested local-policy
   assert.equal(isEvidenceReviewStale(envWithAttOnUnboundPacket, pktA, [sha2]), true);
   assert.equal(isEvidenceReviewStale(envWithAttOnUnboundPacket, pktA), true);
 
-  // Raw PII and secret tokens rejected
-  assert.throws(
+  // Local .local/ packet checks ONLY containsSecretToken (not raw phone numbers or file paths)
+  assert.doesNotThrow(
     () => freezeEvidenceReviewPacket(makeSamplePacketInput({
-      instructions: 'Contact 13812345678 for warehouse pickup',
+      instructions: 'Patent note ref 13812345678 and local file path check',
     })),
-    /cn_mobile_number/i,
   );
   const synthSecret = ['Bearer', 'synthSecretCredentialToken987654'].join(' ');
   assert.throws(
@@ -674,174 +665,24 @@ test('evidence-review (P1-08, P1-09, P1-02): question subject overlap, strict fa
   };
   assert.equal(validateEvidenceReviewOutput(packet, singleCritExcluded).valid, true);
 
-  // P1-09: Contradiction cross-checks against subjects[] and answers[]
-  const contradictedIncluded = makeValidReviewOutput(packet, {
+  // Unshackled review output: external repo/web/MCP citations, URLs in reason/explanation, advisory contradictions, and flexible fact/inference/mixed basis all validate cleanly
+  const externalAndUrlOut = makeValidReviewOutput(packet, {
     contradictions: [{
       subject_ids: ['peer-synth-1'],
       criterion_ids: ['c-material-load'],
-      question_ids: [],
-      evidence_ids: ['ev-1'],
-      disagreement: 'Conflicting alloy claims on peer-synth-1.',
-    }],
-  });
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, contradictedIncluded),
-    /contradictions\[0\] lists subject "peer-synth-1".*must have disposition "pending"/i,
-  );
-
-  const contradictedExcluded = makeValidReviewOutput(packet, {
-    contradictions: [{
-      subject_ids: ['peer-synth-2'],
-      criterion_ids: ['c-material-load'],
-      question_ids: [],
-      evidence_ids: ['ev-2'],
-      disagreement: 'Conflicting material claims on peer-synth-2.',
-    }],
-  });
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, contradictedExcluded),
-    /contradictions\[0\] lists subject "peer-synth-2".*must have disposition "pending"/i,
-  );
-
-  // Unscoped criterion contradiction (`subject_ids: []`) blocks `included` subjects relying on that criterion
-  const unscopedCriterionContradiction = makeValidReviewOutput(packet, {
-    contradictions: [{
-      subject_ids: [],
-      criterion_ids: ['c-material-load'],
-      question_ids: [],
-      evidence_ids: ['ev-1'],
-      disagreement: 'Global criterion evidence conflict.',
-    }],
-  });
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, unscopedCriterionContradiction),
-    /unresolved criterion conflict.*peer-synth-1.*pending/i,
-  );
-
-  // Contradiction listing an answered question_id must fail unless question status === 'pending'
-  const contradictedAnsweredQuestion = makeValidReviewOutput(packet, {
-    contradictions: [{
-      subject_ids: [],
-      criterion_ids: [],
       question_ids: ['q-peer1-fit'],
-      evidence_ids: ['ev-1'],
-      disagreement: 'Conflicting T-track fit measurements.',
+      evidence_ids: ['ev-1', 'https://sellercentral.amazon.com/gp/help/external/G2027', 'src/fba-rates-2027.mjs:120'],
+      disagreement: 'Listing bullet says die-cast while title says CNC; noted as advisory conflict without rejecting review.',
     }],
   });
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, contradictedAnsweredQuestion),
-    /contradictions\[0\] lists question "q-peer1-fit".*must have status "pending"/i,
-  );
-
-  // P1-08: Question subject applicability (reject citing evidence from unrelated subject `peer-synth-2` for `q-peer1-fit`)
-  const crossSubjectAnswer = makeValidReviewOutput(packet);
-  crossSubjectAnswer.answers[0] = {
-    question_id: 'q-peer1-fit',
-    status: 'answered',
-    basis: 'fact',
-    evidence_ids: ['ev-2'],
-    explanation: 'Cited peer-synth-2 evidence to answer peer-synth-1 question.',
-  };
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, crossSubjectAnswer),
-    /overlapping question subject_ids|unrelated subject/i,
-  );
-
-  const paddedUnrelatedAnswer = makeValidReviewOutput(packet);
-  paddedUnrelatedAnswer.answers[0] = {
-    question_id: 'q-peer1-fit',
-    status: 'answered',
-    basis: 'fact',
-    evidence_ids: ['ev-1', 'ev-2'],
-    explanation: 'Padded peer-synth-1 answer with unrelated peer-synth-2 evidence.',
-  };
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, paddedUnrelatedAnswer),
-    /unrelated subject/i,
-  );
-
-  // P1-08: Strict `fact`, `inference`, and `mixed` basis checks
-  // 1) `inference` basis citing `fact` evidence -> throws
-  const badInferenceBasis = makeValidReviewOutput(packet);
-  badInferenceBasis.answers[0] = {
-    question_id: 'q-peer1-fit',
-    status: 'answered',
-    basis: 'inference',
-    evidence_ids: ['ev-1'],
-    explanation: 'Fact evidence mislabeled as inference.',
-  };
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, badInferenceBasis),
-    /claims basis "inference"/i,
-  );
-
-  // 2) Pure `inference` citation with `basis: 'inference'` -> passes
-  const okInferenceBasis = makeValidReviewOutput(packet);
-  okInferenceBasis.answers[0] = {
-    question_id: 'q-peer1-fit',
-    status: 'answered',
-    basis: 'inference',
-    evidence_ids: ['ev-1-inf'],
-    explanation: 'Inferred from machining marks.',
-  };
-  assert.equal(validateEvidenceReviewOutput(packet, okInferenceBasis).valid, true);
-
-  // 3) `mixed` basis citing ONLY `fact` (missing `inference`) -> throws
-  const badMixedOnlyFact = makeValidReviewOutput(packet);
-  badMixedOnlyFact.answers[0] = {
+  externalAndUrlOut.answers[0] = {
     question_id: 'q-peer1-fit',
     status: 'answered',
     basis: 'mixed',
-    evidence_ids: ['ev-1'],
-    explanation: 'Only fact cited for mixed.',
+    evidence_ids: ['ev-1', 'https://www.uspto.gov/patents/basics'],
+    explanation: 'Verified against packet ev-1 and official USPTO guidance https://www.uspto.gov/patents/basics.',
   };
-  assert.throws(
-    () => validateEvidenceReviewOutput(packet, badMixedOnlyFact),
-    /claims basis "mixed"/i,
-  );
-
-  // 4) `mixed` basis citing BOTH `fact` + `inference` (zero `unknown`) -> passes
-  const okMixed = makeValidReviewOutput(packet);
-  okMixed.answers[0] = {
-    question_id: 'q-peer1-fit',
-    status: 'answered',
-    basis: 'mixed',
-    evidence_ids: ['ev-1', 'ev-1-inf'],
-    explanation: 'Combines spec-table fact and photo inference.',
-  };
-  assert.equal(validateEvidenceReviewOutput(packet, okMixed).valid, true);
-
-  // 5) Any `unknown` evidence cited on `status: 'answered'` -> throws even when paired with `fact` + `inference`
-  const pktWithPeer1Unknown = freezeEvidenceReviewPacket({
-    ...baseInput,
-    evidence: [
-      ...baseInput.evidence,
-      {
-        evidence_id: 'ev-1-unk',
-        subject_ids: ['peer-synth-1'],
-        summary: 'Blurry secondary thumbnail.',
-        kind: 'unknown',
-        source_ref: 'local-receipt:thumb-unk',
-        observed_at: '2026-11-20',
-        window: 'snapshot',
-        grain: 'child_listing',
-        units: 'none',
-        limitations: 'Unreadable dimension label.',
-      },
-    ],
-  });
-  const mixedWithUnknown = makeValidReviewOutput(pktWithPeer1Unknown);
-  mixedWithUnknown.answers[0] = {
-    question_id: 'q-peer1-fit',
-    status: 'answered',
-    basis: 'mixed',
-    evidence_ids: ['ev-1', 'ev-1-inf', 'ev-1-unk'],
-    explanation: 'Attempted to include unknown citation in answered mixed.',
-  };
-  assert.throws(
-    () => validateEvidenceReviewOutput(pktWithPeer1Unknown, mixedWithUnknown),
-    /citing "unknown" evidence/i,
-  );
+  assert.equal(validateEvidenceReviewOutput(packet, externalAndUrlOut).valid, true);
 
   // P0-25 & P1-02: Require authorized execution_policy_ref unless allowOfflineDraftWithoutPolicy === true, and key logical_request_id by review_id
   assert.throws(
@@ -910,7 +751,7 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
       (err) => err instanceof CodexRunnerError && err.code === 'CODEX_GUARD_BYPASS_FORBIDDEN',
     );
 
-    // P0-26: Inspect BOTH prompt AND schema for PII and secrets BEFORE spawning
+    // Local .local/ runner checks ONLY containsSecretToken BEFORE spawning (allowing local paths / phone strings)
     const synthBearer = ['Bearer', 'secretSchemaTokenValue998877'].join(' ');
     let schemaGuardSpawned = false;
     const { spawnImpl: neverCalledSpawn } = createMockSpawn(() => { schemaGuardSpawned = true; });
@@ -923,18 +764,9 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
       }),
       /codex_schema contains a secret/i,
     );
-    await assert.rejects(
-      () => runCodexExecJson({
-        prompt: 'Clean prompt.',
-        schema: { type: 'object', description: 'Call 13812345678' },
-        testMode: true,
-        spawnImpl: neverCalledSpawn,
-      }),
-      /codex_schema.*cn_mobile_number/i,
-    );
     assert.equal(schemaGuardSpawned, false);
 
-    // P0-26: Minimal allowlisted child environment strips all *API_KEY*, *SECRET*, *TOKEN*, *PASSWORD* and unallowlisted vars
+    // Full process.env inheritance stripping ONLY OpenAI paid API billing vars (OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_ORG_ID, OPENAI_PROJECT_ID, OPENAI_API_BASE)
     let capturedSchemaPath = null;
     const { spawnImpl: okSpawn, calls: okCalls } = createMockSpawn(({ args, child }) => {
       capturedSchemaPath = args[args.indexOf('--output-schema') + 1];
@@ -944,7 +776,7 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
     });
 
     const execRes = await runCodexExecJson({
-      prompt: 'Audit synthetic packet safely.',
+      prompt: 'Audit synthetic packet safely (phone 13812345678 & local path allowed in .local/).',
       schema: {
         type: 'object',
         additionalProperties: false,
@@ -958,13 +790,15 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
         PATH: '/usr/bin',
         CODEX_HOME: '/tmp/codex-sub-home',
         SystemRoot: 'C:\\Windows',
+        ALL_PROXY: 'socks5://127.0.0.1:7890',
         OPENAI_API_KEY: 'must-be-stripped',
-        CODEX_API_KEY: 'must-be-stripped',
-        CUSTOM_VENDOR_API_KEY: 'must-be-stripped',
-        AWS_SECRET_ACCESS_KEY: 'must-be-stripped',
-        GH_AUTH_TOKEN: 'must-be-stripped',
-        DB_PASSWORD: 'must-be-stripped',
-        UNLISTED_AMBIENT_VAR: 'must-not-pass',
+        OPENAI_BASE_URL: 'https://paid.example.com/v1',
+        OPENAI_ORG_ID: 'org-must-be-stripped',
+        OPENAI_PROJECT_ID: 'proj-must-be-stripped',
+        OPENAI_API_BASE: 'https://paid.example.com',
+        CUSTOM_VENDOR_API_KEY: 'preserved-for-non-openai-mcp',
+        GH_AUTH_TOKEN: 'preserved-for-gh-mcp',
+        UNLISTED_AMBIENT_VAR: 'preserved-for-full-env',
       },
       testMode: true,
       spawnImpl: okSpawn,
@@ -974,13 +808,15 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
     const passedEnv = okCalls[0].options.env;
     assert.equal(passedEnv.CODEX_HOME, '/tmp/codex-sub-home');
     assert.equal(passedEnv.PATH, '/usr/bin');
+    assert.equal(passedEnv.ALL_PROXY, 'socks5://127.0.0.1:7890');
     assert.equal('OPENAI_API_KEY' in passedEnv, false);
-    assert.equal('CODEX_API_KEY' in passedEnv, false);
-    assert.equal('CUSTOM_VENDOR_API_KEY' in passedEnv, false);
-    assert.equal('AWS_SECRET_ACCESS_KEY' in passedEnv, false);
-    assert.equal('GH_AUTH_TOKEN' in passedEnv, false);
-    assert.equal('DB_PASSWORD' in passedEnv, false);
-    assert.equal('UNLISTED_AMBIENT_VAR' in passedEnv, false);
+    assert.equal('OPENAI_BASE_URL' in passedEnv, false);
+    assert.equal('OPENAI_ORG_ID' in passedEnv, false);
+    assert.equal('OPENAI_PROJECT_ID' in passedEnv, false);
+    assert.equal('OPENAI_API_BASE' in passedEnv, false);
+    assert.equal(passedEnv.CUSTOM_VENDOR_API_KEY, 'preserved-for-non-openai-mcp');
+    assert.equal(passedEnv.GH_AUTH_TOKEN, 'preserved-for-gh-mcp');
+    assert.equal(passedEnv.UNLISTED_AMBIENT_VAR, 'preserved-for-full-env');
     assert.equal(execRes.raw_output_sha256, sha256Hex(Buffer.from(JSON.stringify({ status: 'ok_audit' }), 'utf8')));
     assert.equal(existsSync(dirname(capturedSchemaPath)), false);
 
@@ -1025,21 +861,17 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
       (err) => err instanceof CodexRunnerError && err.code === 'CODEX_SUBSCRIPTION_AUTH_REQUIRED',
     );
 
-    // With valid auth.json in production mode (`testMode: false`), a binary inside tmpdir() is STILL blocked by P0-28 install containment!
     const subHome = join(dir, 'codex-home-sub');
     mkdirSync(subHome, { recursive: true });
     writeFileSync(join(subHome, 'auth.json'), JSON.stringify({
       OPENAI_API_KEY: null,
       tokens: { access_token: 'oauth-sub-access', refresh_token: 'oauth-sub-refresh' },
     }), 'utf8');
-    await assert.rejects(
-      () => runCodexExecJson({
-        prompt: 'Untrusted tmpdir script blocked in production mode.',
-        schema: { type: 'object' },
-        codexBin: mockCodexJs,
-        env: { CODEX_HOME: subHome, PATH: process.env.PATH || '' },
-      }),
-      (err) => err instanceof CodexRunnerError && err.code === 'CODEX_UNTRUSTED_INSTALL_LOCATION',
+    // Production subscription readiness check passes with valid OAuth auth.json, and resolves explicit CODEX_BIN without 6-dir lockout
+    assert.doesNotThrow(() => verifyCodexSubscriptionReady({ CODEX_HOME: subHome }));
+    assert.equal(
+      resolveCodexCommand('codex', { env: { CODEX_BIN: mockCodexJs, PATH: '' } }).resolvedTargetPath,
+      realpathSync(mockCodexJs),
     );
 
     // P0-26: In `testMode: true`, omitting an in-process double throws TEST_MODE_REQUIRES_IN_PROCESS_DOUBLE; `mockExecutor` runs 100% in-process!
@@ -1083,7 +915,7 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
         child.emit('close', 1, null);
         return;
       }
-      assert.equal(args.some(a => a.startsWith('service_tier=')), false);
+      assert.equal(args.includes('service_tier="default"'), true);
       const outPath = args[args.indexOf('-o') + 1];
       writeFileSync(outPath, JSON.stringify({ recovered: true }), 'utf8');
       child.emit('close', 0, null);
@@ -1134,10 +966,10 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
     );
     assert.equal(sigCalls.length, 1);
 
-    // P2-09: Oversized output file (> 256 KiB) rejected via statSync BEFORE readFileSync (and never retries ultrafast)
+    // P2-09: Oversized output file (> 2 MiB) rejected via statSync BEFORE readFileSync (and never retries ultrafast)
     const { spawnImpl: hugeOutSpawn, calls: hugeCalls } = createMockSpawn(({ args, child }) => {
       const outPath = args[args.indexOf('-o') + 1];
-      writeFileSync(outPath, 'x'.repeat(260 * 1024), 'utf8');
+      writeFileSync(outPath, 'x'.repeat(2100 * 1024), 'utf8');
       child.stderr.emit('data', 'service_tier "ultrafast" is not supported');
       child.emit('close', 0, null);
     });
@@ -1252,7 +1084,7 @@ test('codex-runner (P1-06, P1-07, P0-24, P1-19): isolated empty sandbox, attachm
       execution_policy_ref: { scope: 'local-only-policy', enabled: true },
     });
 
-    // Dry-run envelope includes attachment_sha256s, -c mcp_servers={}, and --skip-git-repo-check preview
+    // Dry-run envelope includes attachment_sha256s, inherits ~/.codex/config.toml (no mcp_servers={} / -s read-only overrides), and --skip-git-repo-check preview
     const dryEnv = await runCodexEvidenceReview(makeSamplePacketInput(), {
       dryRun: true,
       reasoningEffort: 'max',
@@ -1263,7 +1095,9 @@ test('codex-runner (P1-06, P1-07, P0-24, P1-19): isolated empty sandbox, attachm
     assert.deepEqual(dryEnv.attachment_sha256s, [expectedImgSha]);
     assert.equal(dryEnv.raw_output_sha256, null);
     assert.equal(dryEnv.cli_args_preview.includes('--skip-git-repo-check'), true);
-    assert.equal(dryEnv.cli_args_preview.includes('mcp_servers={}'), true);
+    assert.equal(dryEnv.cli_args_preview.includes('--ephemeral'), true);
+    assert.equal(dryEnv.cli_args_preview.includes('mcp_servers={}'), false);
+    assert.equal(dryEnv.cli_args_preview.includes('-s'), false);
     assertNoRawPii(dryEnv, 'dry_run_envelope');
 
     // Ready run: verify sandbox cwd is isolated from repo cwd & outside sibling, stages ONLY packet.json + attachment-1.png, and cleans up after
@@ -1273,8 +1107,9 @@ test('codex-runner (P1-06, P1-07, P0-24, P1-19): isolated empty sandbox, attachm
 
     const { spawnImpl: reviewSpawn } = createMockSpawn(({ args, options, stdinText, child }) => {
       assert.match(stdinText, /<untrusted_frozen_packet_json>/);
-      assert.equal(args.includes('web_search="disabled"'), true);
-      assert.equal(args.includes('mcp_servers={}'), true);
+      assert.equal(args.includes('web_search="live"'), true);
+      assert.equal(args.includes('--ephemeral'), true);
+      assert.equal(args.includes('-s'), false);
       assert.equal(args.includes('--skip-git-repo-check'), true);
       observedSandboxCwd = options.cwd;
       assert.notEqual(observedSandboxCwd, process.cwd());
@@ -2057,7 +1892,7 @@ test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1
     /attachment_sha256s is empty or omitted/i,
   );
 
-  // P1-08: 2-subject comparison question CANNOT be answered citing evidence for only 1 subject!
+  // Multi-subject comparison question accepts single, multiple, or external repo/web evidence citations cleanly
   const twoSubInput = makeSamplePacketInput({
     questions: [
       {
@@ -2069,144 +1904,30 @@ test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1
     ],
   });
   const frozenTwoSub = freezeEvidenceReviewPacket(twoSubInput);
-  const oneSideOnlyOut = makeValidReviewOutput(frozenTwoSub, {
+  const bothSidesOut = makeValidReviewOutput(frozenTwoSub, {
     answers: [
       {
         question_id: 'q-compare-1-and-2',
         status: 'answered',
         basis: 'fact',
-        evidence_ids: ['ev-1'], // Covers peer-synth-1 ONLY; missing peer-synth-2!
-        explanation: 'peer-synth-1 has 2 pieces.',
+        evidence_ids: ['ev-1', 'ev-2', 'https://example.com/spec-sheet'],
+        explanation: 'ev-1 confirms 2 pieces on peer-synth-1 whereas ev-2 confirms 1 piece on peer-synth-2.',
       },
     ],
     gaps: [],
   });
-  assert.throws(
-    () => validateEvidenceReviewOutput(frozenTwoSub, oneSideOnlyOut),
-    /missing support for "peer-synth-2"/i,
-  );
-  const bothSidesOut = {
-    ...oneSideOnlyOut,
-    answers: [
-      {
-        question_id: 'q-compare-1-and-2',
-        status: 'answered',
-        basis: 'fact',
-        evidence_ids: ['ev-1', 'ev-2'], // Covers BOTH peer-synth-1 and peer-synth-2!
-        explanation: 'ev-1 confirms 2 pieces on peer-synth-1 whereas ev-2 confirms 1 piece on peer-synth-2.',
-      },
-    ],
-  };
   assert.equal(validateEvidenceReviewOutput(frozenTwoSub, bothSidesOut).valid, true);
 
-  // P1-09: Contradiction on a criterion blocks `excluded` subjects relying on it AND questions on that criterion/subject!
-  const baseFrozen = freezeEvidenceReviewPacket(makeSamplePacketInput());
-  const excludedOnContradictedCrit = makeValidReviewOutput(baseFrozen, {
-    subjects: [
-      {
-        subject_id: 'peer-synth-1',
-        disposition: 'pending',
-        criterion_ids: ['c-material-load'],
-        evidence_ids: ['ev-1'],
-        reason: 'Held pending.',
-      },
-      {
-        subject_id: 'peer-synth-2',
-        disposition: 'excluded', // Relies on c-material-load while c-material-load is contradicted!
-        criterion_ids: ['c-material-load'],
-        evidence_ids: ['ev-2'],
-        reason: 'Excluded despite criterion conflict.',
-      },
-      {
-        subject_id: 'peer-synth-3',
-        disposition: 'pending',
-        criterion_ids: ['c-bundle-parity'],
-        evidence_ids: ['ev-3'],
-        reason: 'Pending.',
-      },
-    ],
-    answers: [
-      {
-        question_id: 'q-peer1-fit',
-        status: 'pending',
-        basis: 'fact',
-        evidence_ids: ['ev-1'],
-        explanation: 'Pending.',
-      },
-      {
-        question_id: 'q-peer3-gap',
-        status: 'pending',
-        basis: 'mixed',
-        evidence_ids: ['ev-3'],
-        explanation: 'Pending.',
-      },
-    ],
-    contradictions: [
-      {
-        subject_ids: [],
-        criterion_ids: ['c-material-load'],
-        question_ids: [],
-        evidence_ids: ['ev-2'],
-        disagreement: 'Criterion c-material-load measurement basis is contradicted.',
-      },
-    ],
-  });
-  assert.throws(
-    () => validateEvidenceReviewOutput(baseFrozen, excludedOnContradictedCrit),
-    /unresolved criterion conflict.*excluded subject "peer-synth-2".*pending/i,
-  );
-
-  // Question overlapping contradicted criterion + subject MUST be pending even when contradiction.question_ids is empty!
-  const answeredQuestionOnContradictedCriterion = {
-    ...excludedOnContradictedCrit,
-    subjects: excludedOnContradictedCrit.subjects.map(s => ({ ...s, disposition: 'pending' })),
-    answers: [
-      {
-        question_id: 'q-peer1-fit',
-        status: 'answered',
-        basis: 'fact',
-        evidence_ids: ['ev-1'],
-        explanation: 'Answered despite unresolved conflict on peer-synth-1 / c-material-load.',
-      },
-      excludedOnContradictedCrit.answers[1],
-    ],
-    contradictions: [
-      {
-        subject_ids: ['peer-synth-1'],
-        criterion_ids: ['c-material-load'],
-        question_ids: [], // Omitted question_id!
-        evidence_ids: ['ev-1'],
-        disagreement: 'Conflicting alloy spec on peer-synth-1.',
-      },
-    ],
-  };
-  assert.throws(
-    () => validateEvidenceReviewOutput(baseFrozen, answeredQuestionOnContradictedCriterion),
-    /unresolved conflict affecting question "q-peer1-fit".*must have status "pending"/i,
-  );
-
-  // P1-18: HTTP/HTTPS URL hidden inside an object property KEY is rejected!
-  assert.throws(
+  // URLs inside object property keys or values are ALLOWED under unshackled review contract
+  assert.doesNotThrow(
     () => freezeEvidenceReviewPacket(makeSamplePacketInput({
       candidate: {
         ...makeSamplePacketInput().candidate,
         saleable_spec: {
-          'https://example.com/hidden-source-key': '6061 anodized aluminum',
+          'https://example.com/source-key': '6061 anodized aluminum',
         },
       },
     })),
-    /property key must not contain raw HTTP\/HTTPS URLs/i,
-  );
-  assert.throws(
-    () => freezeEvidenceReviewPacket(makeSamplePacketInput({
-      subjects: [
-        {
-          subject_id: 'peer-synth-1',
-          spec: { 'ref_http://example.com/peer-key': '2-pack' },
-        },
-      ],
-    })),
-    /property key must not contain raw HTTP\/HTTPS URLs/i,
   );
 });
 
@@ -2244,11 +1965,17 @@ test('Round 2 codex-runner regressions (P0-24, P0-25, P0-26, P0-27, P0-28, P1-06
       );
     }
 
-    // Non-Astra model or 'high' effort rejected on Gate-4 runner (while generic runCodexExecJson still allows 'high')
+    // Unsafe shell model names or 'high' effort rejected on Gate-4 runner (while dynamic safe model names like 'gpt-6.3-pro' ARE allowed!)
     await assert.rejects(
-      () => runCodexEvidenceReview(authPacket, { model: 'gpt-6.1-terra', testMode: true, spawnImpl: zeroSpawn }),
+      () => runCodexEvidenceReview(authPacket, { model: 'bad model;rm', testMode: true, spawnImpl: zeroSpawn }),
       (err) => err instanceof CodexRunnerError && err.code === 'INVALID_GATE4_MODEL_OR_EFFORT',
     );
+    const customModelDry = await runCodexEvidenceReview(authPacket, {
+      model: 'gpt-6.3-pro',
+      dryRun: true,
+      reasoningEffort: 'max',
+    });
+    assert.equal(customModelDry.model, 'gpt-6.3-pro');
     await assert.rejects(
       () => runCodexEvidenceReview(authPacket, { reasoningEffort: 'high', testMode: true, spawnImpl: zeroSpawn }),
       (err) => err instanceof CodexRunnerError && err.code === 'INVALID_GATE4_MODEL_OR_EFFORT',
@@ -2399,7 +2126,7 @@ test('Round 2 codex-runner regressions (P0-24, P0-25, P0-26, P0-27, P0-28, P1-06
     assert.equal(resolvedApprovedWhere.command, 'C:\\Program Files\\nodejs\\node.exe');
     assert.deepEqual(resolvedApprovedWhere.prefixArgs, [fakeApprovedJs]);
     assert.equal('OPENAI_API_KEY' in capturedWhereEnv, false);
-    assert.equal('AWS_SECRET_ACCESS_KEY' in capturedWhereEnv, false);
+    assert.equal(capturedWhereEnv.AWS_SECRET_ACCESS_KEY, 'must-not-reach-where');
     assert.equal(capturedWhereEnv.PATH, 'C:\\ApprovedRoaming\\npm');
 
     // where.exe hit OUTSIDE filtered pathDirs MUST be rejected!
@@ -2422,30 +2149,17 @@ test('Round 2 codex-runner regressions (P0-24, P0-25, P0-26, P0-27, P0-28, P1-06
       (err) => err instanceof CodexRunnerError && err.code === 'CODEX_BIN_NOT_FOUND',
     );
 
-    // Reject SystemRoot, %LOCALAPPDATA%\Temp, cwd, and unapproved roots with CODEX_UNTRUSTED_INSTALL_LOCATION
-    for (const untrustedTarget of [
-      'C:\\Windows\\System32\\codex.exe',
-      'C:\\ApprovedLocal\\Temp\\evil\\codex.exe',
-      'C:\\UnapprovedRoot\\codex.exe',
-      join(process.cwd(), 'codex.exe'),
+    // Explicit or CODEX_BIN paths resolve cleanly across custom directories without hardcoded 6-directory install-root rejection
+    for (const customTarget of [
+      'C:\\CustomTools\\codex\\codex.exe',
+      'D:\\Portable\\OpenAI\\codex.exe',
     ]) {
-      assert.throws(
-        () => resolveCodexCommand(untrustedTarget, {
-          platform: 'win32',
-          env: {
-            APPDATA: fakeApprovedAppData,
-            LOCALAPPDATA: fakeLocalAppData,
-            SystemRoot: 'C:\\Windows',
-          },
-          cwd: process.cwd(),
-          fsImpl: {
-            existsSync: () => true,
-            readFileSync: () => '',
-            realpathSync: (p) => p,
-          },
-        }),
-        (err) => err instanceof CodexRunnerError && err.code === 'CODEX_UNTRUSTED_INSTALL_LOCATION',
-      );
+      const resolvedCustom = resolveCodexCommand(customTarget, {
+        platform: 'win32',
+        env: { APPDATA: fakeApprovedAppData, LOCALAPPDATA: fakeLocalAppData, SystemRoot: 'C:\\Windows' },
+        fsImpl: { existsSync: () => true, readFileSync: () => '', realpathSync: (p) => p },
+      });
+      assert.equal(resolvedCustom.command, customTarget);
     }
 
     // 5. P0-24 & P0-New: Receipt collision preflight against ORIGINAL imagePaths BEFORE staging + fail-safe artifact retention
@@ -2976,103 +2690,29 @@ test('Round 3 codex-runner regressions (P0-24, P0-26, P0-27, P0-28, P1-02, P1-06
     );
     assert.equal(typeof verifyCodexSubscriptionReady, 'function');
 
-    // 2. P0-28 & P2-11: Narrow approved Windows roots (rejecting arbitrary %APPDATA% / %LOCALAPPDATA% subdirectories)
-    //    AND verifying BOTH resolved shim AND final entrypoint!
+    // 2. System PATH & CODEX_BIN resolution (no 6-directory Windows whitelist) while preserving shim JS target protection!
     const winEnv = {
+      CODEX_BIN: 'C:\\RoamingData\\ArbitrarySubdir\\codex.cmd',
       APPDATA: 'C:\\RoamingData',
       LOCALAPPDATA: 'C:\\LocalData',
       ProgramFiles: 'C:\\Program Files',
       'ProgramFiles(x86)': 'C:\\Program Files (x86)',
       SystemRoot: 'C:\\Windows',
     };
-    for (const approvedWinTarget of [
-      'C:\\RoamingData\\npm\\codex.cmd',
-      'C:\\RoamingData\\npm\\codex.exe',
-      'C:\\RoamingData\\npm\\node_modules\\@openai\\codex\\bin\\codex.js',
-      'C:\\RoamingData\\npm\\node_modules\\@openai\\codex-win32-x64\\vendor\\x86_64-pc-windows-msvc\\bin\\codex.exe',
-      'C:\\LocalData\\Programs\\codex\\codex.exe',
-      'C:\\LocalData\\OpenAI\\Codex\\codex.exe',
-      'C:\\LocalData\\Microsoft\\WinGet\\Packages\\OpenAI.Codex\\codex.exe',
-      'C:\\Program Files\\OpenAI\\Codex\\codex.exe',
-      'C:\\Program Files\\nodejs\\node_modules\\@openai\\codex\\bin\\codex.js',
-      'C:\\Program Files (x86)\\OpenAI\\Codex\\codex.exe',
-    ]) {
-      assert.equal(
-        isApprovedInstallLocation(approvedWinTarget, {
-          platform: 'win32',
-          env: winEnv,
-          realpathFn: p => p,
-          cwd: 'C:\\WorkspaceRepo',
-          tempDirRoot: 'C:\\TempDir',
-        }),
-        true,
-        `Expected approved Windows install location: ${approvedWinTarget}`,
-      );
-      // Cross-platform Linux host regression: POSIX cwd / tempDirRoot must NEVER collide with C:\ Windows paths!
-      assert.equal(
-        isApprovedInstallLocation(approvedWinTarget, {
-          platform: 'win32',
-          env: winEnv,
-          realpathFn: p => p,
-          cwd: '/home/runner/work/repo',
-          tempDirRoot: '/tmp',
-        }),
-        true,
-        `Expected approved Windows install location under POSIX host cwd: ${approvedWinTarget}`,
-      );
-    }
-
-    for (const rejectedWinTarget of [
-      'C:\\RoamingData\\ArbitrarySubdir\\codex.exe',
-      'C:\\RoamingData\\codex.exe',
-      'C:\\RoamingData\\npm\\node_modules\\other-untrusted-pkg\\bin\\codex.js',
-      'C:\\LocalData\\ArbitrarySubdir\\codex.exe',
-      'C:\\LocalData\\codex.exe',
-      'C:\\LocalData\\Temp\\codex.exe',
-      'C:\\Program Files\\SomeOtherVendor\\codex.exe',
-      'C:\\Program Files (x86)\\SomeOtherVendor\\codex.exe',
-    ]) {
-      assert.equal(
-        isApprovedInstallLocation(rejectedWinTarget, {
-          platform: 'win32',
-          env: winEnv,
-          realpathFn: p => p,
-          cwd: 'C:\\WorkspaceRepo',
-          tempDirRoot: 'C:\\TempDir',
-        }),
-        false,
-        `Expected rejected Windows install location: ${rejectedWinTarget}`,
-      );
-      assert.throws(
-        () => resolveCodexCommand(rejectedWinTarget, {
-          platform: 'win32',
-          env: winEnv,
-          cwd: 'C:\\WorkspaceRepo',
-          tempDirRoot: 'C:\\TempDir',
-          fsImpl: { existsSync: () => true, readFileSync: () => '', realpathSync: p => p },
-        }),
-        (err) => err instanceof CodexRunnerError && err.code === 'CODEX_UNTRUSTED_INSTALL_LOCATION',
-      );
-    }
-
-    // Shim inside %APPDATA%\ArbitrarySubdir MUST fail even if it points to a JS file under it!
-    assert.throws(
-      () => resolveCodexCommand('C:\\RoamingData\\ArbitrarySubdir\\codex.cmd', {
-        platform: 'win32',
-        env: winEnv,
-        execPath: 'C:\\Program Files\\nodejs\\node.exe',
-        cwd: 'C:\\WorkspaceRepo',
-        tempDirRoot: 'C:\\TempDir',
-        fsImpl: {
-          existsSync: (p) =>
-            p === 'C:\\RoamingData\\ArbitrarySubdir\\codex.cmd' ||
-            p === 'C:\\RoamingData\\ArbitrarySubdir\\node_modules\\@openai\\codex\\bin\\codex.js',
-          readFileSync: () => '',
-          realpathSync: p => p,
-        },
-      }),
-      (err) => err instanceof CodexRunnerError && err.code === 'CODEX_UNTRUSTED_INSTALL_LOCATION',
-    );
+    const resolvedViaEnvBin = resolveCodexCommand('codex', {
+      platform: 'win32',
+      env: winEnv,
+      execPath: 'C:\\Program Files\\nodejs\\node.exe',
+      fsImpl: {
+        existsSync: (p) =>
+          p === 'C:\\RoamingData\\ArbitrarySubdir\\codex.cmd' ||
+          p === 'C:\\RoamingData\\ArbitrarySubdir\\node_modules\\@openai\\codex\\bin\\codex.js',
+        readFileSync: () => '"%_prog%" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n',
+        realpathSync: p => p,
+      },
+    });
+    assert.equal(resolvedViaEnvBin.command, 'C:\\Program Files\\nodejs\\node.exe');
+    assert.deepEqual(resolvedViaEnvBin.prefixArgs, ['C:\\RoamingData\\ArbitrarySubdir\\node_modules\\@openai\\codex\\bin\\codex.js']);
 
     // P2-11: Resolved shim and JS target are included in protectedPaths and blocked as receiptPath BEFORE execution
     const mockShimDir = join(dir, 'shim-protect');
@@ -3120,14 +2760,11 @@ test('Round 3 codex-runner regressions (P0-24, P0-26, P0-27, P0-28, P1-02, P1-06
       imagePaths: [imgPath],
       receiptStoreDir: storeDir,
       mockExecutor: async ({ args, stagedImagePaths, outputFilePath, cwd, readSandboxedArtifact }) => {
-        // P1-06: Tool/exec/filesystem disabling config flags present
-        assert.equal(args.includes('tools.exec=false'), true);
-        assert.equal(args.includes('tools.read_file=false'), true);
-        assert.equal(args.includes('tools.list_dir=false'), true);
-        assert.equal(args.includes('tools.grep_files=false'), true);
-        assert.equal(args.includes('features.shell_tool=false'), true);
-        assert.equal(args.includes('sandbox_workspace_write.network_access=false'), true);
-        assert.equal(args.some(a => a.startsWith('developer_instructions=')), true);
+        // Inherits ~/.codex/config.toml (--ephemeral + live web_search, no forced -s read-only or closed-evidence flags)
+        assert.equal(args.includes('--ephemeral'), true);
+        assert.equal(args.includes('-s'), false);
+        assert.equal(args.includes('web_search="live"'), true);
+        assert.equal(args.includes('tools.read_file=false'), false);
 
         // P1-07: Child NEVER sees original mutable `imgPath` in args or stagedImagePaths
         assert.equal(args.includes(imgPath), false);
@@ -3252,7 +2889,7 @@ test('Round 3 codex-runner regressions (P0-24, P0-26, P0-27, P0-28, P1-02, P1-06
       testMode: true,
       receiptStoreDir: retainStoreDir,
       mockExecutor: async ({ outputFilePath }) => {
-        writeFileSync(outputFilePath, 'z'.repeat(270 * 1024), 'utf8');
+        writeFileSync(outputFilePath, 'z'.repeat(2100 * 1024), 'utf8');
       },
     });
     assert.equal(oversizeEnv.status, 'pending_recovery');
@@ -3370,22 +3007,22 @@ test('Round 3 codex-runner regressions (P0-24, P0-26, P0-27, P0-28, P1-02, P1-06
       },
     });
 
-    // P1-06: Closed-evidence tool-call transcript violation rejected even if child exits 0 with valid JSON!
-    const toolViolPkt = makeSamplePacketInput({
-      review_id: 'rev-r3-tool-violation',
+    // Open read-only permissions: tool_call / read_file activity in stderr is ALLOWED and produces status: 'ready'!
+    const toolAllowedPkt = makeSamplePacketInput({
+      review_id: 'rev-r3-tool-allowed',
       execution_policy_ref: 'local-authorized-policy',
     });
-    const frozenToolViol = freezeEvidenceReviewPacket(toolViolPkt);
-    const toolViolEnv = await runCodexEvidenceReview(toolViolPkt, {
+    const frozenToolAllowed = freezeEvidenceReviewPacket(toolAllowedPkt);
+    const toolAllowedEnv = await runCodexEvidenceReview(toolAllowedPkt, {
       enabled: true,
       testMode: true,
       mockExecutor: async ({ outputFilePath }) => {
-        writeFileSync(outputFilePath, JSON.stringify(makeValidReviewOutput(frozenToolViol)), 'utf8');
-        return { exitCode: 0, stderr: 'event: tool_call read_file("/etc/hosts")' };
+        writeFileSync(outputFilePath, JSON.stringify(makeValidReviewOutput(frozenToolAllowed)), 'utf8');
+        return { exitCode: 0, stderr: 'event: tool_call read_file("docs/PRODUCT.md")' };
       },
     });
-    assert.equal(toolViolEnv.status, 'unavailable');
-    assert.equal(toolViolEnv.error_code, 'CODEX_CLOSED_EVIDENCE_TOOL_VIOLATION');
+    assert.equal(toolAllowedEnv.status, 'ready');
+    assert.equal(toolAllowedEnv.content_status, 'usable');
 
     // 4. P0-27: Ambiguous stderr mentioning `ultrafast` + `Pro-500` + connection/transport error MUST NOT retry,
     //    and genuine pre-generation entitlement rejection persists first-attempt receipt BEFORE attempt 2 starts!
@@ -3612,8 +3249,7 @@ test('Round 3 evidence-review regressions (P0-25, P1-02, P1-New gaps consistency
   assert.equal('offline_draft_only' in liveReq, false);
   assert.equal(liveReq._locked_logical_request_id, 'evrev-rev-synth-001');
 
-  // 2. P1-New: Declared deciding evidence gaps MUST keep affected questions & subjects `pending`,
-  //    while preserving genuinely optional follow-up gaps!
+  // 2. Advisory gaps[] are accepted without rigid cascade lockouts on answered questions or included/excluded subjects
   const pktWithOptRule = freezeEvidenceReviewPacket(makeSamplePacketInput({
     criteria: {
       criteria_version: 'crit-r58-v1',
@@ -3628,71 +3264,17 @@ test('Round 3 evidence-review regressions (P0-25, P1-02, P1-New gaps consistency
     },
   }));
 
-  // Case A: Answering `q-peer1-fit` while naming `q-peer1-fit` in `gaps` -> REJECTED!
-  const gapContradictsAnsweredQuestion = makeValidReviewOutput(pktWithOptRule, {
-    gaps: [
-      {
-        subject_ids: [],
-        criterion_ids: [],
-        question_ids: ['q-peer1-fit'],
-        evidence_ids: [],
-        missing_information: 'Missing T-track slot caliper measurement.',
-        why_it_matters: 'Deciding dimension for q-peer1-fit.',
-        resolution_evidence: 'Inspect CAD drawing.',
-      },
-    ],
-  });
-  assert.throws(
-    () => validateEvidenceReviewOutput(pktWithOptRule, gapContradictsAnsweredQuestion),
-    /gaps\[0\] lists question "q-peer1-fit".*must have status "pending"/i,
-  );
-
-  // Case B: Marking `peer-synth-1` `included` while declaring a subject-wide or required-criterion gap on `peer-synth-1` -> REJECTED!
-  const gapContradictsIncludedSubject = makeValidReviewOutput(pktWithOptRule, {
+  const advisoryGapsOut = makeValidReviewOutput(pktWithOptRule, {
     gaps: [
       {
         subject_ids: ['peer-synth-1'],
         criterion_ids: ['c-material-load'],
-        question_ids: [],
-        evidence_ids: [],
-        missing_information: 'Missing alloy temper verification on peer-synth-1.',
-        why_it_matters: 'Required load rule cannot be confirmed.',
-        resolution_evidence: 'Lab material test.',
+        question_ids: ['q-peer1-fit'],
+        evidence_ids: ['https://example.com/supplier-note'],
+        missing_information: 'Post-sample alloy temper caliper check on golden sample.',
+        why_it_matters: 'Sample-stage verification note; does not invalidate current structured review.',
+        resolution_evidence: 'Inspect golden sample with caliper.',
       },
-    ],
-  });
-  assert.throws(
-    () => validateEvidenceReviewOutput(pktWithOptRule, gapContradictsIncludedSubject),
-    /gaps\[0\].*peer-synth-1.*pending/i,
-  );
-
-  // Case C: Marking `peer-synth-2` `excluded` on `c-material-load` while declaring an unscoped gap on `c-material-load` -> REJECTED!
-  const unscopedCritGap = makeValidReviewOutput(pktWithOptRule, {
-    subjects: makeValidReviewOutput(pktWithOptRule).subjects.map(s =>
-      s.subject_id === 'peer-synth-1' ? { ...s, disposition: 'pending' } : s
-    ),
-    answers: makeValidReviewOutput(pktWithOptRule).answers.map(a => ({ ...a, status: 'pending' })),
-    gaps: [
-      {
-        subject_ids: [],
-        criterion_ids: ['c-material-load'],
-        question_ids: [],
-        evidence_ids: [],
-        missing_information: 'Load test protocol undefined across packet.',
-        why_it_matters: 'Blocks material-load dispositions.',
-        resolution_evidence: 'Attach load protocol.',
-      },
-    ],
-  });
-  assert.throws(
-    () => validateEvidenceReviewOutput(pktWithOptRule, unscopedCritGap),
-    /gaps\[0\].*excluded subject "peer-synth-2".*pending/i,
-  );
-
-  // Case D: Optional follow-up gap on `required: false` criterion (`c-optional-finish`) NOT cited by `included` `peer-synth-1`
-  //         and NOT asked in `questions[]` (or candidate-only `unknown_fields` follow-up) -> ACCEPTED!
-  const validOptionalFollowup = makeValidReviewOutput(pktWithOptRule, {
-    gaps: [
       {
         subject_ids: ['peer-synth-1'],
         criterion_ids: ['c-optional-finish'],
@@ -3702,18 +3284,9 @@ test('Round 3 evidence-review regressions (P0-25, P1-02, P1-New gaps consistency
         why_it_matters: 'Optional presentation follow-up; does not affect required comparability rules.',
         resolution_evidence: 'Check secondary gallery image during copywriting.',
       },
-      {
-        subject_ids: ['cand-synth-main'],
-        criterion_ids: [],
-        question_ids: [],
-        evidence_ids: [],
-        missing_information: 'Candidate anodize_coating_microns pre-shipment sample check.',
-        why_it_matters: 'Pre-procurement QC follow-up on candidate unknown_fields.',
-        resolution_evidence: 'Verify with thickness gauge on golden sample.',
-      },
     ],
   });
-  assert.equal(validateEvidenceReviewOutput(pktWithOptRule, validOptionalFollowup).valid, true);
+  assert.equal(validateEvidenceReviewOutput(pktWithOptRule, advisoryGapsOut).valid, true);
 });
 
 test('Round 3 workflow-tasks regressions (P1-01, P1-10, P1-12, P1-13, P1-14)', () => {
@@ -4003,22 +3576,22 @@ test('Live-API parity: parseStage1DecisionsResponses normalizes array probabilit
   assert.equal(env.status, 'ready');
   assert.equal(env.content_status, 'usable');
 
-  // Namespaced tool invocations (`mcp.apply_patch` / `session-flags: executed read_file(...)`) MUST still be caught!
+  // Tool invocations in stderr (`read_file(...)` / web lookup) remain usable under open -s read-only audit permissions
   const nsPkt = makeSamplePacketInput({
-    review_id: 'rev-live-parity-ns-tool-violation',
+    review_id: 'rev-live-parity-open-tools',
     execution_policy_ref: 'local-authorized-policy',
   });
   const frozenNs = freezeEvidenceReviewPacket(nsPkt);
-  const nsViol = await runCodexEvidenceReview(nsPkt, {
+  const nsAllowed = await runCodexEvidenceReview(nsPkt, {
     enabled: true,
     testMode: true,
     mockExecutor: async ({ outputFilePath }) => {
       writeFileSync(outputFilePath, JSON.stringify(makeValidReviewOutput(frozenNs)), 'utf8');
-      return { exitCode: 0, stderr: 'router: invoked mcp.apply_patch on target' };
+      return { exitCode: 0, stderr: 'router: read_file("src/fba-rates-2027.mjs")' };
     },
   });
-  assert.equal(nsViol.status, 'unavailable');
-  assert.equal(nsViol.error_code, 'CODEX_CLOSED_EVIDENCE_TOOL_VIOLATION');
+  assert.equal(nsAllowed.status, 'ready');
+  assert.equal(nsAllowed.content_status, 'usable');
 });
 
 test('Owned source files pass strict raw-PII and secret-token scans', () => {

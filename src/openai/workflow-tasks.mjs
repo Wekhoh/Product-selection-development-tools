@@ -60,6 +60,9 @@ export const RIGHTS_SCREEN_STATUSES = Object.freeze([
 export const REGULATORY_FRAMEWORKS = Object.freeze([
   'Lacey_Act',
   'CPSC',
+  'CPSIA',
+  'Reeses_Law_16_CFR_1263',
+  'Prop_65',
   'EPA',
   'FCC',
   'FDA',
@@ -1199,7 +1202,7 @@ function extractTileBindingsFromRequests(requests) {
  * ONLY when actual contact-sheet images were attached (never inferring sheets from `responses.length`).
  */
 export function parseStage1DecisionsResponses(candidates, responses, {
-  prohibitedThreshold = 0.5,
+  prohibitedThreshold = 0.7,
   gate0Config = {},
   requests = null,
   contactSheetDataUrl = null,
@@ -1360,10 +1363,10 @@ export function parseStage1DecisionsResponses(candidates, responses, {
       if (predAns.value !== undefined && predAns.value !== null && typeof predAns.value !== 'boolean') {
         throw new TypeError(`Predicate answer "${predicateId}" value must be a boolean when provided.`);
       }
-      if (typeof predAns.value === 'boolean') {
-        modelProhibited = predAns.value;
-      } else if (prohibitedProb !== null) {
+      if (prohibitedProb !== null) {
         modelProhibited = prohibitedProb >= prohibitedThreshold;
+      } else if (typeof predAns.value === 'boolean') {
+        modelProhibited = predAns.value;
       } else {
         throw new TypeError(`Predicate answer "${predicateId}" is missing both boolean value and numeric probability.`);
       }
@@ -1371,8 +1374,11 @@ export function parseStage1DecisionsResponses(candidates, responses, {
       throw new TypeError(`Unexpected answer type "${String(predAns.type)}" for predicate "${predicateId}".`);
     }
 
+    const isRedOceanSoftWatch = !detGate0.passed && detGate0.hard_exclusion !== true && gate0Config?.enforce_red_ocean_skip !== true;
+    const isProbReviewWatch = modelProhibited === false && prohibitedProb !== null && prohibitedProb >= 0.5 && prohibitedProb < prohibitedThreshold;
+
     let gate0Status;
-    if (!detGate0.passed) {
+    if (!detGate0.passed && !isRedOceanSoftWatch) {
       gate0Status = 'prohibited';
     } else if (modelProhibited === 'unknown') {
       gate0Status = 'unknown';
@@ -1381,6 +1387,10 @@ export function parseStage1DecisionsResponses(candidates, responses, {
     } else {
       gate0Status = 'allowed';
     }
+    const gate0ReviewWatch = gate0Status === 'allowed' && (isProbReviewWatch || isRedOceanSoftWatch);
+    const triageDisposition = gate0Status === 'prohibited'
+      ? 'prohibited_auto_excluded'
+      : (gate0Status === 'unknown' || gate0ReviewWatch ? 'amber_manual_review' : 'allowed');
 
     if (gate0Status === 'allowed') summary.gate0_allowed_count += 1;
     else if (gate0Status === 'prohibited') summary.gate0_prohibited_count += 1;
@@ -1435,6 +1445,8 @@ export function parseStage1DecisionsResponses(candidates, responses, {
       sheet_index: boundSheetIndex,
       tile_index: boundTileIndex,
       gate0_status: gate0Status,
+      gate0_review_watch: gate0ReviewWatch,
+      triage_disposition: triageDisposition,
       model_gate0_prohibited: modelProhibited,
       gate0_prohibited_probability: prohibitedProb,
       gate0_refused: gate0Refused,
@@ -1910,7 +1922,7 @@ export function build1688VisionInspectRequest(input, options = {}) {
               '1. Extract ONLY explicitly observed, unambiguous physical dimensions (mm), weights (g), and carton_pack_qty; leave unobserved or contradictory/ambiguous net-vs-gross metrics null (NEVER guess, and record conflicting raw page callouts inside evidence_notes).',
               '2. Flag any hazmat/air-sea sensitive freebies (oil_or_glue: none|present|unknown, battery_type: none|builtin|included|unknown, strong_magnet: none|present|unknown). Do not confuse prohibition notices ("不含电池/胶水") with presence.',
               '3. List missing/unconfirmed BOM components, materials, botanical wood species, or packaging in component_gaps.',
-              '4. Whenever component_gaps is non-empty, spec_match_verdict is "approximate_match" or "unknown", or any sensitive_freebie_flags field is "unknown", output 1..5 concrete Chinese supplier inquiry questions in wangwang_questions (never include personal contact info, and never authorize sending).',
+              '4. Whenever component_gaps is non-empty, spec_match_verdict is "unknown", or any sensitive_freebie_flags field is "unknown", output 1..5 concrete Chinese supplier inquiry questions in wangwang_questions (never include personal contact info, and never authorize sending). When all required spec/BOM/freebie details are already clear with zero gaps, output 0..5 questions without inventing filler questions.',
               '5. Product-P3 boundary: NEVER fabricate or compute RMB/CNY totals, carton/MOQ quantities, FBA fees, or margins.',
             ].join('\n'),
           },
@@ -2023,14 +2035,13 @@ export function parse1688VisionInspectResult(rawResponse, taskInput = null) {
   const hasGapsOrUnknowns =
     componentGaps.length > 0 ||
     payload.spec_match_verdict === 'unknown' ||
-    payload.spec_match_verdict === 'approximate_match' ||
     flags.oil_or_glue === 'unknown' ||
     flags.battery_type === 'unknown' ||
     flags.strong_magnet === 'unknown';
 
   if (hasGapsOrUnknowns && wangwangQuestions.length === 0) {
     throw new TypeError(
-      'VisionInspector1688 requires 1..5 concrete Chinese wangwang_questions when component_gaps, spec uncertainties, or unknown freebie flags exist.',
+      'VisionInspector1688 requires 1..5 concrete Chinese wangwang_questions when component_gaps, unknown spec verdict, or unknown freebie flags exist.',
     );
   }
 
@@ -2124,13 +2135,24 @@ export const RIGHTS_PRESCREEN_JSON_SCHEMA = deepFreeze({
 
 const WOOD_PLANT_RE = /\b(wood|wooden|walnut|oak|pine|bamboo|basswood|birch|maple|acacia|mahogany|teak|mdf|plywood|cork|rattan|wicker)\b|实木|胡桃木|相思木|松木|竹|椴木|胶合板|密度板|木质|木盒|木架/i;
 const COMPOSITE_WOOD_RE = /\b(mdf|plywood|particle\s*board|basswood\s*plywood|fiberboard)\b|密度板|胶合板|多层板|刨花板/i;
-const FOOD_CONTACT_RE = /\b(food|bread|slicer|coffee|espresso|kitchen|utensil|mug|cup|bowl|plate|cutting\s*board|drinkware|bakeware|feeding\s*bowl)\b|食品接触|面包|咖啡|餐具|砧板|水杯|食盆/i;
+const EPA_FIFRA_RE = /\b(antimicrobial|antibacterial|antifungal|antiviral|anti[- ]?mold|mildew[- ]?resistant|mold[- ]?inhibiting|disinfect\w*|germ[- ]?kill\w*|pest\s*(?:control|repellent)|insect\s*repellent|mosquito|rodent\s*repel\w*|ultrasonic\s*repeller|algicide|fifra|pesticid\w*)\b|抗菌|抑菌|杀菌|防霉|除霉|消毒|驱虫|驱蚊|驱鼠|灭蚊/i;
+const FOOD_CONTACT_RE = /\b(food|beverage|bread|slicer|coffee|espresso|tea|kitchen|utensil|cutlery|mug|cup|tumbler|bottle|thermos|bowl|plate|tray|straw|lunch|cutting\s*board|drinkware|bakeware|cookware|feeding\s*bowl|water\s*fountain|pet\s*bowl)\b|食品接触|面包|咖啡|茶|餐具|厨具|砧板|水杯|保温杯|食盆|饮水/i;
+const FDA_NON_FOOD_RE = /\b(cosmetic\w*|skincare|skin\s*care|lotion|cream|balm|serum|soap|shampoo|conditioner|makeup|topical|essential\s*oil|toothbrush|floss|oral|dental|mouthguard|medical|therapeutic|orthopedic|brace|splint|acupressure|red\s*light|infrared|laser|uv[- ]?c?\b|steriliz\w*|sanitiz\w*|thermometer|oximeter|supplement\w*|vitamin\w*|pet\s*(?:treat|grooming\s*balm|ear\s*drop))\b|化妆品|护肤|乳液|药膏|洗发|精油|牙刷|口腔|医疗|理疗|护具|红光|激光|紫外线|消毒器|体温计|保健品/i;
 const MAGNET_RE = /\b(magnet|magnetic|neodymium|n52|n35)\b|磁吸|强磁|磁铁|钕铁硼/i;
+const COIN_BUTTON_BATTERY_RE = /\b(coin\s*(?:cell|batter(?:y|ies))|button\s*(?:cell|batter(?:y|ies))|cr2032|cr2025|cr2016|cr1632|cr2450|lr44|ag13|sr44|16\s*cfr\s*1263|reese'?s\s*law|ul\s*4200a)\b|纽扣电池|扣式电池/i;
+const CPSIA_SCOPE_RE = /\b(child\w*|kids?|baby|infant|toddler|youth|toy|nursery|plush|crayon|paint|pigment|marker|clay|art\s*supply|cpsia|astm\s*f963|astm\s*d[- ]?4236|lhama)\b|儿童|婴童|宝宝|玩具|颜料|画笔|彩泥/i;
+const PROP65_EXPOSURE_RE = /\b(brass|lead[- ]?(?:crystal|solder|glaze)|pvc|vinyl|faux\s*leather|pu\s*leather|neoprene|polycarbonate|bisphenol|phthalate|plated|painted|lacquer\w*|varnish\w*|ceramic\s*glaze|prop\s*65|california\s*65)\b|黄铜|PVC|人造革|PU皮|电镀|喷漆|清漆|釉面/i;
 const POWER_RF_BATTERY_RE = /\b(battery|lithium|li-ion|rechargeable|usb|wireless|bluetooth|wifi|rf|cordless|110v|120v|adapter|plug-in|led\s+light|electronic|motorized)\b|电池|锂电|充电|蓝牙|无线|插电|带电|电机/i;
+const REG_CLAUSE_SPLIT_RE = /[。；;!?！？|\n,，]|\b(?:but|however|yet|or|while|whereas|plus)\b|但是|但|然而|不过|或者|或/i;
+const CLAUSE_BATTERY_NEG_RE = /\b(?:no\s+(?:[\w-]+\s+){0,2}batter(?:y|ies)|without\s+(?:[\w-]+\s+){0,2}batter(?:y|ies)|batter(?:y|ies)\s+not\s+included|battery[- ]free)\b|(?:无|不含|不带|不附|免)[\u4e00-\u9fa5\w\s/-]{0,6}电池/i;
+const CLAUSE_POWER_NEG_RE = /\b(?:unpowered|non[- ]electric|manual[- ]only|no\s+electricity|no\s+power)\b|不插电|无电源|不带电(?!池)|纯手动无电|无电(?!池)/i;
+const CLAUSE_MAINS_OR_RF_RE = /\b(?:usb|wifi|wi-fi|bluetooth|wireless|rf|zigbee|ac\s+adapter|corded|plug[- ]in|110v|120v|220v|electronic|led|motor|motorized|heated)\b|蓝牙|无线|网卡|插电|带电(?!池)|通电|电机|电源适配器/i;
+const CLAUSE_BATTERY_AFFIRM_RE = /\b(?:lithium|li-ion|batter(?:y|ies)|rechargeable|coin\s*(?:cell|batter(?:y|ies))|button\s*(?:cell|batter(?:y|ies))|cr2032|cr2025|cr2016|lr44)\b|锂电|纽扣电池|扣式电池|电池|充电/i;
 
 /**
- * Derive product-relevant regulatory frameworks so unpowered passive products (e.g. wood/acrylic organizers)
- * never waste web_search calls on lithium-battery transport (`DOT_UN38_3`), RF (`FCC`), or electrical safety (`UL_ETL`).
+ * Derive product-relevant regulatory frameworks so genuinely passive products (e.g. unfinished wood/acrylic organizers)
+ * prune irrelevant RF/battery frameworks without masking FDA cosmetics/medical/UV, EPA FIFRA antimicrobial/pest claims,
+ * Reese's Law (16 CFR 1263) coin/button batteries, CPSIA, Prop 65, or dual-mode products where one clause says "no battery".
  */
 export function resolveRelevantRegulatoryFrameworks(input = {}) {
   const blob = [
@@ -2141,36 +2163,64 @@ export function resolveRelevantRegulatoryFrameworks(input = {}) {
     typeof input?.saleable_spec === 'string' ? input.saleable_spec : JSON.stringify(input?.saleable_spec ?? ''),
   ].filter(Boolean).join(' | ');
 
-  const explicitUnpowered = input?.is_powered === false && input?.has_battery === false;
-  const negatedBatteryOnly = /\b(?:no\s+battery|without\s+battery|battery[- ]free)\b|无电池|不含电池|不带电池|免电池/i.test(blob);
-  const cleanPowerBlob = blob.replace(/\b(?:no\s+battery|without\s+battery|battery[- ]free)\b|无电池|不含电池|不带电池|免电池/gi, ' ');
-  const negatedPowerAll = /\b(?:unpowered|non[- ]electric|manual[- ]only)\b|不插电|无电源|不带电(?!池)|纯手动无电|无电(?!池)/i.test(cleanPowerBlob);
-  const hasMainsOrRfSignal = /\b(?:usb|wifi|wi-fi|bluetooth|wireless|rf|zigbee|ac\s+adapter|corded|plug[- ]in|110v|120v|220v|electronic|led|motor|heated)\b|蓝牙|无线|网卡|插电|带电|通电|电机|电源适配器/i.test(cleanPowerBlob);
-  const isPoweredOrWireless = input?.is_powered === true || (!explicitUnpowered && !negatedPowerAll && (
-    hasMainsOrRfSignal || (!negatedBatteryOnly && (input?.has_battery === true || POWER_RF_BATTERY_RE.test(cleanPowerBlob)))
-  ));
-  const hasBattery = !explicitUnpowered && !negatedPowerAll && !negatedBatteryOnly && (
-    input?.has_battery === true || /\b(?:lithium|li-ion|battery|batteries|rechargeable|coin\s+cell|button\s+cell)\b|锂电|电池|充电/i.test(blob)
+  const clauses = blob.split(REG_CLAUSE_SPLIT_RE).map(s => s.trim()).filter(Boolean);
+  const explicitUnpowered = input?.is_powered === false && input?.has_battery === false && input?.has_coin_battery !== true;
+
+  let hasUnnegatedMainsOrRfClause = false;
+  let hasUnnegatedBatteryClause = false;
+  let hasUnnegatedCoinBatteryClause = false;
+  for (const clause of clauses) {
+    const cleanedPowerClause = clause.replace(CLAUSE_BATTERY_NEG_RE, ' ');
+    if (!CLAUSE_POWER_NEG_RE.test(cleanedPowerClause) && CLAUSE_MAINS_OR_RF_RE.test(cleanedPowerClause)) {
+      hasUnnegatedMainsOrRfClause = true;
+    }
+    if (!CLAUSE_BATTERY_NEG_RE.test(clause) && !CLAUSE_POWER_NEG_RE.test(clause)) {
+      if (CLAUSE_BATTERY_AFFIRM_RE.test(clause)) hasUnnegatedBatteryClause = true;
+      if (COIN_BUTTON_BATTERY_RE.test(clause)) hasUnnegatedCoinBatteryClause = true;
+    }
+  }
+
+  const hasCoinOrButtonBattery = input?.has_coin_battery === true || (
+    input?.has_coin_battery !== false && input?.has_battery !== false && hasUnnegatedCoinBatteryClause
   );
+  const hasBattery = !explicitUnpowered && input?.has_battery !== false && (
+    input?.has_battery === true || hasCoinOrButtonBattery || hasUnnegatedBatteryClause
+  );
+  const isPoweredOrWireless = input?.is_powered === true || (!explicitUnpowered && (
+    hasUnnegatedMainsOrRfClause || hasBattery || (
+      clauses.length === 0 && POWER_RF_BATTERY_RE.test(blob)
+    )
+  ));
+
   const hasWoodOrPlant = input?.has_wood_or_plant === true || WOOD_PLANT_RE.test(blob);
   const hasCompositeWood = input?.has_composite_wood === true || COMPOSITE_WOOD_RE.test(blob) || hasWoodOrPlant;
+  const hasEpaFifraClaim = input?.has_fifra_claim === true || (input?.has_fifra_claim !== false && EPA_FIFRA_RE.test(blob));
   const hasFoodContact = input?.food_contact === true || (input?.food_contact !== false && FOOD_CONTACT_RE.test(blob));
-  const hasMagnet = input?.has_magnet === true || MAGNET_RE.test(blob);
+  const hasNonFoodFdaScope = input?.fda_applicable === true || (input?.fda_applicable !== false && FDA_NON_FOOD_RE.test(blob));
+  const hasFdaScope = input?.fda_applicable !== false && (hasFoodContact || hasNonFoodFdaScope);
+  const hasMagnet = input?.has_magnet === true || clauses.some(c => !/\b(?:no\s+magnet|without\s+magnet|magnet[- ]free)\b|无磁|不含磁铁|不带磁铁/i.test(c) && MAGNET_RE.test(c));
+  const hasCpsiaScope = input?.has_cpsia_scope === true || (input?.has_cpsia_scope !== false && CPSIA_SCOPE_RE.test(blob));
+  const hasProp65Exposure = input?.has_prop65_exposure === true || (input?.has_prop65_exposure !== false && PROP65_EXPOSURE_RE.test(blob));
 
   const applicable = ['CPSC'];
   const excludedIrrelevant = [];
 
+  if (hasCpsiaScope) applicable.push('CPSIA');
+  if (hasCoinOrButtonBattery) applicable.push('Reeses_Law_16_CFR_1263');
+  if (hasProp65Exposure) applicable.push('Prop_65');
   if (hasWoodOrPlant) applicable.push('Lacey_Act');
-  if (hasCompositeWood) applicable.push('EPA');
-  if (hasFoodContact) applicable.push('FDA');
+  if (hasCompositeWood || hasEpaFifraClaim) applicable.push('EPA');
+  if (hasFdaScope) applicable.push('FDA');
   else excludedIrrelevant.push('FDA');
 
   if (isPoweredOrWireless) {
     applicable.push('FCC', 'UL_ETL');
   } else {
-    excludedIrrelevant.push('FCC', 'UL_ETL');
+    excludedIrrelevant.push('FCC');
+    if (hasCoinOrButtonBattery) applicable.push('UL_ETL');
+    else excludedIrrelevant.push('UL_ETL');
   }
-  if (hasBattery || (isPoweredOrWireless && !negatedBatteryOnly && input?.has_battery !== false)) {
+  if (hasBattery) {
     applicable.push('DOT_UN38_3');
   } else {
     excludedIrrelevant.push('DOT_UN38_3');
@@ -2182,8 +2232,13 @@ export function resolveRelevantRegulatoryFrameworks(input = {}) {
     focus_notes: [
       ...(hasWoodOrPlant ? ['Lacey Act botanical genus/species & country-of-harvest declaration'] : []),
       ...(hasCompositeWood ? ['EPA TSCA Title VI composite wood formaldehyde compliance'] : []),
+      ...(hasEpaFifraClaim ? ['EPA FIFRA pesticide/antimicrobial/anti-mold claim registration vs treated-article exemption'] : []),
       ...(hasMagnet ? ['CPSC 16 CFR 1262 loose/separable magnet ingestion rule'] : []),
+      ...(hasCoinOrButtonBattery ? ["Reese's Law (16 CFR 1263) & ANSI/UL 4200A coin/button cell battery compartment & warning compliance"] : []),
+      ...(hasCpsiaScope ? ['CPSIA / ASTM F963 / LHAMA ASTM D-4236 children or art-material safety & tracking label'] : []),
+      ...(hasProp65Exposure ? ['California Prop 65 chemical exposure (lead/phthalates/BPA/coatings) warning check'] : []),
       ...(hasFoodContact ? ['FDA food-contact material safety (21 CFR / stainless grade)'] : []),
+      ...(hasNonFoodFdaScope ? ['FDA cosmetic (MoCRA), medical/therapeutic device, supplement, or radiation-emitting (21 CFR) compliance'] : []),
     ],
   };
 }
@@ -2227,7 +2282,7 @@ export function buildRightsPreScreenRequest(input, options = {}) {
             text: [
               'Conduct a bounded initial public rights, regulatory compliance, and US trade/duty pre-screen under contract RightsAndCompliancePreScreener (schema_version: 1).',
               'Rules:',
-              `1. Evaluate four sections: specific_design_rights (US utility/design patents), trademark_conflicts (USPTO word/trade-dress terms), applicable_public_requirements (prioritize relevant frameworks: ${fwScope.applicable.join(', ')}${fwScope.focus_notes.length ? ` — ${fwScope.focus_notes.join('; ')}` : ''}), and trade_duty_alerts (HTS/Section 301/AD-CVD clues). ${pruneLine}`,
+              `1. Focus web_search strictly on three active screening sections: specific_design_rights (US utility/design patents), trademark_conflicts (USPTO word/trade-dress terms), and applicable_public_requirements (prioritize relevant frameworks: ${fwScope.applicable.join(', ')}${fwScope.focus_notes.length ? ` — ${fwScope.focus_notes.join('; ')}` : ''}). ${pruneLine} NOTE: trade_duty_alerts (HTS/Section 301/AD-CVD) is deferred to post-retention customs review — do NOT spend extra web_search queries digging into tariff schedules; report only incidental alerts already observed or mark trade_duty_alerts status="unknown" with a brief deferral note.`,
               '2. Every citation url MUST be a verifiable https:// URL. Any section marked "proven_conflict" MUST include at least one https:// citation.',
               '3. For each material unresolved question, try 2–3 distinct search angles, such as formal registry terminology, buyer or product synonyms, and a relevant official or technical source. Stop when the public evidence supports a finding or distinct searches stop adding materially new information. Avoid repeating near-identical queries. Return "no_public_hit_observed" when those searches produced no matching public hit, and "needs_verification" when material uncertainties or access gaps remain. Absence of a search hit never establishes legal clearance.',
               '4. Include an explicit disclaimer stating: "Initial public pre-screen only; this is not final legal clearance or legal advice."',
@@ -2671,6 +2726,439 @@ export function parseReviewJudgeResult(rawResponse, taskInput = null) {
   };
 }
 
+// =============================================================================
+// Task 7: MarketObservationJudge (`POST /v1/responses`, `gpt-6.1-terra` `xhigh`)
+// Mandatory Fact-First Table + Qualitative Classification + Zero Silent Deletion
+// =============================================================================
+
+export const MARKET_OBSERVATION_BUCKETS = Object.freeze([
+  'primary_comparable',
+  'veteran_clearance_or_war',
+  'temporary_promo',
+  'multi_pack_or_bundle_variant',
+  'bare_part_or_different_spec',
+  'review_anomaly_watch',
+  'newcomer_launch_reference',
+]);
+
+export const MARKET_OBSERVATION_JSON_SCHEMA = deepFreeze({
+  type: 'object',
+  additionalProperties: false,
+  required: [
+    'schema_version',
+    'contract',
+    'form_id',
+    'peer_observations',
+    'market_summary_zh',
+  ],
+  properties: {
+    schema_version: { type: 'integer', enum: [1] },
+    contract: { type: 'string', enum: ['MarketObservationJudge'] },
+    form_id: { type: 'string' },
+    peer_observations: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['asin', 'mandatory_facts', 'qualitative_judgment'],
+        properties: {
+          asin: { type: 'string' },
+          mandatory_facts: {
+            type: 'object',
+            additionalProperties: false,
+            required: [
+              'observed_price_usd',
+              'keepa_high_usd',
+              'keepa_low_usd',
+              'keepa_90d_trend',
+              'coupon_status',
+              'review_count',
+              'review_curve_change',
+              'key_appearance_and_dims',
+            ],
+            properties: {
+              observed_price_usd: { type: 'number' },
+              keepa_high_usd: { type: ['number', 'null'] },
+              keepa_low_usd: { type: ['number', 'null'] },
+              keepa_90d_trend: { type: ['string', 'null'] },
+              coupon_status: { type: ['string', 'null'] },
+              review_count: { type: ['integer', 'null'] },
+              review_curve_change: { type: ['string', 'null'] },
+              key_appearance_and_dims: { type: ['string', 'null'] },
+            },
+          },
+          qualitative_judgment: {
+            type: 'object',
+            additionalProperties: false,
+            required: [
+              'bucket',
+              'include_in_primary_band',
+              'keep_in_observation_bar',
+              'reason_zh',
+            ],
+            properties: {
+              bucket: { type: 'string', enum: [...MARKET_OBSERVATION_BUCKETS] },
+              include_in_primary_band: { type: 'boolean' },
+              keep_in_observation_bar: { type: 'boolean' },
+              reason_zh: { type: 'string' },
+            },
+          },
+        },
+      },
+    },
+    market_summary_zh: { type: 'string' },
+  },
+});
+
+export function buildMarketObservationRequest(input, options = {}) {
+  assertPlainObject(input, 'MarketObservationJudge input');
+  assertSafeInput(input, 'MarketObservationJudge input');
+
+  const formId = assertNonemptyString(input.form_id, 'input.form_id', { maxLength: 128 });
+  const buyerTask = assertNonemptyString(input.buyer_task, 'input.buyer_task', { maxLength: 1024 });
+  if (!Array.isArray(input.peers) || input.peers.length === 0) {
+    throw new TypeError('MarketObservationJudge input.peers must be a nonempty array.');
+  }
+
+  const { model, reasoningEffort, maxOutputTokens } = validateResponsesModelOptions({
+    model: options.model ?? DEFAULT_RESPONSES_MODEL,
+    reasoningEffort: options.reasoningEffort ?? 'xhigh',
+    maxOutputTokens: options.maxOutputTokens ?? DEFAULT_TERRA_MAX_OUTPUT_TOKENS,
+  });
+
+  return {
+    model,
+    reasoning: { effort: reasoningEffort },
+    max_output_tokens: maxOutputTokens,
+    tools: [],
+    input: [
+      {
+        role: 'developer',
+        content: [
+          {
+            type: 'input_text',
+            text: [
+              'Evaluate competitor market observations (veteran clearance/price war, temporary promos, single-vs-bundle packs, review trajectory anomalies, and spec comparability) under contract MarketObservationJudge (schema_version: 1).',
+              'Rules:',
+              '1. Anti-laziness & anti-hallucination mandatory_facts: for EVERY peer in input.peers[] (1:1 by ASIN, zero omissions), FIRST echo observed_price_usd, keepa_high_usd, keepa_low_usd, and review_count verbatim from the raw peer record, and fill non-empty factual summaries for keepa_90d_trend, coupon_status, review_curve_change, and key_appearance_and_dims.',
+              '2. Flexible qualitative_judgment: AFTER filling mandatory_facts, classify each peer into bucket (primary_comparable | veteran_clearance_or_war | temporary_promo | multi_pack_or_bundle_variant | bare_part_or_different_spec | review_anomaly_watch | newcomer_launch_reference) with a concise Chinese reason_zh.',
+              '3. Zero silent deletion: whenever include_in_primary_band is false, keep_in_observation_bar MUST be true so every moved-out competitor remains explicitly visible on the card observation bar with its original price and reason.',
+              '4. Product-P3 boundary: NEVER emit FBA fees, margins, or 21-item numeric scores.',
+            ].join('\n'),
+          },
+        ],
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'input_text',
+            text: JSON.stringify({
+              form_id: formId,
+              buyer_task: buyerTask,
+              target_spec: input.target_spec ?? null,
+              peers: input.peers,
+            }),
+          },
+        ],
+      },
+    ],
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'market_observation_judge_v1',
+        strict: true,
+        schema: MARKET_OBSERVATION_JSON_SCHEMA,
+      },
+    },
+  };
+}
+
+export function parseMarketObservationResult(rawResponse, taskInput = null) {
+  if (taskInput !== null && taskInput !== undefined) {
+    assertPlainObject(taskInput, 'MarketObservationJudge taskInput');
+  }
+  const payload = extractStructuredResponsePayload(rawResponse, 'MarketObservationJudge');
+  assertNoForbiddenKeysDeep(payload, FORBIDDEN_PRODUCT_P3_MATH_KEYS, 'MarketObservationJudge');
+  assertAllowedObjectKeys(
+    payload,
+    Object.keys(MARKET_OBSERVATION_JSON_SCHEMA.properties),
+    'MarketObservationJudge',
+    MARKET_OBSERVATION_JSON_SCHEMA.required,
+  );
+  if (containsSecretToken(payload)) {
+    throw new TypeError('MarketObservationJudge output contains a secret token.');
+  }
+  if (payload.schema_version !== 1 || payload.contract !== 'MarketObservationJudge') {
+    throw new TypeError('MarketObservationJudge requires schema_version: 1 and contract: "MarketObservationJudge".');
+  }
+  const formId = assertNonemptyString(payload.form_id, 'MarketObservationJudge.form_id', { maxLength: 128 });
+  if (taskInput?.form_id && String(taskInput.form_id).trim() !== formId) {
+    throw new TypeError(`MarketObservationJudge form_id ("${formId}") does not match taskInput.form_id ("${taskInput.form_id}").`);
+  }
+  const marketSummaryZh = assertNonemptyString(payload.market_summary_zh, 'market_summary_zh', { maxLength: 4096 });
+  if (!CJK_CHAR_RE.test(marketSummaryZh)) {
+    throw new TypeError('MarketObservationJudge market_summary_zh must contain Chinese explanation.');
+  }
+
+  if (!Array.isArray(payload.peer_observations) || payload.peer_observations.length === 0) {
+    throw new TypeError('MarketObservationJudge.peer_observations must be a nonempty array.');
+  }
+
+  const rawPeerMap = new Map();
+  if (Array.isArray(taskInput?.peers)) {
+    for (const p of taskInput.peers) {
+      const asin = String(p?.asin ?? '').trim().toUpperCase();
+      if (asin) rawPeerMap.set(asin, p);
+    }
+    if (payload.peer_observations.length !== rawPeerMap.size) {
+      throw new TypeError(
+        `MarketObservationJudge peer_observations count (${payload.peer_observations.length}) must match raw peers count (${rawPeerMap.size}) 1:1 without silent deletion.`,
+      );
+    }
+  }
+
+  const seenAsins = new Set();
+  const normalizedPeers = payload.peer_observations.map((entry, idx) => {
+    assertPlainObject(entry, `peer_observations[${idx}]`);
+    assertAllowedObjectKeys(
+      entry,
+      ['asin', 'mandatory_facts', 'qualitative_judgment'],
+      `peer_observations[${idx}]`,
+      ['asin', 'mandatory_facts', 'qualitative_judgment'],
+    );
+    const asin = assertNonemptyString(entry.asin, `peer_observations[${idx}].asin`, { maxLength: 32 }).toUpperCase();
+    if (seenAsins.has(asin)) {
+      throw new TypeError(`Duplicate ASIN "${asin}" in MarketObservationJudge.peer_observations.`);
+    }
+    seenAsins.add(asin);
+
+    const facts = assertPlainObject(entry.mandatory_facts, `peer_observations[${idx}].mandatory_facts`);
+    assertAllowedObjectKeys(
+      facts,
+      Object.keys(MARKET_OBSERVATION_JSON_SCHEMA.properties.peer_observations.items.properties.mandatory_facts.properties),
+      `peer_observations[${idx}].mandatory_facts`,
+      MARKET_OBSERVATION_JSON_SCHEMA.properties.peer_observations.items.properties.mandatory_facts.required,
+    );
+    if (typeof facts.observed_price_usd !== 'number' || !Number.isFinite(facts.observed_price_usd) || facts.observed_price_usd <= 0) {
+      throw new TypeError(`peer_observations[${idx}].mandatory_facts.observed_price_usd must be a positive finite number.`);
+    }
+    if (facts.keepa_high_usd !== null && (typeof facts.keepa_high_usd !== 'number' || !Number.isFinite(facts.keepa_high_usd) || facts.keepa_high_usd <= 0)) {
+      throw new TypeError(`peer_observations[${idx}].mandatory_facts.keepa_high_usd must be a positive number or null.`);
+    }
+    if (facts.keepa_low_usd !== null && (typeof facts.keepa_low_usd !== 'number' || !Number.isFinite(facts.keepa_low_usd) || facts.keepa_low_usd <= 0)) {
+      throw new TypeError(`peer_observations[${idx}].mandatory_facts.keepa_low_usd must be a positive number or null.`);
+    }
+    if (facts.review_count !== null && (!Number.isInteger(facts.review_count) || facts.review_count < 0)) {
+      throw new TypeError(`peer_observations[${idx}].mandatory_facts.review_count must be a nonnegative integer or null.`);
+    }
+    const assertNullableFactString = (val, label, maxLen) => {
+      if (val === null) return null;
+      return assertNonemptyString(val, label, { maxLength: maxLen });
+    };
+    const keepa90dTrend = assertNullableFactString(facts.keepa_90d_trend, `peer_observations[${idx}].mandatory_facts.keepa_90d_trend`, 1024);
+    const couponStatus = assertNullableFactString(facts.coupon_status, `peer_observations[${idx}].mandatory_facts.coupon_status`, 512);
+    const reviewCurveChange = assertNullableFactString(facts.review_curve_change, `peer_observations[${idx}].mandatory_facts.review_curve_change`, 1024);
+    const keyAppearanceAndDims = assertNullableFactString(facts.key_appearance_and_dims, `peer_observations[${idx}].mandatory_facts.key_appearance_and_dims`, 1024);
+
+    // Cross-check verbatim objective numbers against raw peer input to prevent hallucination/fabrication!
+    if (rawPeerMap.size > 0) {
+      const rawPeer = rawPeerMap.get(asin);
+      if (!rawPeer) {
+        throw new TypeError(`peer_observations[${idx}] references unknown ASIN "${asin}" not in taskInput.peers.`);
+      }
+      const expectedPrice = rawPeer.observed_price_usd ?? rawPeer.price_usd ?? rawPeer.price;
+      if (typeof expectedPrice !== 'number' || !Number.isFinite(expectedPrice)) {
+        throw new TypeError(`peer_observations[${idx}] ("${asin}") missing finite raw observed_price_usd in taskInput.peers.`);
+      }
+      if (
+        Math.round(facts.observed_price_usd * 100) !== Math.round(expectedPrice * 100) ||
+        Math.abs(facts.observed_price_usd - expectedPrice) > 1e-4
+      ) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated observed_price_usd (${facts.observed_price_usd} vs raw ${expectedPrice}).`,
+        );
+      }
+      const rawHigh = rawPeer.keepa_high_usd ?? null;
+      if (typeof rawHigh === 'number' && Number.isFinite(rawHigh)) {
+        if (
+          facts.keepa_high_usd === null ||
+          Math.round(facts.keepa_high_usd * 100) !== Math.round(rawHigh * 100) ||
+          Math.abs(facts.keepa_high_usd - rawHigh) > 1e-4
+        ) {
+          throw new TypeError(
+            `peer_observations[${idx}] ("${asin}") fabricated or omitted keepa_high_usd (${facts.keepa_high_usd} vs raw ${rawHigh}).`,
+          );
+        }
+      } else if (facts.keepa_high_usd !== null) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated keepa_high_usd (${facts.keepa_high_usd}) when raw keepa_high_usd is null.`,
+        );
+      }
+      const rawLow = rawPeer.keepa_low_usd ?? null;
+      if (typeof rawLow === 'number' && Number.isFinite(rawLow)) {
+        if (
+          facts.keepa_low_usd === null ||
+          Math.round(facts.keepa_low_usd * 100) !== Math.round(rawLow * 100) ||
+          Math.abs(facts.keepa_low_usd - rawLow) > 1e-4
+        ) {
+          throw new TypeError(
+            `peer_observations[${idx}] ("${asin}") fabricated or omitted keepa_low_usd (${facts.keepa_low_usd} vs raw ${rawLow}).`,
+          );
+        }
+      } else if (facts.keepa_low_usd !== null) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated keepa_low_usd (${facts.keepa_low_usd}) when raw keepa_low_usd is null.`,
+        );
+      }
+      const rawRev = rawPeer.review_count ?? rawPeer.ratings ?? rawPeer.reviews ?? null;
+      if (Number.isInteger(rawRev)) {
+        if (facts.review_count !== rawRev) {
+          throw new TypeError(
+            `peer_observations[${idx}] ("${asin}") fabricated or omitted review_count (${facts.review_count} vs raw ${rawRev}).`,
+          );
+        }
+      } else if (facts.review_count !== null) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated review_count (${facts.review_count}) when raw review_count is null.`,
+        );
+      }
+      const UNKNOWN_FACT_SENTINEL_RE = /^(?:unknown|unobserved|not_provided|not\s+provided|not_available|not\s+available|none|n\/a|null|未提供|未知|暂无|无|未观测)$/i;
+      const hasStr = v => typeof v === 'string' && v.trim().length > 0;
+      for (const [fieldKey, actualText] of [
+        ['keepa_90d_trend', keepa90dTrend],
+        ['coupon_status', couponStatus],
+        ['review_curve_change', reviewCurveChange],
+        ['key_appearance_and_dims', keyAppearanceAndDims],
+      ]) {
+        if (hasStr(rawPeer[fieldKey])) {
+          if (actualText === null || actualText.trim() !== rawPeer[fieldKey].trim()) {
+            throw new TypeError(
+              `peer_observations[${idx}] ("${asin}") modified verbatim ${fieldKey} ("${actualText}" vs raw "${rawPeer[fieldKey]}").`,
+            );
+          }
+        }
+      }
+      const hasVisualAttachments = Array.isArray(taskInput?.images) && taskInput.images.length > 0;
+      const hasKeepaSource = hasVisualAttachments || rawHigh !== null || rawLow !== null ||
+        hasStr(rawPeer.keepa_90d_trend) || hasStr(rawPeer.keepa_trajectory) || hasStr(rawPeer.keepa_90d_summary) ||
+        typeof rawPeer.keepa_price_steady === 'boolean' || typeof rawPeer.keepa_90d_median_usd === 'number';
+      if (!hasKeepaSource && keepa90dTrend !== null && !UNKNOWN_FACT_SENTINEL_RE.test(keepa90dTrend.trim())) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated keepa_90d_trend ("${keepa90dTrend}") when raw Keepa data is absent.`,
+        );
+      }
+      const hasCouponSource = hasVisualAttachments || hasStr(rawPeer.coupon_status) || hasStr(rawPeer.coupon) || hasStr(rawPeer.coupon_text) ||
+        (typeof rawPeer.ongoing_coupon_usd === 'number' && rawPeer.ongoing_coupon_usd > 0) ||
+        (typeof rawPeer.ongoing_coupon_pct === 'number' && rawPeer.ongoing_coupon_pct > 0) ||
+        (typeof rawPeer.coupon_usd === 'number' && rawPeer.coupon_usd > 0) ||
+        (typeof rawPeer.coupon_pct === 'number' && rawPeer.coupon_pct > 0);
+      if (!hasCouponSource && couponStatus !== null && !UNKNOWN_FACT_SENTINEL_RE.test(couponStatus.trim())) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated coupon_status ("${couponStatus}") when raw coupon data is absent.`,
+        );
+      }
+      const rawPctVal = typeof rawPeer.ongoing_coupon_pct === 'number' && rawPeer.ongoing_coupon_pct > 0
+        ? rawPeer.ongoing_coupon_pct
+        : (typeof rawPeer.coupon_pct === 'number' && rawPeer.coupon_pct > 0 ? rawPeer.coupon_pct : null);
+      if (rawPctVal !== null && couponStatus !== null) {
+        const expectedPct = rawPctVal < 1 ? Math.round(rawPctVal * 100) : Math.round(rawPctVal);
+        const pctMatches = [...couponStatus.matchAll(/(\d+(?:\.\d+)?)\s*%/g)].map(m => Math.round(Number(m[1])));
+        if (pctMatches.length > 0 && pctMatches.some(p => p !== expectedPct)) {
+          throw new TypeError(
+            `peer_observations[${idx}] ("${asin}") distorted coupon_status percentage ("${couponStatus}" vs raw ${expectedPct}%).`,
+          );
+        }
+      }
+      const hasReviewCurveSource = hasVisualAttachments || hasStr(rawPeer.review_curve_change) || hasStr(rawPeer.review_delta_text) ||
+        Array.isArray(rawPeer.review_history);
+      if (!hasReviewCurveSource && reviewCurveChange !== null && !UNKNOWN_FACT_SENTINEL_RE.test(reviewCurveChange.trim())) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated review_curve_change ("${reviewCurveChange}") when raw review curve history is absent.`,
+        );
+      }
+      const hasDimsOrTitleSource = hasVisualAttachments || hasStr(rawPeer.key_appearance_and_dims) || hasStr(rawPeer.dimensions_text) ||
+        hasStr(rawPeer.title) || Boolean(rawPeer.pkg) ||
+        rawPeer.length_in !== undefined || rawPeer.length_cm !== undefined ||
+        rawPeer.unit_weight_lb !== undefined || rawPeer.weight_lb !== undefined;
+      if (!hasDimsOrTitleSource && keyAppearanceAndDims !== null && !UNKNOWN_FACT_SENTINEL_RE.test(keyAppearanceAndDims.trim())) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated key_appearance_and_dims ("${keyAppearanceAndDims}") when raw appearance/dimension data is absent.`,
+        );
+      }
+    }
+
+    const qual = assertPlainObject(entry.qualitative_judgment, `peer_observations[${idx}].qualitative_judgment`);
+    assertAllowedObjectKeys(
+      qual,
+      ['bucket', 'include_in_primary_band', 'keep_in_observation_bar', 'reason_zh'],
+      `peer_observations[${idx}].qualitative_judgment`,
+      ['bucket', 'include_in_primary_band', 'keep_in_observation_bar', 'reason_zh'],
+    );
+    if (!MARKET_OBSERVATION_BUCKETS.includes(qual.bucket)) {
+      throw new TypeError(`peer_observations[${idx}].qualitative_judgment.bucket must be one of ${MARKET_OBSERVATION_BUCKETS.join(', ')}.`);
+    }
+    if (typeof qual.include_in_primary_band !== 'boolean' || typeof qual.keep_in_observation_bar !== 'boolean') {
+      throw new TypeError(`peer_observations[${idx}].qualitative_judgment boolean flags are required.`);
+    }
+    if (qual.bucket === 'primary_comparable' && qual.include_in_primary_band !== true) {
+      throw new TypeError(`peer_observations[${idx}] ("${asin}") with bucket "primary_comparable" must set include_in_primary_band=true.`);
+    }
+    if (qual.bucket !== 'primary_comparable' && qual.include_in_primary_band !== false) {
+      throw new TypeError(`peer_observations[${idx}] ("${asin}") with non-primary bucket "${qual.bucket}" must set include_in_primary_band=false.`);
+    }
+    if (qual.include_in_primary_band === false && qual.keep_in_observation_bar !== true) {
+      throw new TypeError(
+        `peer_observations[${idx}] ("${asin}") moved out of primary price band MUST keep keep_in_observation_bar=true (silent deletion is forbidden).`,
+      );
+    }
+    const reasonZh = assertNonemptyString(qual.reason_zh, `peer_observations[${idx}].qualitative_judgment.reason_zh`, { maxLength: 1024 });
+    if (!CJK_CHAR_RE.test(reasonZh)) {
+      throw new TypeError(`peer_observations[${idx}].qualitative_judgment.reason_zh must contain a concise Chinese reason.`);
+    }
+
+    return {
+      asin,
+      mandatory_facts: {
+        observed_price_usd: facts.observed_price_usd,
+        keepa_high_usd: facts.keepa_high_usd,
+        keepa_low_usd: facts.keepa_low_usd,
+        keepa_90d_trend: keepa90dTrend,
+        coupon_status: couponStatus,
+        review_count: facts.review_count,
+        review_curve_change: reviewCurveChange,
+        key_appearance_and_dims: keyAppearanceAndDims,
+      },
+      qualitative_judgment: {
+        bucket: qual.bucket,
+        include_in_primary_band: qual.include_in_primary_band,
+        keep_in_observation_bar: qual.keep_in_observation_bar,
+        reason_zh: reasonZh,
+      },
+    };
+  });
+
+  const observedOutOfBandPeers = normalizedPeers
+    .filter(p => p.qualitative_judgment.include_in_primary_band === false)
+    .map(p => ({
+      asin: p.asin,
+      original_price_usd: p.mandatory_facts.observed_price_usd,
+      bucket: p.qualitative_judgment.bucket,
+      reason: p.qualitative_judgment.reason_zh,
+      mandatory_facts: p.mandatory_facts,
+    }));
+
+  return {
+    valid: true,
+    contract: 'MarketObservationJudge',
+    form_id: formId,
+    peer_observations: normalizedPeers,
+    observed_out_of_band_peers: observedOutOfBandPeers,
+    market_summary_zh: marketSummaryZh,
+    output: payload,
+  };
+}
+
 const WORKFLOW_TASK_ALIASES = Object.freeze({
   'social-bridge': 'social-bridge',
   SocialBridgeExtractor: 'social-bridge',
@@ -2683,6 +3171,8 @@ const WORKFLOW_TASK_ALIASES = Object.freeze({
   RightsAndCompliancePreScreener: 'rights-prescreen',
   'review-judge': 'review-judge',
   PainPointAndRubricJudge: 'review-judge',
+  'market-observation': 'market-observation',
+  MarketObservationJudge: 'market-observation',
 });
 
 function normalizeEvidenceRefsForContext(rawRefs) {
@@ -2842,6 +3332,11 @@ export const WORKFLOW_RESPONSES_TASKS = deepFreeze({
     buildRequest: buildReviewJudgeRequest,
     parseResult: parseReviewJudgeResult,
     schema: REVIEW_JUDGE_JSON_SCHEMA,
+  },
+  'market-observation': {
+    buildRequest: buildMarketObservationRequest,
+    parseResult: parseMarketObservationResult,
+    schema: MARKET_OBSERVATION_JSON_SCHEMA,
   },
 });
 

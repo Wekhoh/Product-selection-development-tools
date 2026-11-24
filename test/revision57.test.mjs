@@ -281,6 +281,7 @@ test('report renders revision 57 newcomer mode, 15% ad sensitivity, low-exposure
 
 test('early-screen helper keeps missing returns-processing or bond costs pending instead of converting them to zero', () => {
   const baseInput = {
+    profile_revision: 57,
     saleable_unit: 'one synthetic 2-piece set',
     price_usd: 45,
     fx_cny_per_usd: 7,
@@ -354,6 +355,7 @@ test('early-screen helper keeps missing returns-processing or bond costs pending
 
 test('exact decimal 30% margin passes in revision 57 and early-screen despite IEEE-754 drift while sub-30% fails and r54-56 replay holds', () => {
   const exact30Early = evaluateEarlyScreen({
+    profile_revision: 57,
     saleable_unit: 'one synthetic set',
     price_usd: 29.99,
     order_units: 100,
@@ -375,6 +377,7 @@ test('exact decimal 30% margin passes in revision 57 and early-screen despite IE
   assert.equal(exact30Early.checks.margin, 'pass');
 
   const slightlyBelowEarly = evaluateEarlyScreen({
+    profile_revision: 57,
     saleable_unit: 'one synthetic set',
     price_usd: 29.99,
     order_units: 100,
@@ -493,6 +496,7 @@ test('revision 57 enforces full operating-period month coverage, profile floors,
 
   // 6. Gate-1 handles missing/null refund_fraction as pending and blocks zero headhaul/storage overrides & unavailable peak fees
   const gateBase = {
+    profile_revision: 57,
     saleable_unit: 'one synthetic set',
     price_usd: 45,
     fx_cny_per_usd: 7,
@@ -582,6 +586,7 @@ test('revision 57 enforces companion peak panel, storage month bounds, explicit 
 
   // 2 & 3. Gate-1 rejects mismatched operating_period/sales_window, usd_per_unit without bond_included: true, and omitted referral/collection/other_applicable
   const validGate = {
+    profile_revision: 57,
     saleable_unit: 'one synthetic set',
     price_usd: 29.99,
     order_units: 100,

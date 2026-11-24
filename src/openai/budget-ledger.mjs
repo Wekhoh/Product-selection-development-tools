@@ -1,7 +1,6 @@
 /**
- * SQLite-backed OpenAI API budget policy, atomic reservation & cross-month
- * submission fence ledger, cross-process canonical ledger registry, and strictly
- * read-only legacy budget.sqlite3 inspector.
+ * SQLite-backed OpenAI API natural-month spend ledger, zero-auto-retry duplicate
+ * guard, and strictly read-only legacy budget.sqlite3 inspector.
  *
  * Uses Node.js >= 24 built-in `node:sqlite` (`DatabaseSync`) with WAL mode,
  * `busy_timeout = 5000`, and `BEGIN IMMEDIATE` transactions. Can share
@@ -19,7 +18,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir, userInfo } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -87,17 +86,11 @@ const SAFE_API_BASE_URL_RE = /^https?:\/\/[A-Za-z0-9._:\-[\]]{1,255}(?:\/[A-Za-z
 const TOKEN_PREFIX_RE = /^(?:s[k]-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[bpas]-|AIza|AKIA|ASIA|eyJ|pk_live_|rk_live_)/i;
 const SECRET_LIKE_RE = /(?:bearer\s+\S+|api[_-]?key\s*=|authorization\s*:|cookie\s*=|password\s*=|token\s*=\s*\S+)/i;
 const SAFE_SQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const CANONICAL_REGISTRY_ALLOWED_TABLES = new Set([
-  'canonical_scope_bindings',
-  'canonical_credential_bindings',
-  'canonical_binding_audit',
-]);
 
 // Module-private cryptographic brand recording verified legacy inspections.
 const VERIFIED_INSPECTIONS = new WeakMap();
 let lastInspectionStampMs = 0;
 let registeredClientUploadAuthority = null;
-let defaultTestRegistryDir = null;
 
 export function _bindInternalUploadLifecycleAuthority(authorityToken) {
   if (typeof authorityToken !== 'symbol') {
@@ -107,31 +100,6 @@ export function _bindInternalUploadLifecycleAuthority(authorityToken) {
     throw new OpenAiPolicyError('Internal upload lifecycle authority is already bound.');
   }
   registeredClientUploadAuthority = authorityToken;
-}
-
-function resolveProductionCanonicalRegistryPath() {
-  let home = '';
-  try {
-    home = userInfo().homedir || '';
-  } catch {
-    home = '';
-  }
-  if (!home) home = homedir();
-  return join(resolve(home), '.local-selection-openai-ledger-registry.sqlite');
-}
-
-function getDefaultTestModeRegistryPath() {
-  if (!defaultTestRegistryDir) {
-    defaultTestRegistryDir = mkdtempSync(join(tmpdir(), 'openai-test-canon-reg-'));
-    process.once('exit', () => {
-      try {
-        rmSync(defaultTestRegistryDir, { recursive: true, force: true });
-      } catch {
-        // Ignore process-exit temp cleanup failure.
-      }
-    });
-  }
-  return join(defaultTestRegistryDir, 'test-canonical-registry.sqlite');
 }
 
 function nextInspectionStampMs() {
@@ -591,71 +559,6 @@ function sleepSyncMs(ms) {
   Atomics.wait(view, 0, 0, Math.max(1, Math.trunc(ms)));
 }
 
-const CANONICAL_REGISTRY_SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS canonical_scope_bindings (
-  account_scope TEXT PRIMARY KEY,
-  canonical_path TEXT NOT NULL,
-  norm_path_key TEXT NOT NULL,
-  dev_id TEXT,
-  ino_id TEXT,
-  ledger_instance_id TEXT,
-  bound_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS canonical_credential_bindings (
-  credential_fingerprint_sha256 TEXT PRIMARY KEY,
-  account_scope TEXT NOT NULL,
-  canonical_path TEXT NOT NULL,
-  norm_path_key TEXT NOT NULL,
-  dev_id TEXT,
-  ino_id TEXT,
-  ledger_instance_id TEXT,
-  bound_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS canonical_binding_audit (
-  audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
-  account_scope TEXT NOT NULL,
-  action TEXT NOT NULL,
-  old_canonical_path TEXT,
-  new_canonical_path TEXT NOT NULL,
-  old_dev_id TEXT,
-  old_ino_id TEXT,
-  new_dev_id TEXT,
-  new_ino_id TEXT,
-  old_ledger_instance_id TEXT,
-  new_ledger_instance_id TEXT,
-  old_credential_fp TEXT,
-  new_credential_fp TEXT,
-  operator_note TEXT NOT NULL,
-  recorded_at TEXT NOT NULL
-);
-`;
-
-function ensureCanonicalRegistryColumns(regDb) {
-  const scopeCols = new Set(
-    regDb.prepare('PRAGMA table_info("canonical_scope_bindings")').all().map(c => String(c.name)),
-  );
-  if (!scopeCols.has('ledger_instance_id')) {
-    regDb.exec('ALTER TABLE canonical_scope_bindings ADD COLUMN ledger_instance_id TEXT');
-  }
-  const credCols = new Set(
-    regDb.prepare('PRAGMA table_info("canonical_credential_bindings")').all().map(c => String(c.name)),
-  );
-  if (!credCols.has('ledger_instance_id')) {
-    regDb.exec('ALTER TABLE canonical_credential_bindings ADD COLUMN ledger_instance_id TEXT');
-  }
-  const auditCols = new Set(
-    regDb.prepare('PRAGMA table_info("canonical_binding_audit")').all().map(c => String(c.name)),
-  );
-  if (!auditCols.has('old_ledger_instance_id')) {
-    regDb.exec('ALTER TABLE canonical_binding_audit ADD COLUMN old_ledger_instance_id TEXT');
-  }
-  if (!auditCols.has('new_ledger_instance_id')) {
-    regDb.exec('ALTER TABLE canonical_binding_audit ADD COLUMN new_ledger_instance_id TEXT');
-  }
-}
-
 const SAME_MONTH_PENDING_BUFFER_SQL = `INTEGER NOT NULL DEFAULT 0
   CHECK(typeof(same_month_pending_buffer_cents) = 'integer'
     AND same_month_pending_buffer_cents BETWEEN 0 AND ${MAX_SAME_MONTH_PENDING_BUFFER_CENTS})`;
@@ -807,7 +710,7 @@ CREATE TABLE IF NOT EXISTS openai_request_ledger (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   finished_at TEXT,
-  CHECK(status NOT IN ('in_progress', 'pending_recovery') OR reserved_cents >= 1)
+  CHECK(status NOT IN ('in_progress', 'pending_recovery') OR reserved_cents >= 0)
 );
 `;
 
@@ -999,81 +902,6 @@ function reverifyLegacySnapshotUnchanged(verified) {
     throw new OpenAiBudgetError(
       'Legacy budget SQLite snapshot mutated on disk after inspectLegacyAutopilotBudget ran; re-run inspection on current state.',
       { code: 'STALE_LEGACY_SNAPSHOT_CHANGED', notDispatched: true },
-    );
-  }
-}
-
-function assertRegistryFileSafeBeforeWritableOpen(regPath) {
-  if (!existsSync(regPath)) return;
-  let st;
-  try {
-    st = statSync(regPath);
-  } catch {
-    return;
-  }
-  if (!st.isFile()) {
-    throw new OpenAiBudgetError('canonicalRegistryPath is not a regular file.', {
-      code: 'LEGACY_SOURCE_DESTINATION_COLLISION',
-      notDispatched: true,
-    });
-  }
-  if (typeof st.nlink === 'number' && st.nlink > 1) {
-    throw new OpenAiBudgetError(
-      `canonicalRegistryPath has multiple hard links (nlink=${st.nlink}); hard-linked SQLite aliases are forbidden.`,
-      { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-    );
-  }
-  const realReg = realpathNativeSafe(regPath);
-  const canonSt = statSync(realReg);
-  if (typeof canonSt.nlink === 'number' && canonSt.nlink > 1) {
-    throw new OpenAiBudgetError(
-      `Canonical registry SQLite target has multiple hard links (nlink=${canonSt.nlink}).`,
-      { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-    );
-  }
-  if (canonSt.size === 0) return;
-
-  const walPath = `${realReg}-wal`;
-  const journalPath = `${realReg}-journal`;
-  let tableNames = [];
-  if (!existsSync(walPath) && !existsSync(journalPath)) {
-    const immutableUri = `${pathToFileURL(realReg).href}?immutable=1`;
-    const roDb = new DatabaseSync(immutableUri, { open: true, readOnly: true });
-    try {
-      tableNames = roDb
-        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
-        .all()
-        .map(r => String(r.name));
-    } finally {
-      roDb.close();
-    }
-  } else {
-    const tmp = mkdtempSync(join(tmpdir(), 'openai-reg-preflight-'));
-    try {
-      const snap = join(tmp, 'reg.sqlite');
-      writeFileSync(snap, readFileSync(realReg), { mode: 0o600 });
-      if (existsSync(walPath)) writeFileSync(`${snap}-wal`, readFileSync(walPath), { mode: 0o600 });
-      if (existsSync(journalPath)) writeFileSync(`${snap}-journal`, readFileSync(journalPath), { mode: 0o600 });
-      const roDb = new DatabaseSync(snap, { open: true });
-      try {
-        roDb.exec('PRAGMA query_only = ON;');
-        tableNames = roDb
-          .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")
-          .all()
-          .map(r => String(r.name));
-      } finally {
-        roDb.close();
-      }
-    } finally {
-      rmSync(tmp, { recursive: true, force: true, maxRetries: 6, retryDelay: 20 });
-    }
-  }
-
-  const foreignTable = tableNames.find(name => !CANONICAL_REGISTRY_ALLOWED_TABLES.has(name));
-  if (foreignTable) {
-    throw new OpenAiBudgetError(
-      `canonicalRegistryPath resolves to an existing non-registry SQLite database containing table "${sanitizeDiagnosticText(foreignTable)}"; refusing writable open.`,
-      { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
     );
   }
 }
@@ -1598,7 +1426,6 @@ function inspectSnapshotDatabase(db, {
 
             if (
               explicitHoldFlag ||
-              unfinishedCleanup ||
               mon.hasInvalidMonetary ||
               contradictoryZeroFlag ||
               promoZeroMaskingUnknownUsage ||
@@ -1978,13 +1805,12 @@ export function inspectLegacyAutopilotBudget(
 export class OpenAiBudgetLedger {
   /**
    * @param {string | DatabaseSync | { db: DatabaseSync, readOnly?: boolean, dbPath?: string }} dbOrPath
-   * @param {{ readOnly?: boolean, reconcileOnOpen?: boolean, testMode?: boolean, canonicalRegistryPath?: string | null, nowFn?: (() => Date) | null }} [options]
+   * @param {{ readOnly?: boolean, reconcileOnOpen?: boolean, testMode?: boolean, nowFn?: (() => Date) | null }} [options]
    */
   constructor(dbOrPath = ':memory:', {
     readOnly = false,
     reconcileOnOpen = false,
     testMode = undefined,
-    canonicalRegistryPath = null,
     nowFn = null,
   } = {}) {
     if (testMode !== undefined && typeof testMode !== 'boolean') {
@@ -1992,25 +1818,6 @@ export class OpenAiBudgetLedger {
     }
     this.testMode = testMode !== undefined ? testMode : (dbOrPath === ':memory:');
     this.isTestLedger = Boolean(this.testMode);
-
-    if (canonicalRegistryPath !== null && canonicalRegistryPath !== undefined) {
-      if (typeof canonicalRegistryPath !== 'string' || !canonicalRegistryPath.trim()) {
-        throw new OpenAiValidationError('canonicalRegistryPath must be a nonempty file path string when provided.');
-      }
-      if (!this.testMode) {
-        throw new OpenAiPolicyError(
-          'Custom canonicalRegistryPath is forbidden when testMode is false; production ledgers always resolve the single canonical host registry.',
-          { code: 'CUSTOM_CANONICAL_REGISTRY_FORBIDDEN', notDispatched: true },
-        );
-      }
-      this._canonicalRegistryPath = resolve(canonicalRegistryPath.trim());
-    } else {
-      this._canonicalRegistryPath = null;
-    }
-
-    this._effectiveRegistryPath = this.testMode
-      ? (this._canonicalRegistryPath ?? getDefaultTestModeRegistryPath())
-      : resolveProductionCanonicalRegistryPath();
 
     this._nowFn = typeof nowFn === 'function' ? nowFn : () => new Date();
     this._inTx = false;
@@ -2030,12 +1837,6 @@ export class OpenAiBudgetLedger {
       this._mainFile = queryMainFileFromDatabaseSync(this.db);
       this.dbPath = this._mainFile || ':memory:';
       if (!this.readOnly) {
-        if (this._mainFile !== '' && areSamePhysicalSqliteFile(this._mainFile, this._effectiveRegistryPath)) {
-          throw new OpenAiBudgetError(
-            'OpenAiBudgetLedger database and canonicalRegistryPath resolve to the same physical SQLite file.',
-            { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-          );
-        }
         this._withImmediateTx(() => {
           if (this._hasTable('openai_budget_policy')) {
             this._assertNoPinnedLegacySourceCollision();
@@ -2077,12 +1878,6 @@ export class OpenAiBudgetLedger {
       }
       this.dbPath = this._mainFile || ':memory:';
       if (!this.readOnly) {
-        if (this._mainFile !== '' && areSamePhysicalSqliteFile(this._mainFile, this._effectiveRegistryPath)) {
-          throw new OpenAiBudgetError(
-            'OpenAiBudgetLedger database and canonicalRegistryPath resolve to the same physical SQLite file.',
-            { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-          );
-        }
         this._withImmediateTx(() => {
           if (this._hasTable('openai_budget_policy')) {
             this._assertNoPinnedLegacySourceCollision();
@@ -2212,12 +2007,6 @@ export class OpenAiBudgetLedger {
     }
 
     if (this.dbPath !== ':memory:') {
-      if (areSamePhysicalSqliteFile(this.dbPath, this._effectiveRegistryPath)) {
-        throw new OpenAiBudgetError(
-          'OpenAiBudgetLedger dbPath and canonicalRegistryPath resolve to the same physical SQLite file.',
-          { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-        );
-      }
       mkdirSync(dirname(this.dbPath), { recursive: true });
     }
     const maxAttempts = this.dbPath === ':memory:' ? 1 : 12;
@@ -2227,12 +2016,6 @@ export class OpenAiBudgetLedger {
       try {
         this.db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;');
         this._mainFile = queryMainFileFromDatabaseSync(this.db);
-        if (this._mainFile !== '' && areSamePhysicalSqliteFile(this._mainFile, this._effectiveRegistryPath)) {
-          throw new OpenAiBudgetError(
-            'OpenAiBudgetLedger database and canonicalRegistryPath resolve to the same physical SQLite file.',
-            { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-          );
-        }
         if (this._hasTable('openai_budget_policy')) {
           this._assertNoPinnedLegacySourceCollision();
         }
@@ -2305,7 +2088,7 @@ export class OpenAiBudgetLedger {
     for (const r of rows) {
       if (this._matchesPinnedLegacySourceRow(candidatePath, r)) {
         throw new OpenAiBudgetError(
-          'Writable SQLite target or canonicalRegistryPath collides with the pinned legacy budget SQLite source.',
+          'Writable SQLite target collides with the pinned legacy budget SQLite source.',
           { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
         );
       }
@@ -2315,7 +2098,6 @@ export class OpenAiBudgetLedger {
   _assertNoPinnedLegacySourceCollision() {
     if (this._mainFile !== '') {
       this._assertPathNotPinnedLegacySource(this._mainFile);
-      this._assertPathNotPinnedLegacySource(this._effectiveRegistryPath);
     }
   }
 
@@ -2498,22 +2280,34 @@ export class OpenAiBudgetLedger {
       }
     }
 
-    // P0-04: Transactionally backfill unresolved cleanup states on pre-remediation rows so
-    // completed/failed_known rows with pending_cleanup/delete_failed remain fenced until 404 readback!
+    // Restore any terminal completed/failed_known rows that were previously demoted to pending_recovery
+    // solely due to unfinished remote DELETE cleanup (DELETE failure never locks out or demotes terminal receipts).
     this.db.exec(`
       UPDATE openai_request_ledger
-      SET cleanup_required = 1,
-          terminal_outcome_status = COALESCE(
-            terminal_outcome_status,
-            CASE WHEN status IN ('completed', 'failed_known') THEN status ELSE NULL END
-          ),
-          status = CASE
-            WHEN status IN ('completed', 'failed_known') THEN 'pending_recovery'
-            ELSE status
-          END
-      WHERE cleanup_status IN ('pending_cleanup', 'delete_failed')
-        AND status NOT IN ('not_submitted', 'rejected')
+      SET status = terminal_outcome_status
+      WHERE status = 'pending_recovery'
+        AND terminal_outcome_status IN ('completed', 'failed_known')
+        AND usage_cost_micros IS NOT NULL
+        AND cleanup_status IN ('pending_cleanup', 'delete_failed')
     `);
+
+    // Migrate legacy openai_request_ledger CHECK constraint (`reserved_cents >= 1` -> `reserved_cents >= 0`)
+    // so slimmed zero-upfront-freeze requests (`reserved_cents = 0`) commit cleanly on existing databases.
+    const reqMaster = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'openai_request_ledger'",
+    ).get();
+    if (reqMaster?.sql && reqMaster.sql.includes('reserved_cents >= 1')) {
+      const migratedSql = reqMaster.sql
+        .replace(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["`]?openai_request_ledger["`]?/i, 'CREATE TABLE openai_request_ledger_v2')
+        .replace(/reserved_cents\s*>=\s*1/g, 'reserved_cents >= 0');
+      const cols = this.db.prepare('PRAGMA table_info("openai_request_ledger")').all().map(c => `"${String(c.name)}"`).join(', ');
+      this.db.exec(`
+        ${migratedSql};
+        INSERT INTO openai_request_ledger_v2 (${cols}) SELECT ${cols} FROM openai_request_ledger;
+        DROP TABLE openai_request_ledger;
+        ALTER TABLE openai_request_ledger_v2 RENAME TO openai_request_ledger;
+      `);
+    }
 
     // Backfill per-month carryover table from legacy single-month policy columns if needed.
     const legacyPolicyRows = this.db.prepare(`
@@ -2685,152 +2479,8 @@ export class OpenAiBudgetLedger {
       : null;
   }
 
-  _assertCanonicalBindingMatchesCurrent(row, { normPathKey, devStr, inoStr, instanceId }, scopeLabel) {
-    if (!row) return;
-    if (row.norm_path_key === normPathKey) {
-      // P0-07: ALWAYS verify stored (dev_id, ino_id) AND persistent ledger_instance_id even when
-      // canonical_path matches (catching both file swaps and unlink+recreate when ext4 reuses freed inodes)!
-      const inodeMismatch =
-        devStr !== null &&
-        inoStr !== null &&
-        row.dev_id !== null &&
-        row.dev_id !== undefined &&
-        row.ino_id !== null &&
-        row.ino_id !== undefined &&
-        (row.dev_id !== devStr || row.ino_id !== inoStr);
-      const hasBoundInstanceId =
-        typeof row.ledger_instance_id === 'string' &&
-        row.ledger_instance_id.length > 0;
-      const instanceMismatch = hasBoundInstanceId && instanceId !== row.ledger_instance_id;
-      if (inodeMismatch || instanceMismatch) {
-        throw new OpenAiPolicyError(
-          `Canonical SQLite ledger for "${scopeLabel}" at the registered pathname was replaced with a different physical or logical database file; use rotateOrRelocateCanonicalBinding with an operator note.`,
-          { code: 'CANONICAL_LEDGER_REPLACED_AT_PATH', notDispatched: true },
-        );
-      }
-      return;
-    }
-    throw new OpenAiPolicyError(
-      `OpenAI "${scopeLabel}" is already bound to a different canonical SQLite ledger across processes; splitting one allowance across multiple ledger files is forbidden.`,
-      { code: 'CREDENTIAL_LEDGER_SPLIT_FORBIDDEN', notDispatched: true },
-    );
-  }
-
-  _verifyAndRegisterCanonicalLedger(scope, credentialFp = null) {
-    if (this._mainFile === '') {
-      return null;
-    }
-    const { canonicalPath: canonPath, normPathKey, devStr, inoStr } = computePhysicalIdentityRecord(this._mainFile);
-    const instanceId = this._getLedgerInstanceId();
-    const regPath = this._effectiveRegistryPath;
-
-    if (areSamePhysicalSqliteFile(regPath, this._mainFile)) {
-      throw new OpenAiBudgetError(
-        'OpenAiBudgetLedger database and canonicalRegistryPath resolve to the same physical SQLite file.',
-        { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-      );
-    }
-    this._assertPathNotPinnedLegacySource(regPath);
-    assertRegistryFileSafeBeforeWritableOpen(regPath);
-
-    mkdirSync(dirname(regPath), { recursive: true });
-    const nowIso = new Date().toISOString();
-
-    let lastErr = null;
-    for (let attempt = 1; attempt <= 12; attempt++) {
-      let regDb = null;
-      try {
-        regDb = new DatabaseSync(regPath);
-        regDb.exec('PRAGMA busy_timeout = 5000;');
-        const curMode = String(regDb.prepare('PRAGMA journal_mode').get()?.journal_mode || '').toLowerCase();
-        if (curMode !== 'wal') {
-          regDb.exec('PRAGMA journal_mode = WAL;');
-        }
-        regDb.exec('PRAGMA synchronous = FULL;');
-        regDb.exec('BEGIN IMMEDIATE');
-        try {
-          regDb.exec(CANONICAL_REGISTRY_SCHEMA_SQL);
-          ensureCanonicalRegistryColumns(regDb);
-
-          const existingScope = regDb.prepare(
-            'SELECT * FROM canonical_scope_bindings WHERE account_scope = ?',
-          ).get(scope);
-          if (existingScope) {
-            this._assertCanonicalBindingMatchesCurrent(
-              existingScope,
-              { normPathKey, devStr, inoStr, instanceId },
-              scope,
-            );
-            if (!existingScope.ledger_instance_id && instanceId) {
-              regDb.prepare(
-                'UPDATE canonical_scope_bindings SET ledger_instance_id = ? WHERE account_scope = ? AND ledger_instance_id IS NULL',
-              ).run(instanceId, scope);
-            }
-          } else {
-            regDb.prepare(`
-              INSERT INTO canonical_scope_bindings (
-                account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            `).run(scope, canonPath, normPathKey, devStr, inoStr, instanceId, nowIso);
-          }
-
-          if (credentialFp !== null && credentialFp !== undefined) {
-            const existingCred = regDb.prepare(
-              'SELECT * FROM canonical_credential_bindings WHERE credential_fingerprint_sha256 = ?',
-            ).get(credentialFp);
-            if (existingCred) {
-              if (existingCred.account_scope !== scope) {
-                throw new OpenAiPolicyError(
-                  `OpenAI credential is already bound to account_scope "${existingCred.account_scope}"; splitting one credential across multiple scopes is forbidden.`,
-                  { code: 'CREDENTIAL_SCOPE_SPLIT_FORBIDDEN', notDispatched: true },
-                );
-              }
-              this._assertCanonicalBindingMatchesCurrent(
-                existingCred,
-                { normPathKey, devStr, inoStr, instanceId },
-                existingCred.account_scope,
-              );
-              if (!existingCred.ledger_instance_id && instanceId) {
-                regDb.prepare(
-                  'UPDATE canonical_credential_bindings SET ledger_instance_id = ? WHERE credential_fingerprint_sha256 = ? AND ledger_instance_id IS NULL',
-                ).run(instanceId, credentialFp);
-              }
-            } else {
-              regDb.prepare(`
-                INSERT INTO canonical_credential_bindings (
-                  credential_fingerprint_sha256, account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-              `).run(credentialFp, scope, canonPath, normPathKey, devStr, inoStr, instanceId, nowIso);
-            }
-          }
-
-          regDb.exec('COMMIT');
-          lastErr = null;
-          break;
-        } catch (txErr) {
-          try { regDb.exec('ROLLBACK'); } catch { /* ignore */ }
-          throw txErr;
-        }
-      } catch (err) {
-        lastErr = err;
-        if (err instanceof OpenAiError) throw err;
-        if (attempt < 12 && isTransientSqliteOpenContention(err)) {
-          sleepSyncMs(15 + attempt * 15);
-          continue;
-        }
-        throw err;
-      } finally {
-        if (regDb) {
-          try { regDb.close(); } catch { /* ignore */ }
-        }
-      }
-    }
-    if (lastErr) throw lastErr;
-    return canonPath;
-  }
-
   /**
-   * Evidenced operator relocation or API key rotation for a canonical ledger scope (`P0-07`, `P1-36`).
+   * Evidenced operator API key rotation or note update for a ledger scope.
    * Requires a nonempty operator `note` and a reconciled file-backed ledger.
    */
   rotateOrRelocateCanonicalBinding({
@@ -2855,21 +2505,9 @@ export class OpenAiBudgetLedger {
       ? assertSha256Hex(newCredentialFingerprintSha256, 'newCredentialFingerprintSha256')
       : null;
 
-    const regPath = this._effectiveRegistryPath;
-    if (areSamePhysicalSqliteFile(regPath, this._mainFile)) {
-      throw new OpenAiBudgetError(
-        'OpenAiBudgetLedger database and canonicalRegistryPath resolve to the same physical SQLite file.',
-        { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-      );
-    }
-    this._assertPathNotPinnedLegacySource(regPath);
-    assertRegistryFileSafeBeforeWritableOpen(regPath);
-
-    const { canonicalPath: canonPath, normPathKey, devStr, inoStr } = computePhysicalIdentityRecord(this._mainFile);
     const now = this._nowIso();
 
     return this._withImmediateTx(() => {
-      const instanceId = this._getLedgerInstanceId();
       const existingPolicy = this.db.prepare('SELECT * FROM openai_budget_policy WHERE account_scope = ?').get(scope);
       if (!existingPolicy || existingPolicy.legacy_reconciled !== 1) {
         throw new OpenAiBudgetError(
@@ -2879,7 +2517,7 @@ export class OpenAiBudgetLedger {
       }
       if (!this.testMode && existingPolicy.baseline_mode !== 'verified_production') {
         throw new OpenAiPolicyError(
-          `Cannot bind production canonical registry for "${scope}" without a verified_production baseline.`,
+          `Cannot update production policy binding for "${scope}" without a verified_production baseline.`,
           { code: 'UNVERIFIED_SYNTHETIC_BASELINE', notDispatched: true },
         );
       }
@@ -2898,117 +2536,6 @@ export class OpenAiBudgetLedger {
       }
 
       const effectiveFp = nextFp ?? existingPolicy.credential_fingerprint_sha256 ?? null;
-      mkdirSync(dirname(regPath), { recursive: true });
-
-      let regDb = null;
-      try {
-        regDb = new DatabaseSync(regPath);
-        regDb.exec('PRAGMA busy_timeout = 5000;');
-        const curMode = String(regDb.prepare('PRAGMA journal_mode').get()?.journal_mode || '').toLowerCase();
-        if (curMode !== 'wal') {
-          regDb.exec('PRAGMA journal_mode = WAL;');
-        }
-        regDb.exec('PRAGMA synchronous = FULL;');
-        regDb.exec('BEGIN IMMEDIATE');
-        try {
-          regDb.exec(CANONICAL_REGISTRY_SCHEMA_SQL);
-          ensureCanonicalRegistryColumns(regDb);
-          const prevScopeBind = regDb.prepare(
-            'SELECT * FROM canonical_scope_bindings WHERE account_scope = ?',
-          ).get(scope);
-
-          if (nextFp !== null) {
-            const credConflict = regDb.prepare(
-              'SELECT * FROM canonical_credential_bindings WHERE credential_fingerprint_sha256 = ?',
-            ).get(nextFp);
-            if (credConflict && credConflict.account_scope !== scope) {
-              throw new OpenAiPolicyError(
-                `OpenAI credential is already bound to account_scope "${credConflict.account_scope}".`,
-                { code: 'CREDENTIAL_SCOPE_SPLIT_FORBIDDEN', notDispatched: true },
-              );
-            }
-          }
-
-          regDb.prepare(`
-            INSERT INTO canonical_scope_bindings (
-              account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_scope) DO UPDATE SET
-              canonical_path = excluded.canonical_path,
-              norm_path_key = excluded.norm_path_key,
-              dev_id = excluded.dev_id,
-              ino_id = excluded.ino_id,
-              ledger_instance_id = excluded.ledger_instance_id,
-              bound_at = excluded.bound_at
-          `).run(scope, canonPath, normPathKey, devStr, inoStr, instanceId, now);
-
-          if (nextFp !== null && existingPolicy.credential_fingerprint_sha256 && existingPolicy.credential_fingerprint_sha256 !== nextFp) {
-            regDb.prepare(
-              'DELETE FROM canonical_credential_bindings WHERE credential_fingerprint_sha256 = ? AND account_scope = ?',
-            ).run(existingPolicy.credential_fingerprint_sha256, scope);
-          }
-
-          regDb.prepare(`
-            UPDATE canonical_credential_bindings
-            SET canonical_path = ?,
-                norm_path_key = ?,
-                dev_id = ?,
-                ino_id = ?,
-                ledger_instance_id = ?,
-                bound_at = ?
-            WHERE account_scope = ?
-          `).run(canonPath, normPathKey, devStr, inoStr, instanceId, now, scope);
-
-          if (effectiveFp !== null) {
-            regDb.prepare(`
-              INSERT INTO canonical_credential_bindings (
-                credential_fingerprint_sha256, account_scope, canonical_path, norm_path_key, dev_id, ino_id, ledger_instance_id, bound_at
-              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-              ON CONFLICT(credential_fingerprint_sha256) DO UPDATE SET
-                account_scope = excluded.account_scope,
-                canonical_path = excluded.canonical_path,
-                norm_path_key = excluded.norm_path_key,
-                dev_id = excluded.dev_id,
-                ino_id = excluded.ino_id,
-                ledger_instance_id = excluded.ledger_instance_id,
-                bound_at = excluded.bound_at
-            `).run(effectiveFp, scope, canonPath, normPathKey, devStr, inoStr, instanceId, now);
-          }
-
-          regDb.prepare(`
-            INSERT INTO canonical_binding_audit (
-              account_scope, action, old_canonical_path, new_canonical_path,
-              old_dev_id, old_ino_id, new_dev_id, new_ino_id,
-              old_ledger_instance_id, new_ledger_instance_id,
-              old_credential_fp, new_credential_fp, operator_note, recorded_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `).run(
-            scope,
-            nextFp !== null ? 'rotate_or_relocate' : 'relocate',
-            prevScopeBind ? sanitizeDisplayPath(prevScopeBind.canonical_path) : null,
-            sanitizeDisplayPath(canonPath),
-            prevScopeBind?.dev_id ?? null,
-            prevScopeBind?.ino_id ?? null,
-            devStr,
-            inoStr,
-            prevScopeBind?.ledger_instance_id ?? null,
-            instanceId,
-            existingPolicy.credential_fingerprint_sha256 ?? null,
-            effectiveFp,
-            cleanNote,
-            now,
-          );
-
-          regDb.exec('COMMIT');
-        } catch (regErr) {
-          try { regDb.exec('ROLLBACK'); } catch { /* ignore */ }
-          throw regErr;
-        }
-      } finally {
-        if (regDb) {
-          try { regDb.close(); } catch { /* ignore */ }
-        }
-      }
 
       this.db.prepare(`
         UPDATE openai_budget_policy
@@ -3160,12 +2687,8 @@ export class OpenAiBudgetLedger {
     }
     const now = this._nowIso();
 
-    // P1-36: Validate local scope/credential compatibility BEFORE registering in canonical registry!
     return this._withImmediateTx(() => {
       this._bindCredentialInTx(scope, fp, now);
-      if (this._mainFile !== '') {
-        this._verifyAndRegisterCanonicalLedger(scope, fp);
-      }
       return this.getPolicy(scope);
     });
   }
@@ -3214,12 +2737,6 @@ export class OpenAiBudgetLedger {
       if (this._mainFile !== '' && areSamePhysicalSqliteFile(normExpected, this._mainFile)) {
         throw new OpenAiBudgetError(
           'expectedLegacySourcePath and destination ledger resolve to the same physical file.',
-          { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-        );
-      }
-      if (this._mainFile !== '' && areSamePhysicalSqliteFile(normExpected, this._effectiveRegistryPath)) {
-        throw new OpenAiBudgetError(
-          'expectedLegacySourcePath and canonicalRegistryPath resolve to the same physical file.',
           { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
         );
       }
@@ -3397,12 +2914,6 @@ export class OpenAiBudgetLedger {
       if (areSamePhysicalSqliteFile(verified.canonicalRealPath, this._mainFile)) {
         throw new OpenAiBudgetError(
           'Legacy budget SQLite source and destination ledger resolve to the same physical file.',
-          { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-        );
-      }
-      if (areSamePhysicalSqliteFile(verified.canonicalRealPath, this._effectiveRegistryPath)) {
-        throw new OpenAiBudgetError(
-          'Legacy budget SQLite source and canonicalRegistryPath resolve to the same physical file.',
           { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
         );
       }
@@ -4393,8 +3904,8 @@ export class OpenAiBudgetLedger {
 
   getActiveFences(accountScope = null) {
     if (!this._hasTable('openai_request_ledger')) return [];
-    const { selectSql, unfinishedCleanupWhere, unconfirmedRejectedWhere } = this._buildCompatLedgerProjection();
-    const fenceWhere = `(status IN ('in_progress', 'pending_recovery') OR ${unfinishedCleanupWhere} OR ${unconfirmedRejectedWhere})`;
+    const { selectSql, unconfirmedRejectedWhere } = this._buildCompatLedgerProjection();
+    const fenceWhere = `(status IN ('in_progress', 'pending_recovery') OR ${unconfirmedRejectedWhere})`;
     if (accountScope !== null && accountScope !== undefined) {
       const scope = assertSafeOpenAiAccountScope(accountScope);
       return this.db.prepare(`
@@ -4470,12 +3981,13 @@ export class OpenAiBudgetLedger {
         active_attempt_count: 0,
         blocking_attempt_ids: [],
         fencing_attempts: [],
+        archived_prior_month_timeouts: [],
         status_counts: Object.create(null),
       };
     }
 
-    const { selectSql, unfinishedCleanupWhere, unconfirmedRejectedWhere } = this._buildCompatLedgerProjection();
-    // P2-09 & P0-13: Query targetMonth rows plus ALL unresolved cross-month fences (including unconfirmed rejected)!
+    const { selectSql, unconfirmedRejectedWhere } = this._buildCompatLedgerProjection();
+    // Query targetMonth rows plus prior-month unresolved/timeout rows (auto-archived without locking out the new month).
     const relevantRows = this.db.prepare(`
       SELECT ${selectSql}
       FROM openai_request_ledger
@@ -4483,13 +3995,12 @@ export class OpenAiBudgetLedger {
         AND (
           month_utc = ?
           OR status IN ('in_progress', 'pending_recovery')
-          OR ${unfinishedCleanupWhere}
           OR ${unconfirmedRejectedWhere}
         )
       ORDER BY created_at ASC, attempt_id ASC
     `).all(scope, targetMonth);
 
-    let priorMonthsUnresolvedCents = 0;
+    const priorMonthsUnresolvedCents = 0;
     let sameMonthActiveReservedCents = 0;
     let sameMonthPendingRecoveryCents = 0;
     let sameMonthUnconfirmedFailureCents = 0;
@@ -4498,23 +4009,13 @@ export class OpenAiBudgetLedger {
     let sameMonthPostedBilledCents = 0;
     let sameMonthPostedEffectiveCents = 0;
     const fencingAttempts = [];
-    const hardBlockingAttemptIds = [];
+    const archivedPriorMonthTimeouts = [];
     const statusCounts = Object.create(null);
 
     for (const row of relevantRows) {
       if (row.month_utc === targetMonth) {
         incrementHistogramCount(statusCounts, row.status, 1);
       }
-
-      const effectiveCleanupReq =
-        row.cleanup_required === 1 ||
-        row.cleanup_status === 'pending_cleanup' ||
-        row.cleanup_status === 'delete_failed';
-      const unfinishedCleanup =
-        effectiveCleanupReq &&
-        row.cleanup_status !== 'deleted_verified_404' &&
-        row.status !== 'not_submitted' &&
-        row.status !== 'rejected';
 
       const unconfirmedRejectedFence =
         row.status === 'rejected' &&
@@ -4525,7 +4026,6 @@ export class OpenAiBudgetLedger {
       if (
         row.status === 'in_progress' ||
         row.status === 'pending_recovery' ||
-        unfinishedCleanup ||
         unconfirmedRejectedFence
       ) {
         const usageCeil = row.usage_cost_micros !== null && row.usage_cost_micros !== undefined
@@ -4538,40 +4038,61 @@ export class OpenAiBudgetLedger {
           ? row.posted_billed_cents
           : 0;
         const backgroundUsageCeil = microsToCeilingCents(row.background_usage_floor_micros ?? 0);
-        const holdCents = Math.max(row.reserved_cents, usageCeil, provCeil, posted, backgroundUsageCeil);
+        // Slimmed local budget policy: count ONLY actual observed/billed spend, never speculative upfront reserved_cents.
+        const realizedHoldCents = Math.max(usageCeil, provCeil, posted, backgroundUsageCeil);
+
+        if (row.month_utc !== targetMonth) {
+          // Auto-archive historical prior-month timeouts/unresolved attempts without locking out or charging the new month.
+          archivedPriorMonthTimeouts.push({
+            attempt_id: row.attempt_id,
+            logical_request_id: row.logical_request_id,
+            status: row.status,
+            month_utc: row.month_utc,
+            realized_cents: realizedHoldCents,
+            provider_response_id: row.provider_response_id ?? null,
+            diagnostic_reason: row.diagnostic_reason ?? null,
+          });
+          continue;
+        }
 
         fencingAttempts.push({
           attempt_id: row.attempt_id,
           logical_request_id: row.logical_request_id,
           status: row.status,
-          cleanup_required: Boolean(effectiveCleanupReq),
+          cleanup_required: Boolean(
+            row.cleanup_required === 1 ||
+            row.cleanup_status === 'pending_cleanup' ||
+            row.cleanup_status === 'delete_failed',
+          ),
           cleanup_status: row.cleanup_status ?? null,
           month_utc: row.month_utc,
-          reserved_cents: holdCents,
+          reserved_cents: realizedHoldCents,
           provider_response_id: row.provider_response_id ?? null,
           diagnostic_reason: row.diagnostic_reason ?? null,
         });
-        const bufferEligible = row.month_utc === targetMonth &&
-          row.status === 'pending_recovery' &&
-          !unfinishedCleanup &&
-          holdCents > 0;
-        if (!bufferEligible) hardBlockingAttemptIds.push(row.attempt_id);
-        if (row.month_utc === targetMonth) {
-          if (row.status === 'pending_recovery') sameMonthPendingRecoveryCents += holdCents;
-          if (unconfirmedRejectedFence) {
-            sameMonthUnconfirmedFailureCents += holdCents;
-          } else {
-            sameMonthActiveReservedCents += holdCents;
-          }
-          const knownOrProv = Math.max(row.usage_cost_micros ?? 0, row.provisional_usage_cost_micros ?? 0);
-          if (row.usage_cost_micros !== null || row.provisional_usage_cost_micros !== null) {
-            sameMonthKnownUsageMicros += knownOrProv;
-          }
-          if (row.posted_billed_cents !== null && row.posted_billed_cents !== undefined) {
-            sameMonthPostedBilledCents += row.posted_billed_cents;
-          }
+        if (row.status === 'pending_recovery') sameMonthPendingRecoveryCents += realizedHoldCents;
+        if (unconfirmedRejectedFence) {
+          sameMonthUnconfirmedFailureCents += realizedHoldCents;
         } else {
-          priorMonthsUnresolvedCents += holdCents;
+          sameMonthActiveReservedCents += realizedHoldCents;
+        }
+        const knownOrProv = Math.max(
+          row.usage_cost_micros ?? 0,
+          row.provisional_usage_cost_micros ?? 0,
+          row.background_usage_floor_micros ?? 0,
+        );
+        if (
+          row.usage_cost_micros !== null ||
+          row.provisional_usage_cost_micros !== null ||
+          (row.background_usage_floor_micros ?? 0) > 0
+        ) {
+          sameMonthKnownUsageMicros += knownOrProv;
+        }
+        if (row.posted_billed_cents !== null && row.posted_billed_cents !== undefined) {
+          sameMonthPostedBilledCents += row.posted_billed_cents;
+          sameMonthPostedEffectiveCents += Math.max(row.posted_billed_cents, usageCeil, provCeil, backgroundUsageCeil);
+        } else if (knownOrProv > 0) {
+          sameMonthUnbilledUsageMicros += knownOrProv;
         }
         continue;
       }
@@ -4579,27 +4100,31 @@ export class OpenAiBudgetLedger {
       if (row.month_utc !== targetMonth) continue;
       if (row.status === 'not_submitted') continue;
 
-      const rowKnownOrProvMicros = Math.max(row.usage_cost_micros ?? 0, row.provisional_usage_cost_micros ?? 0);
-      if (row.usage_cost_micros !== null || row.provisional_usage_cost_micros !== null) {
+      const hasAuthoritativeUsage = row.usage_cost_micros !== null && row.usage_cost_micros !== undefined;
+      const rowKnownOrProvMicros = hasAuthoritativeUsage
+        ? row.usage_cost_micros
+        : Math.max(
+            row.provisional_usage_cost_micros ?? 0,
+            row.background_usage_floor_micros ?? 0,
+          );
+      if (
+        hasAuthoritativeUsage ||
+        row.provisional_usage_cost_micros !== null ||
+        (row.background_usage_floor_micros ?? 0) > 0
+      ) {
         sameMonthKnownUsageMicros += rowKnownOrProvMicros;
       }
       if (row.posted_billed_cents !== null && row.posted_billed_cents !== undefined) {
         sameMonthPostedBilledCents += row.posted_billed_cents;
       }
 
+      const rowEffectiveCeil = microsToCeilingCents(rowKnownOrProvMicros);
+
       if (row.status === 'completed') {
-        const usageCeil = row.usage_cost_micros !== null && row.usage_cost_micros !== undefined
-          ? microsToCeilingCents(row.usage_cost_micros)
-          : 0;
-        const provCeil = row.provisional_usage_cost_micros !== null && row.provisional_usage_cost_micros !== undefined
-          ? microsToCeilingCents(row.provisional_usage_cost_micros)
-          : 0;
         if (row.posted_billed_cents !== null && row.posted_billed_cents !== undefined) {
-          sameMonthPostedEffectiveCents += Math.max(row.posted_billed_cents, usageCeil, provCeil);
-        } else if (row.usage_cost_micros !== null && row.usage_cost_micros !== undefined) {
-          sameMonthUnbilledUsageMicros += Math.max(row.usage_cost_micros, row.provisional_usage_cost_micros ?? 0);
-        } else {
-          sameMonthActiveReservedCents += Math.max(row.reserved_cents, provCeil);
+          sameMonthPostedEffectiveCents += Math.max(row.posted_billed_cents, rowEffectiveCeil);
+        } else if (rowKnownOrProvMicros > 0) {
+          sameMonthUnbilledUsageMicros += rowKnownOrProvMicros;
         }
         continue;
       }
@@ -4609,26 +4134,15 @@ export class OpenAiBudgetLedger {
           row.confirmed_zero_charge === 1 &&
           !(row.posted_billed_cents > 0) &&
           !(row.usage_cost_micros > 0) &&
-          !(row.provisional_usage_cost_micros > 0)
+          !(row.provisional_usage_cost_micros > 0) &&
+          !(hasAuthoritativeUsage ? false : (row.background_usage_floor_micros ?? 0) > 0)
         ) {
           continue;
         }
-        const usageCeil = row.usage_cost_micros !== null && row.usage_cost_micros !== undefined
-          ? microsToCeilingCents(row.usage_cost_micros)
-          : 0;
-        const provCeil = row.provisional_usage_cost_micros !== null && row.provisional_usage_cost_micros !== undefined
-          ? microsToCeilingCents(row.provisional_usage_cost_micros)
-          : 0;
-        if (row.posted_billed_cents !== null && row.posted_billed_cents !== undefined) {
-          if (row.posted_billed_cents === 0 && (row.usage_cost_micros === null || row.usage_cost_micros === undefined)) {
-            sameMonthUnconfirmedFailureCents += Math.max(row.reserved_cents, provCeil);
-          } else {
-            sameMonthPostedEffectiveCents += Math.max(row.posted_billed_cents, usageCeil, provCeil);
-          }
-        } else if (row.usage_cost_micros !== null && row.usage_cost_micros !== undefined) {
-          sameMonthUnbilledUsageMicros += Math.max(row.usage_cost_micros, row.provisional_usage_cost_micros ?? 0);
-        } else {
-          sameMonthUnconfirmedFailureCents += Math.max(row.reserved_cents, provCeil);
+        if (row.posted_billed_cents !== null && row.posted_billed_cents !== undefined && row.posted_billed_cents > 0) {
+          sameMonthPostedEffectiveCents += Math.max(row.posted_billed_cents, rowEffectiveCeil);
+        } else if (rowKnownOrProvMicros > 0) {
+          sameMonthUnbilledUsageMicros += rowKnownOrProvMicros;
         }
       }
     }
@@ -4636,18 +4150,14 @@ export class OpenAiBudgetLedger {
     const sameMonthKnownUsageCentsCeiling = microsToCeilingCents(sameMonthKnownUsageMicros);
     const sameMonthUnbilledUsageCentsCeiling = microsToCeilingCents(sameMonthUnbilledUsageMicros);
     const currentMonthCommittedCents =
-      sameMonthActiveReservedCents +
-      sameMonthUnconfirmedFailureCents +
       sameMonthPostedEffectiveCents +
       sameMonthUnbilledUsageCentsCeiling;
     const effectiveCommittedCents =
       legacyCarryoverCents +
-      priorMonthsUnresolvedCents +
       currentMonthCommittedCents;
-    // A positive buffer relaxes admission for same-month recovery only; every hold still consumes budget.
-    const blockingAttemptIds = sameMonthPendingBufferCents === 0 || sameMonthPendingRecoveryCents > sameMonthPendingBufferCents
-      ? fencingAttempts.map(attempt => attempt.attempt_id)
-      : hardBlockingAttemptIds;
+    // Slimmed local budget policy: never globally lock out the entire account on a timeout or cross-month hold;
+    // duplicate retries remain blocked per-request via DUPLICATE_LOGICAL_REQUEST and DUPLICATE_PENDING_PAYLOAD.
+    const blockingAttemptIds = [];
 
     return {
       account_scope: scope,
@@ -4668,10 +4178,11 @@ export class OpenAiBudgetLedger {
       current_month_committed_cents: currentMonthCommittedCents,
       effective_committed_cents: effectiveCommittedCents,
       remaining_cents: Math.max(0, cappedMonthlyLimitCents - effectiveCommittedCents),
-      fenced: blockingAttemptIds.length > 0,
+      fenced: false,
       active_attempt_count: fencingAttempts.length,
       blocking_attempt_ids: blockingAttemptIds,
       fencing_attempts: fencingAttempts,
+      archived_prior_month_timeouts: archivedPriorMonthTimeouts,
       status_counts: statusCounts,
     };
   }
@@ -4937,7 +4448,9 @@ export class OpenAiBudgetLedger {
 
     const pSha = assertSha256Hex(payloadSha256, 'payloadSha256');
     const pktSha = packetSha256 ? assertSha256Hex(packetSha256, 'packetSha256') : null;
-    const cents = assertPositiveInt(reservedCents, 'reservedCents');
+    const cents = reservedCents === undefined || reservedCents === null
+      ? 0
+      : assertNonNegInt(reservedCents, 'reservedCents');
     const estIn = estimatedInputTokens !== null && estimatedInputTokens !== undefined
       ? assertNonNegInt(estimatedInputTokens, 'estimatedInputTokens')
       : null;
@@ -5101,74 +4614,49 @@ export class OpenAiBudgetLedger {
       if (cleanFp !== null) {
         this._bindCredentialInTx(scope, cleanFp, now);
       }
-      if (
-        this._mainFile !== '' &&
-        (!this.testMode || isLiveTransport || cleanFp !== null || this._canonicalRegistryPath !== null)
-      ) {
-        this._verifyAndRegisterCanonicalLedger(scope, cleanFp);
-      }
 
-      // 4. Enforce cross-month and active-dispatch fences and the same-month recovery buffer.
+      // 4. Prevent duplicate automatic retries of an identical in-flight or timed-out payload (POST 0 auto-retry),
+      // including across month rollover so an unresolved attempt is recovered via GET rather than POSTed twice,
+      // while never locking out distinct new jobs in a new month.
       const summary = this.getMonthlySummary({ accountScope: scope, monthUtc: month });
-      if (summary.fenced) {
-        const blocker = summary.fencing_attempts.find(attempt => attempt.attempt_id === summary.blocking_attempt_ids[0]);
+      const matchingHold = this.db.prepare(`
+        SELECT attempt_id, logical_request_id
+        FROM openai_request_ledger
+        WHERE account_scope = ? AND endpoint = ?
+          AND payload_sha256 = ? AND status IN ('in_progress', 'pending_recovery')
+        ORDER BY created_at ASC, attempt_id ASC
+        LIMIT 1
+      `).get(scope, cleanEndpoint, pSha);
+      if (matchingHold) {
         throw new OpenAiBudgetError(
-          `OpenAI account_scope "${scope}" is fenced by unresolved ${blocker.status} request "${blocker.logical_request_id}" (attempt=${blocker.attempt_id}, month=${blocker.month_utc}, reserved_cents=${blocker.reserved_cents}). Recover or reconcile before submitting new billable requests.`,
+          'The same OpenAI payload already has an unresolved attempt. Recover or reconcile it before resubmitting.',
           {
-            code: 'ACCOUNT_FENCED_PENDING_RECOVERY',
+            code: 'DUPLICATE_PENDING_PAYLOAD',
             notDispatched: true,
             details: {
-              blocking_attempt_id: blocker.attempt_id,
-              blocking_logical_request_id: blocker.logical_request_id,
-              blocking_status: blocker.status,
-              blocking_month_utc: blocker.month_utc,
-              blocking_reserved_cents: blocker.reserved_cents,
-              same_month_pending_recovery_cents: summary.same_month_pending_recovery_cents,
-              same_month_pending_buffer_cents: summary.same_month_pending_buffer_cents,
+              blocking_attempt_id: matchingHold.attempt_id,
+              blocking_logical_request_id: matchingHold.logical_request_id,
             },
           },
         );
       }
 
-      // A buffer permits distinct work. An unresolved payload cannot be replayed with a fresh logical ID.
-      if (summary.same_month_pending_recovery_cents > 0) {
-        const matchingHold = this.db.prepare(`
-          SELECT attempt_id, logical_request_id
-          FROM openai_request_ledger
-          WHERE account_scope = ? AND month_utc = ? AND endpoint = ?
-            AND payload_sha256 = ? AND status = 'pending_recovery'
-          ORDER BY created_at ASC, attempt_id ASC
-          LIMIT 1
-        `).get(scope, month, cleanEndpoint, pSha);
-        if (matchingHold) {
-          throw new OpenAiBudgetError(
-            'The same OpenAI payload already has an unresolved attempt. Recover or reconcile it before resubmitting.',
-            {
-              code: 'DUPLICATE_PENDING_PAYLOAD',
-              details: {
-                blocking_attempt_id: matchingHold.attempt_id,
-                blocking_logical_request_id: matchingHold.logical_request_id,
-              },
-            },
-          );
-        }
-      }
-
-      // 5. Enforce monthly ceiling ($200/month max), including downstream batch headroom on /v1/files uploads!
+      // 5. Enforce natural-month realized spend ceiling ($200/month max; zero upfront speculative per-call cap freeze).
       const effectiveLimitCents = Math.min(MAX_MONTHLY_LIMIT_CENTS, rawPolicyRow.monthly_limit_cents);
-      const downstreamBatchEst = Number.isSafeInteger(batchManifest?.estimated_reservation_cents) && batchManifest.estimated_reservation_cents > cents
-        ? batchManifest.estimated_reservation_cents
-        : cents;
-      if (summary.effective_committed_cents + downstreamBatchEst > effectiveLimitCents) {
+      if (
+        effectiveLimitCents <= 0 ||
+        summary.effective_committed_cents >= effectiveLimitCents ||
+        (cents > 0 && summary.effective_committed_cents + cents > effectiveLimitCents)
+      ) {
         throw new OpenAiBudgetError(
-          `OpenAI monthly budget exceeded for "${scope}" in ${month}: committed=${summary.effective_committed_cents}c + requested=${downstreamBatchEst}c > limit=${effectiveLimitCents}c.`,
+          `OpenAI monthly budget exceeded for "${scope}" in ${month}: committed=${summary.effective_committed_cents}c + requested=${cents}c >= limit=${effectiveLimitCents}c.`,
           {
             code: 'MONTHLY_BUDGET_EXCEEDED',
             notDispatched: true,
             details: {
               month_utc: month,
               committed_cents: summary.effective_committed_cents,
-              requested_cents: downstreamBatchEst,
+              requested_cents: cents,
               monthly_limit_cents: effectiveLimitCents,
             },
           },
@@ -5600,26 +5088,9 @@ export class OpenAiBudgetLedger {
       }
 
       const summary = this.getMonthlySummary({ accountScope: scope, monthUtc: existing.month_utc });
-      const externalBlockerId = summary.blocking_attempt_ids.find(id => id !== existing.attempt_id);
-      if (externalBlockerId) {
-        const reason = `Account "${scope}" became fenced by attempt "${externalBlockerId}" before POST /v1/batches; aborting batch creation.`;
-        return abortAndRejectAttempt(
-          reason,
-          new OpenAiBudgetError(reason, {
-            code: 'ACCOUNT_FENCED_PENDING_RECOVERY',
-            notDispatched: false,
-            details: {
-              attempt_id: existing.attempt_id,
-              blocking_attempt_id: externalBlockerId,
-              uploaded_file_id: cleanFileId,
-            },
-          }),
-        );
-      }
-
       const effectiveLimitCents = Math.min(MAX_MONTHLY_LIMIT_CENTS, policyRow.monthly_limit_cents);
-      if (summary.effective_committed_cents > effectiveLimitCents) {
-        const reason = `OpenAI monthly_limit_cents (${effectiveLimitCents}c) was lowered below committed spend (${summary.effective_committed_cents}c) before POST /v1/batches; aborting batch creation.`;
+      if (effectiveLimitCents <= 0 || summary.effective_committed_cents >= effectiveLimitCents) {
+        const reason = `OpenAI monthly_limit_cents (${effectiveLimitCents}c) was lowered to or below committed spend (${summary.effective_committed_cents}c) before POST /v1/batches; aborting batch creation.`;
         return abortAndRejectAttempt(
           reason,
           new OpenAiBudgetError(reason, {
@@ -5743,8 +5214,12 @@ export class OpenAiBudgetLedger {
       if (
         existing.raw_receipt_json === null ||
         existing.raw_receipt_sha256 === null ||
-        existing.usage_cost_micros === null ||
-        (!existing.terminal_outcome_status && existing.status !== 'completed' && existing.status !== 'failed_known')
+        (existing.usage_cost_micros === null && existing.posted_billed_cents === null && !existing.confirmed_zero_charge) ||
+        (!existing.terminal_outcome_status &&
+          existing.status !== 'completed' &&
+          existing.status !== 'failed_known' &&
+          existing.posted_billed_cents === null &&
+          !existing.confirmed_zero_charge)
       ) {
         throw new OpenAiPolicyError(
           `Refusing DELETE /v1/responses/${cleanRespId} before receipt and usage are persisted on attempt "${existing.attempt_id}".`,
@@ -5788,7 +5263,6 @@ export class OpenAiBudgetLedger {
         SET cleanup_required = 1,
             cleanup_status = CASE WHEN cleanup_status = 'deleted_verified_404' THEN cleanup_status ELSE 'pending_cleanup' END,
             terminal_outcome_status = ?,
-            status = CASE WHEN cleanup_status = 'deleted_verified_404' THEN status ELSE 'pending_recovery' END,
             background_delete_dispatched_at = CASE WHEN background_mode = 1 THEN ? ELSE NULL END,
             updated_at = ?
         WHERE attempt_id = ?
@@ -6064,27 +5538,18 @@ export class OpenAiBudgetLedger {
       }
 
       let persistedStatus = status;
-      // P0-05: Monotonic deleted_verified_404 — never regress cleanup_status away from deleted_verified_404!
+      // Monotonic deleted_verified_404 — never regress cleanup_status away from deleted_verified_404;
+      // remote DELETE cleanup status is tracked advisory-only without demoting terminal status or locking the account.
       let persistedCleanupStatus = alreadyVerified404
         ? 'deleted_verified_404'
         : (cleanupStatus !== undefined
           ? cleanupStatus
           : (existing.cleanup_status ?? (effectiveCleanupReq ? 'pending_cleanup' : 'not_requested')));
-      let nextTerminalOutcomeStatus = existing.terminal_outcome_status ?? null;
-
-      if (effectiveCleanupReq && !alreadyVerified404) {
-        if (status === 'completed' || status === 'failed_known') {
-          nextTerminalOutcomeStatus = mergedRespId ? status : null;
-          persistedStatus = 'pending_recovery';
-          if (!persistedCleanupStatus || persistedCleanupStatus === 'not_requested') {
-            persistedCleanupStatus = 'pending_cleanup';
-          }
-        } else if (status === 'rejected' && mergedRespId) {
-          persistedStatus = 'pending_recovery';
-          if (!persistedCleanupStatus || persistedCleanupStatus === 'not_requested') {
-            persistedCleanupStatus = 'pending_cleanup';
-          }
-        }
+      let nextTerminalOutcomeStatus = existing.terminal_outcome_status ?? (
+        (status === 'completed' || status === 'failed_known') ? status : null
+      );
+      if (effectiveCleanupReq && !alreadyVerified404 && (!persistedCleanupStatus || persistedCleanupStatus === 'not_requested')) {
+        persistedCleanupStatus = 'pending_cleanup';
       }
 
       let nextManifestJson = existing.batch_manifest_json ?? null;
@@ -6328,7 +5793,7 @@ export class OpenAiBudgetLedger {
       if (
         existing.raw_receipt_json === null ||
         existing.raw_receipt_sha256 === null ||
-        existing.usage_cost_micros === null ||
+        (existing.usage_cost_micros === null && existing.posted_billed_cents === null && !existing.confirmed_zero_charge) ||
         (!existing.terminal_outcome_status && existing.status !== 'completed' && existing.status !== 'failed_known')
       ) {
         throw new OpenAiPolicyError(
@@ -6354,7 +5819,6 @@ export class OpenAiBudgetLedger {
             delete_ack_at = COALESCE(delete_ack_at, ?),
             delete_ack_receipt_json = COALESCE(delete_ack_receipt_json, ?),
             terminal_outcome_status = COALESCE(terminal_outcome_status, ?),
-            status = CASE WHEN cleanup_status = 'deleted_verified_404' THEN status ELSE 'pending_recovery' END,
             cleanup_status = CASE WHEN cleanup_status = 'deleted_verified_404' THEN cleanup_status ELSE 'pending_cleanup' END,
             updated_at = ?
         WHERE attempt_id = ?
@@ -6407,7 +5871,10 @@ export class OpenAiBudgetLedger {
           { code: 'DELETE_WITHOUT_VERIFIED_ORIGINAL_BYTES_FORBIDDEN' },
         );
       }
-      if (existing.raw_receipt_json === null || existing.usage_cost_micros === null) {
+      if (
+        existing.raw_receipt_json === null ||
+        (existing.usage_cost_micros === null && existing.posted_billed_cents === null && !existing.confirmed_zero_charge)
+      ) {
         throw new OpenAiBudgetError(
           `Cannot finalize cleanup on attempt "${existing.attempt_id}" without persisted receipt and usage_cost_micros.`,
           { code: 'MISSING_COMPLETED_RECEIPT' },
@@ -6464,7 +5931,6 @@ export class OpenAiBudgetLedger {
         return existing;
       }
       const isFailureOrPending = cleanupStatus === 'delete_failed' || cleanupStatus === 'pending_cleanup';
-      const nextStatus = isFailureOrPending ? 'pending_recovery' : existing.status;
       const preservedTerminal = existing.terminal_outcome_status ?? (
         isFailureOrPending && ['completed', 'failed_known'].includes(existing.status)
           ? existing.status
@@ -6472,15 +5938,13 @@ export class OpenAiBudgetLedger {
       );
       this.db.prepare(`
         UPDATE openai_request_ledger
-        SET status = ?,
-            cleanup_required = CASE WHEN ? = 1 THEN 1 ELSE cleanup_required END,
+        SET cleanup_required = CASE WHEN ? = 1 THEN 1 ELSE cleanup_required END,
             cleanup_status = ?,
             terminal_outcome_status = COALESCE(terminal_outcome_status, ?),
             diagnostic_reason = COALESCE(?, diagnostic_reason),
             updated_at = ?
         WHERE attempt_id = ?
       `).run(
-        nextStatus,
         isFailureOrPending ? 1 : 0,
         cleanupStatus,
         preservedTerminal,
@@ -6729,6 +6193,17 @@ export class OpenAiBudgetLedger {
           nextCleanupReq = 0;
           nextCleanupStatus = 'not_requested';
           nextConfirmedNotCreated = 1;
+        } else if (
+          existing.raw_receipt_json !== null &&
+          (hasStrictlyPositiveVerifiedCharge ||
+            (targetStatus === 'failed_known' && confirmedZeroCharge))
+        ) {
+          // Allow accounting terminal state to settle independently when charge evidence and local receipt
+          // are persisted, keeping remote cleanup tracked explicitly as pending_cleanup without deadlocking.
+          nextCleanupReq = 1;
+          nextCleanupStatus = (nextCleanupStatus && nextCleanupStatus !== 'not_requested')
+            ? nextCleanupStatus
+            : 'pending_cleanup';
         } else {
           throw new OpenAiBudgetError(
             `Attempt "${existing.attempt_id}" requires remote cleanup verification via bound DELETE 200 + GET 404 readback (or confirmedZeroCharge: true + confirmedNotCreatedRemotely: true when never created remotely) before settling to "${targetStatus}".`,
@@ -6840,16 +6315,9 @@ function extractSqliteMainFileFromDbOrTarget(dbOrLedger) {
 
 /**
  * Reconcile an inspected legacy budget summary (or legacy DB path) into a target store/DB/ledger.
- * Checks physical file-identity collision against BOTH destination ledger and canonicalRegistryPath
- * BEFORE opening any writable store/ledger or running DDL!
+ * Checks physical file-identity collision against destination ledger BEFORE opening any writable store/ledger or running DDL.
  */
 export function reconcileLegacyBudgetIntoStore(dbOrLedger, legacySummaryOrPath, options = {}) {
-  if (options.testMode !== true && options.canonicalRegistryPath !== null && options.canonicalRegistryPath !== undefined) {
-    throw new OpenAiPolicyError(
-      'canonicalRegistryPath overrides are forbidden when testMode is false; production ledgers always bind to the authoritative per-user registry.',
-      { code: 'CUSTOM_CANONICAL_REGISTRY_FORBIDDEN', notDispatched: true },
-    );
-  }
   const destInfo = extractSqliteMainFileFromDbOrTarget(dbOrLedger);
   let srcPath = null;
   if (typeof legacySummaryOrPath === 'string') {
@@ -6871,10 +6339,6 @@ export function reconcileLegacyBudgetIntoStore(dbOrLedger, legacySummaryOrPath, 
     throw new OpenAiValidationError('legacySummaryOrPath must be a file path string or inspected summary object.');
   }
 
-  const effectiveRegCandidate = options.testMode === true
-    ? (options.canonicalRegistryPath ? normalizeFilesystemPathInput(options.canonicalRegistryPath) : getDefaultTestModeRegistryPath())
-    : resolveProductionCanonicalRegistryPath();
-
   if (srcPath) {
     if (!destInfo.isMemory) {
       if (!destInfo.mainFile) {
@@ -6890,18 +6354,6 @@ export function reconcileLegacyBudgetIntoStore(dbOrLedger, legacySummaryOrPath, 
         );
       }
     }
-    if (effectiveRegCandidate && areSamePhysicalSqliteFile(srcPath, effectiveRegCandidate)) {
-      throw new OpenAiBudgetError(
-        'Legacy budget SQLite source and canonicalRegistryPath resolve to the same physical file.',
-        { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-      );
-    }
-  }
-  if (!destInfo.isMemory && destInfo.mainFile && effectiveRegCandidate && areSamePhysicalSqliteFile(destInfo.mainFile, effectiveRegCandidate)) {
-    throw new OpenAiBudgetError(
-      'Destination OpenAiBudgetLedger and canonicalRegistryPath resolve to the same physical file.',
-      { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
-    );
   }
 
   const summary = typeof legacySummaryOrPath === 'string'
@@ -6913,7 +6365,6 @@ export function reconcileLegacyBudgetIntoStore(dbOrLedger, legacySummaryOrPath, 
   }
   const ledger = new OpenAiBudgetLedger(dbOrLedger, {
     testMode: Boolean(options.testMode === true),
-    canonicalRegistryPath: options.testMode === true ? (options.canonicalRegistryPath ?? null) : null,
   });
   try {
     return ledger.reconcileLegacySummary(summary, options);

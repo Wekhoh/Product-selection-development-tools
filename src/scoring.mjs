@@ -1,7 +1,8 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
 import { validEvidenceDate as validDate } from './observations.mjs';
 import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS } from './economics.mjs';
-import { resolveEffectivePricing } from './fee-basis.mjs';
+import { resolveEffectivePricing, resolveUniquePackageByRef, hasProhibited2026PeakExtrapolation } from './fee-basis.mjs';
+import { lookupUnifiedFulfillmentFee2027 } from './fba-rates-2027.mjs';
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -264,8 +265,17 @@ function scoreMetric(item, input, ctx, profile) {
   let validScope;
   if (item.id === 'purchase_demand_scale') {
     const allowedGrains = profile.revision >= 59
-      ? new Set(['parent_units', 'target_child_units'])
+      ? new Set(['parent_units', 'family_units', 'target_child_units'])
       : new Set(['parent_units']);
+    const isSingleOrMedianStat = [input?.grain, input?.scope, input?.basis, input?.aggregation, input?.statistic, input?.method].some(
+      v => typeof v === 'string' && /(?:single_color|single_child|single_variant|\bmedian\b|\bp50\b|\baverage\b|\bmean\b)/i.test(v),
+    ) || input?.single_child_only === true || input?.is_median === true;
+    if (isSingleOrMedianStat) {
+      return missing(item, 'purchase_demand_scale requires category comparable total sales and cannot use a single-variant or median statistic.', input);
+    }
+    if (profile.revision >= 59 && input?.grain === 'target_child_units' && !Object.hasOwn(input, 'value_range')) {
+      return missing(item, 'purchase_demand_scale with target_child_units requires a coherent deduplicated niche value_range (point target_child_units belongs only to Q31).', input);
+    }
     validScope = input?.window_days === 30 && input.window_basis === 'latest_30_days' &&
       input.coverage_supported === true && input.deduplicated === true &&
       ['niche', 'period', 'grain'].every(key => text(input[key])) &&
@@ -291,9 +301,31 @@ function scoreMetric(item, input, ctx, profile) {
   return reading.value === null ? missing(item, reading.reason, input) : scored(item, numericScore(item, reading.value), input);
 }
 
-function scoreJudgment(item, input, ctx) {
+function scoreJudgment(item, input, ctx, profile = null, candidate = null) {
   if (input?.anchor === null || input?.anchor === undefined) {
     return missing(item, text(input?.reason) ? input.reason : 'The rubric judgment is unavailable and needs evidence.', input);
+  }
+  if ((profile?.revision ?? 0) >= 59 && item.id === 'feasible_light_differentiation') {
+    if (input?.reviews_inspected === false) {
+      return missing(item, 'feasible_light_differentiation cannot score when reviews_inspected is false.', input);
+    }
+    if (Array.isArray(input?.review_citations) && input.review_citations.length > 0) {
+      const targetAsin = text(input?.target_variant_asin)
+        ? input.target_variant_asin.trim().toUpperCase()
+        : (text(candidate?.screening?.reference_price_usd?.target_variant_asin)
+          ? candidate.screening.reference_price_usd.target_variant_asin.trim().toUpperCase()
+          : null);
+      const targetSkuText = text(input?.target_sku) ? input.target_sku.trim().toLowerCase() : null;
+      const hasMatchingTargetSkuCitation = input.review_citations.some(
+        c => c?.sku_verified === true &&
+          c?.sku_matches_target !== false &&
+          (!targetAsin || !text(c?.asin) || c.asin.trim().toUpperCase() === targetAsin) &&
+          (!targetSkuText || !text(c?.variant_sku) || c.variant_sku.trim().toLowerCase() === targetSkuText),
+      );
+      if (!hasMatchingTargetSkuCitation) {
+        return missing(item, 'feasible_light_differentiation review_citations do not match a SKU-verified review on target_variant_asin.', input);
+      }
+    }
   }
   if (!input || !text(input.reason) || !hasEvidence(input.evidence, ctx) || input.supported === false || input.material_conflict === true) {
     return missing(item, input?.reason ?? 'A bounded judgment needs a reason and valid evidence references.', input);
@@ -308,25 +340,47 @@ function scoreJudgment(item, input, ctx) {
   });
 }
 
-function scoreMarket(item, market, ctx) {
+function scoreMarket(item, market, ctx, profile = null) {
+  const isR59 = (profile?.revision ?? 0) >= 59;
   const concentration = { product_dispersion: 'product', brand_dispersion: 'brand', seller_dispersion: 'seller' }[item.id];
-  const input = concentration ? market?.concentrations?.[concentration] :
-    market?.newcomer?.[item.id === 'new_product_count_share' ? 'count_share' : 'unit_sales_share'];
+  const flatConcMap = {
+    product_dispersion: market?.product_concentration_top10,
+    brand_dispersion: market?.brand_concentration_top10,
+    seller_dispersion: market?.seller_concentration_top10,
+  };
+  const flatNewMap = {
+    new_product_count_share: market?.newcomer_count_share,
+    new_product_sales_share: market?.newcomer_sales_share,
+  };
+  const input = concentration
+    ? (market?.concentrations?.[concentration] ?? (isR59 ? flatConcMap[item.id] : undefined))
+    : (market?.newcomer?.[item.id === 'new_product_count_share' ? 'count_share' : 'unit_sales_share'] ?? (isR59 ? flatNewMap[item.id] : undefined));
+  const effectivePeriod = market?.period ?? (isR59 ? (market?.archive_month ?? market?.dataMonth ?? null) : null);
+  const effectiveHeadGroup = market?.head_group ?? (isR59 && concentration && flatConcMap[item.id] ? 'top10' : null);
+  const effectiveEvidence = market?.evidence ?? (isR59 ? input?.evidence : undefined);
   const commonValid = market?.provider === 'sellersprite' && market.relevant === true &&
-    ['report_id', 'population', 'family_basis', 'period'].every(key => text(market[key])) &&
-    hasEvidence(market.evidence, ctx) && (!input?.report_id || input.report_id === market.report_id);
-  if (!commonValid || (concentration && !text(market.head_group))) {
+    ['report_id', 'population', 'family_basis'].every(key => text(market[key])) &&
+    text(effectivePeriod) &&
+    hasEvidence(effectiveEvidence, ctx) && (!input?.report_id || input.report_id === market.report_id);
+  if (!commonValid || (concentration && !text(effectiveHeadGroup))) {
     return missing(item, input?.reason ?? 'One relevant source-native report with compatible population, period and basis is required.', input);
   }
-  if (!concentration && (market.newcomer_age_months !== 3 || market.newcomer_sales_window !== 'latest_30_days')) {
-    return missing(item, 'Native newcomer shares require the same three-month report and latest-30-day unit window.', input);
+  const effectiveAgeMonths = market.newcomer_age_months ?? (isR59 && market.archive_basis === 'sellersprite_latest_monthly_archive' ? 3 : null);
+  const effectiveSalesWin = market.newcomer_sales_window ?? (isR59 ? (input?.window ?? (market.archive_basis === 'sellersprite_latest_monthly_archive' ? 'latest_monthly_archive' : null)) : null);
+  const allowedSalesWindows = isR59
+    ? new Set(['latest_30_days', 'latest_monthly_archive', 'monthly_archive', 'NEAR_30_DAYS'])
+    : new Set(['latest_30_days']);
+  if (!concentration && (effectiveAgeMonths !== 3 || !allowedSalesWindows.has(effectiveSalesWin))) {
+    return missing(item, isR59
+      ? 'Native newcomer shares require a three-month report using latest_30_days or SellerSprite latest monthly archive.'
+      : 'Native newcomer shares require the same three-month report and latest-30-day unit window.', input);
   }
   if (!concentration && input && Object.hasOwn(input, 'denominator') && (!number(input.denominator) || input.denominator <= 0)) {
     return missing(item, 'A supplied native ratio denominator must be supported and positive; zero or unknown is not a zero share.', input);
   }
   const reading = readNumber(input, 'fraction', ctx, { max: 1 });
   return reading.value === null ? missing(item, reading.reason, input) : scored(item, numericScore(item, reading.value), input,
-    { report_id: market.report_id, source_population: market.population, period: market.period, family_basis: market.family_basis });
+    { report_id: market.report_id, source_population: market.population, period: effectivePeriod, family_basis: market.family_basis });
 }
 
 function bidSource(input, source, bids, ctx, profile = null) {
@@ -650,7 +704,14 @@ function scoreNatural(member, ctx, profile, cohortPeriod = null, cohortGrain = n
     return { score: null, reason: input?.reason ?? 'A SIF overall share needs identified period, subject and relevant-entry evidence.', input };
   }
   if (profile.revision >= 58) {
-    if (cohortPeriod !== null && (input.period !== cohortPeriod || (input.window_days !== undefined && input.window_days !== 30))) {
+    const isNear30Cohort = profile.revision >= 59 && /^NEAR_30_DAYS(?:@\d{4}-\d{2}-\d{2})?$/i.test(String(cohortPeriod ?? '').trim());
+    const validNear30NatPeriod = isNear30Cohort && (
+      input.period === cohortPeriod ||
+      /^NEAR_30_DAYS(?:@\d{4}-\d{2}-\d{2})?$/i.test(input.period.trim()) ||
+      input.period.trim() === 'latelyDay_30' ||
+      /^\d{4}-\d{2}-\d{2}\/\d{4}-\d{2}-\d{2}$/.test(input.period.trim())
+    );
+    if (cohortPeriod !== null && ((!validNear30NatPeriod && input.period !== cohortPeriod) || (input.window_days !== undefined && input.window_days !== 30))) {
       return { score: null, reason: 'Natural visibility period must align with the cohort latest-30-day period.', input };
     }
     if (input.source !== undefined && !/\bsif\b/i.test(String(input.source))) {
@@ -1188,11 +1249,22 @@ const R58_VALID_NEWCOMER_GRAINS = new Set(['parent_units', 'family', 'family_rep
 const R58_VALID_COMPARABILITY = new Set(['comparable', 'same_task', 'excluded_different_task']);
 const R58_COMPARABLE_VERDICTS = new Set(['comparable', 'same_task']);
 const INTERNAL_PERIOD_TOKEN = Symbol('INTERNAL_OPERATING_PERIOD');
-const stripInternalRat = ({ e_rat: _unused, ...rest }) => rest;
+const stripInternalRat = ({ e_rat: _unused, e_rat_hi: _unusedHi, ...rest }) => rest;
 
-function isAlignedLatest30DayPeriod(period, obsCal) {
+function isAlignedLatest30DayPeriod(period, obsCal, isR59 = false) {
   if (!text(period) || !obsCal) return false;
-  const m = /^(\d{4}-\d{2}-\d{2})\/(\d{4}-\d{2}-\d{2})$/.exec(period.trim());
+  const trimmed = period.trim();
+  if (isR59) {
+    const nearMatch = /^NEAR_30_DAYS(?:@(\d{4}-\d{2}-\d{2}))?$/i.exec(trimmed);
+    if (nearMatch) {
+      if (!nearMatch[1]) return true;
+      const anchorCal = toUsSiteCalendarDate(nearMatch[1]);
+      if (!anchorCal) return false;
+      const lag = calendarDayDiff(obsCal, anchorCal);
+      return lag >= 0 && lag <= 5;
+    }
+  }
+  const m = /^(\d{4}-\d{2}-\d{2})\/(\d{4}-\d{2}-\d{2})$/.exec(trimmed);
   if (!m) return false;
   const fromCal = toUsSiteCalendarDate(m[1]);
   const throughCal = toUsSiteCalendarDate(m[2]);
@@ -1200,7 +1272,7 @@ function isAlignedLatest30DayPeriod(period, obsCal) {
   const spanDays = calendarDayDiff(throughCal, fromCal) + 1;
   if (spanDays !== 30) return false;
   const lagDays = calendarDayDiff(obsCal, throughCal);
-  return lagDays >= 0 && lagDays <= 2;
+  return lagDays >= 0 && lagDays <= (isR59 ? 5 : 2);
 }
 
 function scoreNewcomersR58(cohort, ctx, profile, defs) {
@@ -1229,12 +1301,23 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
   const validGrains = isR59
     ? new Set([...R58_VALID_NEWCOMER_GRAINS, 'target_child_units'])
     : R58_VALID_NEWCOMER_GRAINS;
+  const validObservationBases = isR59
+    ? new Set(['current_latest_30_days', 'sellersprite_near_30_days', 'NEAR_30_DAYS'])
+    : new Set(['current_latest_30_days']);
+  const validCohortScopes = isR59
+    ? new Set(['current_relevant_bsr_top100', 'sellersprite_near_30_days', 'sellersprite_near_30_days_leaf'])
+    : new Set(['current_relevant_bsr_top100']);
   const validRefScopes = isR59
-    ? new Set(['current_relevant_bsr_top100_all_ages', 'current_relevant_bsr_top100_mature_only'])
+    ? new Set([
+        'current_relevant_bsr_top100_all_ages',
+        'current_relevant_bsr_top100_mature_only',
+        'sellersprite_near_30_days_all_ages',
+        'sellersprite_near_30_days_mature_only',
+      ])
     : new Set(['current_relevant_bsr_top100_all_ages']);
 
-  if (!cohort || cohort.reference_supported !== true || cohort.observation_basis !== 'current_latest_30_days' ||
-    cohort.scope !== 'current_relevant_bsr_top100' || cohort.query_complete !== true ||
+  if (!cohort || cohort.reference_supported !== true || !validObservationBases.has(cohort.observation_basis) ||
+    !validCohortScopes.has(cohort.scope) || cohort.query_complete !== true ||
     !['observation_date', 'period', 'niche', 'grain', 'relevant_bsr_node'].every(key => text(cohort[key])) ||
     !validGrains.has(cohort.grain) ||
     !validDate(cohort.observation_date) || !hasEvidence(cohort.evidence, ctx) || !Array.isArray(cohort.members)) {
@@ -1242,10 +1325,68 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     return pending(cohort?.reason ?? 'A completed current-category query with valid sales grain and aligned all-age sales reference is required.');
   }
 
+  const isNear30DaysMode = isR59 && (
+    cohort.scope === 'sellersprite_near_30_days' ||
+    cohort.scope === 'sellersprite_near_30_days_leaf' ||
+    cohort.observation_basis === 'sellersprite_near_30_days' ||
+    cohort.observation_basis === 'NEAR_30_DAYS' ||
+    cohort.bsr_verification_mode === 'sellersprite_near_30_days'
+  );
+  const near30DaysDisclosure = isNear30DaysMode
+    ? 'Q31 采用卖家精灵每日滚动 NEAR_30_DAYS 口径（免切前台实时叶节点 BSR Top 100）'
+    : null;
+  if (isNear30DaysMode) {
+    diagnostics.rolling_source_mode = 'sellersprite_near_30_days';
+    diagnostics.rolling_source_disclosure = near30DaysDisclosure;
+  }
+
+  const allowChildUnitsRange = isR59 && cohort.grain === 'target_child_units';
+  const readUnitsObservation = input => {
+    if (allowChildUnitsRange && input && typeof input === 'object' && Object.hasOwn(input, 'value_range') && input.value_range !== null) {
+      const vr = input.value_range;
+      if (input.value != null || input.coherent === false || !Array.isArray(vr) || vr.length !== 2 || !vr.every(number) || vr[0] < 0 || vr[0] > vr[1]) {
+        return { value: null, lo: null, hi: null, isRange: false, exactZero: false, key: null, reason: input?.reason ?? 'Invalid target_child_units value_range bounds.' };
+      }
+      if (input.tier === 'sub_50_unconfirmed') {
+        return { value: null, lo: null, hi: null, isRange: false, exactZero: false, key: null, reason: input.reason ?? 'Multi-variant child <50/mo requires child activity disambiguation before Q31 scoring.' };
+      }
+      const loRead = readNumber({ ...input, value: vr[0] }, 'units', ctx);
+      const hiRead = readNumber({ ...input, value: vr[1] }, 'units', ctx);
+      if (loRead.value === null || hiRead.value === null) {
+        return { value: null, lo: null, hi: null, isRange: false, exactZero: false, key: null, reason: loRead.reason ?? hiRead.reason };
+      }
+      const isRange = loRead.value !== hiRead.value;
+      return {
+        value: loRead.value,
+        lo: loRead.value,
+        hi: hiRead.value,
+        isRange,
+        exactZero: loRead.value === 0 && hiRead.value === 0,
+        key: isRange ? `range:${loRead.value}..${hiRead.value}` : `pt:${loRead.value}`,
+        reason: null,
+      };
+    }
+    const pt = readNumber(input, 'units', ctx);
+    if (pt.value === null) {
+      return { value: null, lo: null, hi: null, isRange: false, exactZero: false, key: null, reason: pt.reason };
+    }
+    return {
+      value: pt.value,
+      lo: pt.value,
+      hi: pt.value,
+      isRange: false,
+      exactZero: pt.value === 0,
+      key: `pt:${pt.value}`,
+      reason: null,
+    };
+  };
+
   const obsCal = toUsSiteCalendarDate(cohort.observation_date);
   if (!obsCal) return pending('Invalid observation_date on newcomer_cohort.');
-  if ((cohort.window_days !== undefined && cohort.window_days !== 30) || !isAlignedLatest30DayPeriod(cohort.period, obsCal)) {
-    return pending('Revision 58 newcomer cohort requires a verified latest-30-day period aligned with observation_date (YYYY-MM-DD/YYYY-MM-DD, 30 days).');
+  if ((cohort.window_days !== undefined && cohort.window_days !== 30) || !isAlignedLatest30DayPeriod(cohort.period, obsCal, isR59)) {
+    return pending(isR59
+      ? 'Revision 59 newcomer cohort requires NEAR_30_DAYS or a verified 30-day rolling period aligned with observation_date.'
+      : 'Revision 58 newcomer cohort requires a verified latest-30-day period aligned with observation_date (YYYY-MM-DD/YYYY-MM-DD, 30 days).');
   }
   const earliestCal = threeCalendarMonthsEarlier(obsCal);
 
@@ -1270,7 +1411,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
 
     const launchCal = toUsSiteCalendarDate(member?.launch_date);
     const ratingsReading = readNumber(member?.ratings, 'count', ctx, { integer: true });
-    const unitsReading = readNumber(member?.units_30d, 'units', ctx);
+    const unitsReading = readUnitsObservation(member?.units_30d);
     const unitsEv = (Array.isArray(member?.units_30d?.evidence) ? member.units_30d.evidence : []).map(id => ctx.evidence.get(id)).filter(Boolean);
     const badUnitsWindow = Boolean(
       (member?.units_30d && typeof member.units_30d === 'object' && (
@@ -1280,31 +1421,57 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         hasNon30DayWindowParam([member.units_30d, ...unitsEv])
       ))
     );
-    const inBsrWindow = Boolean(text(member?.family_id) && text(member?.asin) && launchCal &&
-      launchCal >= earliestCal && launchCal <= obsCal &&
-      member?.current_bsr_node === cohort.relevant_bsr_node && Number.isInteger(member?.current_bsr_rank) &&
-      member.current_bsr_rank >= 1 && member.current_bsr_rank <= 100);
+    const nodeMatchesOrOmittedNear30 = isNear30DaysMode
+      ? (member?.current_bsr_node === undefined || member?.current_bsr_node === null || member.current_bsr_node === cohort.relevant_bsr_node)
+      : (member?.current_bsr_node === cohort.relevant_bsr_node);
+    const rankMatchesOrOptionalNear30 = isNear30DaysMode
+      ? (member?.current_bsr_rank === undefined || member?.current_bsr_rank === null || (Number.isInteger(member.current_bsr_rank) && member.current_bsr_rank >= 1))
+      : (Number.isInteger(member?.current_bsr_rank) && member.current_bsr_rank >= 1 && member.current_bsr_rank <= 100);
+    const inBsrWindow = Boolean(
+      text(member?.family_id) &&
+      text(member?.asin) &&
+      launchCal &&
+      launchCal >= earliestCal &&
+      launchCal <= obsCal &&
+      nodeMatchesOrOmittedNear30 &&
+      rankMatchesOrOptionalNear30,
+    );
     if (launchCal && launchCal <= obsCal) {
       record.launch_calendar_date = launchCal;
       record.age_days = calendarDayDiff(obsCal, launchCal);
     }
 
+    const pushClassified = (kind, poolEligible, missingPoolStats) => {
+      classified.push({
+        record,
+        kind,
+        poolEligible,
+        missingPoolStats,
+        ratingsVal: ratingsReading.value,
+        unitsVal: unitsReading.value,
+        unitsLo: unitsReading.lo,
+        unitsHi: unitsReading.hi,
+        unitsExactZero: unitsReading.exactZero,
+        unitsKey: unitsReading.key,
+      });
+    };
+
     // Evaluate buyer-task comparability BEFORE old-review / sampling exclusions so pending/different-task rows never enter the stratification pool.
     if (member?.comparability_verdict !== undefined && !R58_VALID_COMPARABILITY.has(member.comparability_verdict)) {
       record.effective_status = 'pending';
       record.reason = text(member.reason) ? member.reason : 'Buyer-task comparability verdict must be comparable (or same_task) or excluded_different_task; unknown/pending remains blocking.';
-      classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+      pushClassified('pending', false, false);
       continue;
     }
 
     if (member?.comparability_verdict === 'excluded_different_task') {
       if (text(member.reason) && hasEvidence(member.evidence, ctx)) {
         record.effective_status = 'excluded';
-        classified.push({ record, kind: 'task_excluded', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+        pushClassified('task_excluded', false, false);
       } else {
         record.effective_status = 'pending';
         record.reason = 'Task-comparability exclusion requires a reason and valid evidence references.';
-        classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+        pushClassified('pending', false, false);
       }
       continue;
     }
@@ -1313,13 +1480,10 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       if (hasEvidence(member.evidence, ctx) && !badUnitsWindow && R58_COMPARABLE_VERDICTS.has(member.comparability_verdict)) {
         record.effective_status = 'excluded';
         record.reason = text(member.reason) ? member.reason : 'Supported old reviews predate the purported recent launch; excluded from the normal-start reference.';
-        const relevantForStrat = inBsrWindow && !(record.age_days < 30 && unitsReading.value === 0);
+        const relevantForStrat = inBsrWindow && !(record.age_days < 30 && unitsReading.exactZero);
         const missingPoolStats = relevantForStrat && (ratingsReading.value === null || unitsReading.value === null);
         const poolEligible = relevantForStrat && !missingPoolStats;
-        classified.push({
-          record, kind: 'old_review_excluded', poolEligible, missingPoolStats,
-          ratingsVal: ratingsReading.value, unitsVal: unitsReading.value,
-        });
+        pushClassified('old_review_excluded', poolEligible, missingPoolStats);
       } else {
         record.effective_status = 'pending';
         record.reason = !R58_COMPARABLE_VERDICTS.has(member.comparability_verdict)
@@ -1327,7 +1491,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
           : badUnitsWindow
             ? 'Newcomer units_30d observation must cover the aligned 30-day cohort window.'
             : 'The asserted old-review conflict lacks valid evidence references.';
-        classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+        pushClassified('pending', false, false);
       }
       continue;
     }
@@ -1341,17 +1505,14 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
           : badUnitsWindow
             ? 'Newcomer units_30d observation must cover the aligned 30-day cohort window.'
             : 'An excluded newcomer record requires a reason and valid evidence references.';
-        classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+        pushClassified('pending', false, false);
       } else {
         const relevantForStrat = member.sampling_excluded === true && inBsrWindow &&
           R58_COMPARABLE_VERDICTS.has(member.comparability_verdict) &&
-          !(record.age_days < 30 && unitsReading.value === 0);
+          !(record.age_days < 30 && unitsReading.exactZero);
         const missingPoolStats = relevantForStrat && (ratingsReading.value === null || unitsReading.value === null);
         const poolEligible = relevantForStrat && !missingPoolStats;
-        classified.push({
-          record, kind: member.sampling_excluded === true ? 'sampling_excluded' : 'other_excluded',
-          poolEligible, missingPoolStats, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value,
-        });
+        pushClassified(member.sampling_excluded === true ? 'sampling_excluded' : 'other_excluded', poolEligible, missingPoolStats);
       }
       continue;
     }
@@ -1359,20 +1520,20 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     if (badUnitsWindow) {
       record.effective_status = 'pending';
       record.reason = 'Newcomer units_30d observation must cover the aligned 30-day cohort window.';
-      classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+      pushClassified('pending', false, false);
       continue;
     }
 
     if (!['qualified', 'unsampled_stratified', 'ramp_up_zero_sales'].includes(record.effective_status)) {
       record.effective_status = 'pending';
-      classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+      pushClassified('pending', false, false);
       continue;
     }
 
     if (!R58_COMPARABLE_VERDICTS.has(member?.comparability_verdict)) {
       record.effective_status = 'pending';
       record.reason = 'Revision 58 requires an explicit buyer-task comparability_verdict ("comparable" or "same_task") on every active newcomer record.';
-      classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+      pushClassified('pending', false, false);
       continue;
     }
 
@@ -1381,46 +1542,43 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       invalidReference = true;
       record.effective_status = 'pending';
       record.reason = 'A newcomer record needs frozen family/listing identity and valid evidence references.';
-      classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+      pushClassified('pending', false, false);
       continue;
     }
 
     if (!inBsrWindow) {
       record.effective_status = 'pending';
       record.reason = 'A current-category newcomer needs matching rank 1-100 and a valid US-site launch date within three calendar months (not in the future).';
-      classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+      pushClassified('pending', false, false);
       continue;
     }
 
     if (record.effective_status === 'ramp_up_zero_sales') {
-      if (record.age_days >= 30 || unitsReading.value !== 0) {
+      if (record.age_days >= 30 || !unitsReading.exactZero) {
         record.effective_status = 'pending';
         record.reason = 'Only verified <30-day zero-sales listings may be pre-excluded as ramp_up_zero_sales.';
-        classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+        pushClassified('pending', false, false);
         continue;
       }
     } else if (record.effective_status === 'unsampled_stratified') {
       if (ratingsReading.value === null || unitsReading.value === null) {
         record.effective_status = 'pending';
         record.reason = 'unsampled_stratified requires reliable ratings and units_30d inputs; missing inputs remain blocking.';
-        classified.push({ record, kind: 'pending', poolEligible: false, missingPoolStats: false, ratingsVal: ratingsReading.value, unitsVal: unitsReading.value });
+        pushClassified('pending', false, false);
         continue;
       }
-      if (record.age_days < 30 && unitsReading.value === 0) {
+      if (record.age_days < 30 && unitsReading.exactZero) {
         record.effective_status = 'ramp_up_zero_sales';
       }
     } else if (record.effective_status === 'qualified') {
-      if (record.age_days < 30 && unitsReading.value === 0) {
+      if (record.age_days < 30 && unitsReading.exactZero) {
         record.effective_status = 'ramp_up_zero_sales';
       }
     }
 
     const activePoolEligible = record.effective_status !== 'ramp_up_zero_sales' &&
-      !(record.age_days < 30 && unitsReading.value === 0);
-    classified.push({
-      record, kind: 'active', poolEligible: activePoolEligible, missingPoolStats: false,
-      ratingsVal: ratingsReading.value, unitsVal: unitsReading.value,
-    });
+      !(record.age_days < 30 && unitsReading.exactZero);
+    pushClassified('active', activePoolEligible, false);
   }
 
   // Transitive family/ASIN/parent_asin/representative_asin/shared_launch grouping across ALL members so duplicates never inflate counts or distort pools.
@@ -1496,19 +1654,24 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       // Check observation consistency across ALL members in the duplicate excluded group (not just poolEligible ones)
       // so a <30d zero-sales old-review row duplicated with a 35-sale unmarked row never silently inflates the pool.
       const obsRatings = [...new Set(group.map(e => e.ratingsVal).filter(v => v !== null))];
-      const obsUnits = [...new Set(group.map(e => e.unitsVal).filter(v => v !== null))];
+      const obsUnits = [...new Set(group.map(e => e.unitsKey).filter(Boolean))];
       const obsDates = [...new Set(group.map(e => e.record.launch_calendar_date).filter(Boolean))];
       if (obsRatings.length > 1 || obsUnits.length > 1 || obsDates.length > 1) {
         invalidReference = true;
         canonical.record.reason = 'Duplicated excluded family/ASIN records have incompatible observations or launch dates.';
       } else {
         const eligibleExcl = exclMembers
-          .filter(e => e.poolEligible && !(e.record.age_days < 30 && e.unitsVal === 0))
+          .filter(e => e.poolEligible && !(e.record.age_days < 30 && e.unitsExactZero))
           .sort((a, b) => compareIdentityTrimmed(a.record, b.record) || compareIdentity(a.record, b.record));
         if (eligibleExcl.length > 0) {
           const rep = eligibleExcl[0];
           samplingExcludedPool.push({
-            record: rep.record, ratings: rep.ratingsVal, units: rep.unitsVal, age_days: rep.record.age_days,
+            record: rep.record,
+            ratings: rep.ratingsVal,
+            units: rep.unitsLo,
+            unitsLo: rep.unitsLo,
+            unitsHi: rep.unitsHi,
+            age_days: rep.record.age_days,
           });
         } else if (group.some(e => e.missingPoolStats)) {
           hasExcludedMissingPoolStats = true;
@@ -1541,7 +1704,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
           (canonical.record.natural?.scope ?? null) !== (dup.record.natural?.scope ?? null);
         if (scoreDiffers || metaDiffers) natConflict = true;
       }
-      if (dup.ratingsVal !== canonical.ratingsVal || dup.unitsVal !== canonical.unitsVal ||
+      if (dup.ratingsVal !== canonical.ratingsVal || dup.unitsKey !== canonical.unitsKey ||
         dup.record.launch_calendar_date !== canonical.record.launch_calendar_date || natConflict) {
         invalidReference = true;
         dup.record.reason = 'Duplicated family/shared-launch records have incompatible observations, launch dates, or natural exposure records.';
@@ -1607,8 +1770,13 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         continue;
       }
       const isExcluded = rf.comparability_verdict === 'excluded_different_task';
-      const refVal = isExcluded ? null : readNumber(rf?.units_30d, 'units', ctx).value;
-      const info = { isExcluded, units: refVal };
+      const refObs = isExcluded ? null : readUnitsObservation(rf?.units_30d);
+      const info = {
+        isExcluded,
+        unitsKey: refObs?.key ?? null,
+        unitsLo: refObs?.lo ?? null,
+        unitsHi: refObs?.hi ?? null,
+      };
       for (const tok of rowTokens) {
         pushMap(refTokenList, tok, info);
       }
@@ -1631,8 +1799,8 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         if ((memExcludedTask && !refMatch.isExcluded) || (memIsSameTask && refMatch.isExcluded)) {
           return 'Conflicting comparability verdict between newcomer_cohort.members and market_reference.families for the same family/ASIN.';
         }
-        if (!refMatch.isExcluded && entry.unitsVal !== null && refMatch.units !== null &&
-          Math.abs(entry.unitsVal - refMatch.units) > 1e-9) {
+        if (!refMatch.isExcluded && entry.unitsLo !== null && refMatch.unitsLo !== null &&
+          (Math.abs(entry.unitsLo - refMatch.unitsLo) > 1e-9 || Math.abs(entry.unitsHi - refMatch.unitsHi) > 1e-9)) {
           return 'Conflicting units_30d between newcomer_cohort.members and market_reference.families for the same family/ASIN.';
         }
       }
@@ -1645,14 +1813,19 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     if (crossErr) return pending(crossErr);
   }
 
+  const rollingSourceFields = near30DaysDisclosure ? {
+    rolling_source_mode: 'sellersprite_near_30_days',
+    rolling_source_disclosure: near30DaysDisclosure,
+  } : {};
+
   // Completed query with zero active full-month or positive ramp-up newcomers (including all-<30d zero-sales).
   if (qualifiedActive.length === 0 && unsampledActive.length === 0) {
     diagnostics.no_qualifying_examples = true;
     diagnostics.absence_note = '所查范围内无同任务正常起步新品样板';
     const evidence = mergeRefs(cohort.evidence, ...diagnostics.members.map(row => row.evidence));
     return {
-      low: scored(lowDef, 0, cohort, { evidence, absence_note: diagnostics.absence_note }),
-      natural: scored(naturalDef, 0, cohort, { evidence, absence_note: diagnostics.absence_note }),
+      low: scored(lowDef, 0, cohort, { evidence, absence_note: diagnostics.absence_note, ...rollingSourceFields }),
+      natural: scored(naturalDef, 0, cohort, { evidence, absence_note: diagnostics.absence_note, ...rollingSourceFields }),
       diagnostics,
     };
   }
@@ -1716,27 +1889,36 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       return pending('All-age reference units_30d observations must cover the aligned 30-day cohort window and match cohort.grain.');
     }
   }
-  const refSales = comparableRefFamilies.map(row => readNumber(row?.units_30d, 'units', ctx));
+  const refSales = comparableRefFamilies.map(row => readUnitsObservation(row?.units_30d));
   if (refSales.some(row => row.value === null)) {
     return pending('All-age reference families need unique identities and supported sales, including real zeros; missing T stays pending.');
   }
-  const tRat = medianRat(refSales.map(row => row.value));
-  const tEffRat = ratMax(tRat, rat(10n, 1n));
+  const hasRangeRef = refSales.some(row => row.isRange);
+  const tLoRat = medianRat(refSales.map(row => row.lo));
+  const tHiRat = hasRangeRef ? medianRat(refSales.map(row => row.hi)) : tLoRat;
+  const tEffLoRat = ratMax(tLoRat, rat(10n, 1n));
+  const tEffHiRat = ratMax(tHiRat, rat(10n, 1n));
   diagnostics.references = {
-    sales_median: ratToNumber(tRat),
-    effective_sales_median: ratToNumber(tEffRat),
-    floor_applied: ratCmp(tRat, rat(10n, 1n)) < 0,
+    sales_median: ratToNumber(tLoRat),
+    effective_sales_median: ratToNumber(tEffLoRat),
+    floor_applied: ratCmp(tLoRat, rat(10n, 1n)) < 0,
     family_count: comparableRefFamilies.length,
     grain: reference.grain,
     scope: reference.scope,
     task_filter_signature: reference.task_filter_signature ?? null,
-    sales_units: refSales.map(row => row.value),
+    sales_units: refSales.map(row => row.isRange ? [row.lo, row.hi] : row.value),
+    ...(hasRangeRef ? {
+      sales_median_range: [ratToNumber(tLoRat), ratToNumber(tHiRat)],
+      effective_sales_median_range: [ratToNumber(tEffLoRat), ratToNumber(tEffHiRat)],
+    } : {}),
   };
 
   const evaluateRow = member => {
     const ratings = readNumber(member.ratings, 'count', ctx, { integer: true });
-    const units = readNumber(member.units_30d, 'units', ctx);
-    const { actualRat, ratioRat, ceilingRat, eRat } = evalExampleRat(ratings.value, units.value, tEffRat, profile);
+    const units = readUnitsObservation(member.units_30d);
+    const hasInterval = units.isRange || hasRangeRef;
+    const { actualRat, ratioRat, ceilingRat, eRat } = evalExampleRat(ratings.value, units.lo, tEffHiRat, profile);
+    const hiEval = hasInterval ? evalExampleRat(ratings.value, units.hi, tEffLoRat, profile) : { eRat };
     return {
       family_id: member.family_id,
       asin: member.asin,
@@ -1744,25 +1926,27 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       launch_calendar_date: member.launch_calendar_date,
       is_full_month: member.age_days >= 30,
       effective_status: member.effective_status,
-      units_30d: units.value,
+      units_30d: units.isRange ? [units.lo, units.hi] : units.value,
       ratings: ratings.value,
       actual_score: actualRat ? ratToNumber(actualRat) : null,
       sales_ratio: ratioRat ? ratToNumber(ratioRat) : null,
       sales_ceiling: ceilingRat ? ratToNumber(ceilingRat) : null,
       score: eRat ? ratToNumber(eRat) : null,
+      ...(hasInterval && eRat && hiEval.eRat ? { score_range: [ratToNumber(eRat), ratToNumber(hiEval.eRat)] } : {}),
       e_rat: eRat,
+      e_rat_hi: hiEval.eRat,
       natural: member.effective_status === 'qualified' ? scoreNatural(member, ctx, profile, cohort.period, cohort.grain) : null,
       reason: ratings.reason ?? units.reason ?? null,
     };
   };
 
   const evalQualified = qualifiedActive.map(evaluateRow);
-  if (evalQualified.some(row => row.e_rat === null)) {
+  if (evalQualified.some(row => row.e_rat === null || row.e_rat_hi === null)) {
     diagnostics.examples = evalQualified.map(stripInternalRat);
     return pending('Every verified qualified newcomer requires supported ratings and 30-day sales.');
   }
   const evalUnsampled = unsampledActive.map(evaluateRow);
-  if (evalUnsampled.some(row => row.e_rat === null)) {
+  if (evalUnsampled.some(row => row.e_rat === null || row.e_rat_hi === null)) {
     diagnostics.examples = evalQualified.map(stripInternalRat);
     return pending('Every unsampled_stratified candidate requires supported ratings and 30-day sales.');
   }
@@ -1790,17 +1974,23 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     const exclPoolItems = samplingExcludedPool
       .filter(item => !seenKeys.has(memberKey(item.record)))
       .map(item => {
-        const { eRat } = evalExampleRat(item.ratings, item.units, tEffRat, profile);
+        const { eRat } = evalExampleRat(item.ratings, item.unitsLo, tEffHiRat, profile);
         return {
           family_id: item.record.family_id,
           asin: item.record.asin,
           e_rat: eRat,
-          units_30d: item.units,
+          units_30d: item.unitsLo,
           excluded: true,
         };
       });
     const fullPool = [
-      ...allActiveEval.map(r => ({ family_id: r.family_id, asin: r.asin, e_rat: r.e_rat, units_30d: r.units_30d, excluded: false })),
+      ...allActiveEval.map(r => ({
+        family_id: r.family_id,
+        asin: r.asin,
+        e_rat: r.e_rat,
+        units_30d: Array.isArray(r.units_30d) ? r.units_30d[0] : r.units_30d,
+        excluded: false,
+      })),
       ...exclPoolItems,
     ];
     const stratResult = selectStratifiedNewcomers(fullPool);
@@ -1836,17 +2026,26 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
   diagnostics.stratification = stratifiedMeta;
   diagnostics.examples = scoringPool.map(stripInternalRat);
 
+  const hasScoringInterval = hasRangeRef || scoringPool.some(r => r.e_rat_hi && ratCmp(r.e_rat, r.e_rat_hi) !== 0);
   const mFull = scoringPool.filter(r => r.is_full_month);
   const mRamp = scoringPool.filter(r => !r.is_full_month && r.e_rat.n > 0n);
   const greedy = evalGreedyFRat(mFull, mRamp);
-  const selectedSorted = [...greedy.selected].sort((a, b) => ratCmp(b.e_rat, a.e_rat) || compareIdentityTrimmed(a, b) || compareIdentity(a, b));
+  const greedyHi = hasScoringInterval
+    ? evalGreedyFRat(
+      scoringPool.filter(r => r.is_full_month).map(r => ({ ...r, e_rat: r.e_rat_hi ?? r.e_rat })),
+      scoringPool.filter(r => !r.is_full_month && (r.e_rat_hi ?? r.e_rat).n > 0n).map(r => ({ ...r, e_rat: r.e_rat_hi ?? r.e_rat })),
+    )
+    : greedy;
+  const selectedBase = greedy.selected.length > 0 ? greedy.selected : greedyHi.selected;
+  const selectedSorted = [...selectedBase].sort((a, b) => ratCmp(b.e_rat, a.e_rat) || compareIdentityTrimmed(a, b) || compareIdentity(a, b));
   const selectedIds = selectedSorted.map(({ family_id, asin }) => ({ family_id, asin }));
 
   diagnostics.selected_pair = selectedIds;
   diagnostics.selected_examples = selectedSorted.map(r => ({
     family_id: r.family_id, asin: r.asin, age_days: r.age_days, is_full_month: r.is_full_month, score: r.score,
+    ...(r.score_range ? { score_range: r.score_range } : {}),
   }));
-  diagnostics.denominator = greedy.denominator;
+  diagnostics.denominator = greedy.selected.length > 0 ? greedy.denominator : greedyHi.denominator;
   diagnostics.ramp_up_excluded = greedy.rejected_ramp_up.map(r => ({
     family_id: r.family_id, asin: r.asin, age_days: r.age_days, score: r.score,
   }));
@@ -1860,13 +2059,13 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
   if (selectedSorted.length === 0) {
     diagnostics.absence_note = '所查范围内无同任务正常起步新品样板';
     return {
-      low: scored(lowDef, 0, cohort, { evidence, denominator: 0, absence_note: diagnostics.absence_note }),
-      natural: scored(naturalDef, 0, cohort, { evidence, denominator: 0, absence_note: diagnostics.absence_note }),
+      low: scored(lowDef, 0, cohort, { evidence, denominator: 0, absence_note: diagnostics.absence_note, ...rollingSourceFields }),
+      natural: scored(naturalDef, 0, cohort, { evidence, denominator: 0, absence_note: diagnostics.absence_note, ...rollingSourceFields }),
       diagnostics,
     };
   }
 
-  const D = greedy.denominator; // max(|S*|, 2)
+  const D = diagnostics.denominator; // max(|S*|, 2)
   const substantialCount = selectedSorted.filter(r => ratCmp(r.e_rat, rat(2n, 1n)) >= 0).length;
   const loneAlert = selectedSorted.length === 1 || substantialCount < 2;
   diagnostics.lone_newcomer_alert = loneAlert;
@@ -1876,17 +2075,22 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       : '孤例/单极新品突围预警（有效起量 e≥2 同任务新品不足 2 家）：二阶段重点排查专利或站外/关联壁垒。')
     : null;
 
+  const lowMinScore = ratToNumber(greedy.f_rat);
+  const lowMaxScore = ratToNumber(greedyHi.f_rat);
+  const lowScoreRange = [Math.min(lowMinScore, lowMaxScore), Math.max(lowMinScore, lowMaxScore)];
   const lowExtra = {
     selected_pair: selectedIds,
     denominator: D,
     evidence,
+    ...(hasScoringInterval && lowScoreRange[0] !== lowScoreRange[1] ? { score_range: lowScoreRange } : {}),
+    ...rollingSourceFields,
     ...(stratifiedMeta.applied ? {
       stratified_estimate: true,
       stratified_disclosure: stratifiedMeta.disclosure,
       stratified_bounds: stratifiedMeta.stratified_bounds,
     } : {}),
   };
-  const low = scored(lowDef, ratToNumber(greedy.f_rat), cohort, lowExtra);
+  const low = scored(lowDef, point(lowScoreRange), cohort, lowExtra);
 
   const naturalScores = selectedSorted.map(row => row.natural.score);
   const knownNatural = naturalScores.filter(v => v !== null);
@@ -1897,6 +2101,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     selected_pair: selectedIds,
     denominator: D,
     evidence: naturalEvidence,
+    ...rollingSourceFields,
     ...(stratifiedMeta.applied ? {
       stratified_estimate: true,
       stratified_disclosure: stratifiedMeta.disclosure,
@@ -1923,6 +2128,44 @@ function datedScenario(scenario, economics, ctx, profile, forceSensitivityOnly =
     const ledger = forceSensitivityOnly ? { ...rawLedger, sensitivity_only: true } : rawLedger;
     calculation = calculateEconomics(ledger, { requireFeeBasis: true, requireRegularRepeatOrder: profile.revision >= 57,
       profileRevision: profile.revision, evidenceIds: [...ctx.evidence.keys()], operatingMonths: economics.operating_months });
+    if (profile.revision >= 59 && calculation?.scoring_supported) {
+      const effPricing = resolveEffectivePricing(ledger);
+      const hasOngoingCouponOnly = effPricing.valid &&
+        ((effPricing.ongoing_coupon_usd ?? 0) > 0 || (effPricing.ongoing_coupon_pct ?? 0) > 0) &&
+        !((ledger.prime_exclusive_discount_usd ?? 0) > 0 || (ledger.prime_exclusive_discount_pct ?? 0) > 0);
+      if (hasOngoingCouponOnly) {
+        const fulLine = Array.isArray(ledger.lines) ? ledger.lines.find(l => l?.id === 'fulfillment') : null;
+        const pkgPool = Array.isArray(ledger.packages) && ledger.packages.length > 0
+          ? ledger.packages
+          : economics?.packages;
+        const pkgResolved = resolveUniquePackageByRef(pkgPool, ledger.fee_context?.package_ref).pkg ?? ledger.pkg ?? null;
+        const salesWin = ledger.fee_context?.sales;
+        if (fulLine && fulLine.status !== 'pending' && number(fulLine.amount_usd) &&
+          pkgResolved && typeof pkgResolved === 'object' &&
+          salesWin?.from >= '2027-01-15' && salesWin?.through <= '2027-10-14') {
+          const expectedFul = lookupUnifiedFulfillmentFee2027({
+            pkg: pkgResolved,
+            price_usd: effPricing.net_effective_price_usd,
+            list_price_usd: effPricing.list_price_usd,
+            has_ongoing_coupon: true,
+            sales_window: salesWin,
+            is_apparel: ledger.is_apparel_or_shoes === true,
+            is_dangerous_goods: ledger.is_dangerous_goods === true,
+            is_sipp: ledger.is_sipp === true,
+            requires_amazon_packaging: ledger.requires_amazon_packaging,
+            fee_category: ledger.fee_category ?? null,
+          });
+          if (expectedFul.status === 'verified' && fulLine.amount_usd < expectedFul.total_usd - 0.005) {
+            calculation.scoring_supported = false;
+            calculation.fee_validation.issues.push({
+              line: 'fulfillment',
+              code: 'coupon_list_price_tier_understated',
+              reason: `Fulfillment amount ($${fulLine.amount_usd}) understates 2027 list-price band (${expectedFul.price_band} @ $${effPricing.list_price_usd} -> $${expectedFul.total_usd}) under ongoing coupon.`,
+            });
+          }
+        }
+      }
+    }
     if (!calculation.scoring_supported) {
       reason = calculation.fee_validation.issues.map(issue => `${issue.line}: ${issue.reason}`).join(' ') ||
         `Unconfirmed costs: ${calculation.pending_lines.join(', ')}; sensitivity-only results cannot be scored.`;
@@ -2229,6 +2472,12 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
   if (marginsComplete) {
     const allFail = profile.revision >= 57 ? scenarios.every(s => !s.margin_eligible) : diagnostics.margin_range[1] < floor;
     const allPass = profile.revision >= 57 ? scenarios.every(s => s.margin_eligible) : diagnostics.margin_range[0] >= floor;
+    if (isR59) {
+      const distinctQuotes = new Set(
+        scenarios.map(s => s?.input?.quote_id ?? s?.input?.cost_ledger?.source_inputs?.quote_id ?? s.id),
+      );
+      diagnostics.second_factory_quote_needed = !allPass && distinctQuotes.size < 3;
+    }
     if (allFail) {
       marginStatus = 'fail';
       marginReason = 'The supported margin upper bound is below the existing 30% floor.';
@@ -2345,6 +2594,14 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
   const dateSupported = typeof date?.value === 'boolean' && date.unit === 'boolean' && hasEvidence(date.evidence, ctx) &&
     date.supported !== false && date.material_conflict !== true;
   const rights = items.find(item => item.id === 'specific_design_rights');
+  const sdrInput = candidate?.judgments?.specific_design_rights;
+  const tmInput = candidate?.judgments?.trademark_conflicts;
+  const aprInput = candidate?.judgments?.applicable_public_requirements;
+  const spApiHardBan = candidate?.sp_api_calibration?.restrictions?.hard_category_ban === true;
+  const isR59 = profile.revision >= 59;
+  const rightsStatus = (isR59 && (sdrInput?.proven_conflict === true || tmInput?.proven_conflict === true))
+    ? 'fail'
+    : (rights.status === 'scored' ? (rights.score === 0 ? 'fail' : 'pass') : 'pending');
   const conditions = [
     { id: 'reference_price', status: priceSupported ? pricePass ? 'pass' : 'fail' : 'pending', input: priceInput ?? null,
       reason: priceSupported
@@ -2353,12 +2610,20 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
           : (pricePass ? 'Supported matched-spec reference price is above USD 30.' : 'Supported matched-spec reference price does not exceed USD 30.'))
         : (isR58 ? r58Anchor.reason : null) ?? priceInput?.reason ?? 'A supported positive matched-spec reference price is required.' },
     profit.screening,
-    { id: 'specific_form_rights', status: rights.status === 'scored' ? rights.score === 0 ? 'fail' : 'pass' : 'pending',
+    { id: 'specific_form_rights', status: rightsStatus,
       reason: rights.reason, evidence: rights.evidence },
     { id: 'strong_date_dependency', status: dateSupported ? date.value ? 'defer' : 'pass' : 'pending', input: date ?? null,
       reason: dateSupported ? date.value ? 'The supported strong holiday/date dependency is deferred in this reference profile.' : 'No strong holiday/date dependency is identified in the supported initial check.' :
         date?.reason ?? 'Strong date dependency has not been assessed with supported evidence.' },
   ];
+  if (isR59 && (aprInput?.proven_conflict === true || aprInput?.hard_ban === true || spApiHardBan)) {
+    conditions.push({
+      id: 'public_compliance_or_category_ban',
+      status: 'fail',
+      reason: aprInput?.reason ?? 'Proven statutory/public compliance conflict or SP-API hard category ban.',
+      evidence: aprInput?.evidence ?? [],
+    });
+  }
   const status = conditions.some(condition => condition.status === 'fail') ? 'excluded' :
     conditions.some(condition => condition.status === 'defer') ? 'deferred' :
       conditions.some(condition => condition.status === 'pending') ? 'pending' :
@@ -2384,7 +2649,7 @@ function aggregate(items, definitionsByGroup, profit) {
   };
 }
 
-function validateOperatingPeriods(economics, isR58 = false) {
+function validateOperatingPeriods(economics, isR58 = false, isR59 = false) {
   const periods = economics.operating_periods;
   if (Object.hasOwn(economics, 'scenarios')) {
     throw new TypeError('Operating-period economics cannot also contain root scenarios; put every scenario in its period.');
@@ -2392,6 +2657,11 @@ function validateOperatingPeriods(economics, isR58 = false) {
   if (!text(economics.saleable_unit) || !Array.isArray(periods) || periods.length === 0) {
     throw new TypeError('Operating-period economics require one common saleable unit and a nonempty operating_periods array.');
   }
+  const periodsHaveCleanOct14Split = isR59 && periods.length === 2 &&
+    periods.some(p => Array.isArray(p?.scenarios) && p.scenarios.length > 0 &&
+      p.scenarios.every(s => s?.cost_ledger?.fee_context?.sales?.through === '2027-10-14')) &&
+    periods.some(p => Array.isArray(p?.scenarios) && p.scenarios.length > 0 &&
+      p.scenarios.every(s => s?.cost_ledger?.fee_context?.sales?.from === '2027-10-15'));
   const ids = new Set();
   const months = new Set();
   for (const period of periods) {
@@ -2402,10 +2672,13 @@ function validateOperatingPeriods(economics, isR58 = false) {
       throw new TypeError('Every operating period needs a unique nonempty id, label, explicit months and a nonempty scenarios array.');
     }
     ids.add(period.id);
+    const localMonths = new Set();
     for (const month of period.months) {
-      if (!Number.isInteger(month) || month < 1 || month > 12 || months.has(month)) {
+      const crossSplitOct10Allowed = periodsHaveCleanOct14Split && month === 10 && !localMonths.has(10);
+      if (!Number.isInteger(month) || month < 1 || month > 12 || localMonths.has(month) || (months.has(month) && !crossSplitOct10Allowed)) {
         throw new TypeError('Operating-period months must be unique integers from 1 to 12, without overlap within or between periods.');
       }
+      localMonths.add(month);
       months.add(month);
     }
     const scenarioIds = new Set();
@@ -2421,7 +2694,19 @@ function validateOperatingPeriods(economics, isR58 = false) {
 }
 
 const PRIMARY_OFF_PEAK_MONTHS = [2, 3, 4, 5, 6, 7, 8, 9];
+const PRIMARY_OFF_PEAK_MONTHS_R59 = [2, 3, 4, 5, 6, 7, 8, 9, 10];
 const HOLIDAY_PEAK_MONTHS = [10, 11, 12];
+
+function isPrimaryOffPeakMonthsList(months, isR59 = false) {
+  if (!Array.isArray(months)) return false;
+  if (months.length === PRIMARY_OFF_PEAK_MONTHS.length && PRIMARY_OFF_PEAK_MONTHS.every(m => months.includes(m))) {
+    return true;
+  }
+  if (isR59 && months.length === PRIMARY_OFF_PEAK_MONTHS_R59.length && PRIMARY_OFF_PEAK_MONTHS_R59.every(m => months.includes(m))) {
+    return true;
+  }
+  return false;
+}
 
 function validIsoWindow(w) {
   return Boolean(w && validDate(w.from) && validDate(w.through) && w.from <= w.through);
@@ -2440,42 +2725,58 @@ function monthsInIsoWindow(w) {
   return [...res].sort((a, b) => a - b);
 }
 
-function coversPrimaryOffPeakScenario(scenario) {
+function coversPrimaryOffPeakScenario(scenario, isR59 = false) {
   const ctx = scenario?.input?.cost_ledger?.fee_context;
   const calc = scenario?.input?.calculation;
   if (!ctx || !calc?.scoring_supported || calc.fee_validation?.status !== 'validated') return false;
-  return ctx.sales?.from === '2027-02-01' && ctx.sales?.through === '2027-09-30' &&
+  const legacyOk = ctx.sales?.from === '2027-02-01' && ctx.sales?.through === '2027-09-30' &&
     ctx.storage?.from === '2027-02-01' && ctx.storage?.through === '2027-09-30' &&
     ctx.inbound?.from >= '2027-01-15' && ctx.inbound?.through <= '2027-09-30';
+  if (legacyOk) return true;
+  if (isR59) {
+    return ctx.sales?.from === '2027-02-01' && ctx.sales?.through === '2027-10-14' &&
+      ctx.storage?.from === '2027-02-01' && ctx.storage?.through === '2027-09-30' &&
+      ctx.inbound?.from >= '2027-01-15' && ctx.inbound?.through <= '2027-10-14';
+  }
+  return false;
 }
 
-function coversPrimaryOffPeakDates(scenarios) {
+function coversPrimaryOffPeakDates(scenarios, isR59 = false) {
   if (!Array.isArray(scenarios) || scenarios.length === 0) return false;
+  let mode = null;
   for (const scenario of scenarios) {
     const ctx = scenario?.input?.cost_ledger?.fee_context;
     if (!ctx || !validIsoWindow(ctx.sales) || !validIsoWindow(ctx.storage) || !validIsoWindow(ctx.inbound)) return false;
-    if (ctx.sales.from !== '2027-02-01' || ctx.sales.through !== '2027-09-30' ||
-      ctx.storage.from !== '2027-02-01' || ctx.storage.through !== '2027-09-30' ||
-      ctx.inbound.from < '2027-01-15' || ctx.inbound.through > '2027-09-30') {
-      return false;
-    }
+    const isLegacy = ctx.sales.from === '2027-02-01' && ctx.sales.through === '2027-09-30' &&
+      ctx.storage.from === '2027-02-01' && ctx.storage.through === '2027-09-30' &&
+      ctx.inbound.from >= '2027-01-15' && ctx.inbound.through <= '2027-09-30';
+    const isCanonicalR59 = isR59 && ctx.sales.from === '2027-02-01' && ctx.sales.through === '2027-10-14' &&
+      ctx.storage.from === '2027-02-01' && ctx.storage.through === '2027-09-30' &&
+      ctx.inbound.from >= '2027-01-15' && ctx.inbound.through <= '2027-10-14';
+    if (!isLegacy && !isCanonicalR59) return false;
+    const curMode = isCanonicalR59 ? 'r59_oct14' : 'legacy_sep30';
+    if (mode === null) mode = curMode;
+    else if (mode !== curMode) return false;
   }
   return true;
 }
 
-function hasExactPeakMonthsR58(period) {
+function hasExactPeakMonthsR58(period, isR59 = false) {
   if (!period || !Array.isArray(period.months)) return false;
   const sorted = [...period.months].sort((a, b) => a - b);
-  return sorted.length === 3 && sorted[0] === 10 && sorted[1] === 11 && sorted[2] === 12;
+  if (sorted.length === 3 && sorted[0] === 10 && sorted[1] === 11 && sorted[2] === 12) return true;
+  if (isR59 && sorted.length === 4 && sorted[0] === 1 && sorted[1] === 10 && sorted[2] === 11 && sorted[3] === 12) return true;
+  return false;
 }
 
 /**
  * Returns null when the period is a valid 2027 companion holiday peak panel, otherwise the first
- * concrete reason (missing/pending cost line, failed binding or date mismatch). Validity rules are
- * identical to the former boolean check; only the diagnostic wording is added.
+ * concrete reason (missing/pending cost line, failed binding or date mismatch).
  */
-function diagnoseCompanionPeakPanelR58(period) {
-  if (!hasExactPeakMonthsR58(period)) return 'panel does not cover exact months [10, 11, 12]';
+function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
+  if (!hasExactPeakMonthsR58(period, isR59)) {
+    return isR59 ? 'panel does not cover exact months [10, 11, 12] or [10, 11, 12, 1]' : 'panel does not cover exact months [10, 11, 12]';
+  }
   if (period.diagnostics?.economics?.expected_structural_error) return 'expected primary scenario structure is invalid';
   const scenarios = period.diagnostics?.economics?.scenarios;
   if (!Array.isArray(scenarios) || scenarios.length === 0) return 'panel has no dated cost_ledger scenarios';
@@ -2495,10 +2796,18 @@ function diagnoseCompanionPeakPanelR58(period) {
     if (missingIds.length) return `required cost lines missing: ${missingIds.join(', ')}`;
     if (ctx.marketplace !== 'US' || ctx.currency !== 'USD' || !text(ctx.package_ref)) return 'fee_context marketplace/currency/package_ref binding is invalid';
     if (!validIsoWindow(ctx.sales) || !validIsoWindow(ctx.storage) || !validIsoWindow(ctx.inbound)) return 'sales/storage/inbound fee windows are invalid';
-    if (!ctx.sales.from.startsWith('2027-') || !ctx.sales.through.startsWith('2027-') ||
-      !ctx.storage.from.startsWith('2027-') || !ctx.storage.through.startsWith('2027-')) return 'sales/storage windows are not in 2027';
+    const r59CrossYearPeakOk = isR59 &&
+      ctx.sales.from === '2027-10-15' &&
+      (ctx.sales.through === '2028-01-14' || ctx.sales.through === '2027-12-31') &&
+      (ctx.storage.from === '2027-10-01' || ctx.storage.from === '2027-10-15') &&
+      ctx.storage.through === '2027-12-31';
+    if (!r59CrossYearPeakOk && (!ctx.sales.from.startsWith('2027-') || !ctx.sales.through.startsWith('2027-') ||
+      !ctx.storage.from.startsWith('2027-') || !ctx.storage.through.startsWith('2027-'))) return 'sales/storage windows are not in 2027';
     if (ctx.inbound.from < '2027-01-15' || ctx.inbound.through > ctx.sales.through) return 'inbound window falls outside 2027-01-15..sales end';
     const fulLine = ledger.lines.find(l => l?.id === 'fulfillment');
+    if (isR59 && hasProhibited2026PeakExtrapolation(fulLine, ledger)) {
+      return '2027 Q4 peak fulfillment fees cannot be estimated from 2026 peak uplifts';
+    }
     const fulBasis = fulLine?.fee_basis;
     if (!fulBasis || typeof fulBasis !== 'object' || !['unavailable', 'published'].includes(fulBasis.status)) return 'fulfillment fee_basis must be published or unavailable';
     const fulIssues = (calc.fee_validation?.issues ?? []).filter(issue => issue.line === 'fulfillment');
@@ -2533,9 +2842,8 @@ function diagnoseCompanionPeakPanelR58(period) {
       if (fulBasis.months !== undefined && (!Array.isArray(fulBasis.months) || !fulBasis.months.length ||
         fulBasis.months.some(m => !Number.isInteger(m) || m < 1 || m > 12))) return `${fulBinding} (published months)`;
       const fulIsPending = fulLine.status === 'pending' || fulLine.amount_usd === null;
-      if (fulIsPending && fulIssues.length === 0) return 'published covering 2027 peak fulfillment rate is left pending/null'; // Covering 2027 peak rate cannot be left pending/null!
+      if (fulIsPending && fulIssues.length === 0) return 'published covering 2027 peak fulfillment rate is left pending/null';
     }
-    // Only late-2027 holiday peak fulfillment unavailability/date-cutoff (and payout-dependent collection) may remain pending on the companion peak panel.
     const validFulIssue = issue => issue.line === 'fulfillment' && (
       (fulBasis.status === 'unavailable' && issue.code === 'unpublished_fee') ||
       (fulBasis.status === 'published' && allowedPublishedFulfillmentIssues.has(issue.code))
@@ -2546,9 +2854,10 @@ function diagnoseCompanionPeakPanelR58(period) {
     if (badPending.length) return `pending cost inputs: ${badPending.join(', ')} (only late-2027 peak fulfillment and collection may remain pending)`;
     const sm = monthsInIsoWindow(ctx.sales);
     const stm = monthsInIsoWindow(ctx.storage);
-    const monthsOk = sm.length === 3 && sm[0] === 10 && sm[1] === 11 && sm[2] === 12 &&
+    const legacyMonthsOk = sm.length === 3 && sm[0] === 10 && sm[1] === 11 && sm[2] === 12 &&
       stm.length === 3 && stm[0] === 10 && stm[1] === 11 && stm[2] === 12;
-    return monthsOk ? null : 'sales/storage windows do not cover exactly Oct–Dec';
+    const r59MonthsOk = isR59 && r59CrossYearPeakOk;
+    return (legacyMonthsOk || r59MonthsOk) ? null : 'sales/storage windows do not cover Oct–Dec / 2027-10-15..2028-01-14';
   };
   for (const sc of scenarios) {
     const reason = scenarioReason(sc);
@@ -2557,8 +2866,8 @@ function diagnoseCompanionPeakPanelR58(period) {
   return null;
 }
 
-function isValidCompanionPeakPanelR58(period) {
-  return diagnoseCompanionPeakPanelR58(period) === null;
+function isValidCompanionPeakPanelR58(period, isR59 = false) {
+  return diagnoseCompanionPeakPanelR58(period, isR59) === null;
 }
 
 function coversFullCalendarYearDates(scenarios) {
@@ -2689,6 +2998,121 @@ function selectDisplayPeriodR58(periods, primaryPeriodId) {
   return ranked[0].id;
 }
 
+const R59_MANDATORY_CORE_ITEM_IDS = Object.freeze([
+  'refund_adjusted_pre_ad_margin',
+  'unit_contribution',
+  'relevant_purchase_entry_bid',
+  'purchase_demand_scale',
+  'supported_opportunity',
+  'purchase_entry_match',
+  'product_dispersion',
+  'brand_dispersion',
+  'seller_dispersion',
+  'new_product_count_share',
+  'new_product_sales_share',
+  'low_rating_sales_performance',
+  'natural_visibility_development',
+  'low_return_preference',
+]);
+
+const R59_SAMPLE_DEFERRED_ITEM_LABELS = Object.freeze({
+  existing_solution_fit: '现有方案契合度（英文说明书／配件编码等拿样核对）',
+  feasible_light_differentiation: '低成本微改可行性（拿样后工厂工艺核对）',
+  storage_tolerance: '仓储耐受度（拿样受潮／堆码核对）',
+  transport_tolerance: '运输耐受度（拿样跌落／内衬核对）',
+  routine_complexity: '日常运营复杂度（旺旺确认质检／备件细节）',
+  specific_design_rights: '具体外观／结构权利（待拿实物比对 1–2 件近似专利号）',
+  applicable_public_requirements: '适用合规与材料申报（如木头拉丁学名／检测报价待问工厂）',
+});
+
+function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, screening, periodCoverageOk) {
+  if (!periodCoverageOk) return { eligible: false, items: [] };
+  if (candidate?.sourcing_disposition === 'private_mold_reserved') return { eligible: false, items: [] };
+  if (candidate?.ingest_isolated_pending === true) return { eligible: false, items: [] };
+  if (candidate?.bare_part_only === true || candidate?.complete_set_verified === false) return { eligible: false, items: [] };
+
+  const condById = new Map((screening?.conditions ?? []).map(c => [c.id, c]));
+  if (condById.get('reference_price')?.status !== 'pass') return { eligible: false, items: [] };
+  if (condById.get('strong_date_dependency')?.status !== 'pass') return { eligible: false, items: [] };
+  if (profit?.screening?.status !== 'pass') return { eligible: false, items: [] };
+  if (condById.get('specific_form_rights')?.status === 'fail') return { eligible: false, items: [] };
+  if (items.some(it => it.status === 'ineligible')) return { eligible: false, items: [] };
+
+  const scenarios = Array.isArray(profit?.diagnostics?.scenarios) ? profit.diagnostics.scenarios : [];
+  if (scenarios.length === 0) return { eligible: false, items: [] };
+  if (scenarios.some(sc => {
+    const inp = sc?.input;
+    const si = inp?.cost_ledger?.source_inputs;
+    return inp?.rejected_spec === true || inp?.complete_set_verified === false ||
+      si?.rejected_spec === true || si?.complete_set_verified === false || si?.bare_part_only === true;
+  })) {
+    return { eligible: false, items: [] };
+  }
+
+  const itemById = new Map(items.map(it => [it.id, it]));
+  for (const coreId of R59_MANDATORY_CORE_ITEM_IDS) {
+    if (itemById.get(coreId)?.status !== 'scored') {
+      return { eligible: false, items: [] };
+    }
+  }
+
+  const aprItem = itemById.get('applicable_public_requirements');
+  const aprInput = candidate?.judgments?.applicable_public_requirements;
+  const sdrInput = candidate?.judgments?.specific_design_rights;
+  if (
+    aprInput?.proven_conflict === true ||
+    aprInput?.hard_ban === true ||
+    sdrInput?.proven_conflict === true ||
+    candidate?.sp_api_calibration?.restrictions?.hard_category_ban === true ||
+    aprInput?.prescreen_completed === false ||
+    sdrInput?.prescreen_completed === false ||
+    (aprItem?.status === 'scored' && aprItem.score === 0 && aprInput?.hard_ban === true)
+  ) {
+    return { eligible: false, items: [] };
+  }
+
+  const unscored = items.filter(it => it.status !== 'scored');
+  if (unscored.length === 0) return { eligible: false, items: [] };
+
+  const deferredList = [];
+  for (const it of unscored) {
+    if (it.status !== 'needs_evidence' || !Object.hasOwn(R59_SAMPLE_DEFERRED_ITEM_LABELS, it.id)) {
+      return { eligible: false, items: [] };
+    }
+    const j = candidate?.judgments?.[it.id];
+    if (!j || typeof j !== 'object' || j.proven_conflict === true || j.material_conflict === true || j.supported === false) {
+      return { eligible: false, items: [] };
+    }
+    if (!text(j.reason) || !hasEvidence(j.evidence, ctx)) {
+      return { eligible: false, items: [] };
+    }
+    if (it.id === 'existing_solution_fit') {
+      if (j.complete_set_verified === false || j.bare_part_only === true || j.rejected_spec === true) {
+        return { eligible: false, items: [] };
+      }
+      if (j.complete_set_verified !== true && j.sample_check_required !== true) {
+        return { eligible: false, items: [] };
+      }
+    } else if (it.id === 'specific_design_rights' || it.id === 'applicable_public_requirements') {
+      if (j.prescreen_completed !== true || (j.sample_check_required !== true && j.defer_to_sample !== true)) {
+        return { eligible: false, items: [] };
+      }
+    } else {
+      if (j.sample_check_required !== true && j.defer_to_sample !== true) {
+        return { eligible: false, items: [] };
+      }
+    }
+    deferredList.push({
+      id: it.id,
+      label: R59_SAMPLE_DEFERRED_ITEM_LABELS[it.id],
+      weight: it.weight,
+      reason: j.reason.trim(),
+    });
+  }
+
+  return { eligible: true, items: deferredList };
+}
+
 function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldReserved = false) {
   if (isR59 && isPrivateMoldReserved) {
     const displayId = selectDisplayPeriodR58(periods, null);
@@ -2700,35 +3124,63 @@ function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldRese
       reasons: ['Candidate is routed to private_mold_reserved (no open 1688 public mold verified) and never counts toward ready-stock qualifying target.'],
     };
   }
-  const hasPeakPanel = periods.some(isValidCompanionPeakPanelR58);
+  const hasPeakPanel = periods.some(p => isValidCompanionPeakPanelR58(p, isR59));
   const offPeakCandidates = periods.filter(period =>
     period.queue === 'comparable' &&
-    period.months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
-    PRIMARY_OFF_PEAK_MONTHS.every(month => period.months.includes(month)) &&
+    isPrimaryOffPeakMonthsList(period.months, isR59) &&
     period.diagnostics?.economics?.scenarios?.length > 0 &&
-    period.diagnostics.economics.scenarios.every(coversPrimaryOffPeakScenario) &&
+    period.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59)) &&
     period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass',
   ).sort(comparePeriodOrder);
 
   if (hasPeakPanel && offPeakCandidates.length > 0) {
     const primary = offPeakCandidates[0];
+    const usesOct14 = primary.diagnostics.economics.scenarios.some(
+      s => s?.input?.cost_ledger?.fee_context?.sales?.through === '2027-10-14',
+    );
     return {
       counts_toward_target: true,
       mode: 'seasonal_eligible',
       primary_period_id: primary.id,
       display_period_id: primary.id,
-      reasons: ['Primary 2027-02-01..2027-09-30 off-peak period is complete (21/21) and comparable with companion Oct–Dec 2027 peak panel.'],
+      ...(isR59 ? { unpublished_peak_note: '待亚马逊公布 2027 旺季费率后补充' } : {}),
+      reasons: [usesOct14
+        ? 'Primary 2027-02-01..2027-10-14 off-peak period is complete (21/21) and comparable with companion 2027 Q4 peak panel (peak fulfillment held blank pending official 2027 peak rate publication).'
+        : 'Primary 2027-02-01..2027-09-30 off-peak period is complete (21/21) and comparable with companion Oct–Dec 2027 peak panel.'],
     };
   }
 
   if (isR59 && hasPeakPanel) {
+    const samplePendingOffPeak = periods.filter(period =>
+      Array.isArray(period.sample_check_items) &&
+      period.sample_check_items.length > 0 &&
+      isPrimaryOffPeakMonthsList(period.months, isR59) &&
+      period.diagnostics?.economics?.scenarios?.length > 0 &&
+      period.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59)) &&
+      period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass',
+    ).sort(comparePeriodOrder);
+    if (samplePendingOffPeak.length > 0) {
+      const primary = samplePendingOffPeak[0];
+      return {
+        counts_toward_target: true,
+        mode: 'seasonal_sample_pending_qualifying',
+        primary_period_id: primary.id,
+        display_period_id: primary.id,
+        covered_weight: primary.covered_weight,
+        sample_check_items: primary.sample_check_items,
+        unpublished_peak_note: '待亚马逊公布 2027 旺季费率后补充',
+        reasons: [
+          `Primary 2027 off-peak period qualifies at ${primary.covered_weight}/100 covered weight with ${primary.sample_check_items.length} post-sample/supplier verification item(s) held honestly blank and no proven patent/compliance conflict.`,
+        ],
+      };
+    }
+
     const crossingOffPeak = periods.filter(period =>
       Array.isArray(period.total_range) &&
       period.diagnostics?.economics?.crossing_margin_floor === true &&
-      period.months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
-      PRIMARY_OFF_PEAK_MONTHS.every(month => period.months.includes(month)) &&
+      isPrimaryOffPeakMonthsList(period.months, isR59) &&
       period.diagnostics?.economics?.scenarios?.length > 0 &&
-      period.diagnostics.economics.scenarios.every(coversPrimaryOffPeakScenario) &&
+      period.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59)) &&
       period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass',
     ).sort(comparePeriodOrder);
     if (crossingOffPeak.length > 0) {
@@ -2739,29 +3191,31 @@ function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldRese
         mode: 'crossing_30pct_interval',
         primary_period_id: primary.id,
         display_period_id: primary.id,
-        reasons: ['Primary 2027-02-01..2027-09-30 off-peak period is 21/21 scored across a crossing-30% scenario interval with companion Oct–Dec 2027 peak panel (held separate from strict all-scenario qualifying count).'],
+        unpublished_peak_note: '待亚马逊公布 2027 旺季费率后补充',
+        reasons: ['Primary 2027 off-peak period is 21/21 scored across a crossing-30% scenario interval with companion 2027 Q4 peak panel (held separate from strict all-scenario qualifying count).'],
       };
     }
   }
 
   const reasons = [];
   if (!hasPeakPanel) {
-    const nominalPeak = periods.filter(hasExactPeakMonthsR58).sort(comparePeriodOrder)[0];
+    const nominalPeak = periods.filter(p => hasExactPeakMonthsR58(p, isR59)).sort(comparePeriodOrder)[0];
     if (nominalPeak) {
-      reasons.push(`Companion 2027 holiday peak panel (${nominalPeak.id}) is present with exact months [10, 11, 12], but its cost/fulfillment inputs are incomplete: ${diagnoseCompanionPeakPanelR58(nominalPeak)}.`);
+      reasons.push(`Companion 2027 holiday peak panel (${nominalPeak.id}) is present with exact months [10, 11, 12], but its cost/fulfillment inputs are incomplete: ${diagnoseCompanionPeakPanelR58(nominalPeak, isR59)}.`);
     } else {
       reasons.push('Missing valid 2027 companion holiday peak operating panel covering exact months [10, 11, 12] with dated cost_ledger.');
     }
   }
-  const nominalOffPeak = periods.find(p => p.months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
-    PRIMARY_OFF_PEAK_MONTHS.every(m => p.months.includes(m)));
+  const nominalOffPeak = periods.find(p => isPrimaryOffPeakMonthsList(p.months, isR59));
   if (!nominalOffPeak) {
     reasons.push('Missing primary off-peak operating panel covering all months 2 through 9.');
   } else {
     if (nominalOffPeak.queue !== 'comparable') reasons.push(`Primary off-peak panel (${nominalOffPeak.id}) has queue ${nominalOffPeak.queue}, not comparable.`);
     if (!nominalOffPeak.diagnostics?.economics?.scenarios?.length ||
-      !nominalOffPeak.diagnostics.economics.scenarios.every(coversPrimaryOffPeakScenario)) {
-      reasons.push(`Primary off-peak panel (${nominalOffPeak.id}) does not cover full 2027-02-01..2027-09-30 validated scenarios.`);
+      !nominalOffPeak.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59))) {
+      reasons.push(isR59
+        ? `Primary off-peak panel (${nominalOffPeak.id}) does not cover full 2027-02-01..2027-10-14 sales (with 2027-02-01..2027-09-30 off-peak storage) validated scenarios.`
+        : `Primary off-peak panel (${nominalOffPeak.id}) does not cover full 2027-02-01..2027-09-30 validated scenarios.`);
     }
     if (nominalOffPeak.screening?.conditions?.find(c => c.id === 'strong_date_dependency')?.status !== 'pass') {
       reasons.push('Strong date dependency did not pass on the primary off-peak panel.');
@@ -3146,7 +3600,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
   const isR59 = profile.revision >= 59;
   const isOperatingPeriod = internal === INTERNAL_PERIOD_TOKEN;
   if (!isOperatingPeriod && candidate.economics && Object.hasOwn(candidate.economics, 'operating_periods')) {
-    validateOperatingPeriods(candidate.economics, isR58);
+    validateOperatingPeriods(candidate.economics, isR58, isR59);
     const {
       operating_periods: rawPeriods,
       expected_primary_scenarios: rootExpected,
@@ -3157,18 +3611,24 @@ export function scoreCandidate(candidate, profile, internal = null) {
     const evaluatedPeriods = orderedPeriods.map(period => {
       const mergedExpected = isR58 ? mergeExpectedPrimaryScenarios(rootExpected, period.expected_primary_scenarios) : period.expected_primary_scenarios;
       const mergedStress = isR58 ? mergeStressScenarios(rootStress, period.stress_scenarios) : period.stress_scenarios;
+      const scoredP = scoreCandidate({
+        ...candidate,
+        economics: {
+          ...economics,
+          scenarios: period.scenarios,
+          operating_months: period.months,
+          ...(mergedExpected !== undefined ? { expected_primary_scenarios: mergedExpected } : {}),
+          ...(mergedStress !== undefined ? { stress_scenarios: mergedStress } : {}),
+        },
+      }, profile, INTERNAL_PERIOD_TOKEN);
+      const isPeakWithPendingFul = isR59 && hasExactPeakMonthsR58(period, true) &&
+        !Array.isArray(scoredP.diagnostics?.economics?.margin_range);
       return {
-        ...scoreCandidate({
-          ...candidate,
-          economics: {
-            ...economics,
-            scenarios: period.scenarios,
-            operating_months: period.months,
-            ...(mergedExpected !== undefined ? { expected_primary_scenarios: mergedExpected } : {}),
-            ...(mergedStress !== undefined ? { stress_scenarios: mergedStress } : {}),
-          },
-        }, profile, INTERNAL_PERIOD_TOKEN),
-        id: period.id, label: period.label, months: period.months,
+        ...scoredP,
+        id: period.id,
+        label: period.label,
+        months: period.months,
+        ...(isPeakWithPendingFul ? { unpublished_peak_note: period.unpublished_peak_note ?? '待亚马逊公布 2027 旺季费率后补充' } : {}),
       };
     });
     const isPrivateMoldReserved = isR59 && candidate.sourcing_disposition === 'private_mold_reserved';
@@ -3179,8 +3639,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
     const seasonalOps = isR58
       ? buildOperationalDisclosuresR58(candidate, displayPeriodForOps?.diagnostics?.economics?.scenarios ?? [])
       : null;
-    const primaryOffPeak = evaluatedPeriods.find(p =>
-      p.months.length === PRIMARY_OFF_PEAK_MONTHS.length && PRIMARY_OFF_PEAK_MONTHS.every(m => p.months.includes(m)));
+    const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, isR59));
     const seasonalDispR59 = !isR59 ? undefined
       : isPrivateMoldReserved ? 'private_mold_reserved'
         : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
@@ -3188,7 +3647,8 @@ export function scoreCandidate(candidate, profile, internal = null) {
             : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
               : primaryOffPeak?.queue === 'deferred' ? 'deferred'
                 : 'pending_evidence';
-    const allowShortlistSeasonal = !isR59 || seasonalDispR59 === 'hard_excluded';
+    const allowShortlistSeasonal = !isR59;
+    const allowPkgShortlistSeasonal = isR59 && seasonalDispR59 === 'hard_excluded';
     return {
       candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
       profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [],
@@ -3196,9 +3656,11 @@ export function scoreCandidate(candidate, profile, internal = null) {
       total: null, total_range: null, conditional_total_range: null, supported_score: null, supported_range: null,
       covered_weight: null, unscored_weight: null, scoring_complete: null, queue: 'seasonal_review',
       ...(isR59 ? { effective_disposition: seasonalDispR59 } : {}),
+      ...(isR59 && Array.isArray(qualR58?.sample_check_items) && qualR58.sample_check_items.length > 0 ? { sample_check_items: qualR58.sample_check_items } : {}),
       ...(isR58 ? { qualification: qualR58, diagnostics: { operational_disclosures: seasonalOps } } : {}),
       ...(isR58 && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
       ...(isR58 && allowShortlistSeasonal && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
+      ...(allowPkgShortlistSeasonal && candidate.packaging_redesign_shortlist ? { packaging_redesign_shortlist: candidate.packaging_redesign_shortlist } : {}),
     };
   }
   const economicsInput = isR58 && !isOperatingPeriod && candidate.economics && Object.hasOwn(candidate.economics, 'operating_months')
@@ -3214,9 +3676,9 @@ export function scoreCandidate(candidate, profile, internal = null) {
     if (item.id === 'natural_visibility_development') return newcomers.natural;
     if (item.id === 'relevant_purchase_entry_bid') return scoreBids(item, candidate.bids, ctx, profile);
     if (['purchase_demand_scale', 'low_return_preference'].includes(item.id)) return scoreMetric(item, candidate.metrics?.[item.id], ctx, profile);
-    if (item.mapping.anchors?.some(anchor => !Array.isArray(anchor))) return scoreJudgment(item, candidate.judgments?.[item.id], ctx);
+    if (item.mapping.anchors?.some(anchor => !Array.isArray(anchor))) return scoreJudgment(item, candidate.judgments?.[item.id], ctx, profile, candidate);
     if (['market_entry', 'normal_newcomer'].includes(item.group) &&
-      !['low_rating_sales_performance', 'natural_visibility_development'].includes(item.id)) return scoreMarket(item, candidate.market, ctx);
+      !['low_rating_sales_performance', 'natural_visibility_development'].includes(item.id)) return scoreMarket(item, candidate.market, ctx, profile);
     return missing(item, 'Required evidence has not been supplied.');
   });
   const bidsItem = items.find(item => item.id === 'relevant_purchase_entry_bid');
@@ -3240,15 +3702,17 @@ export function scoreCandidate(candidate, profile, internal = null) {
   const screening = screenCandidate(candidate, ctx, profit, items, profile);
 
   const isTopLevelFlatR58 = isR58 && !isOperatingPeriod;
-  const isPrimaryOffPeakPeriodR58 = isR58 && isOperatingPeriod && Array.isArray(economicsInput?.operating_months) &&
-    economicsInput.operating_months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
-    PRIMARY_OFF_PEAK_MONTHS.every(m => economicsInput.operating_months.includes(m));
+  const isPrimaryOffPeakPeriodR58 = isR58 && isOperatingPeriod && isPrimaryOffPeakMonthsList(economicsInput?.operating_months, isR59);
   const fullYearDatesOk = !isTopLevelFlatR58 || coversFullCalendarYearDates(profit.diagnostics.scenarios);
-  const offPeakDatesOk = !isPrimaryOffPeakPeriodR58 || coversPrimaryOffPeakDates(profit.diagnostics.scenarios);
+  const offPeakDatesOk = !isPrimaryOffPeakPeriodR58 || coversPrimaryOffPeakDates(profit.diagnostics.scenarios, isR59);
   const periodCoverageOk = fullYearDatesOk && offPeakDatesOk;
   const isPrivateMoldFlatR59 = isR59 && !isOperatingPeriod && candidate.sourcing_disposition === 'private_mold_reserved';
-  const strictComplete = !isPrivateMoldFlatR59 && totals.covered_weight === 100 && screening.status === 'eligible' && periodCoverageOk;
-  const crossingCompleteR59 = !isPrivateMoldFlatR59 && isR59 && totals.covered_weight === 100 && screening.status === 'crossing_eligible' && periodCoverageOk;
+  const strictComplete = !isPrivateMoldFlatR59 && candidate.ingest_isolated_pending !== true && totals.covered_weight === 100 && screening.status === 'eligible' && periodCoverageOk;
+  const crossingCompleteR59 = !isPrivateMoldFlatR59 && candidate.ingest_isolated_pending !== true && isR59 && totals.covered_weight === 100 && screening.status === 'crossing_eligible' && periodCoverageOk;
+  const samplePendingEvalR59 = isR59 && !strictComplete && !crossingCompleteR59 && (isTopLevelFlatR58 || isPrimaryOffPeakPeriodR58)
+    ? evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, screening, periodCoverageOk)
+    : { eligible: false, items: [] };
+  const samplePendingQualifyingR59 = samplePendingEvalR59.eligible === true;
   const hasFullTotalRange = strictComplete || crossingCompleteR59;
   const queue = ['excluded', 'deferred'].includes(screening.status) ? screening.status : strictComplete ? 'comparable' : 'pending';
   const conditional = queue === 'pending' && !crossingCompleteR59 && periodCoverageOk ? addRanges(items.filter(item => item.group !== 'profit')
@@ -3271,6 +3735,18 @@ export function scoreCandidate(candidate, profile, internal = null) {
         primary_period_id: null,
         display_period_id: null,
         reasons: ['All 21 items supported and full 12-month target-year calendar coverage verified.'],
+      };
+    } else if (samplePendingQualifyingR59) {
+      qualification = {
+        counts_toward_target: true,
+        mode: 'sample_pending_qualifying',
+        primary_period_id: null,
+        display_period_id: null,
+        covered_weight: totals.covered_weight,
+        sample_check_items: samplePendingEvalR59.items,
+        reasons: [
+          `Qualifies at ${totals.covered_weight}/100 covered weight with ${samplePendingEvalR59.items.length} post-sample/supplier verification item(s) held honestly blank and no proven patent/compliance conflict.`,
+        ],
       };
     } else if (crossingCompleteR59) {
       qualification = {
@@ -3298,13 +3774,14 @@ export function scoreCandidate(candidate, profile, internal = null) {
 
   const flatDispR59 = !isR59 || isOperatingPeriod ? undefined
     : candidate.sourcing_disposition === 'private_mold_reserved' ? 'private_mold_reserved'
-      : strictComplete ? 'full_annual_qualifying'
+      : (strictComplete || samplePendingQualifyingR59) ? 'full_annual_qualifying'
         : crossingCompleteR59 || profit.diagnostics.crossing_margin_floor === true ? 'crossing_30pct_interval'
           : queue === 'excluded' ? 'hard_excluded'
             : queue === 'deferred' ? 'deferred'
               : 'pending_evidence';
 
-  const allowShortlistFlat = !isR59 || flatDispR59 === 'hard_excluded';
+  const allowShortlistFlat = !isR59;
+  const allowPkgShortlistFlat = isR59 && flatDispR59 === 'hard_excluded';
   return {
     candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
     profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [], items, ...totals,
@@ -3312,9 +3789,11 @@ export function scoreCandidate(candidate, profile, internal = null) {
     total: hasFullTotalRange ? point(totals.supported_range) : null, total_range: hasFullTotalRange ? totals.supported_range : null,
     conditional_total_range: conditional, queue, screening,
     ...(flatDispR59 ? { effective_disposition: flatDispR59 } : {}),
+    ...(samplePendingQualifyingR59 ? { sample_check_items: samplePendingEvalR59.items } : {}),
     ...(qualification ? { qualification } : {}),
     ...(isR58 && !isOperatingPeriod && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
     ...(isR58 && !isOperatingPeriod && allowShortlistFlat && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
+    ...(!isOperatingPeriod && allowPkgShortlistFlat && candidate.packaging_redesign_shortlist ? { packaging_redesign_shortlist: candidate.packaging_redesign_shortlist } : {}),
     diagnostics: {
       bids: bidsItem,
       newcomers: newcomers.diagnostics,
@@ -3330,6 +3809,7 @@ export function scoreBatch(batch, profile) {
     throw new TypeError('A version-1 batch with matching profile_revision and a candidates array is required.');
   }
   const isR58 = profile.revision >= 58;
+  const isR59 = profile.revision >= 59;
   const ids = new Set();
   const results = batch.candidates.map(candidate => {
     if (ids.has(candidate?.id)) throw new TypeError('Candidate IDs must be unique within a batch.');
@@ -3375,7 +3855,11 @@ export function scoreBatch(batch, profile) {
     seasonalEligible.sort((a, b) => {
       const pa = periodById(a, a.qualification.primary_period_id);
       const pb = periodById(b, b.qualification.primary_period_id);
-      return compareRangeDesc(pa?.total_range, pb?.total_range) || compareText(a.candidate_id, b.candidate_id);
+      const ra = isR59 ? (pa?.total_range ?? pa?.supported_range) : pa?.total_range;
+      const rb = isR59 ? (pb?.total_range ?? pb?.supported_range) : pb?.total_range;
+      return compareRangeDesc(ra, rb) ||
+        (isR59 ? ((pb?.covered_weight ?? -1) - (pa?.covered_weight ?? -1)) : 0) ||
+        compareText(a.candidate_id, b.candidate_id);
     });
     seasonalRemaining.sort((a, b) => {
       const pa = periodById(a, a.qualification.display_period_id);
@@ -3390,26 +3874,53 @@ export function scoreBatch(batch, profile) {
   for (const result of pending) {
     result.may_exceed_comparable_leader = leader && result.conditional_total_range ? result.conditional_total_range[1] > leader.total_range[0] : null;
   }
-  const queues = { comparable, pending, deferred, excluded, ...(seasonalReview.length ? { seasonal_review: seasonalReview } : {}) };
-  const orderedCandidates = profile.revision >= 57
-    ? [...comparable, ...seasonalEligible, ...pending, ...seasonalRemaining, ...deferred, ...excluded]
-    : Object.values(queues).flat();
-  const dispositionByCandId = new Map(orderedCandidates.map(c => [c.candidate_id, c.effective_disposition]));
-  const filteredNegotiationShortlist = isR58 && Array.isArray(batch.negotiation_shortlist)
-    ? (profile.revision >= 59
-        ? batch.negotiation_shortlist.filter(row => {
-            const fid = row?.form_id ?? row?.candidate_id ?? row?.id ?? null;
-            if (!fid || !dispositionByCandId.has(fid)) return true;
-            return dispositionByCandId.get(fid) === 'hard_excluded';
-          })
-        : batch.negotiation_shortlist)
+  const samplePendingFlatR59 = isR59
+    ? pending.filter(r => r.qualification?.counts_toward_target === true)
     : [];
+  const nonQualifyingPendingR59 = isR59
+    ? pending.filter(r => r.qualification?.counts_toward_target !== true)
+    : pending;
+  const flatQualifyingOrderedR59 = isR59
+    ? [...comparable, ...samplePendingFlatR59].sort((a, b) =>
+        compareRangeDesc(a.total_range ?? a.supported_range, b.total_range ?? b.supported_range) ||
+        ((b.covered_weight ?? -1) - (a.covered_weight ?? -1)) ||
+        compareText(a.candidate_id, b.candidate_id))
+    : comparable;
+  const queues = { comparable, pending, deferred, excluded, ...(seasonalReview.length ? { seasonal_review: seasonalReview } : {}) };
+  const orderedCandidates = isR59
+    ? [...flatQualifyingOrderedR59, ...seasonalEligible, ...nonQualifyingPendingR59, ...seasonalRemaining, ...deferred, ...excluded]
+    : profile.revision >= 57
+      ? [...comparable, ...seasonalEligible, ...pending, ...seasonalRemaining, ...deferred, ...excluded]
+      : Object.values(queues).flat();
+  const dispositionByCandId = new Map(orderedCandidates.map(c => [c.candidate_id, c.effective_disposition]));
+  const filteredNegotiationShortlist = isR58 && !isR59 && Array.isArray(batch.negotiation_shortlist)
+    ? batch.negotiation_shortlist
+    : [];
+  const rawPkgShortlist = profile.revision >= 59
+    ? [
+        ...(Array.isArray(batch.packaging_redesign_shortlist) ? batch.packaging_redesign_shortlist : []),
+        ...orderedCandidates
+          .filter(c => c.packaging_redesign_shortlist?.eligible === true)
+          .map(c => ({ form_id: c.candidate_id, label: c.label, ...c.packaging_redesign_shortlist })),
+      ]
+    : [];
+  const seenPkgShortlistIds = new Set();
+  const filteredPackagingRedesignShortlist = rawPkgShortlist.filter(row => {
+    if (!row || row.eligible !== true) return false;
+    const fid = row?.form_id ?? row?.candidate_id ?? row?.id ?? null;
+    if (fid && dispositionByCandId.has(fid) && dispositionByCandId.get(fid) !== 'hard_excluded') return false;
+    const dedupKey = fid ? `${fid}::${row.scenario_id ?? ''}` : JSON.stringify(row);
+    if (seenPkgShortlistIds.has(dedupKey)) return false;
+    seenPkgShortlistIds.add(dedupKey);
+    return true;
+  });
   return {
     schema_version: 1, profile_revision: profile.revision, total_budget: 100,
     candidates: orderedCandidates,
     order: Object.fromEntries(Object.entries(queues).map(([key, values]) => [key, values.map(result => result.candidate_id)])),
     comparable_leader: leader ? { candidate_id: leader.candidate_id, total_range: leader.total_range, conservative_score: leader.total_range[0] } : null,
     ...(filteredNegotiationShortlist.length > 0 ? { negotiation_shortlist: filteredNegotiationShortlist } : {}),
+    ...(filteredPackagingRedesignShortlist.length > 0 ? { packaging_redesign_shortlist: filteredPackagingRedesignShortlist } : {}),
     summary: {
       candidates: results.length, complete: comparable.length,
       complete_points: comparable.filter(result => result.total !== null).length,
@@ -3419,7 +3930,12 @@ export function scoreBatch(batch, profile) {
       pending: pending.length, deferred: deferred.length, excluded: excluded.length,
       ...(seasonalReview.length ? { seasonal_review: seasonalReview.length,
         seasonal_eligible: seasonalEligible.length } : {}),
-      ...(isR58 ? { qualifying: comparable.length + seasonalEligible.length } : {}),
+      ...(isR58 ? {
+        qualifying: isR59
+          ? results.filter(r => r.qualification?.counts_toward_target === true).length
+          : comparable.length + seasonalEligible.length,
+      } : {}),
+      ...(isR59 && samplePendingFlatR59.length > 0 ? { sample_pending_qualifying: samplePendingFlatR59.length } : {}),
       ...(profile.revision >= 59 ? {
         dispositions: {
           full_annual_qualifying: results.filter(r => r.effective_disposition === 'full_annual_qualifying').length,

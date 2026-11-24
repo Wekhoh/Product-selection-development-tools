@@ -1,6 +1,6 @@
 # Development workflow
 
-Status: development process, updated 2026-11-22. The bounded native-research, offline-card, SQLite multi-channel operations, Curatorial Studio (`01 视觉策展室`) report, and Scheme A `src/openai/` + subscription `Codex CLI` integration slices are implemented; STATE records current cards, verification evidence, and remaining live-activation gates. Full deployment and unattended operation remain separate. For another agent's review or a refactor, follow [CONTEXT-ROUTER](CONTEXT-ROUTER.md) without restarting settled design questions.
+Status: development process, updated 2026-11-24. The bounded native-research, offline-card, SQLite multi-channel operations, Curatorial Studio (`01 视觉策展室`) report, Scheme A `src/openai/` + subscription `Codex CLI` layer, and Revision 59 (`r59`) 2027 FBA / SP-API finalist calibration / workflow rationalization upgrades are implemented; STATE records current cards, verification evidence, and remaining live-activation gates. Full deployment and unattended operation remain separate. For another agent's review or a refactor, follow [CONTEXT-ROUTER](CONTEXT-ROUTER.md) without restarting settled design questions. Never invent or hardcode unconfirmed business threshold numbers without explicit owner confirmation.
 
 ## Canonical records
 

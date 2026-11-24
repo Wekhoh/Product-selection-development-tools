@@ -1190,6 +1190,7 @@ test('B09–B12 & Calibration Notes: 3-way returns_processing parity, Gate 1 bas
 
   // B10(b): estimateGate1A2027 rejects missing sales/inbound windows or inbound after sales (2029)
   const g1aNoWindows = estimateGate1A2027({
+    profile_revision: 58,
     price_usd: 49.99, refund_fraction: 0.05, physical_return_fraction: 0.05,
     referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
     fee_category: 'Business, Industrial, and Scientific Supplies',

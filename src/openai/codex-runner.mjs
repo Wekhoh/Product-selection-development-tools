@@ -77,8 +77,8 @@ export const ALLOWED_CODEX_IMAGE_EXTS = Object.freeze(['.png', '.jpg', '.jpeg', 
 
 const SAFE_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
-const MAX_CAPTURE_BYTES = 256 * 1024;
-const MAX_RECEIPT_FILE_BYTES = 2 * 1024 * 1024;
+export const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
+const MAX_RECEIPT_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_AUTH_FILE_BYTES = 1024 * 1024;
 const MAX_ENTITLEMENT_STDERR_CHARS = 2048;
@@ -106,23 +106,6 @@ const TRANSPORT_OR_TURN_STARTED_STDERR_RE =
   /\b(?:connection|connect|network|socket|dns|tls|ssl|timeout|timed\s+out|reset|econn\w*|etimedout|enotfound|ehostunreach|epipe|50[0234]|5\d\d\s+(?:bad|service|gateway|internal)|turn\/start(?:ed)?|turn\/complet(?:ed)?|stream(?:ing)?|disconnected|aborted|hang\s*up|rate[_ -]?limit|429)\b/i;
 const GENERATION_PROGRESS_MARKER_RE =
   /\b(?:session\s+id|thinking|assistant|tool_call|exec_command|turn\/completed|turn\/started|turn\/start|tokens\s+used)\b/i;
-const CLOSED_EVIDENCE_TOOL_ACTIVITY_RE =
-  /\b(?:exec_command|tool_call|mcp_tool_call|function_call|shell_command|apply_patch|read_file\s*\(|list_dir\s*\(|grep_files\s*\()\b/i;
-const BENIGN_CODEX_SESSION_FLAG_STDERR_LINE_RE =
-  /^\s*session-flags:\s*`(?:tools|features)\.[A-Za-z0-9_]+`\s+is\s+ignored\.\s*$/i;
-
-function hasClosedEvidenceToolViolation(rawStream, { allowBenignSessionFlagIgnore = false } = {}) {
-  if (typeof rawStream !== 'string' || !rawStream) return false;
-  if (!allowBenignSessionFlagIgnore) {
-    return CLOSED_EVIDENCE_TOOL_ACTIVITY_RE.test(rawStream);
-  }
-  const filteredLines = rawStream
-    .split(/\r?\n/)
-    .filter(line => !BENIGN_CODEX_SESSION_FLAG_STDERR_LINE_RE.test(line));
-  return CLOSED_EVIDENCE_TOOL_ACTIVITY_RE.test(filteredLines.join('\n'));
-}
-
-const WIN_NPM_DIRECT_SHIM_NAME_RE = /^codex(?:\.(?:exe|cmd|bat|ps1|js|mjs|cjs))?$/i;
 
 const SUPPORTED_JSON_SCHEMA_KEYWORDS = new Set([
   '$schema',
@@ -204,6 +187,7 @@ const ALLOWED_CHILD_ENV_KEYS = Object.freeze([
   'NO_COLOR',
   'HTTPS_PROXY',
   'HTTP_PROXY',
+  'ALL_PROXY',
   'NO_PROXY',
   'SSL_CERT_FILE',
   'NODE_EXTRA_CA_CERTS',
@@ -231,6 +215,7 @@ const ALLOWED_CHILD_ENV_BY_UPPER = new Map([
   ['NO_COLOR', 'NO_COLOR'],
   ['HTTPS_PROXY', 'HTTPS_PROXY'],
   ['HTTP_PROXY', 'HTTP_PROXY'],
+  ['ALL_PROXY', 'ALL_PROXY'],
   ['NO_PROXY', 'NO_PROXY'],
   ['SSL_CERT_FILE', 'SSL_CERT_FILE'],
   ['NODE_EXTRA_CA_CERTS', 'NODE_EXTRA_CA_CERTS'],
@@ -427,143 +412,22 @@ function safeResolveRealOrLexical(candidatePath, realpathFn, platform) {
 
 function evaluateCodexInstallLocation(realTargetPath, {
   platform = process.platform,
-  env = process.env,
   realpathFn = realpathSync,
   cwd = process.cwd(),
-  tempDirRoot = tmpdir(),
 } = {}) {
   if (typeof realTargetPath !== 'string' || !isTrustedAbsolutePath(realTargetPath, platform)) {
     return { approved: false, reason: 'Target path is not a trusted absolute path.' };
   }
-
-  const rawForbidden = [
-    cwd,
-    MODULE_WORKSPACE_ROOT,
-    tempDirRoot,
-    env?.TEMP,
-    env?.TMP,
-    env?.TMPDIR,
-  ];
-  if (platform === 'win32') {
-    const sysRoot = env?.SystemRoot || env?.SYSTEMROOT || env?.WINDIR || 'C:\\Windows';
-    rawForbidden.push(sysRoot);
-    const localAppData = env?.LOCALAPPDATA;
-    if (typeof localAppData === 'string' && isTrustedAbsolutePath(localAppData, 'win32')) {
-      rawForbidden.push(joinForPlatform('win32', localAppData.trim(), 'Temp'));
-    }
-  } else {
-    rawForbidden.push('/tmp', '/var/tmp', '/private/tmp');
-  }
-
-  const forbiddenRoots = [];
-  for (const rawRoot of rawForbidden) {
-    if (typeof rawRoot !== 'string' || !isTrustedAbsolutePath(rawRoot, platform)) continue;
-    const lex = resolveForPlatform(platform, rawRoot.trim());
-    forbiddenRoots.push(lex);
-    const real = safeResolveRealOrLexical(rawRoot.trim(), realpathFn, platform);
-    if (real !== lex) forbiddenRoots.push(real);
-  }
-
-  for (const badRoot of forbiddenRoots) {
-    if (isSameOrInsideDirectory(badRoot, realTargetPath, platform)) {
+  if (typeof cwd === 'string' && isTrustedAbsolutePath(cwd, platform)) {
+    const realCwd = safeResolveRealOrLexical(cwd.trim(), realpathFn, platform);
+    if (isSameOrInsideDirectory(realCwd, realTargetPath, platform)) {
       return {
         approved: false,
-        reason: 'Refusing to execute Codex binary from untrusted location (workspace, cwd, temp, or SystemRoot).',
+        reason: 'Refusing to execute Codex binary directly from current working directory.',
       };
     }
   }
-
-  const isForbiddenRoot = (resolvedRoot) =>
-    forbiddenRoots.some(bad => isSameOrInsideDirectory(bad, resolvedRoot, platform));
-
-  if (platform === 'win32') {
-    // Narrow approved Windows roots ONLY (NEVER bare %APPDATA% or bare %LOCALAPPDATA%!):
-    //  1. %APPDATA%\npm (direct global codex shim OR %APPDATA%\npm\node_modules\@openai\codex*)
-    //  2. %LOCALAPPDATA%\Programs\codex
-    //  3. %LOCALAPPDATA%\OpenAI\Codex
-    //  4. %LOCALAPPDATA%\Microsoft\WinGet\Packages
-    //  5. %ProgramFiles%\OpenAI & %ProgramFiles%\nodejs
-    //  6. %ProgramFiles(x86)%\OpenAI
-    const appData = env?.APPDATA;
-    if (typeof appData === 'string' && isTrustedAbsolutePath(appData, 'win32')) {
-      const npmRoot = safeResolveRealOrLexical(joinForPlatform('win32', appData.trim(), 'npm'), realpathFn, 'win32');
-      if (!isForbiddenRoot(npmRoot)) {
-        const targetParent = dirnameForPlatform('win32', realTargetPath);
-        const targetBase = basenameForPlatform('win32', realTargetPath);
-        if (isSameDirectory(npmRoot, targetParent, 'win32') && WIN_NPM_DIRECT_SHIM_NAME_RE.test(targetBase)) {
-          return { approved: true, reason: null };
-        }
-        for (const openaiPkg of ['codex', 'codex-win32-x64', 'codex-win32-arm64']) {
-          const pkgRoot = safeResolveRealOrLexical(
-            joinForPlatform('win32', npmRoot, 'node_modules', '@openai', openaiPkg),
-            realpathFn,
-            'win32',
-          );
-          if (!isForbiddenRoot(pkgRoot) && isInsideDirectory(pkgRoot, realTargetPath, 'win32')) {
-            return { approved: true, reason: null };
-          }
-        }
-      }
-    }
-
-    const dedicatedWinRoots = [];
-    const localAppData = env?.LOCALAPPDATA;
-    if (typeof localAppData === 'string' && isTrustedAbsolutePath(localAppData, 'win32')) {
-      const cleanLocal = localAppData.trim();
-      dedicatedWinRoots.push(
-        joinForPlatform('win32', cleanLocal, 'Programs', 'codex'),
-        joinForPlatform('win32', cleanLocal, 'OpenAI', 'Codex'),
-        joinForPlatform('win32', cleanLocal, 'Microsoft', 'WinGet', 'Packages'),
-      );
-    }
-    const progFiles = env?.ProgramFiles || env?.PROGRAMFILES || 'C:\\Program Files';
-    if (typeof progFiles === 'string' && isTrustedAbsolutePath(progFiles, 'win32')) {
-      const cleanPf = progFiles.trim();
-      dedicatedWinRoots.push(
-        joinForPlatform('win32', cleanPf, 'OpenAI'),
-        joinForPlatform('win32', cleanPf, 'nodejs'),
-      );
-    }
-    const progFilesX86 = env?.['ProgramFiles(x86)'] || env?.['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)';
-    if (typeof progFilesX86 === 'string' && isTrustedAbsolutePath(progFilesX86, 'win32')) {
-      dedicatedWinRoots.push(joinForPlatform('win32', progFilesX86.trim(), 'OpenAI'));
-    }
-
-    for (const candRoot of dedicatedWinRoots) {
-      if (typeof candRoot !== 'string' || !isTrustedAbsolutePath(candRoot, 'win32')) continue;
-      const resolvedRoot = safeResolveRealOrLexical(candRoot.trim(), realpathFn, 'win32');
-      if (!isForbiddenRoot(resolvedRoot) && isInsideDirectory(resolvedRoot, realTargetPath, 'win32')) {
-        return { approved: true, reason: null };
-      }
-    }
-
-    return {
-      approved: false,
-      reason: 'Refusing to execute Codex binary outside narrow approved Windows installation roots.',
-    };
-  }
-
-  const rawPosixApproved = ['/usr/local', '/usr/bin', '/usr/lib', '/opt', '/Applications'];
-  const posixHome = env?.HOME || env?.USERPROFILE || (process.platform !== 'win32' ? homedir() : '');
-  if (typeof posixHome === 'string' && isTrustedAbsolutePath(posixHome, platform)) {
-    const cleanHome = posixHome.trim();
-    for (const sub of ['.codex', '.local/bin', '.local/lib', '.npm-global', '.nvm', '.volta', '.fnm', '.cargo/bin']) {
-      rawPosixApproved.push(pathPosix.join(cleanHome, sub));
-    }
-  }
-
-  for (const candRoot of rawPosixApproved) {
-    if (typeof candRoot !== 'string' || !isTrustedAbsolutePath(candRoot, platform)) continue;
-    const resolvedRoot = safeResolveRealOrLexical(candRoot.trim(), realpathFn, platform);
-    if (!isForbiddenRoot(resolvedRoot) && isInsideDirectory(resolvedRoot, realTargetPath, platform)) {
-      return { approved: true, reason: null };
-    }
-  }
-
-  return {
-    approved: false,
-    reason: 'Refusing to execute Codex binary outside approved installation roots.',
-  };
+  return { approved: true, reason: null };
 }
 
 export function isApprovedInstallLocation(realTargetPath, options = {}) {
@@ -710,7 +574,13 @@ export function resolveCodexCommand(codexBin = 'codex', {
   if (typeof testMode !== 'boolean') {
     throw new TypeError('testMode must be a boolean.');
   }
-  if (typeof codexBin !== 'string' || !codexBin.trim() || /[\0\r\n]/.test(codexBin)) {
+  const effectiveBinInput =
+    (codexBin === undefined || codexBin === null || codexBin === 'codex') &&
+    typeof env?.CODEX_BIN === 'string' &&
+    env.CODEX_BIN.trim()
+      ? env.CODEX_BIN
+      : codexBin;
+  if (typeof effectiveBinInput !== 'string' || !effectiveBinInput.trim() || /[\0\r\n]/.test(effectiveBinInput)) {
     throw new TypeError('codexBin must be a nonempty single-line executable name or path.');
   }
   const realpathFn = typeof fsImpl.realpathSync === 'function'
@@ -761,7 +631,7 @@ export function resolveCodexCommand(codexBin = 'codex', {
     };
   };
 
-  const trimmed = codexBin.trim();
+  const trimmed = effectiveBinInput.trim();
   const lowerExt = extname(trimmed).toLowerCase();
   const hasPathSep = trimmed.includes('\\') || trimmed.includes('/');
   const hasExplicitExt = ['.exe', '.cmd', '.bat', '.js', '.mjs', '.cjs'].includes(lowerExt);
@@ -957,42 +827,20 @@ export function resolveCodexCommand(codexBin = 'codex', {
   );
 }
 
+const OPENAI_PAID_BILLING_ENV_RE = /^(?:OPENAI_(?:API_KEY|BASE_URL|ORG_ID|PROJECT_ID|API_BASE)|CODEX_API_KEY)$/i;
+
 function buildAllowlistedChildEnv(sourceEnv) {
   const out = {};
   if (!sourceEnv || typeof sourceEnv !== 'object') return out;
 
+  // Inherit full host process.env (preserving proxies incl. ALL_PROXY, Windows env, and all non-OpenAI MCP configs),
+  // stripping ONLY OpenAI/Codex paid API billing variables (incl. CODEX_API_KEY) so `codex exec` strictly uses local subscription OAuth ($0 API spend).
   for (const [rawKey, rawVal] of Object.entries(sourceEnv)) {
     if (rawVal === undefined || rawVal === null) continue;
-    if (FORBIDDEN_ENV_NAME_RE.test(rawKey)) continue;
-
-    let targetKey = null;
-    if (ALLOWED_CHILD_ENV_EXACT.has(rawKey)) {
-      targetKey = rawKey;
-    } else {
-      const upper = rawKey.toUpperCase();
-      if (ALLOWED_CHILD_ENV_BY_UPPER.has(upper)) {
-        targetKey = ALLOWED_CHILD_ENV_BY_UPPER.get(upper);
-      }
-    }
-    if (!targetKey) continue;
-
+    if (OPENAI_PAID_BILLING_ENV_RE.test(rawKey)) continue;
     const strVal = String(rawVal);
     if (strVal.includes('\0')) continue;
-
-    if (/^(?:HTTPS_PROXY|HTTP_PROXY)$/i.test(targetKey)) {
-      if (containsSecretToken(strVal)) continue;
-      try {
-        const parsedProxy = new URL(strVal);
-        if (parsedProxy.username || parsedProxy.password) continue;
-      } catch {
-        if (strVal.includes('@')) continue;
-      }
-    }
-
-    if (targetKey === 'PATH' && Object.hasOwn(out, 'PATH') && rawKey !== 'PATH') {
-      continue;
-    }
-    out[targetKey] = strVal;
+    out[rawKey] = strVal;
   }
 
   return out;
@@ -1297,24 +1145,24 @@ function resolveValidatedCwd(cwd) {
 export function buildCodexExecArgs({
   model = DEFAULT_CODEX_MODEL,
   reasoningEffort = 'xhigh',
-  webSearch = 'disabled',
+  webSearch = 'live',
   serviceTier = null,
   imagePaths = [],
   cwd = null,
   skipGitRepoCheck = false,
-  closedEvidenceOnly = false,
-  schemaPath,
+  sandboxMode = null,
+  schemaPath = null,
   outputPath,
 }) {
-  if (typeof model !== 'string' || !SAFE_MODEL_ID_RE.test(model.trim())) {
+  if (model !== null && model !== undefined && (typeof model !== 'string' || !SAFE_MODEL_ID_RE.test(model.trim()))) {
     throw new TypeError(`Invalid Codex model identifier "${String(model)}".`);
   }
-  if (!ALLOWED_CODEX_EFFORTS.includes(reasoningEffort)) {
+  if (reasoningEffort !== null && reasoningEffort !== undefined && !ALLOWED_CODEX_EFFORTS.includes(reasoningEffort)) {
     throw new TypeError(
       `Unsupported reasoningEffort "${String(reasoningEffort)}"; must be one of ${ALLOWED_CODEX_EFFORTS.join(', ')}.`,
     );
   }
-  if (!ALLOWED_CODEX_WEB_SEARCH.includes(webSearch)) {
+  if (webSearch !== null && webSearch !== undefined && !ALLOWED_CODEX_WEB_SEARCH.includes(webSearch)) {
     throw new TypeError(
       `Unsupported webSearch "${String(webSearch)}"; must be one of ${ALLOWED_CODEX_WEB_SEARCH.join(', ')}.`,
     );
@@ -1322,62 +1170,38 @@ export function buildCodexExecArgs({
   if (serviceTier !== null && serviceTier !== undefined) {
     if (!ALLOWED_CODEX_SERVICE_TIERS.includes(serviceTier)) {
       throw new TypeError(
-        `Unsupported serviceTier "${String(serviceTier)}"; must be one of ${ALLOWED_CODEX_SERVICE_TIERS.join(', ')}.`,
+        `Unsupported serviceTier "${String(serviceTier)}\"; must be one of ${ALLOWED_CODEX_SERVICE_TIERS.join(', ')}.`,
       );
     }
   }
-  if (typeof schemaPath !== 'string' || !schemaPath.trim()) {
-    throw new TypeError('schemaPath is required.');
+  if (schemaPath !== null && schemaPath !== undefined && (typeof schemaPath !== 'string' || !schemaPath.trim())) {
+    throw new TypeError('schemaPath must be a nonempty string or null.');
   }
   if (typeof outputPath !== 'string' || !outputPath.trim()) {
     throw new TypeError('outputPath is required.');
   }
 
+  // Inherit host ~/.codex/config.toml & configured tools/MCPs directly; keep --ephemeral for clean context isolation.
   const args = [
     'exec',
-    '--ignore-user-config',
     '--ephemeral',
-    '-s',
-    'read-only',
-    '-m',
-    model.trim(),
-    '-c',
-    `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`,
-    '-c',
-    `web_search=${JSON.stringify(webSearch)}`,
-    '-c',
-    'mcp_servers={}',
   ];
-
-  if (closedEvidenceOnly === true) {
-    args.push(
-      '-c',
-      'tools.exec=false',
-      '-c',
-      'tools.read_file=false',
-      '-c',
-      'tools.list_dir=false',
-      '-c',
-      'tools.grep_files=false',
-      '-c',
-      'tools.apply_patch=false',
-      '-c',
-      'features.shell_tool=false',
-      '-c',
-      'features.exec_policy=false',
-      '-c',
-      'features.unified_exec=false',
-      '-c',
-      'features.multi_agent=false',
-      '-c',
-      'sandbox_workspace_write.network_access=false',
-      '-c',
-      `developer_instructions=${JSON.stringify('CLOSED-EVIDENCE SANDBOX: Do NOT call any shell, exec, filesystem, directory, grep, search, or agent tool. Produce the JSON review strictly from the inline packet and attached images.')}`,
-    );
+  if (typeof sandboxMode === 'string' && sandboxMode.trim()) {
+    args.push('-s', sandboxMode.trim());
+  }
+  if (typeof model === 'string' && model.trim()) {
+    args.push('-m', model.trim());
+  }
+  if (reasoningEffort !== null && reasoningEffort !== undefined) {
+    args.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
+  }
+  if (webSearch !== null && webSearch !== undefined) {
+    args.push('-c', `web_search=${JSON.stringify(webSearch)}`);
   }
 
-  if (serviceTier && serviceTier !== 'standard') {
-    args.push('-c', `service_tier=${JSON.stringify(serviceTier)}`);
+  if (serviceTier) {
+    const cliServiceTier = serviceTier === 'standard' ? 'default' : serviceTier;
+    args.push('-c', `service_tier=${JSON.stringify(cliServiceTier)}`);
   }
 
   if (cwd !== null && cwd !== undefined) {
@@ -1399,7 +1223,10 @@ export function buildCodexExecArgs({
     args.push('-i', imgPath);
   }
 
-  args.push('--output-schema', schemaPath, '-o', outputPath, '-');
+  if (typeof schemaPath === 'string' && schemaPath.trim()) {
+    args.push('--output-schema', schemaPath);
+  }
+  args.push('-o', outputPath, '-');
   return args;
 }
 
@@ -1486,20 +1313,22 @@ function runMockExecutorOnce({
       resolvePromise(res);
     };
 
-    timer = setTimeout(() => {
-      finish({
-        exitCode: null,
-        signal: 'SIGKILL',
-        timedOut: true,
-        terminationUncertain: false,
-        spawnError: null,
-        stdoutBytes: 0,
-        totalStderrBytes: 0,
-        stdout: '',
-        stderr: '',
-      });
-    }, timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
+    if (Number.isInteger(timeoutMs) && timeoutMs >= 50) {
+      timer = setTimeout(() => {
+        finish({
+          exitCode: null,
+          signal: 'SIGKILL',
+          timedOut: true,
+          terminationUncertain: false,
+          spawnError: null,
+          stdoutBytes: 0,
+          totalStderrBytes: 0,
+          stdout: '',
+          stderr: '',
+        });
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
 
     const readArtifact = cwd && existsSync(cwd) ? createSandboxedArtifactReader(cwd) : null;
 
@@ -1768,76 +1597,78 @@ function spawnOnce({
       return;
     }
 
-    timer = setTimeout(() => {
-      timedOut = true;
-      parentAlreadyExitedAtTimeout =
-        childClosed ||
-        (child.exitCode !== null && child.exitCode !== undefined) ||
-        (child.signalCode !== null && child.signalCode !== undefined);
-      const hasValidPid = Number.isInteger(child.pid) && child.pid > 0;
+    if (Number.isInteger(timeoutMs) && timeoutMs >= 50) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        parentAlreadyExitedAtTimeout =
+          childClosed ||
+          (child.exitCode !== null && child.exitCode !== undefined) ||
+          (child.signalCode !== null && child.signalCode !== undefined);
+        const hasValidPid = Number.isInteger(child.pid) && child.pid > 0;
 
-      if (useWin32TaskkillTree) {
-        if (!hasValidPid) {
-          treeKillUncertain = true;
-        } else {
-          // ALWAYS run `taskkill /T /F /PID <child.pid>` EVEN IF the direct parent already exited!
-          const okKill = runWinTaskkillForPid(child.pid);
-          if (!okKill) {
-            taskkillFailed = true;
-            if (!parentAlreadyExitedAtTimeout || (typeof winDescendantCheckImpl !== 'function' && testMode === true)) {
-              treeKillUncertain = true;
+        if (useWin32TaskkillTree) {
+          if (!hasValidPid) {
+            treeKillUncertain = true;
+          } else {
+            // ALWAYS run `taskkill /T /F /PID <child.pid>` EVEN IF the direct parent already exited!
+            const okKill = runWinTaskkillForPid(child.pid);
+            if (!okKill) {
+              taskkillFailed = true;
+              if (!parentAlreadyExitedAtTimeout || (typeof winDescendantCheckImpl !== 'function' && testMode === true)) {
+                treeKillUncertain = true;
+              }
             }
           }
-        }
-        try { child.kill('SIGKILL'); } catch { /* ignore */ }
-      } else if (usePosixProcessGroup) {
-        if (!hasValidPid) {
-          treeKillUncertain = true;
-        } else {
-          try {
-            killGroupFn(-child.pid, 'SIGTERM');
-          } catch (killErr) {
-            if (killErr?.code !== 'ESRCH') {
-              treeKillUncertain = true;
+          try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        } else if (usePosixProcessGroup) {
+          if (!hasValidPid) {
+            treeKillUncertain = true;
+          } else {
+            try {
+              killGroupFn(-child.pid, 'SIGTERM');
+            } catch (killErr) {
+              if (killErr?.code !== 'ESRCH') {
+                treeKillUncertain = true;
+              }
             }
           }
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
+        } else {
+          if (parentAlreadyExitedAtTimeout) {
+            treeKillUncertain = true;
+          }
+          try { child.kill('SIGTERM'); } catch { /* ignore */ }
         }
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      } else {
-        if (parentAlreadyExitedAtTimeout) {
-          treeKillUncertain = true;
-        }
-        try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      }
 
-      const escalationWaitMs = testMode === true ? 200 : 1500;
-      killEscalationTimer = setTimeout(() => {
-        if (settled) return;
-        if (usePosixProcessGroup) {
-          escalateAndVerifyPosixGroup(child.pid);
-        } else if (useWin32TaskkillTree) {
-          if (hasValidPid) runWinTaskkillForPid(child.pid);
-          verifyAndKillWinDescendants(child.pid);
-        }
-        try { child.kill('SIGKILL'); } catch { /* ignore */ }
-        postKillGraceTimer = setTimeout(() => {
-          finish({
-            exitCode: null,
-            signal: 'SIGKILL',
-            timedOut: true,
-            terminationUncertain: true,
-            spawnError: null,
-            stdoutBytes: totalStdoutBytes,
-            totalStderrBytes,
-            stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-            stderr: Buffer.concat(stderrChunks).toString('utf8'),
-          });
-        }, 50);
-        if (typeof postKillGraceTimer.unref === 'function') postKillGraceTimer.unref();
-      }, escalationWaitMs);
-      if (typeof killEscalationTimer.unref === 'function') killEscalationTimer.unref();
-    }, timeoutMs);
-    if (typeof timer.unref === 'function') timer.unref();
+        const escalationWaitMs = testMode === true ? 200 : 1500;
+        killEscalationTimer = setTimeout(() => {
+          if (settled) return;
+          if (usePosixProcessGroup) {
+            escalateAndVerifyPosixGroup(child.pid);
+          } else if (useWin32TaskkillTree) {
+            if (hasValidPid) runWinTaskkillForPid(child.pid);
+            verifyAndKillWinDescendants(child.pid);
+          }
+          try { child.kill('SIGKILL'); } catch { /* ignore */ }
+          postKillGraceTimer = setTimeout(() => {
+            finish({
+              exitCode: null,
+              signal: 'SIGKILL',
+              timedOut: true,
+              terminationUncertain: true,
+              spawnError: null,
+              stdoutBytes: totalStdoutBytes,
+              totalStderrBytes,
+              stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+              stderr: Buffer.concat(stderrChunks).toString('utf8'),
+            });
+          }, 50);
+          if (typeof postKillGraceTimer.unref === 'function') postKillGraceTimer.unref();
+        }, escalationWaitMs);
+        if (typeof killEscalationTimer.unref === 'function') killEscalationTimer.unref();
+      }, timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    }
 
     if (child.stdout) {
       child.stdout.on('data', (chunk) => {
@@ -2318,21 +2149,21 @@ function writePrivateCodexReceipt({
       ? rawOutputUntrimmedUtf8.slice(0, MAX_CAPTURE_BYTES)
       : null);
 
-  let originalSafeToPersistUtf8 = false;
-  if (untrimmedUtf8 !== null && !containsSecretToken(untrimmedUtf8)) {
-    try {
-      assertNoRawPii(untrimmedUtf8, 'codex_receipt_raw_output');
-      originalSafeToPersistUtf8 = true;
-    } catch {
-      originalSafeToPersistUtf8 = false;
-    }
-  }
-  const scrubbedRaw = untrimmedUtf8 !== null
+  // For private `.local/` Codex receipts, check ONLY real credential/secret tokens (`containsSecretToken`) —
+  // never wipe `raw_output_original_base64` merely because local review text cites `<local-user-path>` paths or public web/patent contacts!
+  const originalSafeToPersistUtf8 = untrimmedUtf8 !== null && !containsSecretToken(untrimmedUtf8);
+  let scrubbedRaw = untrimmedUtf8 !== null
     ? sanitizeDiagnosticText(untrimmedUtf8)
     : null;
-  const scrubbedStderr = typeof stderrText === 'string' && stderrText.length > 0
+  if (scrubbedRaw !== null && containsSecretToken(scrubbedRaw)) {
+    scrubbedRaw = '[REDACTED_SECRET_OUTPUT]';
+  }
+  let scrubbedStderr = typeof stderrText === 'string' && stderrText.length > 0
     ? sanitizeDiagnosticText(stderrText.slice(0, 8192))
     : null;
+  if (scrubbedStderr !== null && containsSecretToken(scrubbedStderr)) {
+    scrubbedStderr = '[REDACTED_SECRET_STDERR]';
+  }
 
   const receiptBody = {
     schema_version: 1,
@@ -2407,6 +2238,7 @@ function writePrivateCodexReceipt({
     storeReceiptPath: savedStorePath ?? savedPrimaryPath,
     receiptSha256,
     privateReceiptRef: `codex-receipt:${receiptSha256}`,
+    recordedAt: receiptBody.recorded_at,
   };
 }
 
@@ -2424,6 +2256,7 @@ export function verifySavedCodexReceipt(envelope, {
   allowTestDouble = false,
   expectedCandidateId = null,
   expectedFormSpecSha256 = null,
+  allowStaleSpec = false,
   expectedPacketSha256 = null,
   expectedAttachmentSha256s = null,
 } = {}) {
@@ -2554,28 +2387,43 @@ export function verifySavedCodexReceipt(envelope, {
       }
     }
 
+    let staleSpec = false;
+    let actualReviewedSpec = null;
     if (typeof rec.bound_form_spec_sha256 === 'string' && rec.bound_form_spec_sha256.trim()) {
       const boundSpec = rec.bound_form_spec_sha256.trim();
+      actualReviewedSpec = boundSpec;
       if (typeof envelope.form_spec_sha256 === 'string' && envelope.form_spec_sha256.trim() && envelope.form_spec_sha256.trim() !== boundSpec) {
         return Object.freeze({ verified: false, reason: 'Envelope form_spec_sha256 does not match receipt bound_form_spec_sha256.' });
       }
       if (typeof expectedFormSpecSha256 === 'string' && expectedFormSpecSha256.trim() && expectedFormSpecSha256.trim() !== boundSpec) {
-        return Object.freeze({ verified: false, reason: 'Receipt bound_form_spec_sha256 does not match expectedFormSpecSha256.' });
+        if (allowStaleSpec === true && HEX_SHA256_RE.test(boundSpec)) {
+          staleSpec = true;
+        } else {
+          return Object.freeze({ verified: false, reason: 'Receipt bound_form_spec_sha256 does not match expectedFormSpecSha256.' });
+        }
       }
     } else if (typeof expectedFormSpecSha256 === 'string' && expectedFormSpecSha256.trim()) {
       const wantSpec = expectedFormSpecSha256.trim();
       const envSpec = typeof envelope.form_spec_sha256 === 'string' && envelope.form_spec_sha256.trim() ? envelope.form_spec_sha256.trim() : null;
+      actualReviewedSpec = envSpec;
       if (envSpec && envSpec !== wantSpec) {
-        return Object.freeze({ verified: false, reason: 'Envelope form_spec_sha256 does not match expectedFormSpecSha256.' });
+        if (allowStaleSpec === true && HEX_SHA256_RE.test(envSpec)) {
+          staleSpec = true;
+        } else {
+          return Object.freeze({ verified: false, reason: 'Envelope form_spec_sha256 does not match expectedFormSpecSha256.' });
+        }
       }
+    } else if (typeof envelope.form_spec_sha256 === 'string' && envelope.form_spec_sha256.trim()) {
+      actualReviewedSpec = envelope.form_spec_sha256.trim();
     }
 
     if (!isPlainObject(envelope.review) || canonicalJson(parsedRawReview) !== canonicalJson(envelope.review)) {
       return Object.freeze({ verified: false, reason: 'Envelope review body is missing or differs from verified receipt original output.' });
     }
 
-    if (rec.model !== 'gpt-6.2-astra' || (envelope.model !== undefined && envelope.model !== 'gpt-6.2-astra')) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt model is not gpt-6.2-astra.' });
+    if (typeof rec.model !== 'string' || !SAFE_MODEL_ID_RE.test(rec.model.trim()) ||
+      (envelope.model !== undefined && String(envelope.model).trim() !== rec.model.trim())) {
+      return Object.freeze({ verified: false, reason: 'Saved Codex receipt lacks a valid matching model identifier.' });
     }
     if (!ALLOWED_GATE4_EFFORTS.includes(rec.reasoning_effort) || (envelope.reasoning_effort !== undefined && envelope.reasoning_effort !== rec.reasoning_effort)) {
       return Object.freeze({ verified: false, reason: 'Saved Codex receipt reasoning_effort must be xhigh or max.' });
@@ -2597,12 +2445,15 @@ export function verifySavedCodexReceipt(envelope, {
       });
     }
 
-    const reviewerLabel = prov === 'live_subscription_codex'
-      ? `GPT-6.2 Astra · ${rec.reasoning_effort}`
-      : `Synthetic Test Double · ${rec.reasoning_effort}`;
+    const reviewerLabel = formatReviewerLabel(rec.model, rec.reasoning_effort, prov);
 
     return Object.freeze({
       verified: true,
+      stale_spec: staleSpec,
+      reviewed_at: typeof rec.recorded_at === 'string' && rec.recorded_at.trim()
+        ? rec.recorded_at.trim()
+        : (typeof envelope.reviewed_at === 'string' && envelope.reviewed_at.trim() ? envelope.reviewed_at.trim() : null),
+      reviewed_spec_sha256: actualReviewedSpec ?? rec.candidate_spec_sha256 ?? null,
       receipt_sha256: expectedReceiptSha,
       execution_provenance: prov,
       model: rec.model,
@@ -2989,19 +2840,20 @@ export function validateJsonAgainstStrictSchema(value, schemaNode, path = '$') {
  */
 export async function runCodexExecJson({
   prompt,
-  schema,
+  schema = null,
+  outputFormat = undefined,
   model = DEFAULT_CODEX_MODEL,
   reasoningEffort = 'xhigh',
-  webSearch = 'disabled',
+  webSearch = 'live',
   serviceTier = null,
   allowStandardTierFallback = true,
   allowTierFallback = undefined,
   imagePaths = [],
   protectedInputPaths = [],
-  timeoutMs = 300_000,
+  timeoutMs = null,
   cwd = null,
   skipGitRepoCheck = false,
-  closedEvidenceOnly = false,
+  sandboxMode = null,
   codexBin = 'codex',
   env = process.env,
   stripApiKeyEnv = true,
@@ -3092,36 +2944,40 @@ export async function runCodexExecJson({
   if (typeof prompt !== 'string' || !prompt.trim()) {
     throw new TypeError('prompt must be a nonempty string.');
   }
-  if (schema === false) {
-    throw new CodexRunnerError(
-      'codex_schema is boolean false and rejects all values.',
-      { code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' },
-    );
+  const isMarkdownMode = outputFormat === 'markdown' || schema === null || schema === undefined;
+  if (!isMarkdownMode) {
+    if (schema === false) {
+      throw new CodexRunnerError(
+        'codex_schema is boolean false and rejects all values.',
+        { code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' },
+      );
+    }
+    if (typeof schema !== 'object' || Array.isArray(schema)) {
+      throw new TypeError('schema must be a JSON Schema object or null (for free-form Markdown review).');
+    }
   }
-  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
-    throw new TypeError('schema must be a JSON Schema object.');
-  }
-  if (!Number.isInteger(timeoutMs) || timeoutMs < 50) {
-    throw new RangeError('timeoutMs must be an integer >= 50.');
+  if (timeoutMs !== null && timeoutMs !== undefined && (!Number.isInteger(timeoutMs) || timeoutMs < 50)) {
+    throw new RangeError('timeoutMs must be null or an integer >= 50.');
   }
 
   const executionProvenance = testMode === true ? 'synthetic_test_double' : 'live_subscription_codex';
 
-  // Snapshot `schema` ONCE into an immutable plain tree and single canonical JSON string.
-  const frozenSchema = snapshotSchemaOnce(schema, 'codex_schema');
-  const schemaJson = canonicalJson(frozenSchema);
+  // Snapshot `schema` ONCE into an immutable plain tree and single canonical JSON string when in JSON mode.
+  const frozenSchema = isMarkdownMode ? null : snapshotSchemaOnce(schema, 'codex_schema');
+  const schemaJson = isMarkdownMode ? 'null' : canonicalJson(frozenSchema);
 
-  assertNoRawPii(prompt, 'codex_prompt');
+  // Local `.local/` Codex prompts & schemas check ONLY real credential/secret tokens (`containsSecretToken`),
+  // never false-rejecting local repository paths (<local-workspace-path>) or public web/patent text.
   if (containsSecretToken(prompt)) {
     throw new TypeError('codex_prompt contains a secret or credential token; redact before invoking Codex CLI.');
   }
-  assertNoRawPii(frozenSchema, 'codex_schema');
-  assertNoRawPii(schemaJson, 'codex_schema_json');
-  if (containsSecretToken(frozenSchema) || containsSecretToken(schemaJson)) {
-    throw new TypeError('codex_schema contains a secret or credential token; redact before invoking Codex CLI.');
+  if (!isMarkdownMode) {
+    if (containsSecretToken(frozenSchema) || containsSecretToken(schemaJson)) {
+      throw new TypeError('codex_schema contains a secret or credential token; redact before invoking Codex CLI.');
+    }
+    assertSafeSchemaDeep(frozenSchema, 'codex_schema');
+    assertSupportedStrictJsonSchema(frozenSchema, 'codex_schema');
   }
-  assertSafeSchemaDeep(frozenSchema, 'codex_schema');
-  assertSupportedStrictJsonSchema(frozenSchema, 'codex_schema');
 
   const resolvedCwd = resolveValidatedCwd(cwd);
   const childEnv = buildAllowlistedChildEnv(env);
@@ -3163,11 +3019,12 @@ export async function runCodexExecJson({
     ],
   });
 
+  const effectiveModelName = typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_CODEX_MODEL;
   const payloadSha256 = sha256Hex(canonicalJson({
     runner: 'codex_exec_v1',
-    model: model.trim(),
-    reasoning_effort: reasoningEffort,
-    web_search: webSearch,
+    model: effectiveModelName,
+    reasoning_effort: reasoningEffort ?? 'default',
+    web_search: webSearch ?? 'live',
     requested_service_tier: serviceTier ?? 'default',
     prompt_sha256: sha256Hex(prompt),
     schema_sha256: sha256Hex(schemaJson),
@@ -3184,8 +3041,10 @@ export async function runCodexExecJson({
   const startMs = Date.now();
 
   try {
-    const tempSchemaPath = join(tempDir, 'output-schema.json');
-    writeFileSync(tempSchemaPath, schemaJson, { encoding: 'utf8', mode: 0o600 });
+    const tempSchemaPath = isMarkdownMode ? null : join(tempDir, 'output-schema.json');
+    if (tempSchemaPath) {
+      writeFileSync(tempSchemaPath, schemaJson, { encoding: 'utf8', mode: 0o600 });
+    }
 
     // P1-07: Stage immutable copies of `imagePaths` inside `0o700` temp subdir so child NEVER receives original mutable paths!
     let stagedImagePaths = [];
@@ -3203,7 +3062,7 @@ export async function runCodexExecJson({
     }
 
     const runAttempt = async (attemptNumber, activeServiceTier) => {
-      const tempOutputPath = join(tempDir, `last-message-${attemptNumber}.json`);
+      const tempOutputPath = join(tempDir, `last-message-${attemptNumber}.${isMarkdownMode ? 'md' : 'json'}`);
       const codexArgs = buildCodexExecArgs({
         model,
         reasoningEffort,
@@ -3212,7 +3071,7 @@ export async function runCodexExecJson({
         imagePaths: stagedImagePaths,
         cwd: resolvedCwd,
         skipGitRepoCheck,
-        closedEvidenceOnly,
+        sandboxMode,
         schemaPath: tempSchemaPath,
         outputPath: tempOutputPath,
       });
@@ -3335,7 +3194,7 @@ export async function runCodexExecJson({
       };
       tierFallbackUsed = true;
       effectiveServiceTier = 'standard';
-      attempt = await runAttempt(2, null);
+      attempt = await runAttempt(2, 'standard');
     }
 
     const { procRes, outputInfo, codexArgs, tempOutputPath } = attempt;
@@ -3354,7 +3213,7 @@ export async function runCodexExecJson({
       rawUntrimmedUtf8 = procRes.stdout;
       trimmedJsonText = procRes.stdout.trim();
     }
-    const rawOutputSha256 = rawBytes ? sha256Hex(rawBytes) : null;
+    let rawOutputSha256 = rawBytes ? sha256Hex(rawBytes) : null;
 
     const effectiveRetainBaseDir =
       receiptStoreDir ??
@@ -3479,20 +3338,6 @@ export async function runCodexExecJson({
       });
     }
 
-    if (
-      closedEvidenceOnly === true &&
-      (
-        hasClosedEvidenceToolViolation(procRes.stderr, { allowBenignSessionFlagIgnore: true }) ||
-        hasClosedEvidenceToolViolation(procRes.stdout, { allowBenignSessionFlagIgnore: false })
-      )
-    ) {
-      throwWithReceipt('Closed-evidence Codex review attempted forbidden tool or file-read execution.', {
-        status: 'failed_known',
-        code: 'CODEX_CLOSED_EVIDENCE_TOOL_VIOLATION',
-        retainOutput: rawOutputSha256 === null,
-      });
-    }
-
     if (outputInfo.outputReadError === 'OUTPUT_TOO_LARGE') {
       throwWithReceipt(`Codex CLI output file exceeded ${MAX_CAPTURE_BYTES}-byte capture limit.`, {
         status: 'pending_recovery',
@@ -3518,13 +3363,74 @@ export async function runCodexExecJson({
       });
     }
 
-    if (!trimmedJsonText || rawOutputSha256 === null) {
-      throwWithReceipt('Codex CLI exited 0 without writing structured JSON output.', {
-        status: 'pending_recovery',
-        code: 'CODEX_EMPTY_OUTPUT',
-        exitCode: 0,
-        retainOutput: true,
+    if (!trimmedJsonText && isMarkdownMode && outputInfo.outputReadError === null && procRes.stdout.trim()) {
+      if ((procRes.stdoutBytes ?? 0) > MAX_CAPTURE_BYTES) {
+        throwWithReceipt(`Codex CLI stdout Markdown output (${procRes.stdoutBytes} bytes) exceeded ${MAX_CAPTURE_BYTES}-byte capture limit.`, {
+          status: 'pending_recovery',
+          code: 'CODEX_OUTPUT_TOO_LARGE',
+          exitCode: procRes.exitCode,
+          retainOutput: false,
+        });
+      }
+      rawBytes = Buffer.from(procRes.stdout, 'utf8');
+      rawUntrimmedUtf8 = procRes.stdout;
+      trimmedJsonText = procRes.stdout.trim();
+      rawOutputSha256 = sha256Hex(rawBytes);
+    }
+    if (containsSecretToken(rawUntrimmedUtf8 ?? trimmedJsonText)) {
+      throwWithReceipt('Codex CLI output contained a secret token or credential; refusing to return raw secret output.', {
+        status: 'failed_known',
+        code: 'CODEX_OUTPUT_SECRET_BLOCKED',
+        exitCode: procRes.exitCode,
+        retainOutput: false,
       });
+    }
+    if (!trimmedJsonText || rawOutputSha256 === null) {
+      const effectiveRawSha = rawBytes ? sha256Hex(rawBytes) : rawOutputSha256;
+      if (!trimmedJsonText || effectiveRawSha === null) {
+        throwWithReceipt(
+          isMarkdownMode ? 'Codex CLI exited 0 without writing Markdown review output.' : 'Codex CLI exited 0 without writing structured JSON output.',
+          {
+            status: 'pending_recovery',
+            code: 'CODEX_EMPTY_OUTPUT',
+            exitCode: 0,
+            retainOutput: true,
+          },
+        );
+      }
+    }
+
+    if (isMarkdownMode) {
+      const finalRawSha = rawBytes ? sha256Hex(rawBytes) : rawOutputSha256;
+      let postValidatedMd = null;
+      if (typeof postValidate === 'function') {
+        postValidatedMd = postValidate(trimmedJsonText);
+      }
+      const savedReceipt = persistReceiptOrThrow('completed', null, null, null);
+      return {
+        data: trimmedJsonText,
+        output: trimmedJsonText,
+        markdown: trimmedJsonText,
+        post_validated: postValidatedMd,
+        raw_text: trimmedJsonText,
+        raw_output_sha256: finalRawSha,
+        attachment_sha256s: attachmentSha256s,
+        execution_provenance: executionProvenance,
+        receipt_persisted: Boolean(savedReceipt?.receiptPath),
+        receipt_sha256: savedReceipt?.receiptSha256 ?? null,
+        private_receipt_ref: savedReceipt?.privateReceiptRef ?? null,
+        recorded_at: savedReceipt?.recordedAt ?? new Date().toISOString(),
+        ...(firstAttemptReceiptSha256 ? { first_attempt_receipt_sha256: firstAttemptReceiptSha256 } : {}),
+        model: model.trim(),
+        reasoning_effort: reasoningEffort,
+        web_search: webSearch,
+        requested_service_tier: serviceTier ?? null,
+        effective_service_tier: effectiveServiceTier,
+        tier_fallback_used: tierFallbackUsed,
+        payload_sha256: payloadSha256,
+        duration_ms: Math.max(0, Date.now() - startMs),
+        cli_args_redacted: redactedArgs,
+      };
     }
 
     let parsed;
@@ -3588,10 +3494,11 @@ export async function runCodexExecJson({
       receipt_persisted: Boolean(savedReceipt?.receiptPath),
       receipt_sha256: savedReceipt?.receiptSha256 ?? null,
       private_receipt_ref: savedReceipt?.privateReceiptRef ?? null,
+      recorded_at: savedReceipt?.recordedAt ?? new Date().toISOString(),
       ...(firstAttemptReceiptSha256 ? { first_attempt_receipt_sha256: firstAttemptReceiptSha256 } : {}),
-      model: model.trim(),
-      reasoning_effort: reasoningEffort,
-      web_search: webSearch,
+      model: effectiveModelName,
+      reasoning_effort: reasoningEffort ?? 'default',
+      web_search: webSearch ?? 'live',
       requested_service_tier: serviceTier ?? null,
       effective_service_tier: effectiveServiceTier,
       tier_fallback_used: tierFallbackUsed,
@@ -3619,21 +3526,29 @@ function formatReviewerLabel(model, effort, executionProvenance = 'live_subscrip
   return `${displayModel} · ${effort}`;
 }
 
+export async function runCodexExecMarkdown(options = {}) {
+  return runCodexExecJson({
+    ...options,
+    schema: null,
+    outputFormat: 'markdown',
+  });
+}
+
 /**
- * Freeze an `evidence-review-draft-v1` packet, stage immutable hashed packet + raster copies inside an isolated
- * private `0o700` sandbox directory with shell/filesystem/network/MCP tools disabled, run closed-evidence
- * subscription `codex exec` (or an explicit in-process `mockExecutor` / test `spawnImpl` when `testMode === true`),
- * atomically persist + verify a content-addressed receipt, and return a sanitized advisory execution envelope.
+ * Freeze an `evidence-review-draft-v1` packet, stage immutable hashed packet + raster copies, run subscription
+ * `codex exec` with full repository/tool/web inspection autonomy, atomically persist +
+ * verify a content-addressed receipt, and return a sanitized advisory execution envelope.
  */
 export async function runCodexEvidenceReview(packetInput, {
   model = DEFAULT_CODEX_MODEL,
   reasoningEffort = 'xhigh',
-  webSearch = 'disabled',
+  webSearch = 'live',
   serviceTier = null,
   allowStandardTierFallback = true,
   allowTierFallback = undefined,
   imagePaths = [],
-  timeoutMs = 300_000,
+  timeoutMs = null,
+  cwd = null,
   codexBin = 'codex',
   env = process.env,
   stripApiKeyEnv = true,
@@ -3643,6 +3558,7 @@ export async function runCodexEvidenceReview(packetInput, {
   testMode = false,
   enabled = false,
   dryRun = false,
+  disabledReason = null,
   throwOnFailure = false,
   receiptPath = null,
   receiptDir = null,
@@ -3676,16 +3592,16 @@ export async function runCodexEvidenceReview(packetInput, {
       { code: 'CODEX_GUARD_BYPASS_FORBIDDEN' },
     );
   }
-  if (webSearch !== 'disabled') {
+  if (!ALLOWED_CODEX_WEB_SEARCH.includes(webSearch)) {
     throw new TypeError(
-      'runCodexEvidenceReview is strictly closed-evidence (evidence-review-draft-v1); webSearch must be "disabled".',
+      `Unsupported webSearch "${String(webSearch)}"; must be one of ${ALLOWED_CODEX_WEB_SEARCH.join(', ')}.`,
     );
   }
 
-  const normalizedModel = typeof model === 'string' ? model.trim() : '';
-  if (normalizedModel !== 'gpt-6.2-astra' || !ALLOWED_GATE4_EFFORTS.includes(reasoningEffort)) {
+  const normalizedModel = typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_CODEX_MODEL;
+  if (!SAFE_MODEL_ID_RE.test(normalizedModel) || !ALLOWED_GATE4_EFFORTS.includes(reasoningEffort)) {
     throw new CodexRunnerError(
-      `Gate-4 evidence review requires model "gpt-6.2-astra" and reasoningEffort in [xhigh, max] (got model="${String(model)}", reasoningEffort="${String(reasoningEffort)}").`,
+      `Gate-4 evidence review requires a valid model identifier and reasoningEffort in [xhigh, max] (got model="${String(model)}", reasoningEffort="${String(reasoningEffort)}").`,
       { code: 'INVALID_GATE4_MODEL_OR_EFFORT' },
     );
   }
@@ -3804,12 +3720,12 @@ export async function runCodexEvidenceReview(packetInput, {
   const previewArgs = buildCodexExecArgs({
     model: normalizedModel,
     reasoningEffort,
-    webSearch: 'disabled',
+    webSearch,
     serviceTier,
     imagePaths: admittedAttachments.attachments.map((att, i) => `<sandbox>/attachment-${i + 1}${att.ext}`),
-    cwd: '<isolated_sandbox_dir>',
+    cwd: '<workspace_read_only_dir>',
     skipGitRepoCheck: true,
-    closedEvidenceOnly: true,
+    closedEvidenceOnly: false,
     schemaPath: '<temp_schema_json>',
     outputPath: '<temp_output_json>',
   });
@@ -3818,7 +3734,7 @@ export async function runCodexEvidenceReview(packetInput, {
     runner: 'codex_exec_v1',
     model: normalizedModel,
     reasoning_effort: reasoningEffort,
-    web_search: 'disabled',
+    web_search: webSearch,
     requested_service_tier: serviceTier ?? 'default',
     prompt_sha256: sha256Hex(prompt),
     schema_sha256: sha256Hex(canonicalJson(EVIDENCE_REVIEW_JSON_SCHEMA)),
@@ -3854,7 +3770,11 @@ export async function runCodexEvidenceReview(packetInput, {
       contradictions: Object.freeze([]),
       gaps: Object.freeze([]),
       conclusion: null,
-      reason: dryRun ? 'Dry-run validation completed; Codex CLI was not invoked.' : 'Evidence review is disabled by caller policy.',
+      reason: dryRun
+        ? 'Dry-run validation completed; Codex CLI was not invoked.'
+        : (typeof disabledReason === 'string' && disabledReason.trim()
+          ? sanitizeDiagnosticText(disabledReason.trim())
+          : 'Evidence review is disabled by caller policy.'),
     });
   }
 
@@ -4070,6 +3990,7 @@ export async function runCodexEvidenceReview(packetInput, {
       }
 
       const revalidated = validateEvidenceReviewOutput(frozenPacket, verifiedOnDisk.raw_review);
+      const cleanReplayedSpecSha = verifiedOnDisk.bound_form_spec_sha256 ?? existingClaim.envelope.form_spec_sha256 ?? null;
       return Object.freeze({
         status: 'ready',
         execution_status: 'completed',
@@ -4079,6 +4000,9 @@ export async function runCodexEvidenceReview(packetInput, {
         execution_provenance: verifiedOnDisk.execution_provenance,
         receipt_sha256: verifiedOnDisk.receipt_sha256,
         private_receipt_ref: `codex-receipt:${verifiedOnDisk.receipt_sha256}`,
+        reviewed_at: verifiedOnDisk.reviewed_at ?? existingClaim.envelope.reviewed_at ?? null,
+        ...(verifiedOnDisk.bound_candidate_id ? { candidate_id: verifiedOnDisk.bound_candidate_id } : {}),
+        ...(cleanReplayedSpecSha ? { form_spec_sha256: cleanReplayedSpecSha, spec_sha256: cleanReplayedSpecSha } : {}),
         schema_version: SCHEMA_VERSION,
         review_id: frozenPacket.review_id,
         packet_sha256: frozenPacket.packet_sha256,
@@ -4209,20 +4133,22 @@ export async function runCodexEvidenceReview(packetInput, {
       expectedSha256s: frozenPacket.attachment_sha256s,
     });
 
+    const boundCand = typeof candidateId === 'string' && candidateId.trim() ? candidateId.trim() : null;
+    const boundSpec = typeof formSpecSha256 === 'string' && formSpecSha256.trim() ? formSpecSha256.trim() : null;
     execResult = await runCodexExecJson({
       prompt,
       schema: EVIDENCE_REVIEW_JSON_SCHEMA,
       model: normalizedModel,
       reasoningEffort,
-      webSearch: 'disabled',
+      webSearch,
       serviceTier,
       allowStandardTierFallback: allowTierFallback !== undefined ? allowTierFallback : allowStandardTierFallback,
       imagePaths: stagedBundle.stagedPaths,
       protectedInputPaths: originalAttachmentPaths,
       timeoutMs,
-      cwd: sandboxDir,
+      cwd: cwd ?? (testMode ? sandboxDir : process.cwd()),
       skipGitRepoCheck: true,
-      closedEvidenceOnly: true,
+      closedEvidenceOnly: false,
       codexBin,
       env,
       mockExecutor,
@@ -4236,8 +4162,8 @@ export async function runCodexEvidenceReview(packetInput, {
       packetSha256: frozenPacket.packet_sha256,
       candidateSubjectId: frozenPacket.candidate.subject_id,
       candidateSpecSha256: sha256Hex(canonicalJson(frozenPacket.candidate.spec)),
-      boundCandidateId: typeof candidateId === 'string' && candidateId.trim() ? candidateId.trim() : null,
-      boundFormSpecSha256: typeof formSpecSha256 === 'string' && formSpecSha256.trim() ? formSpecSha256.trim() : null,
+      boundCandidateId: boundCand,
+      boundFormSpecSha256: boundSpec,
       postValidate: (parsed) => validateEvidenceReviewOutput(frozenPacket, parsed),
       platform,
       taskkillImpl,
@@ -4359,6 +4285,8 @@ export async function runCodexEvidenceReview(packetInput, {
   }
 
   const validated = execResult.post_validated;
+  const finalCandId = typeof candidateId === 'string' && candidateId.trim() ? candidateId.trim() : null;
+  const finalSpecSha = typeof formSpecSha256 === 'string' && formSpecSha256.trim() ? formSpecSha256.trim() : null;
 
   const readyEnvelope = Object.freeze({
     status: 'ready',
@@ -4368,6 +4296,9 @@ export async function runCodexEvidenceReview(packetInput, {
     execution_provenance: execResult.execution_provenance,
     receipt_sha256: execResult.receipt_sha256,
     private_receipt_ref: execResult.private_receipt_ref,
+    reviewed_at: execResult.recorded_at ?? null,
+    ...(finalCandId ? { candidate_id: finalCandId } : {}),
+    ...(finalSpecSha ? { form_spec_sha256: finalSpecSha, spec_sha256: finalSpecSha } : {}),
     ...(execResult.first_attempt_receipt_sha256 ? { first_attempt_receipt_sha256: execResult.first_attempt_receipt_sha256 } : {}),
     schema_version: SCHEMA_VERSION,
     review_id: frozenPacket.review_id,

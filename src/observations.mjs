@@ -409,58 +409,161 @@ export function evaluateGoogleTrendsSeries(rawPayload = {}) {
 }
 
 /**
- * Classify Keepa historical review-count trajectories into objective card tags without hardcoded review-rate kills:
- * distinguishes normal Vine 2/10/30 trickle, variant-split drops, and sharp nonlinear step-jumps.
+ * Extract objective Keepa review-curve facts and attach qualitative review-trajectory tags
+ * without unapproved hardcoded step-jump/drop numeric cutoffs.
  */
-export function classifyKeepaReviewTrajectory(points = [], { vine_tier = null, variant_split_detected = false } = {}) {
+export function classifyKeepaReviewTrajectory(points = [], {
+  vine_tier = null,
+  variant_split_detected = false,
+  ai_review_anomaly = false,
+  qualitative_tag = null,
+} = {}) {
   if (!Array.isArray(points) || points.length < 2) {
     return {
       classification: 'unobserved',
       tag: 'Keepa评论历史未取得',
       max_step_delta: null,
+      observed_facts: null,
     };
   }
   const sorted = points
     .filter(p => p && typeof p.date === 'string' && finite(p.reviews) && p.reviews >= 0)
     .sort((a, b) => a.date.localeCompare(b.date));
   if (sorted.length < 2) {
-    return { classification: 'unobserved', tag: 'Keepa评论历史未取得', max_step_delta: null };
+    return { classification: 'unobserved', tag: 'Keepa评论历史未取得', max_step_delta: null, observed_facts: null };
   }
   let maxJump = 0;
   let maxDrop = 0;
   for (let i = 1; i < sorted.length; i++) {
-    const d0 = Date.parse(`${sorted[i - 1].date.slice(0, 10)}T00:00:00Z`);
-    const d1 = Date.parse(`${sorted[i].date.slice(0, 10)}T00:00:00Z`);
-    const days = Math.max(1, (d1 - d0) / 86400000);
     const delta = sorted[i].reviews - sorted[i - 1].reviews;
-    if (delta > 0 && days <= 7 && delta > maxJump) maxJump = delta;
+    if (delta > maxJump) maxJump = delta;
     if (delta < 0 && Math.abs(delta) > maxDrop) maxDrop = Math.abs(delta);
   }
-  if (maxJump > 35) {
+  const startReviews = sorted[0].reviews;
+  const endReviews = sorted[sorted.length - 1].reviews;
+  const observedFacts = {
+    point_count: sorted.length,
+    start_date: sorted[0].date.slice(0, 10),
+    end_date: sorted[sorted.length - 1].date.slice(0, 10),
+    start_reviews: startReviews,
+    end_reviews: endReviews,
+    net_delta: endReviews - startReviews,
+    max_positive_step: maxJump,
+    max_negative_step: maxDrop,
+  };
+  if (ai_review_anomaly === true) {
     return {
-      classification: 'sharp_nonlinear_step_jump',
-      tag: `Keepa评论阶梯骤增预警（7天内骤增 +${maxJump} 条，疑合并变体/异常操控）`,
+      classification: 'qualitative_review_anomaly_watch',
+      tag: typeof qualitative_tag === 'string' && qualitative_tag.trim()
+        ? qualitative_tag.trim()
+        : `Keepa评论曲线异常提醒（期初 ${startReviews} -> 期末 ${endReviews}，最大单次变动 +${maxJump}/-${maxDrop}）`,
       max_step_delta: maxJump,
+      observed_facts: observedFacts,
     };
   }
-  if (variant_split_detected || maxDrop >= 15) {
+  if (variant_split_detected === true) {
     return {
       classification: 'variant_split_drop',
-      tag: `拆变体评数变动（单次掉评 -${maxDrop} 条）`,
+      tag: typeof qualitative_tag === 'string' && qualitative_tag.trim()
+        ? qualitative_tag.trim()
+        : `拆变体评数变动（最大单次掉评 -${maxDrop} 条）`,
       max_step_delta: -maxDrop,
+      observed_facts: observedFacts,
     };
   }
-  if ([2, 10, 30].includes(vine_tier) || (sorted[0].reviews <= 2 && sorted[sorted.length - 1].reviews <= 35)) {
+  if ([2, 10, 30].includes(vine_tier)) {
     return {
       classification: 'vine_gradual_ramp',
-      tag: vine_tier ? `Vine ${vine_tier}档常规回评爬坡` : '常规自然/Vine渐进回评',
+      tag: `Vine ${vine_tier}档回评爬坡`,
       max_step_delta: maxJump,
+      observed_facts: observedFacts,
     };
   }
   return {
     classification: 'steady_organic_accumulation',
-    tag: null,
+    tag: typeof qualitative_tag === 'string' && qualitative_tag.trim() ? qualitative_tag.trim() : null,
     max_step_delta: maxJump,
+    observed_facts: observedFacts,
+  };
+}
+
+/**
+ * Extract Vine / Verified Purchase (VP) / unverified direct review breakdown for Q31 exemplar display.
+ * Never fabricates zero when fields are unreported.
+ */
+export function extractNewcomerReviewOriginBreakdown(raw = {}) {
+  if (!raw || typeof raw !== 'object') return null;
+  let listVine = null;
+  let listVp = null;
+  let listDirect = null;
+  if (Array.isArray(raw.reviews_list) && raw.reviews_list.length > 0) {
+    let vCnt = 0;
+    let vpCnt = 0;
+    let dCnt = 0;
+    let anyKnown = false;
+    for (const r of raw.reviews_list) {
+      if (!r || typeof r !== 'object') continue;
+      if (r.is_vine === true || r.vine === true || /vine/i.test(String(r.badge ?? r.origin ?? ''))) {
+        vCnt += 1;
+        anyKnown = true;
+      } else if (r.verified_purchase === true || r.is_vp === true || r.vp === true) {
+        vpCnt += 1;
+        anyKnown = true;
+      } else if (r.verified_purchase === false || r.is_vp === false || r.direct === true) {
+        dCnt += 1;
+        anyKnown = true;
+      }
+    }
+    if (anyKnown) {
+      listVine = vCnt;
+      listVp = vpCnt;
+      listDirect = dCnt;
+    }
+  }
+  const pickNonNeg = (...vals) => {
+    for (const v of vals) {
+      if (finite(v) && v >= 0) return v;
+    }
+    return null;
+  };
+  const vine = pickNonNeg(raw.vine_count, raw.vineCount, raw.vine_reviews, raw.vineReviews, listVine);
+  const vp = pickNonNeg(raw.vp_count, raw.vpCount, raw.vp_reviews, raw.verified_purchase_count, raw.verifiedPurchaseCount, raw.vpReviews, listVp);
+  const direct = pickNonNeg(
+    raw.direct_count,
+    raw.directCount,
+    raw.direct_review_count,
+    raw.directReviewCount,
+    raw.non_vp_direct_reviews,
+    raw.direct_reviews,
+    raw.unverified_review_count,
+    raw.unverifiedReviewCount,
+    raw.directReviews,
+    listDirect,
+  );
+  const vineShare = finite(raw.vine_share) && raw.vine_share >= 0 && raw.vine_share <= 1 ? raw.vine_share : null;
+  const vpShare = finite(raw.vp_share) && raw.vp_share >= 0 && raw.vp_share <= 1 ? raw.vp_share : null;
+  const directShare = finite(raw.direct_share) && raw.direct_share >= 0 && raw.direct_share <= 1 ? raw.direct_share : null;
+
+  if (vine === null && vp === null && direct === null && vineShare === null && vpShare === null && directShare === null) {
+    return null;
+  }
+  const parts = [];
+  if (vine !== null) parts.push(`Vine ${vine}`);
+  else if (vineShare !== null) parts.push(`Vine ${(vineShare * 100).toFixed(0)}%`);
+  if (vp !== null) parts.push(`VP ${vp}`);
+  else if (vpShare !== null) parts.push(`VP ${(vpShare * 100).toFixed(0)}%`);
+  if (direct !== null) parts.push(`直评 ${direct}`);
+  else if (directShare !== null) parts.push(`直评 ${(directShare * 100).toFixed(0)}%`);
+  const summaryText = parts.join(' · ');
+  return {
+    vine_count: vine,
+    vp_count: vp,
+    direct_count: direct,
+    vine_share: vineShare,
+    vp_share: vpShare,
+    direct_share: directShare,
+    summary_zh: summaryText,
+    display_zh: summaryText,
   };
 }
 

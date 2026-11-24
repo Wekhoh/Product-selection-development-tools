@@ -7,9 +7,10 @@
  * Read-only inspection commands (status, trace, coverage, plan-discovery) open SQLite strictly
  * read-only without mutating active in-flight requests. Leaves legacy src/cli.mjs untouched.
  */
+import { createServer } from 'node:http';
 import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
 import { mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -37,7 +38,7 @@ import {
 import { attachDiscovery, attachStoreDiscoveryProvenance, prepareDiscovery } from './discovery.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
-import { ingestTrialSpecification } from './raw-ingest.mjs';
+import { extractSpApiFinalistCalibration, ingestTrialSpecification } from './raw-ingest.mjs';
 import { assertNoRawPii, containsSecretToken, sanitizeDiagnosticText } from './contracts.mjs';
 import {
   WORKFLOW_RESPONSES_TASKS,
@@ -56,7 +57,9 @@ import {
 } from './openai/index.mjs';
 
 const THIS_DIR = dirname(fileURLToPath(import.meta.url));
+const REPO_CANONICAL_BUDGET_DB = resolve(THIS_DIR, '..', '.local', 'state', 'selection.sqlite');
 const CONTACT_SHEET_SCRIPT = resolve(THIS_DIR, '..', 'scripts', 'render_contact_sheet.py');
+const stringifyCliJson = value => JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2);
 const ioCode = error => (typeof error?.code === 'string' && /^[A-Z_]+$/.test(error.code) ? error.code : 'IO_ERROR');
 const pathKey = value => (process.platform === 'win32' ? value.toLowerCase() : value);
 
@@ -87,11 +90,22 @@ const USAGE = [
   '  funnel-ledger      --db <sqlite> [--since <ISO-timestamp>] [--output <out.json>]',
   '  openai-batch-build --task <social-bridge|spec-matcher|1688-vision|review-judge|rights-prescreen> --input <items.json> --output <batch.jsonl> [--max-tool-calls <n>]',
   '  ingest-trial       --input <spec.json> --profile <profile.json> [--output <out.batch.json>]  (无状态，校验原始回执 ASIN 溯源并生成 r59 双季批次)',
+  '  sp-api-calibrate   --input <sp-api-bundle.json> [--output <out.json>]  (无状态，从只读 SP-API 终审回执提取官方包装尺寸、佣金比例与限售状态)',
+  '  serve-report       --dir <report-dir> [--port <port>] [--check | --once]  (无状态，在 127.0.0.1 启动本地 HTML 报告渲染预览服务)',
   '  redteam-review     --packet <packet.json> --output <review.json> [--effort <xhigh|max>] [--image <file>...] [--dry-run | --offline]  (未传 --dry-run/--offline 时调用本地订阅 codex exec)',
   '',
 ].join('\n');
 
-const STATELESS_COMMANDS = new Set(['price-band', 'solve-min-price', 'contact-sheet', 'openai-batch-build', 'ingest-trial', 'redteam-review']);
+const STATELESS_COMMANDS = new Set([
+  'price-band',
+  'solve-min-price',
+  'contact-sheet',
+  'openai-batch-build',
+  'ingest-trial',
+  'sp-api-calibrate',
+  'serve-report',
+  'redteam-review',
+]);
 const LIVE_COMMANDS = new Set(['luna-triage', 'openai-task', 'openai-cancel']);
 const OPENAI_DB_COMMANDS = new Set(['openai-status', 'openai-reconcile', ...LIVE_COMMANDS]);
 const READ_ONLY_DB_COMMANDS = new Set(['status', 'trace', 'coverage', 'plan-discovery', 'openai-status', 'dedupe-forms', 'funnel-ledger']);
@@ -515,7 +529,8 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
     attachmentShasByCandidateId = null,
     verifyReceiptFn = null,
   } = typeof options === 'number' ? { profileRevision: options } : (options ?? {});
-  const effectiveFeeSnapshot = feeTableSnapshot ?? (profile ? getFba2027RateTableSnapshot() : null);
+  const effectiveRevForSnap = Number(profile?.revision ?? profileRevision ?? boundBatch?.profile_revision ?? 59);
+  const effectiveFeeSnapshot = feeTableSnapshot ?? (profile ? getFba2027RateTableSnapshot({ profileRevision: effectiveRevForSnap }) : null);
 
   const notesByFormId = new Map();
   if (Array.isArray(boundBatch?.candidates)) {
@@ -577,11 +592,16 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
         ? attachmentShasByCandidateId.get(cand.id)
         : (Array.isArray(currentAttachmentSha256s) ? currentAttachmentSha256s : null);
 
-      const verifyAndSanitizeCandidateReview = (parsedEvRev) => {
+      const allowStaleSpecR59 = (profileRevision ?? 59) >= 59;
+      const verifyAndSanitizeCandidateReview = (parsedEvRev, { fromHistoricalBundle = false } = {}) => {
         if (!parsedEvRev || typeof parsedEvRev !== 'object' || Array.isArray(parsedEvRev)) return null;
+        const reviewedSpecSha = typeof parsedEvRev.form_spec_sha256 === 'string' && parsedEvRev.form_spec_sha256.trim()
+          ? parsedEvRev.form_spec_sha256.trim()
+          : (typeof parsedEvRev.spec_sha256 === 'string' && parsedEvRev.spec_sha256.trim() ? parsedEvRev.spec_sha256.trim() : null);
+        const specChanged = Boolean(form?.spec_sha256 && (!reviewedSpecSha || reviewedSpecSha !== form.spec_sha256));
         if (
           parsedEvRev.candidate_id !== cand.id ||
-          (form?.spec_sha256 && (!parsedEvRev.form_spec_sha256 || parsedEvRev.form_spec_sha256 !== form.spec_sha256))
+          (specChanged && (!allowStaleSpecR59 || !reviewedSpecSha))
         ) {
           return {
             status: 'unavailable',
@@ -606,8 +626,13 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
             reason: 'Evidence review requires matching current per-candidate attachment digests on export.',
           };
         }
+        let recCheck = null;
         if (typeof verifyReceiptFn === 'function' && parsedEvRev.status === 'ready') {
-          const recCheck = verifyReceiptFn(parsedEvRev);
+          recCheck = verifyReceiptFn(parsedEvRev, {
+            allowStaleSpec: allowStaleSpecR59,
+            currentFormSpecSha256: form?.spec_sha256 ?? null,
+            expectedCandidateId: cand.id,
+          });
           if (!recCheck || recCheck.verified !== true) {
             return {
               status: 'unavailable',
@@ -619,6 +644,17 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
             };
           }
         }
+        if (allowStaleSpecR59 && (specChanged || fromHistoricalBundle || recCheck?.stale_spec || parsedEvRev.stale_spec === true)) {
+          return {
+            ...parsedEvRev,
+            stale_spec: true,
+            reviewed_spec_sha256: recCheck?.reviewed_spec_sha256 ?? reviewedSpecSha,
+            ...(reviewedSpecSha ? { spec_sha256: reviewedSpecSha } : {}),
+            ...(recCheck?.reviewed_at || parsedEvRev.reviewed_at
+              ? { reviewed_at: recCheck?.reviewed_at ?? parsedEvRev.reviewed_at }
+              : {}),
+          };
+        }
         return parsedEvRev;
       };
 
@@ -626,32 +662,42 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
         // P1-17: Inline `evidence_review` already present in batch.json MUST undergo the exact same binding, attachment, and receipt checks!
         cand.evidence_review = verifyAndSanitizeCandidateReview(cand.evidence_review);
       } else {
+        const pickReviewFromEvals = (evalRows) => {
+          let foundJson = undefined;
+          for (const ev of evalRows) {
+            if (expectedHtmlSha256 && ev.receipt_json) {
+              try {
+                const rec = JSON.parse(ev.receipt_json);
+                const matchedReceipt = Array.isArray(rec.batch_receipts)
+                  ? rec.batch_receipts.find(b => b.batch_html_sha256 === expectedHtmlSha256)
+                  : null;
+                if (matchedReceipt && Object.hasOwn(matchedReceipt, 'evidence_review_json')) {
+                  foundJson = matchedReceipt.evidence_review_json;
+                  continue;
+                }
+              } catch { /* ignore */ }
+            }
+            if (ev.evidence_review_json) {
+              foundJson = ev.evidence_review_json;
+            }
+          }
+          return foundJson;
+        };
+
         const candidateEvals = (expectedBundleSha ? matchingBundleEvals : evals).filter(
           ev => profileRevision === null || profileRevision === undefined || ev.profile_revision === profileRevision,
         );
-        let selectedReviewJson = undefined;
-        for (const ev of candidateEvals) {
-          if (expectedHtmlSha256 && ev.receipt_json) {
-            try {
-              const rec = JSON.parse(ev.receipt_json);
-              const matchedReceipt = Array.isArray(rec.batch_receipts)
-                ? rec.batch_receipts.find(b => b.batch_html_sha256 === expectedHtmlSha256)
-                : null;
-              if (matchedReceipt && Object.hasOwn(matchedReceipt, 'evidence_review_json')) {
-                selectedReviewJson = matchedReceipt.evidence_review_json;
-                continue;
-              }
-            } catch { /* ignore */ }
-          }
-          if (ev.evidence_review_json) {
-            selectedReviewJson = ev.evidence_review_json;
-          }
+        let selectedReviewJson = pickReviewFromEvals(candidateEvals);
+        let fromHistoricalBundle = false;
+        if (!selectedReviewJson && allowStaleSpecR59 && !expectedHtmlSha256 && evals.length > 0) {
+          selectedReviewJson = pickReviewFromEvals(evals);
+          if (selectedReviewJson) fromHistoricalBundle = true;
         }
 
         if (selectedReviewJson) {
           try {
             const parsedEvRev = JSON.parse(selectedReviewJson);
-            const verified = verifyAndSanitizeCandidateReview(parsedEvRev);
+            const verified = verifyAndSanitizeCandidateReview(parsedEvRev, { fromHistoricalBundle });
             if (verified) cand.evidence_review = verified;
           } catch { /* ignore */ }
         }
@@ -698,7 +744,57 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
       }
     } catch { /* ignore */ }
   }
-  return { notesByFormId, storedShortlist };
+  const packagingForms = store.db.prepare(`
+    SELECT form_id, lifecycle_status, spec_sha256, label, gate1a_result_json, gate1b_result_json, packaging_redesign_shortlist_json
+    FROM candidate_forms
+    WHERE packaging_redesign_shortlist_json IS NOT NULL
+    ORDER BY form_id ASC
+  `).all();
+  const storedPackagingShortlist = [];
+  for (const row of packagingForms) {
+    if (row.lifecycle_status !== 'gate1b_rejected') continue;
+    let g1b = null;
+    try {
+      g1b = row.gate1b_result_json ? JSON.parse(row.gate1b_result_json) : null;
+    } catch { g1b = null; }
+    if (!g1b || g1b.margin_interval_verdict !== 'all_below_30pct') continue;
+    if (g1b.spec_sha256 && g1b.spec_sha256 !== row.spec_sha256) continue;
+    let hasRights = false;
+    for (const raw of [row.gate1a_result_json, row.gate1b_result_json]) {
+      if (!raw) continue;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed?.specific_rights_conflict_proven === true && (!parsed.spec_sha256 || parsed.spec_sha256 === row.spec_sha256)) {
+          hasRights = true;
+        }
+      } catch { /* ignore */ }
+    }
+    if (hasRights) continue;
+    try {
+      const pkg = JSON.parse(row.packaging_redesign_shortlist_json);
+      const trimM = pkg?.redesigned_margin ?? pkg?.trimmed_margin;
+      if (
+        pkg &&
+        pkg.eligible === true &&
+        typeof pkg.overshoot_mm === 'number' &&
+        Number.isFinite(pkg.overshoot_mm) &&
+        pkg.overshoot_mm > 0 &&
+        pkg.overshoot_mm <= 10.0001 &&
+        typeof trimM === 'number' &&
+        Number.isFinite(trimM) &&
+        trimM >= 0.30
+      ) {
+        storedPackagingShortlist.push({
+          ...pkg,
+          redesigned_margin: trimM,
+          trimmed_margin: trimM,
+          form_id: row.form_id,
+          label: row.label,
+        });
+      }
+    } catch { /* ignore */ }
+  }
+  return { notesByFormId, storedShortlist, storedPackagingShortlist };
 }
 
 function runPythonContactSheet({ inputPath, outputPath, manifestOut, title, offline }) {
@@ -765,8 +861,22 @@ function spendReceipt(ledger, attemptId, accountScope) {
   };
 }
 
-async function runLiveCommand(command, values, streams, dbPath, accountScope, testHooks) {
+async function runLiveCommand(command, values, streams, dbPath, budgetDbPath, accountScope, testHooks) {
   if (values.offline || values['dry-run']) throw new Phase2CliError('该命令执行实时请求，不能与离线参数一起使用。');
+  const isTestRun = Boolean(
+    testHooks?.testLedgerOptions?.testMode === true ||
+    testHooks?.openAiClientOptions?.testMode === true,
+  );
+  if (!isTestRun && process.env.OPENAI_ALLOW_CUSTOM_BUDGET_DB_FOR_TESTS !== '1') {
+    if (budgetDbPath === ':memory:') {
+      throw new Phase2CliError('实时付费 OpenAI 命令禁止使用 :memory: 临时预算账本；请绑定仓库唯一持久化主账本 .local/state/selection.sqlite。');
+    }
+    if (pathKey(budgetDbPath) !== pathKey(REPO_CANONICAL_BUDGET_DB)) {
+      throw new Phase2CliError(
+        `实时付费 OpenAI 命令必须绑定账户唯一主预算账本（${sanitizeDiagnosticText(REPO_CANONICAL_BUDGET_DB)}），禁止使用其他目录或副账本重置 $200 自然月累计额度；如需将选品结果写入独立候选库，请同时传入 --budget-db 指向上述主预算账本。`,
+      );
+    }
+  }
   const credentialFile = resolve(requireOption(values['credential-file'], 'credential-file'));
   const inputPath = command === 'openai-cancel' ? null : command === 'luna-triage'
     ? resolve(requireOption(values.listings, 'listings')) : resolve(requireOption(values.input, 'input'));
@@ -774,14 +884,15 @@ async function runLiveCommand(command, values, streams, dbPath, accountScope, te
   const sheet = values['contact-sheet'] && resolve(values['contact-sheet']);
   const progress = values['progress-file'] && resolve(values['progress-file']);
   const inputs = [credentialFile, inputPath, sheet].filter(Boolean);
-  if (inputs.some(p => sqlitePaths(dbPath).some(s => isSamePhysicalFileCli(p, s))) ||
+  const allProtectedSqlitePaths = [...new Set([...sqlitePaths(dbPath), ...sqlitePaths(budgetDbPath)])];
+  if (inputs.some(p => allProtectedSqlitePaths.some(s => isSamePhysicalFileCli(p, s))) ||
       [inputPath, sheet].some(p => isSamePhysicalFileCli(p, credentialFile))) throw new Phase2CliError('凭据、输入与数据库需要各自独立的路径。');
   const input = inputPath && await readJsonFileSafe(inputPath, '任务输入文件');
   if (input) checkOperatorPayload(input);
-  const ledger = openOpenAiBudgetLedger(dbPath, testHooks?.testLedgerOptions);
+  const ledger = openOpenAiBudgetLedger(budgetDbPath, testHooks?.testLedgerOptions);
   let stage;
   try {
-    const protectedPaths = [...sqlitePaths(dbPath), ...sqlitePaths(ledger._effectiveRegistryPath), ...inputs];
+    const protectedPaths = [...allProtectedSqlitePaths, ...sqlitePaths(ledger._effectiveRegistryPath), ...inputs];
     if (output) stage = await preflightSingleFileDestination(output, [...protectedPaths, progress]);
     if (progress) {
       const progressStage = await preflightSingleFileDestination(progress, [...protectedPaths, output]);
@@ -947,6 +1058,7 @@ export async function runPhase2Cli(
           'disallow-stage4-media': { type: 'boolean' },
           task: { type: 'string' },
           packet: { type: 'string' },
+          model: { type: 'string' },
           effort: { type: 'string' },
           'service-tier': { type: 'string' },
           'form-spec-sha256': { type: 'string' },
@@ -954,6 +1066,12 @@ export async function runPhase2Cli(
           'dry-run': { type: 'boolean' },
           'allow-synthetic': { type: 'boolean' },
           'codex-bin': { type: 'string' },
+          'budget-db': { type: 'string' },
+          force: { type: 'boolean' },
+          dir: { type: 'string' },
+          port: { type: 'string' },
+          once: { type: 'boolean' },
+          check: { type: 'boolean' },
         },
       });
     } catch {
@@ -1056,13 +1174,26 @@ export async function runPhase2Cli(
         const inputPath = resolve(requireOption(values.input, 'input'));
         const payload = await readJsonFileSafe(inputPath, '价位带输入文件');
         const listings = Array.isArray(payload) ? payload : payload.listings;
-        const gate0Opts = payload?.gate0_options ?? payload?.options?.gate0_config ?? {};
+        const pbRev = values['profile-revision'] !== undefined
+          ? Number(values['profile-revision'])
+          : (payload?.profile_revision ?? payload?.options?.profile_revision);
+        if (pbRev !== undefined && (!Number.isInteger(pbRev) || pbRev < 50)) {
+          throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+        }
+        const gate0Opts = {
+          ...(payload?.gate0_options ?? payload?.options?.gate0_config ?? {}),
+          ...(pbRev !== undefined ? { profile_revision: pbRev } : {}),
+        };
+        const bandOpts = {
+          ...(payload?.options ?? {}),
+          ...(pbRev !== undefined ? { profile_revision: pbRev } : {}),
+        };
         const gate0 = payload?.category_check
           ? evaluateGate0CategoryBoundary(payload.category_check, gate0Opts)
           : null;
-        const analysis = analyzeMainstreamPriceBand(listings, payload?.options ?? {});
+        const analysis = analyzeMainstreamPriceBand(listings, bandOpts);
         const tightened = Array.isArray(payload?.clusters) && payload.clusters.length > 0
-          ? tightenClusterBands(analysis, payload.clusters, payload?.options ?? {})
+          ? tightenClusterBands(analysis, payload.clusters, bandOpts)
           : null;
         const out = {
           ok: true,
@@ -1094,6 +1225,133 @@ export async function runPhase2Cli(
           offline: values.offline === true,
         });
         streams.stdout.write(`${JSON.stringify({ ok: true, command, rendered }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'sp-api-calibrate') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const spec = await readJsonFileSafe(inputPath, 'SP-API 终审校参输入文件');
+        const calibration = extractSpApiFinalistCalibration({
+          asin: spec.asin ?? null,
+          marketplace_id: spec.marketplace_id ?? spec.marketplaceId ?? 'ATVPDKIKX0DER',
+          currency: spec.currency ?? 'USD',
+          catalogItemRaw: spec.catalogItemRaw ?? spec.catalog_item ?? spec.catalogItem ?? null,
+          feesEstimateRaw: spec.feesEstimateRaw ?? spec.fees_estimate ?? spec.feesEstimate ?? null,
+          restrictionsRaw: spec.restrictionsRaw ?? spec.listings_restrictions ?? spec.listingsRestrictions ?? null,
+          sellerSpriteCachedRow: spec.sellerSpriteCachedRow ?? spec.seller_sprite_pkg ?? spec.sellerSpritePkg ?? null,
+          price_usd: spec.price_usd ?? spec.priceUsd ?? null,
+          target_is_own_white_label: spec.target_is_own_white_label !== false,
+        });
+        const out = { ok: true, command, calibration };
+        const json = `${JSON.stringify(out, null, 2)}\n`;
+        if (values.output) {
+          await writeSingleFileSafe(resolve(values.output), Buffer.from(json, 'utf8'), [inputPath]);
+        }
+        streams.stdout.write(json);
+        return 0;
+      }
+
+      if (command === 'serve-report') {
+        const rawDir = values.dir ?? values.input;
+        const rootDir = resolve(requireOption(rawDir, 'dir'));
+        let rootReal;
+        try {
+          const st = statSync(rootDir);
+          if (!st.isDirectory()) throw new Phase2CliError('--dir 必须指向已导出的报告目录。');
+          rootReal = realpathSync(rootDir);
+        } catch (err) {
+          if (err instanceof Phase2CliError) throw err;
+          throw new Phase2CliError(`无法读取报告目录（${ioCode(err)}）。`);
+        }
+        const requestedPort = values.port !== undefined
+          ? Number(values.port)
+          : (values.check === true || values.once === true ? 0 : 4178);
+        if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65535) {
+          throw new Phase2CliError('--port 必须为 0..65535 的整数。');
+        }
+        const mimeByExt = {
+          '.html': 'text/html; charset=utf-8',
+          '.json': 'application/json; charset=utf-8',
+          '.png': 'image/png',
+          '.jpg': 'image/jpeg',
+          '.jpeg': 'image/jpeg',
+          '.webp': 'image/webp',
+          '.svg': 'image/svg+xml',
+          '.css': 'text/css; charset=utf-8',
+        };
+        let servedCount = 0;
+        const server = createServer((req, res) => {
+          try {
+            const urlObj = new URL(req.url || '/', 'http://127.0.0.1');
+            const relPath = decodeURIComponent(urlObj.pathname === '/' ? '/index.html' : urlObj.pathname).replace(/^\/+/, '');
+            const candidatePath = resolve(rootReal, relPath || 'index.html');
+            const realTarget = realpathSync(candidatePath);
+            const relCheck = relative(rootReal, realTarget);
+            if (relCheck.startsWith('..') || isAbsolute(relCheck) || !statSync(realTarget).isFile()) {
+              res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+              res.end('Not Found');
+              return;
+            }
+            const ext = extname(realTarget).toLowerCase();
+            const body = readFileSync(realTarget);
+            res.writeHead(200, {
+              'Content-Type': mimeByExt[ext] ?? 'application/octet-stream',
+              'Cache-Control': 'no-store',
+            });
+            res.end(body);
+          } catch {
+            res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+            res.end('Not Found');
+          } finally {
+            servedCount += 1;
+            if (values.once === true && servedCount >= 1) {
+              setImmediate(() => server.close());
+            }
+          }
+        });
+        await new Promise((resolveListen, rejectListen) => {
+          server.once('error', rejectListen);
+          server.listen(requestedPort, '127.0.0.1', () => {
+            server.removeListener('error', rejectListen);
+            resolveListen();
+          });
+        });
+        const addr = server.address();
+        const actualPort = typeof addr === 'object' && addr ? addr.port : requestedPort;
+        const previewUrl = `http://127.0.0.1:${actualPort}/index.html`;
+        if (values.check === true) {
+          try {
+            const resp = await fetch(previewUrl);
+            const textBody = await resp.text();
+            if (resp.status !== 200 || !textBody.includes('<html')) {
+              throw new Phase2CliError(`本地预览自检失败（HTTP ${resp.status}）。`);
+            }
+            streams.stdout.write(`${JSON.stringify({
+              ok: true,
+              command,
+              url: previewUrl,
+              port: actualPort,
+              verified_http_status: resp.status,
+              byte_length: Buffer.byteLength(textBody, 'utf8'),
+            }, null, 2)}\n`);
+            return 0;
+          } finally {
+            await new Promise(r => server.close(() => r()));
+          }
+        }
+        streams.stdout.write(`${JSON.stringify({
+          ok: true,
+          command,
+          url: previewUrl,
+          port: actualPort,
+          root_dir: sanitizeCliDisplayPath(rootDir),
+        }, null, 2)}\n`);
+        await new Promise(resolveClose => {
+          const shutdown = () => server.close(() => resolveClose());
+          process.once('SIGINT', shutdown);
+          process.once('SIGTERM', shutdown);
+          server.once('close', resolveClose);
+        });
         return 0;
       }
 
@@ -1222,21 +1480,82 @@ export async function runPhase2Cli(
         }
         const boundCandidateId = packetSubjectId ?? explicitFormArg;
         let boundFormSpecSha256 = values['form-spec-sha256'] ? values['form-spec-sha256'].trim() : undefined;
+        let skipNonQualifyingReason = null;
         const optDbPaths = [];
         if (values.db && values.db !== ':memory:') {
           const absDb = resolve(values.db);
           optDbPaths.push(absDb);
-          if (boundCandidateId && existsSync(absDb)) {
+          if (!existsSync(absDb)) {
+            if (!isDryRun && values.force !== true) {
+              skipNonQualifyingReason = `指定的数据库不存在，无法核实候选形态 "${boundCandidateId ?? 'unknown'}" 当前规格已入围；按 Gate-4 仅复核入围卡片规则自动跳过（如需强制复核请传入 --force）。`;
+            }
+          } else if (!boundCandidateId) {
+            if (!isDryRun && values.force !== true) {
+              skipNonQualifyingReason = '未提供候选形态 ID（candidate.subject_id 或 --form），无法在数据库中核实入围资格；按 Gate-4 规则自动跳过（如需强制复核请传入 --force）。';
+            }
+          } else {
             const roStore = openSelectionStore(absDb, { readOnly: true });
             try {
               const dbForm = roStore.getCandidateForm(boundCandidateId);
-              if (dbForm?.spec_sha256) {
-                if (boundFormSpecSha256 && boundFormSpecSha256 !== dbForm.spec_sha256) {
+              if (!dbForm) {
+                if (!isDryRun && values.force !== true) {
+                  skipNonQualifyingReason = `数据库中不存在候选形态 "${boundCandidateId}" 的记录，按 Gate-4 仅复核入围卡片规则自动跳过；如需强制复核请传入 --force。`;
+                }
+              } else {
+                if (dbForm.spec_sha256 && boundFormSpecSha256 && boundFormSpecSha256 !== dbForm.spec_sha256) {
                   throw new Phase2CliError(
                     `--form-spec-sha256 与数据库中候选形态 "${sanitizeDiagnosticText(boundCandidateId)}" 的当前 spec_sha256 不一致。`,
                   );
                 }
-                boundFormSpecSha256 = dbForm.spec_sha256;
+                if (!isDryRun && values.force !== true) {
+                  const effLifecycle = dbForm.effective_lifecycle_status ?? dbForm.lifecycle_status;
+                  const NON_QUALIFYING_LIFECYCLES = new Set([
+                    'discovered',
+                    'gate1a_rejected',
+                    'gate1b_rejected',
+                    'gate1a_needs_verification',
+                    'gate1b_needs_verification',
+                    'gate1b_queued',
+                    'gate1b_pending',
+                    'gate1b_passed',
+                    'deferred',
+                    'private_mold_reserved',
+                  ]);
+                  if (NON_QUALIFYING_LIFECYCLES.has(effLifecycle)) {
+                    skipNonQualifyingReason = `候选形态 "${boundCandidateId}" 当前状态为 ${effLifecycle}（尚未完成终审入围），按 Gate-4 仅复核入围卡片规则自动跳过；如需强制复核请传入 --force。`;
+                  } else {
+                    const evalRows = roStore.getEvaluationsForForm(boundCandidateId);
+                    const matchingSpecEvalRows = evalRows.filter(r => {
+                      let rec = {};
+                      try { rec = JSON.parse(r.receipt_json || '{}'); } catch { rec = {}; }
+                      if (typeof rec.form_spec_sha256 === 'string' && rec.form_spec_sha256) {
+                        return rec.form_spec_sha256 === dbForm.spec_sha256;
+                      }
+                      if ((dbForm.spec_version ?? 1) > 1 && r.created_at && dbForm.updated_at && r.created_at < dbForm.updated_at) {
+                        return false;
+                      }
+                      return (dbForm.spec_version ?? 1) === 1;
+                    });
+                    if (matchingSpecEvalRows.length === 0) {
+                      skipNonQualifyingReason = `候选形态 "${boundCandidateId}" 当前规格（v${dbForm.spec_version ?? 1}）尚无终审评估记录，按 Gate-4 仅复核入围卡片规则自动跳过；如需强制复核请传入 --force。`;
+                    } else {
+                      const latestBundleSha = matchingSpecEvalRows[matchingSpecEvalRows.length - 1].evidence_bundle_sha256;
+                      const latestRows = matchingSpecEvalRows.filter(r => r.evidence_bundle_sha256 === latestBundleSha);
+                      const parsedQuals = latestRows.map(r => {
+                        try { return JSON.parse(r.qualification_json || '{}'); } catch { return {}; }
+                      });
+                      const anyQualifying = parsedQuals.some(q => q?.counts_toward_target === true);
+                      if (!anyQualifying) {
+                        const modeStr = parsedQuals[0]?.mode ?? 'non_qualifying';
+                        skipNonQualifyingReason = `候选形态 "${boundCandidateId}" 当前规格最新评估未入围（counts_toward_target=false, mode=${modeStr}），按 Gate-4 仅复核入围卡片规则自动跳过；如需强制复核请传入 --force。`;
+                      } else if (dbForm.spec_sha256) {
+                        boundFormSpecSha256 = dbForm.spec_sha256;
+                      }
+                    }
+                  }
+                } else if (dbForm.spec_sha256) {
+                  boundFormSpecSha256 = dbForm.spec_sha256;
+                }
               }
             } finally {
               roStore.close();
@@ -1244,6 +1563,7 @@ export async function runPhase2Cli(
           }
         }
         const serviceTier = values['service-tier'] ? values['service-tier'].trim() : null;
+        const skippedForNonQualifying = Boolean(skipNonQualifyingReason);
 
         // P2-11: Preflight and stage protected destination (including directory, special-file, PATH/shim/JS target & --codex-bin checks) BEFORE invoking Codex CLI!
         const stageState = await preflightSingleFileDestination(outputPath, [
@@ -1256,13 +1576,15 @@ export async function runPhase2Cli(
         let outSha;
         try {
           reviewEnvelope = await runCodexEvidenceReview(packet, {
+            ...(values.model ? { model: values.model.trim() } : {}),
             reasoningEffort: effort,
             ...(serviceTier ? { serviceTier } : {}),
             ...(boundCandidateId ? { candidateId: boundCandidateId } : {}),
             ...(boundFormSpecSha256 ? { formSpecSha256: boundFormSpecSha256 } : {}),
             imagePaths,
             dryRun: isDryRun,
-            enabled: !isDryRun,
+            enabled: !isDryRun && !skippedForNonQualifying,
+            ...(skippedForNonQualifying ? { disabledReason: skipNonQualifyingReason } : {}),
             ...(mockExecutor ? { testMode: true, mockExecutor } : {}),
             ...(testReceiptDir ? { receiptDir: testReceiptDir } : {}),
             ...(codexBin ? { codexBin } : {}),
@@ -1275,9 +1597,10 @@ export async function runPhase2Cli(
         }
 
         const summary = {
-          ok: isDryRun || reviewEnvelope.status === 'ready',
+          ok: isDryRun || skippedForNonQualifying || reviewEnvelope.status === 'ready',
           command,
           dry_run: isDryRun,
+          ...(skippedForNonQualifying ? { skipped_non_qualifying: true } : {}),
           ...(isOffline ? { offline: true } : {}),
           status: reviewEnvelope.status,
           execution_status: reviewEnvelope.execution_status,
@@ -1295,7 +1618,7 @@ export async function runPhase2Cli(
           ...(reviewEnvelope.reason ? { reason: reviewEnvelope.reason } : {}),
         };
 
-        if (!isDryRun && reviewEnvelope.status !== 'ready') {
+        if (!isDryRun && !skippedForNonQualifying && reviewEnvelope.status !== 'ready') {
           streams.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
           streams.stderr.write(
             `Phase 2 CLI 失败：红队复核未生成可用结果（${sanitizeDiagnosticText(reviewEnvelope.reason || reviewEnvelope.status)}）；已将不可用回执保存至输出文件。\n`,
@@ -1308,8 +1631,11 @@ export async function runPhase2Cli(
     }
 
     if (OPENAI_DB_COMMANDS.has(command)) {
-      const rawDb = requireOption(values.db, 'db');
-      const dbPath = rawDb === ':memory:' ? ':memory:' : resolve(rawDb);
+      const rawPrimaryDb = values.db ?? values['budget-db'];
+      if (!rawPrimaryDb) requireOption(values.db, 'db');
+      const dbPath = rawPrimaryDb === ':memory:' ? ':memory:' : resolve(rawPrimaryDb);
+      const rawBudgetDb = values['budget-db'] ?? process.env.OPENAI_BUDGET_LEDGER_DB ?? rawPrimaryDb;
+      const budgetDbPath = rawBudgetDb === ':memory:' ? ':memory:' : resolve(rawBudgetDb);
       const accountScope = assertSafeOpenAiAccountScope(
         values['account-scope'] ? values['account-scope'].trim() : 'openai-default',
       );
@@ -1321,10 +1647,10 @@ export async function runPhase2Cli(
         ? testHooks.testLedgerOptions
         : {};
 
-      if (LIVE_COMMANDS.has(command)) return await runLiveCommand(command, values, streams, dbPath, accountScope, testHooks);
+      if (LIVE_COMMANDS.has(command)) return await runLiveCommand(command, values, streams, dbPath, budgetDbPath, accountScope, testHooks);
 
       if (command === 'openai-status') {
-        const ledger = openOpenAiBudgetLedger(dbPath, { readOnly: true, ...testLedgerOpts });
+        const ledger = openOpenAiBudgetLedger(budgetDbPath, { readOnly: true, ...testLedgerOpts });
         try {
           const status = ledger.getStatus({ accountScope, monthUtc });
           const legacySummary = legacyPath
@@ -1333,7 +1659,7 @@ export async function runPhase2Cli(
           streams.stdout.write(`${JSON.stringify({
             ok: true,
             command,
-            private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(dbPath)}#scope:${accountScope}`,
+            private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(budgetDbPath)}#scope:${accountScope}`,
             status: formatNarrowLedgerStatus(status),
             ...(legacySummary ? { legacy_budget: formatNarrowLegacySummary(legacySummary) } : {}),
           }, null, 2)}\n`);
@@ -1351,7 +1677,7 @@ export async function runPhase2Cli(
           throw new Phase2CliError('--allow-stage4-media 与 --disallow-stage4-media 不能同时传入。');
         }
         // P0-11: Physical file-identity collision check (resolving junctions, symlinks, and hard links) BEFORE writable open!
-        if (legacyPath && dbPath !== ':memory:' && isSamePhysicalFileCli(legacyPath, dbPath)) {
+        if (legacyPath && budgetDbPath !== ':memory:' && isSamePhysicalFileCli(legacyPath, budgetDbPath)) {
           throw new Phase2CliError('--legacy-budget 不能与目标可写 --db 指向同一物理数据库文件（含软硬链接/目录联接）。');
         }
 
@@ -1402,7 +1728,7 @@ export async function runPhase2Cli(
           ? inspectLegacyAutopilotBudget(legacyPath, { monthUtc })
           : null;
 
-        const ledger = openOpenAiBudgetLedger(dbPath, { readOnly: false, ...testLedgerOpts });
+        const ledger = openOpenAiBudgetLedger(budgetDbPath, { readOnly: false, ...testLedgerOpts });
         try {
           let reconciledAttempt = null;
           const hasLegacyHolds = Boolean(
@@ -1493,14 +1819,14 @@ export async function runPhase2Cli(
                 confirmed_zero_charge: reconciledAttempt.confirmed_zero_charge,
                 reconciliation_note: reconciledAttempt.reconciliation_note,
                 updated_at: reconciledAttempt.updated_at,
-                private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(dbPath)}#attempt:${reconciledAttempt.attempt_id}`,
+                private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(budgetDbPath)}#attempt:${reconciledAttempt.attempt_id}`,
               }
             : null;
 
           streams.stdout.write(`${JSON.stringify({
             ok: true,
             command,
-            private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(dbPath)}#scope:${accountScope}`,
+            private_receipt_ref: `sqlite:${sanitizeCliDisplayPath(budgetDbPath)}#scope:${accountScope}`,
             ...(legacySummary ? { legacy_budget: formatNarrowLegacySummary(legacySummary) } : {}),
             ...(narrowAttemptSummary ? { reconciled_attempt: narrowAttemptSummary } : {}),
             status: formatNarrowLedgerStatus(ledger.getStatus({ accountScope, monthUtc })),
@@ -1553,7 +1879,8 @@ export async function runPhase2Cli(
       }
 
       if (command === 'coverage') {
-        const audit = auditDiscoveryCoverage(store);
+        const covProfileRev = values['profile-revision'] !== undefined ? Number(values['profile-revision']) : 59;
+        const audit = auditDiscoveryCoverage(store, { profile_revision: covProfileRev });
         streams.stdout.write(`${JSON.stringify({ ok: true, command, audit }, null, 2)}\n`);
         return 0;
       }
@@ -1680,11 +2007,14 @@ export async function runPhase2Cli(
           ...(testReceiptStoreDir ? { receiptStoreDir: testReceiptStoreDir } : {}),
           ...(allowTestDoubleReceipts ? { allowTestDoubleReceipts: true } : {}),
         };
-        const defaultVerifyReceiptFn = (ev) => verifySavedCodexReceipt(ev, {
+        const defaultVerifyReceiptFn = (ev, opts = {}) => verifySavedCodexReceipt(ev, {
           receiptStoreDir: testReceiptStoreDir,
           allowTestDouble: allowTestDoubleReceipts,
+          allowStaleSpec: Boolean(opts?.allowStaleSpec),
+          expectedFormSpecSha256: opts?.currentFormSpecSha256 ?? null,
+          expectedCandidateId: opts?.expectedCandidateId ?? null,
         });
-        const { notesByFormId, storedShortlist } = enrichBatchAndResultFromStore(boundBatch, store, {
+        const { notesByFormId, storedShortlist, storedPackagingShortlist } = enrichBatchAndResultFromStore(boundBatch, store, {
           profileRevision: profile.revision,
           profile,
           manifest,
@@ -1701,7 +2031,7 @@ export async function runPhase2Cli(
             if (notes && notes.length > 0) sc.review_notes = notes;
           }
         }
-        if (storedShortlist.length > 0) {
+        if ((profile.revision ?? 58) < 59 && storedShortlist.length > 0) {
           const existingList = Array.isArray(scoredResult.negotiation_shortlist) ? scoredResult.negotiation_shortlist : [];
           const seenIds = new Set(existingList.map(x => x?.form_id || x?.id).filter(Boolean));
           const mergedShortlist = [...existingList];
@@ -1712,6 +2042,18 @@ export async function runPhase2Cli(
             }
           }
           scoredResult.negotiation_shortlist = mergedShortlist;
+        }
+        if ((profile.revision ?? 58) >= 59 && Array.isArray(storedPackagingShortlist) && storedPackagingShortlist.length > 0) {
+          const existingPkgList = Array.isArray(scoredResult.packaging_redesign_shortlist) ? scoredResult.packaging_redesign_shortlist : [];
+          const seenPkgIds = new Set(existingPkgList.map(x => x?.form_id || x?.candidate_id || x?.id).filter(Boolean));
+          const mergedPkgShortlist = [...existingPkgList];
+          for (const item of storedPackagingShortlist) {
+            if (!seenPkgIds.has(item.form_id)) {
+              seenPkgIds.add(item.form_id);
+              mergedPkgShortlist.push(item);
+            }
+          }
+          scoredResult.packaging_redesign_shortlist = mergedPkgShortlist;
         }
 
         const resultBytes = Buffer.from(`${JSON.stringify(scoredResult, null, 2)}\n`, 'utf8');
@@ -1770,7 +2112,7 @@ export async function runPhase2Cli(
         }
         const g1aProfileRev = values['profile-revision'] !== undefined
           ? Number(values['profile-revision'])
-          : (spec.profile_revision ?? 58);
+          : (spec.profile_revision ?? 59);
         if (!Number.isInteger(g1aProfileRev) || g1aProfileRev < 50) {
           throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
         }
@@ -1788,7 +2130,7 @@ export async function runPhase2Cli(
           allow_forward_price_discovery: spec.allow_forward_price_discovery,
           disallow_pre1688_cost_guess_kill: spec.disallow_pre1688_cost_guess_kill,
         });
-        streams.stdout.write(`${JSON.stringify({ ok: true, command, form_id: formId, result }, null, 2)}\n`);
+        streams.stdout.write(`${stringifyCliJson({ ok: true, command, form_id: formId, result })}\n`);
         return 0;
       }
 
@@ -1801,7 +2143,7 @@ export async function runPhase2Cli(
         }
         const g1bProfileRev = values['profile-revision'] !== undefined
           ? Number(values['profile-revision'])
-          : (spec.profile_revision ?? 58);
+          : (spec.profile_revision ?? 59);
         if (!Number.isInteger(g1bProfileRev) || g1bProfileRev < 50) {
           throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
         }

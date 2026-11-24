@@ -8,10 +8,9 @@
  *  - Strict `maxRetries = 0`, `redirect: 'error'`, and locked `baseOrigin` + credential on all HTTP calls
  *  - Atomic pre-dispatch SQLite reservation & `pending_recovery` cross-month fencing
  *  - `POST /v1/decisions` (`gpt-6-luna` only, zero `reasoning` keys, `1..400` questions, cumulative `<= 256 KiB` `input_json`, strict ID & answer-type validation)
- *  - `POST /v1/responses` (Terra xhigh by default, web search only, optional background polling and verified cleanup)
+ *  - `POST /v1/responses` (Terra xhigh by default, web search only, optional background polling and optional remote DELETE)
  *  - Origin- and credential-bound `recoverPendingResponse` via `GET /v1/responses/{id}`
- *  - 50%-discount Batch `.jsonl` builder/parser & durable upload-bound submission (`/v1/responses`, `/v1/images/generations`)
- *  - Opt-in Stage-4 media (`createConceptImage`, `createSpeechBriefing` gated by BOTH `policy.enableStage4Media === true` AND `policyRow.allow_stage4_media === true`)
+ *  - 50%-discount Batch `.jsonl` builder/parser & durable upload-bound submission (`/v1/responses`)
  */
 import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -29,14 +28,12 @@ import {
   OpenAiPolicyError,
   OpenAiValidationError,
   WEB_SEARCH_CALL_MICROS,
-  computeTtsCostMicros,
   computeUsageCostMicros,
   estimateCostBreakdown,
   estimateReservationCents,
   isAstraModel,
   microsToCeilingCents,
   resolveModelPricing,
-  resolveTtsMicrosPer1kChars,
   resolveUncappedWebSearchReservationCalls,
   safeMicrosToNumber,
 } from './pricing.mjs';
@@ -71,7 +68,6 @@ const MAX_DECISION_CHOICES_PER_QUESTION = 32;
 const MAX_DECISION_INPUT_JSON_BYTES = 256 * 1024; // 256 KiB cumulative across input_json blocks
 const DECISION_OUTPUT_TOKENS_PER_QUESTION = 256;
 const MIN_XHIGH_OUTPUT_TOKENS = 4_096;
-const MAX_INLINE_IMAGE_DIMENSION = 8_192;
 const IMAGE_LOW_DETAIL_TOKEN_BOUND = 2_048;
 const IMAGE_HIGH_DETAIL_TOKEN_BOUND = 8_192;
 const IMAGE_ORIGINAL_DETAIL_TOKEN_BOUND = 16_384;
@@ -80,11 +76,9 @@ const MAX_BATCH_LINES = 50_000;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
 const SAFE_RESOURCE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$/;
 const INLINE_DATA_IMAGE_URI_RE = /^data:image\/(png|jpeg|jpg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$/i;
-const VALID_AUDIO_CONTENT_TYPE_RE = /^(?:audio\/[a-z0-9.+-]+|application\/octet-stream)(?:\s*;.*)?$/i;
-const ALLOWED_SPEECH_FORMATS = new Set(['mp3', 'wav', 'opus', 'aac', 'flac', 'pcm']);
 const VALID_IMAGE_DETAILS = new Set(['low', 'high', 'auto', 'original']);
 const VALID_DECISION_QUESTION_TYPES = new Set(['predicate', 'choice', 'score']);
-const ALLOWED_BATCH_ENDPOINTS = new Set(['/v1/responses', '/v1/images/generations']);
+const ALLOWED_BATCH_ENDPOINTS = new Set(['/v1/responses']);
 const ALLOWED_INTERACTIVE_SERVICE_TIERS = new Set(['auto', 'default', 'standard', 'flex', 'fast', 'priority']);
 const KNOWN_RESPONSE_STATUSES = new Set([
   'completed',
@@ -372,7 +366,7 @@ function isActiveResponseStatus(status) {
 function isSettledResponseAttempt(attempt) {
   return Boolean(attempt) && !['in_progress', 'pending_recovery'].includes(attempt.status) &&
     (!attempt.cleanup_required || attempt.status === 'rejected' ||
-      ['deleted_verified_404', 'not_requested'].includes(attempt.cleanup_status));
+      ['deleted_verified_404', 'delete_failed', 'not_requested'].includes(attempt.cleanup_status));
 }
 
 async function withBackgroundProgressResult(emitProgress, operation) {
@@ -622,392 +616,6 @@ async function readBoundedUtf8Response(res, maxBytes = DEFAULT_MAX_RESPONSE_BYTE
 }
 
 /**
- * Parse exact pixel `(width, height)` from PNG, JPEG, WebP, or GIF binary headers (`P0-15`).
- * Returns `{ format, width, height }` or `null` when binary headers are malformed/truncated.
- */
-export function parseInlineRasterDimensions(buf, expectedFormat = null) {
-  if (!Buffer.isBuffer(buf) || buf.length < 10) return null;
-  const normExpected = expectedFormat ? (expectedFormat === 'jpg' ? 'jpeg' : expectedFormat.toLowerCase()) : null;
-
-  // PNG: 8-byte signature + 4-byte length + 'IHDR' + 4-byte BE width + 4-byte BE height
-  const isPng =
-    buf.length >= 24 &&
-    buf[0] === 0x89 &&
-    buf[1] === 0x50 &&
-    buf[2] === 0x4e &&
-    buf[3] === 0x47 &&
-    buf[4] === 0x0d &&
-    buf[5] === 0x0a &&
-    buf[6] === 0x1a &&
-    buf[7] === 0x0a &&
-    buf.subarray(12, 16).toString('ascii') === 'IHDR';
-  if (isPng) {
-    if (normExpected && normExpected !== 'png') return null;
-    const width = buf.readUInt32BE(16);
-    const height = buf.readUInt32BE(20);
-    if (width < 1 || height < 1) return null;
-    return { format: 'png', width, height };
-  }
-
-  // JPEG: 0xFF 0xD8 ... scan markers to SOFn (0xC0..0xCF excluding 0xC4 DHT, 0xC8 JPG, 0xCC DAC)
-  const isJpeg = buf.length >= 11 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
-  if (isJpeg) {
-    if (normExpected && normExpected !== 'jpeg') return null;
-    let pos = 2;
-    while (pos + 3 < buf.length) {
-      if (buf[pos] !== 0xff) {
-        pos++;
-        continue;
-      }
-      while (pos < buf.length && buf[pos] === 0xff) pos++;
-      if (pos >= buf.length) break;
-      const marker = buf[pos];
-      pos++;
-      if (marker === 0xd9 || marker === 0xda) break; // EOI or SOS before SOF
-      if (marker === 0x00 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
-        continue;
-      }
-      if (pos + 2 > buf.length) return null;
-      const segLen = buf.readUInt16BE(pos);
-      if (segLen < 2 || pos + segLen > buf.length) return null;
-      const isSof =
-        (marker >= 0xc0 && marker <= 0xc3) ||
-        (marker >= 0xc5 && marker <= 0xc7) ||
-        (marker >= 0xc9 && marker <= 0xcb) ||
-        (marker >= 0xcd && marker <= 0xcf);
-      if (isSof) {
-        if (segLen < 7 || pos + 7 > buf.length) return null;
-        const height = buf.readUInt16BE(pos + 3);
-        const width = buf.readUInt16BE(pos + 5);
-        if (width < 1 || height < 1) return null;
-        return { format: 'jpeg', width, height };
-      }
-      pos += segLen;
-    }
-    return null;
-  }
-
-  // WebP: 'RIFF' + size + 'WEBP' + ('VP8 ' | 'VP8L' | 'VP8X')
-  const isWebp =
-    buf.length >= 21 &&
-    buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
-    buf.subarray(8, 12).toString('ascii') === 'WEBP';
-  if (isWebp) {
-    if (normExpected && normExpected !== 'webp') return null;
-    const chunkType = buf.subarray(12, 16).toString('ascii');
-    if (chunkType === 'VP8 ' && buf.length >= 30) {
-      if (buf[23] !== 0x9d || buf[24] !== 0x01 || buf[25] !== 0x2a) return null;
-      const width = buf.readUInt16LE(26) & 0x3fff;
-      const height = buf.readUInt16LE(28) & 0x3fff;
-      if (width < 1 || height < 1) return null;
-      return { format: 'webp', width, height };
-    }
-    if (chunkType === 'VP8L' && buf.length >= 25) {
-      if (buf[20] !== 0x2f) return null;
-      const b0 = buf[21];
-      const b1 = buf[22];
-      const b2 = buf[23];
-      const b3 = buf[24];
-      const width = 1 + (b0 | ((b1 & 0x3f) << 8));
-      const height = 1 + (((b1 & 0xc0) >> 6) | (b2 << 2) | ((b3 & 0x0f) << 10));
-      if (width < 1 || height < 1) return null;
-      return { format: 'webp', width, height };
-    }
-    if (chunkType === 'VP8X' && buf.length >= 30) {
-      const width = 1 + (buf[24] | (buf[25] << 8) | (buf[26] << 16));
-      const height = 1 + (buf[27] | (buf[28] << 8) | (buf[29] << 16));
-      if (width < 1 || height < 1) return null;
-      return { format: 'webp', width, height };
-    }
-    return null;
-  }
-
-  // GIF: 'GIF87a' or 'GIF89a'
-  const isGif =
-    buf.length >= 10 &&
-    (buf.subarray(0, 6).toString('ascii') === 'GIF87a' || buf.subarray(0, 6).toString('ascii') === 'GIF89a');
-  if (isGif) {
-    if (normExpected && normExpected !== 'gif') return null;
-    const width = buf.readUInt16LE(6);
-    const height = buf.readUInt16LE(8);
-    if (width < 1 || height < 1) return null;
-    return { format: 'gif', width, height };
-  }
-
-  return null;
-}
-
-function hasValidRasterMagicBytes(buf, expectedFormat = null) {
-  if (!Buffer.isBuffer(buf) || buf.length < 4) return false;
-  const isPng =
-    buf.length >= 8 &&
-    buf[0] === 0x89 &&
-    buf[1] === 0x50 &&
-    buf[2] === 0x4e &&
-    buf[3] === 0x47 &&
-    buf[4] === 0x0d &&
-    buf[5] === 0x0a &&
-    buf[6] === 0x1a &&
-    buf[7] === 0x0a;
-  const isJpeg =
-    buf.length >= 3 &&
-    buf[0] === 0xff &&
-    buf[1] === 0xd8 &&
-    buf[2] === 0xff;
-  const isWebp =
-    buf.length >= 12 &&
-    buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
-    buf.subarray(8, 12).toString('ascii') === 'WEBP';
-
-  if (expectedFormat === 'png') return isPng;
-  if (expectedFormat === 'jpeg') return isJpeg;
-  if (expectedFormat === 'webp') return isWebp;
-  return isPng || isJpeg || isWebp;
-}
-
-function decodeStrictBase64Raster(rawB64, expectedFormat = null) {
-  if (typeof rawB64 !== 'string') return null;
-  const cleaned = rawB64.replace(/\s+/g, '');
-  if (!cleaned || cleaned.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) {
-    return null;
-  }
-  const decoded = Buffer.from(cleaned, 'base64');
-  if (decoded.length === 0 || !hasValidRasterMagicBytes(decoded, expectedFormat)) {
-    return null;
-  }
-  const dims = parseInlineRasterDimensions(decoded, expectedFormat);
-  if (!dims) return null;
-  return { cleanedB64: cleaned, decoded, width: dims.width, height: dims.height };
-}
-
-const MPEG1_BITRATES_L1 = [0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448];
-const MPEG1_BITRATES_L2 = [0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384];
-const MPEG1_BITRATES_L3 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320];
-const MPEG2_BITRATES_L1 = [0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256];
-const MPEG2_BITRATES_L23 = [0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160];
-
-function computeMpegFrameByteLength(audioBytes, offset) {
-  if (offset + 4 > audioBytes.length) return null;
-  const b0 = audioBytes[offset];
-  const b1 = audioBytes[offset + 1];
-  const b2 = audioBytes[offset + 2];
-  if (b0 !== 0xff || (b1 & 0xe0) !== 0xe0) return null;
-
-  const versionBits = (b1 >> 3) & 0x03; // 00=MPEG2.5, 01=reserved, 10=MPEG2, 11=MPEG1
-  const layerBits = (b1 >> 1) & 0x03;   // 00=reserved, 01=LayerIII, 10=LayerII, 11=LayerI
-  const bitrateIdx = (b2 >> 4) & 0x0f;
-  const sampleIdx = (b2 >> 2) & 0x03;
-  const padding = (b2 >> 1) & 0x01;
-
-  if (versionBits === 0x01 || layerBits === 0x00 || bitrateIdx === 0 || bitrateIdx === 0x0f || sampleIdx === 0x03) {
-    return null;
-  }
-
-  const isMpeg1 = versionBits === 0x03;
-  const sampleRateTable = isMpeg1
-    ? [44100, 48000, 32000]
-    : (versionBits === 0x02 ? [22050, 24000, 16000] : [11025, 12000, 8000]);
-  const sampleRate = sampleRateTable[sampleIdx];
-
-  let bitrateKbps;
-  if (isMpeg1) {
-    bitrateKbps = layerBits === 0x03
-      ? MPEG1_BITRATES_L1[bitrateIdx]
-      : (layerBits === 0x02 ? MPEG1_BITRATES_L2[bitrateIdx] : MPEG1_BITRATES_L3[bitrateIdx]);
-  } else {
-    bitrateKbps = layerBits === 0x03
-      ? MPEG2_BITRATES_L1[bitrateIdx]
-      : MPEG2_BITRATES_L23[bitrateIdx];
-  }
-  if (!bitrateKbps || !sampleRate) return null;
-
-  const bitrateBps = bitrateKbps * 1000;
-  let frameLen;
-  if (layerBits === 0x03) {
-    frameLen = (Math.floor((12 * bitrateBps) / sampleRate) + padding) * 4;
-  } else if (layerBits === 0x02 || isMpeg1) {
-    frameLen = Math.floor((144 * bitrateBps) / sampleRate) + padding;
-  } else {
-    frameLen = Math.floor((72 * bitrateBps) / sampleRate) + padding;
-  }
-  return frameLen >= 24 ? frameLen : null;
-}
-
-/**
- * Validate audio container magic bytes & complete audio frame/packet presence (`P1-03`).
- * Rejects JSON/HTML error payloads, ID3-only MP3 tags, truncated 4-byte MPEG headers,
- * and Ogg/Opus header-only stubs lacking audio packet pages!
- */
-export function validateAudioFramingAndMagicBytes(audioBytes, responseFormat = 'mp3') {
-  if (!Buffer.isBuffer(audioBytes) || audioBytes.length === 0) return false;
-  const fmt = String(responseFormat || 'mp3').trim().toLowerCase();
-  if (!ALLOWED_SPEECH_FORMATS.has(fmt)) return false;
-
-  const headUtf8 = audioBytes.subarray(0, Math.min(audioBytes.length, 64)).toString('utf8');
-  if (/^\s*(?:\{\s*"|\[|<(?!!--|\/)?(?:!doctype|html|head|body|xml|error)\b)/i.test(headUtf8)) {
-    return false;
-  }
-
-  if (fmt === 'pcm') {
-    return audioBytes.length >= 2 && audioBytes.length % 2 === 0;
-  }
-
-  if (audioBytes.length < 16) return false;
-
-  if (fmt === 'mp3') {
-    let offset = 0;
-    // Skip optional ID3v2 tag ("ID3" + version < 0xff + synchsafe 28-bit size) and require a complete MPEG frame after it!
-    if (
-      audioBytes[0] === 0x49 &&
-      audioBytes[1] === 0x44 &&
-      audioBytes[2] === 0x33
-    ) {
-      if (
-        audioBytes[3] >= 0xff ||
-        audioBytes[4] >= 0xff ||
-        audioBytes[6] >= 0x80 ||
-        audioBytes[7] >= 0x80 ||
-        audioBytes[8] >= 0x80 ||
-        audioBytes[9] >= 0x80
-      ) {
-        return false;
-      }
-      const id3PayloadLen =
-        (audioBytes[6] << 21) |
-        (audioBytes[7] << 14) |
-        (audioBytes[8] << 7) |
-        audioBytes[9];
-      const hasFooter = (audioBytes[5] & 0x10) !== 0;
-      offset = 10 + id3PayloadLen + (hasFooter ? 10 : 0);
-      if (offset >= audioBytes.length) return false;
-      // Skip up to 512 zero padding bytes if present between ID3 tag and first MPEG sync
-      let padSkipped = 0;
-      while (offset < audioBytes.length && audioBytes[offset] === 0x00 && padSkipped < 512) {
-        offset++;
-        padSkipped++;
-      }
-    }
-    const frameLength = computeMpegFrameByteLength(audioBytes, offset);
-    if (frameLength === null) return false;
-    return audioBytes.length >= offset + frameLength;
-  }
-
-  if (fmt === 'wav') {
-    if (
-      audioBytes.length < 44 ||
-      audioBytes.subarray(0, 4).toString('ascii') !== 'RIFF' ||
-      audioBytes.subarray(8, 12).toString('ascii') !== 'WAVE'
-    ) {
-      return false;
-    }
-    let pos = 12;
-    let sawFmt = false;
-    let sawNonEmptyData = false;
-    while (pos + 8 <= audioBytes.length) {
-      const chunkId = audioBytes.subarray(pos, pos + 4).toString('ascii');
-      const chunkSize = audioBytes.readUInt32LE(pos + 4);
-      const payloadStart = pos + 8;
-      if (chunkId === 'fmt ') {
-        if (chunkSize < 16 || payloadStart + chunkSize > audioBytes.length) return false;
-        sawFmt = true;
-      } else if (chunkId === 'data') {
-        if (chunkSize >= 2 && payloadStart + Math.min(chunkSize, 2) <= audioBytes.length && payloadStart + chunkSize <= audioBytes.length) {
-          sawNonEmptyData = true;
-          break;
-        }
-        return false;
-      }
-      const paddedSize = chunkSize + (chunkSize % 2);
-      if (payloadStart + paddedSize > audioBytes.length) break;
-      pos = payloadStart + paddedSize;
-    }
-    return sawFmt && sawNonEmptyData;
-  }
-
-  if (fmt === 'opus') {
-    // Walk Ogg pages: Page 1 must be BOS with OpusHead, and stream must include >= 1 complete audio packet page!
-    let pos = 0;
-    let pageIndex = 0;
-    let sawOpusHead = false;
-    let sawAudioPage = false;
-
-    while (pos < audioBytes.length) {
-      if (pos + 27 > audioBytes.length) return false;
-      if (audioBytes.subarray(pos, pos + 4).toString('ascii') !== 'OggS') return false;
-      if (audioBytes[pos + 4] !== 0) return false; // Ogg stream_structure_version === 0
-      const headerType = audioBytes[pos + 5];
-      const numSegments = audioBytes[pos + 26];
-      const segTableEnd = pos + 27 + numSegments;
-      if (segTableEnd > audioBytes.length) return false;
-      let bodyLen = 0;
-      for (let s = 0; s < numSegments; s++) {
-        bodyLen += audioBytes[pos + 27 + s];
-      }
-      const pageEnd = segTableEnd + bodyLen;
-      if (pageEnd > audioBytes.length) return false;
-
-      const payload = audioBytes.subarray(segTableEnd, pageEnd);
-      if (pageIndex === 0) {
-        if ((headerType & 0x02) === 0 || payload.length < 19) return false;
-        if (payload.subarray(0, 8).toString('ascii') !== 'OpusHead') return false;
-        if (payload[9] < 1) return false; // channel count >= 1
-        sawOpusHead = true;
-      } else if (payload.length >= 8 && payload.subarray(0, 8).toString('ascii') === 'OpusTags') {
-        // Valid OpusTags comment header page; keep scanning for audio page
-      } else if (payload.length >= 1) {
-        sawAudioPage = true;
-      }
-
-      pos = pageEnd;
-      pageIndex++;
-    }
-    return sawOpusHead && sawAudioPage;
-  }
-
-  if (fmt === 'flac') {
-    if (audioBytes.length <= 42 || audioBytes.subarray(0, 4).toString('ascii') !== 'fLaC') {
-      return false;
-    }
-    let pos = 4;
-    let sawStreamInfo = false;
-    while (pos + 4 <= audioBytes.length) {
-      const isLast = (audioBytes[pos] & 0x80) !== 0;
-      const blockType = audioBytes[pos] & 0x7f;
-      const blockLen = (audioBytes[pos + 1] << 16) | (audioBytes[pos + 2] << 8) | audioBytes[pos + 3];
-      pos += 4;
-      if (pos + blockLen > audioBytes.length) return false;
-      if (blockType === 0 && blockLen === 34) sawStreamInfo = true;
-      pos += blockLen;
-      if (isLast) break;
-    }
-    // Require at least 2 bytes of FLAC frame sync (0xFFF8 / 0xFFF9) following metadata!
-    if (!sawStreamInfo || pos + 2 > audioBytes.length) return false;
-    return audioBytes[pos] === 0xff && (audioBytes[pos + 1] & 0xfc) === 0xf8;
-  }
-
-  if (fmt === 'aac') {
-    const isAdts = audioBytes[0] === 0xff && (audioBytes[1] & 0xf6) === 0xf0;
-    if (isAdts) {
-      const adtsFrameLen = ((audioBytes[3] & 0x03) << 11) | (audioBytes[4] << 3) | ((audioBytes[5] >> 5) & 0x07);
-      return adtsFrameLen >= 7 && audioBytes.length >= adtsFrameLen;
-    }
-    if (audioBytes.subarray(4, 8).toString('ascii') === 'ftyp') {
-      let pos = 0;
-      while (pos + 8 <= audioBytes.length) {
-        const boxSize = audioBytes.readUInt32BE(pos);
-        const boxType = audioBytes.subarray(pos + 4, pos + 8).toString('ascii');
-        if (boxSize < 8 || pos + boxSize > audioBytes.length) return false;
-        if (boxType === 'mdat' && boxSize > 8) return true;
-        pos += boxSize;
-      }
-    }
-    return false;
-  }
-
-  return false;
-}
-
-/**
  * Load an OpenAI API key STRICTLY from an explicit `credentialFile` OR an explicit
  * `apiKeyEnvVar` when `allowEnvKey === true`. Never reads ambient env variables implicitly,
  * and never echoes file paths or key bytes in errors.
@@ -1147,25 +755,10 @@ function validateInlineInputImage(part, pathLabel) {
       { code: 'REMOTE_IMAGE_URL_FORBIDDEN' },
     );
   }
-  const mimeSubtype = match[1].toLowerCase();
   const cleanedB64 = match[2].replace(/\s+/g, '');
   if (!cleanedB64 || cleanedB64.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleanedB64)) {
     throw new OpenAiValidationError(
       `${pathLabel}.image_url contains malformed base64 data.`,
-      { code: 'INVALID_INLINE_IMAGE_RASTER' },
-    );
-  }
-  const decodedBuf = Buffer.from(cleanedB64, 'base64');
-  const dims = parseInlineRasterDimensions(decodedBuf, mimeSubtype);
-  if (!dims) {
-    throw new OpenAiValidationError(
-      `${pathLabel}.image_url did not decode to a valid ${mimeSubtype.toUpperCase()} raster header with width/height.`,
-      { code: 'INVALID_INLINE_IMAGE_RASTER' },
-    );
-  }
-  if (dims.width > MAX_INLINE_IMAGE_DIMENSION || dims.height > MAX_INLINE_IMAGE_DIMENSION) {
-    throw new OpenAiValidationError(
-      `${pathLabel}.image_url dimensions (${dims.width}x${dims.height}) exceed ${MAX_INLINE_IMAGE_DIMENSION}x${MAX_INLINE_IMAGE_DIMENSION} maximum.`,
       { code: 'INVALID_INLINE_IMAGE_RASTER' },
     );
   }
@@ -1177,23 +770,9 @@ function validateInlineInputImage(part, pathLabel) {
     );
   }
 
-  if (detail === 'low') {
-    return IMAGE_LOW_DETAIL_TOKEN_BOUND;
-  }
-  const patches32 = Math.ceil(dims.width / 32) * Math.ceil(dims.height / 32);
-  const tiles512 = Math.ceil(dims.width / 512) * Math.ceil(dims.height / 512);
-  if (detail === 'original') {
-    return Math.max(
-      IMAGE_ORIGINAL_DETAIL_TOKEN_BOUND,
-      patches32 * 2,
-      1024 + tiles512 * 1536,
-    );
-  }
-  return Math.max(
-    IMAGE_HIGH_DETAIL_TOKEN_BOUND,
-    Math.min(patches32, 16_384),
-    1024 + tiles512 * 1105,
-  );
+  if (detail === 'low') return IMAGE_LOW_DETAIL_TOKEN_BOUND;
+  if (detail === 'original') return IMAGE_ORIGINAL_DETAIL_TOKEN_BOUND;
+  return IMAGE_HIGH_DETAIL_TOKEN_BOUND;
 }
 
 /**
@@ -2355,7 +1934,7 @@ export function buildBatchJsonl(rawRequests, options = {}) {
     const url = String(item.url ?? item.endpoint ?? defaultUrl).trim();
     if (!ALLOWED_BATCH_ENDPOINTS.has(url)) {
       throw new OpenAiValidationError(
-        `requests[${i}].url "${url}" is not supported for Batch (allowed: /v1/responses, /v1/images/generations).`,
+        `requests[${i}].url "${url}" is not supported for Batch (allowed: /v1/responses).`,
       );
     }
     defineSafeProp(endpointCounts, url, (Object.hasOwn(endpointCounts, url) ? endpointCounts[url] : 0) + 1);
@@ -2364,105 +1943,57 @@ export function buildBatchJsonl(rawRequests, options = {}) {
     const rawBody = item.body ?? item.request;
     assertPlainObject(rawBody, `requests[${i}].body`);
 
-    let normalizedBody;
-    let lineEstimatedMicros = 0;
-    let canonicalLineModel;
-    let lineSpecObj;
-
-    if (url === '/v1/responses') {
-      const {
-        wire,
-        canonicalModel,
-        inferredInputTokens,
-        maxWebSearchCalls,
-        expectsJsonObject,
-        jsonSchema,
-        lockedLogicalRequestId,
-      } = validateAndNormalizeResponsesBody(origBodyRef ?? rawBody, {
-        allowAstraApi,
-        batch: true,
-        uncappedWebSearchReservationCalls,
-      });
-      if (lockedLogicalRequestId !== null) {
-        if (cleanCustomId !== lockedLogicalRequestId) {
-          throw new OpenAiPolicyError(
-            `Batch requests[${i}].custom_id ("${cleanCustomId}") must match locked logical request ID "${lockedLogicalRequestId}".`,
-            { code: 'LOCKED_LOGICAL_REQUEST_ID_MISMATCH', notDispatched: true },
-          );
-        }
-        if (seenLockedIds.has(lockedLogicalRequestId)) {
-          throw new OpenAiValidationError(
-            `Duplicate locked logical request ID "${lockedLogicalRequestId}" in Batch requests.`,
-            { code: 'DUPLICATE_BATCH_CUSTOM_ID' },
-          );
-        }
-        seenLockedIds.add(lockedLogicalRequestId);
-        lockedLogicalIds.push(lockedLogicalRequestId);
+    const {
+      wire,
+      canonicalModel,
+      inferredInputTokens,
+      maxWebSearchCalls,
+      expectsJsonObject,
+      jsonSchema,
+      lockedLogicalRequestId,
+    } = validateAndNormalizeResponsesBody(origBodyRef ?? rawBody, {
+      allowAstraApi,
+      batch: true,
+      uncappedWebSearchReservationCalls,
+    });
+    if (lockedLogicalRequestId !== null) {
+      if (cleanCustomId !== lockedLogicalRequestId) {
+        throw new OpenAiPolicyError(
+          `Batch requests[${i}].custom_id ("${cleanCustomId}") must match locked logical request ID "${lockedLogicalRequestId}".`,
+          { code: 'LOCKED_LOGICAL_REQUEST_ID_MISMATCH', notDispatched: true },
+        );
       }
-      delete wire.service_tier;
-      normalizedBody = wire;
-      canonicalLineModel = canonicalModel;
-      lineSpecObj = {
-        endpoint: '/v1/responses',
-        model: canonicalModel,
-        expects_json_object: expectsJsonObject,
-        schema_json: jsonSchema ?? null,
-      };
-      const explicitIn = Number.isSafeInteger(item.estimatedInputTokens) && item.estimatedInputTokens >= 0
-        ? Math.max(inferredInputTokens, item.estimatedInputTokens)
-        : inferredInputTokens;
-      const breakdown = estimateCostBreakdown({
-        endpoint: '/v1/responses',
-        model: wire.model,
-        serviceTier: 'batch',
-        estimatedInputTokens: explicitIn,
-        maxOutputTokens: wire.max_output_tokens,
-        maxWebSearchCalls,
-        allowAstraApi,
-      });
-      lineEstimatedMicros = breakdown.estimated_micros;
-    } else {
-      const wire = stripLocalKeys(rawBody);
-      defineSafeProp(wire, 'model', wire.model ?? 'gpt-image-2.6-sunburst');
-      const spec = resolveModelPricing(wire.model, { allowAstraApi, endpoint: '/v1/images/generations' });
-      if (spec.family !== 'image') {
-        throw new OpenAiValidationError(`Batch /v1/images/generations requires a gpt-image model (got "${wire.model}").`);
+      if (seenLockedIds.has(lockedLogicalRequestId)) {
+        throw new OpenAiValidationError(
+          `Duplicate locked logical request ID "${lockedLogicalRequestId}" in Batch requests.`,
+          { code: 'DUPLICATE_BATCH_CUSTOM_ID' },
+        );
       }
-      if (typeof wire.prompt !== 'string' || !wire.prompt.trim()) {
-        throw new OpenAiValidationError(`requests[${i}].body.prompt must be a nonempty string.`);
-      }
-      const nCount = wire.n ?? 1;
-      if (!Number.isSafeInteger(nCount) || nCount < 1 || nCount > 4) {
-        throw new OpenAiValidationError(`requests[${i}].body.n must be an integer between 1 and 4.`);
-      }
-      const outFmt = wire.output_format ?? 'png';
-      if (!['png', 'jpeg', 'webp'].includes(outFmt)) {
-        throw new OpenAiValidationError(`requests[${i}].body.output_format must be png, jpeg, or webp.`);
-      }
-      defineSafeProp(wire, 'output_format', outFmt);
-      assertCleanOutgoingPayload(wire, `requests[${i}].body`);
-      normalizedBody = wire;
-      canonicalLineModel = spec.canonicalModel;
-      lineSpecObj = {
-        endpoint: '/v1/images/generations',
-        model: spec.canonicalModel,
-        expected_image_count: nCount,
-        expected_output_format: outFmt,
-      };
-      const breakdown = estimateCostBreakdown({
-        endpoint: '/v1/images/generations',
-        model: wire.model,
-        serviceTier: 'batch',
-        imageEstimate: {
-          count: nCount,
-          quality: wire.quality ?? 'high',
-          size: wire.size ?? '1536x1024',
-          textInputTokens: Math.max(250, utf8ByteLength(wire.prompt)),
-        },
-        allowAstraApi,
-      });
-      lineEstimatedMicros = breakdown.estimated_micros;
+      seenLockedIds.add(lockedLogicalRequestId);
+      lockedLogicalIds.push(lockedLogicalRequestId);
     }
+    delete wire.service_tier;
+    const normalizedBody = wire;
+    const canonicalLineModel = canonicalModel;
+    const lineSpecObj = {
+      endpoint: '/v1/responses',
+      model: canonicalModel,
+      expects_json_object: expectsJsonObject,
+      schema_json: jsonSchema ?? null,
+    };
+    const explicitIn = Number.isSafeInteger(item.estimatedInputTokens) && item.estimatedInputTokens >= 0
+      ? Math.max(inferredInputTokens, item.estimatedInputTokens)
+      : inferredInputTokens;
+    const breakdown = estimateCostBreakdown({
+      endpoint: '/v1/responses',
+      model: wire.model,
+      serviceTier: 'batch',
+      estimatedInputTokens: explicitIn,
+      maxOutputTokens: wire.max_output_tokens,
+      maxWebSearchCalls,
+      allowAstraApi,
+    });
+    const lineEstimatedMicros = breakdown.estimated_micros;
 
     const lineRecord = Object.create(null);
     defineSafeProp(lineRecord, 'custom_id', cleanCustomId);
@@ -2689,11 +2220,7 @@ export function parseBatchOutputJsonl(jsonlText, {
 
     http200Count++;
     const looksLikeImageBody = Array.isArray(body.data) && !Object.hasOwn(body, 'output');
-    const endpointContradiction =
-      (expectedLineEndpoint === '/v1/images/generations' && !looksLikeImageBody) ||
-      (expectedLineEndpoint === '/v1/responses' && looksLikeImageBody);
-
-    if (endpointContradiction) {
+    if (looksLikeImageBody || (expectedLineEndpoint && expectedLineEndpoint !== '/v1/responses')) {
       failedCount++;
       hasUnknownUsage = true;
       const entry = {
@@ -2704,79 +2231,8 @@ export function parseBatchOutputJsonl(jsonlText, {
         status: 'failed',
         http_status: 200,
         content_status: 'invalid',
-        error: `Batch item "${cleanId}" body shape contradicted expected endpoint "${expectedLineEndpoint}".`,
+        error: `Batch item "${cleanId}" body shape contradicted expected endpoint "${expectedLineEndpoint ?? '/v1/responses'}".`,
         usage_cost_micros: null,
-        body,
-      };
-      results.push(entry);
-      defineSafeProp(byCustomId, cleanId, entry);
-      continue;
-    }
-
-    if (looksLikeImageBody) {
-      const returnedImgModel = typeof body.model === 'string' && body.model.trim() ? body.model.trim() : null;
-      const effectiveImgModel = returnedImgModel ?? expectedLineModel;
-      let modelMismatch = false;
-      if (returnedImgModel && expectedLineModel) {
-        try {
-          const retSpec = resolveModelPricing(returnedImgModel, { allowAstraApi: true, endpoint: '/v1/images/generations' });
-          const expSpec = resolveModelPricing(expectedLineModel, { allowAstraApi: true, endpoint: '/v1/images/generations' });
-          if (retSpec.canonicalModel !== expSpec.canonicalModel) modelMismatch = true;
-        } catch {
-          modelMismatch = true;
-        }
-      }
-
-      let usageMicros = null;
-      if (body.usage && effectiveImgModel) {
-        try {
-          usageMicros = computeUsageCostMicros({
-            model: effectiveImgModel,
-            serviceTier: 'batch',
-            usage: body.usage,
-            allowAstraApi: true,
-          });
-          knownUsageCostMicrosBig += BigInt(usageMicros);
-        } catch {
-          usageMicros = null;
-          hasUnknownUsage = true;
-        }
-      } else {
-        hasUnknownUsage = true;
-      }
-
-      const expectedImgCount = Number.isSafeInteger(lineSpec?.expected_image_count) ? lineSpec.expected_image_count : null;
-      const rawExpFmt = lineSpec?.expected_output_format ?? lineSpec?.expected_image_format;
-      const expectedImgFormat = typeof rawExpFmt === 'string' && rawExpFmt.trim() ? rawExpFmt.trim() : null;
-
-      // P1: Legacy image manifests missing line_specs, expected_image_count, or expected_output_format cannot mark lines usable: true!
-      const missingLegacyImgSpec = expectedImgCount === null || expectedImgFormat === null;
-      const countValid = !missingLegacyImgSpec && (expectedImgCount !== null ? body.data.length === expectedImgCount : body.data.length >= 1);
-      const validImages = countValid && body.data.every(item => (
-        typeof item?.b64_json === 'string' && decodeStrictBase64Raster(item.b64_json, expectedImgFormat) !== null
-      ));
-      const isLineUsable = !modelMismatch && !missingLegacyImgSpec && validImages && usageMicros !== null;
-
-      if (isLineUsable) {
-        succeededCount++;
-        usableCount++;
-      } else {
-        failedCount++;
-      }
-
-      const entry = {
-        custom_id: cleanId,
-        batch_request_id: safeBatchReqId,
-        ok: isLineUsable,
-        usable: isLineUsable,
-        status: isLineUsable ? 'completed' : 'failed',
-        http_status: 200,
-        content_status: isLineUsable ? 'usable' : 'invalid',
-        ...(missingLegacyImgSpec ? { error: 'unverified_legacy_image_manifest' } : {}),
-        model: effectiveImgModel,
-        usage: body.usage ?? null,
-        web_search_calls: 0,
-        usage_cost_micros: usageMicros,
         body,
       };
       results.push(entry);
@@ -3004,32 +2460,21 @@ function validateExternalBatchManifest(rawManifest, { endpoint, allowAstraApi, e
       );
     }
     const lineModel = rawManifest.line_models[trimmedId];
-    const spec = resolveModelPricing(lineModel, { allowAstraApi, endpoint });
-    if (endpoint === '/v1/images/generations' && spec.family !== 'image') {
-      throw new OpenAiValidationError(`batchManifest.line_models["${trimmedId}"] must be an image model.`);
-    }
-    if (endpoint === '/v1/responses' && spec.family !== 'text') {
+    const spec = resolveModelPricing(lineModel, { allowAstraApi });
+    if (spec.family !== 'text') {
       throw new OpenAiValidationError(`batchManifest.line_models["${trimmedId}"] must be a text/responses model.`);
     }
     cleanCustomIds.push(trimmedId);
     defineSafeProp(cleanLineModels, trimmedId, spec.canonicalModel);
 
-    const floorBreakdown = endpoint === '/v1/images/generations'
-      ? estimateCostBreakdown({
-          endpoint: '/v1/images/generations',
-          model: spec.canonicalModel,
-          serviceTier: 'batch',
-          imageEstimate: { count: 1, quality: 'low', size: '1024x1024', textInputTokens: 1 },
-          allowAstraApi,
-        })
-      : estimateCostBreakdown({
-          endpoint: '/v1/responses',
-          model: spec.canonicalModel,
-          serviceTier: 'batch',
-          estimatedInputTokens: 1,
-          maxOutputTokens: 1,
-          allowAstraApi,
-        });
+    const floorBreakdown = estimateCostBreakdown({
+      endpoint: '/v1/responses',
+      model: spec.canonicalModel,
+      serviceTier: 'batch',
+      estimatedInputTokens: 1,
+      maxOutputTokens: 1,
+      allowAstraApi,
+    });
     minFloorMicrosBig += BigInt(floorBreakdown.estimated_micros);
   }
 
@@ -3523,7 +2968,7 @@ export class OpenAiClient {
       normalizedQuestions.length * DECISION_OUTPUT_TOKENS_PER_QUESTION,
     );
 
-    const reservedCents = estimateReservationCents({
+    estimateReservationCents({
       endpoint: '/v1/decisions',
       model: 'gpt-6-luna',
       serviceTier: tierInfo.reservationTier,
@@ -3531,6 +2976,7 @@ export class OpenAiClient {
       maxOutputTokens: estMaxOutputTokens,
       allowAstraApi: false,
     });
+    const reservedCents = 0;
 
     const ledger = this._requireBillableLedger(eff);
     const { apiKey, credentialFingerprintSha256 } = this._resolveApiKeyAndFingerprint(eff);
@@ -3977,7 +3423,7 @@ export class OpenAiClient {
       ? Math.max(inferredInputTokens, eff.estimatedInputTokens)
       : inferredInputTokens;
 
-    const reservedCents = estimateReservationCents({
+    estimateReservationCents({
       endpoint: '/v1/responses',
       model: wire.model,
       serviceTier: tierInfo.reservationTier,
@@ -3986,6 +3432,7 @@ export class OpenAiClient {
       maxWebSearchCalls,
       allowAstraApi: eff.allowAstraApi,
     });
+    const reservedCents = 0;
 
     const ledger = this._requireBillableLedger(eff);
     const { apiKey, credentialFingerprintSha256 } = this._resolveApiKeyAndFingerprint(eff);
@@ -4879,13 +4326,39 @@ export class OpenAiClient {
       ? 'invalid'
       : extracted.contentStatus;
 
+    const alreadyFinanciallySettled =
+      ['completed', 'failed_known'].includes(attempt.status) &&
+      (attempt.posted_billed_cents !== null || Boolean(attempt.confirmed_zero_charge));
+    if (alreadyFinanciallySettled && usageCostMicros !== null && attempt.usage_cost_micros === null) {
+      const enrichedUsageObj = isPlainObject(sanitizedBody.usage)
+        ? { ...sanitizedBody.usage, web_search_calls: extracted.webSearchCalls }
+        : null;
+      ledger.db.prepare(`
+        UPDATE openai_request_ledger
+        SET usage_cost_micros = ?,
+            usage_json = COALESCE(usage_json, ?),
+            updated_at = ?
+        WHERE attempt_id = ?
+      `).run(
+        usageCostMicros,
+        enrichedUsageObj ? JSON.stringify(enrichedUsageObj) : null,
+        ledger._nowIso(),
+        attempt.attempt_id,
+      );
+    }
+
     let desiredTerminalStatus;
     let diagReason = null;
     if (usageCostMicros === null) {
-      desiredTerminalStatus = 'pending_recovery';
-      diagReason = usageValidationWarning
-        ? `Terminal response "${extracted.responseStatus}" had unverifiable model/usage (${usageValidationWarning}); holding reservation until reconciled.`
-        : `Terminal response "${extracted.responseStatus}" missing usage object; holding reservation until reconciled.`;
+      if (alreadyFinanciallySettled) {
+        desiredTerminalStatus = attempt.status;
+        diagReason = attempt.diagnostic_reason ?? null;
+      } else {
+        desiredTerminalStatus = 'pending_recovery';
+        diagReason = usageValidationWarning
+          ? `Terminal response "${extracted.responseStatus}" had unverifiable model/usage (${usageValidationWarning}); holding reservation until reconciled.`
+          : `Terminal response "${extracted.responseStatus}" missing usage object; holding reservation until reconciled.`;
+      }
     } else if (extracted.responseStatus === 'failed' || extracted.responseStatus === 'cancelled') {
       if (usageCostMicros > 0) {
         desiredTerminalStatus = 'failed_known';
@@ -4912,25 +4385,27 @@ export class OpenAiClient {
     const wantCleanup = Boolean(cleanupRequired && desiredTerminalStatus !== 'pending_recovery');
 
     // Persist sanitized raw receipt, original_body_sha256, & terminal usage BEFORE optional DELETE + 404 readback!
-    const persistedBeforeDelete = ledger.recordTerminalOutcome(attempt.attempt_id, {
-      status: desiredTerminalStatus,
-      contentStatus: finalContentStatus,
-      usageCostMicros,
-      usage: isPlainObject(sanitizedBody.usage)
-        ? { ...sanitizedBody.usage, web_search_calls: extracted.webSearchCalls }
-        : null,
-      provisionalUsage: usageCostMicros === null ? provisional.usage : null,
-      provisionalUsageCostMicros: usageCostMicros === null ? provisional.micros : null,
-      providerResponseId: returnedId,
-      providerModel: returnedModelStr ?? requestedModel,
-      httpStatus,
-      cleanupStatus: cleanupRequired ? 'pending_cleanup' : 'not_requested',
-      rawReceipt: sanitizedBody,
-      originalBodySha256,
-      rawBodyText: scrubbedRawText,
-      rawBodySha256: scrubbedRawSha256,
-      diagnosticReason: diagReason,
-    });
+    const persistedBeforeDelete = alreadyFinanciallySettled
+      ? ledger.getAttemptById(attempt.attempt_id)
+      : ledger.recordTerminalOutcome(attempt.attempt_id, {
+        status: desiredTerminalStatus,
+        contentStatus: finalContentStatus,
+        usageCostMicros,
+        usage: isPlainObject(sanitizedBody.usage)
+          ? { ...sanitizedBody.usage, web_search_calls: extracted.webSearchCalls }
+          : null,
+        provisionalUsage: usageCostMicros === null ? provisional.usage : null,
+        provisionalUsageCostMicros: usageCostMicros === null ? provisional.micros : null,
+        providerResponseId: returnedId,
+        providerModel: returnedModelStr ?? requestedModel,
+        httpStatus,
+        cleanupStatus: cleanupRequired ? 'pending_cleanup' : 'not_requested',
+        rawReceipt: sanitizedBody,
+        originalBodySha256,
+        rawBodyText: scrubbedRawText,
+        rawBodySha256: scrubbedRawSha256,
+        diagnosticReason: diagReason,
+      });
 
     let ledgerStatus = persistedBeforeDelete.status;
     let cleanupSummary = {
@@ -4952,7 +4427,6 @@ export class OpenAiClient {
             ? 'Blocked DELETE because full original raw payload bytes could not be persisted and verified locally.'
             : 'Blocked DELETE because raw receipt persistence verification failed.',
         });
-        ledgerStatus = 'pending_recovery';
         cleanupSummary = { requested: true, status: 'delete_failed', verified_404: false };
       } else {
         try {
@@ -4983,7 +4457,6 @@ export class OpenAiClient {
             cleanupStatus: 'delete_failed',
             diagnosticReason: `Cleanup error after receipt persistence: ${scrubTextForReceipt(err?.message || 'delete_error', apiKey)}`,
           });
-          ledgerStatus = 'pending_recovery';
           cleanupSummary = {
             requested: true,
             status: 'delete_failed',
@@ -5445,8 +4918,7 @@ export class OpenAiClient {
     const refreshed = ledger.getAttemptById(existing.attempt_id);
     const stillFenced =
       refreshed.status === 'pending_recovery' ||
-      refreshed.status === 'in_progress' ||
-      (refreshed.cleanup_required === true && refreshed.cleanup_status !== 'deleted_verified_404' && refreshed.status !== 'rejected');
+      refreshed.status === 'in_progress';
 
     return {
       recovered: !stillFenced,
@@ -5461,7 +4933,7 @@ export class OpenAiClient {
     const ledger = eff.ledger;
     if (
       existing.raw_receipt_json !== null &&
-      existing.usage_cost_micros !== null &&
+      (existing.usage_cost_micros !== null || existing.posted_billed_cents !== null || Boolean(existing.confirmed_zero_charge)) &&
       Boolean(existing.delete_ack_at && existing.delete_ack_receipt_json) &&
       ledger._hasVerifiedOriginalBytesForAttempt(existing) &&
       (existing.cleanup_required === true || existing.cleanup_status === 'pending_cleanup' || existing.cleanup_status === 'delete_failed')
@@ -5533,19 +5005,15 @@ export class OpenAiClient {
       throw new OpenAiValidationError('A single OpenAI Batch upload must target one uniform endpoint.');
     }
     const endpoint = endpointsUsed[0];
-    if (endpoint === '/v1/images/generations') {
-      this._assertStage4MediaAuthorized(eff, ledger);
-    }
 
     const { apiKey, credentialFingerprintSha256 } = this._resolveApiKeyAndFingerprint(eff);
-    const uploadModel = endpoint === '/v1/images/generations' ? 'gpt-image-2.6-sunburst' : 'gpt-6.1-terra';
+    const uploadModel = 'gpt-6.1-terra';
     const uploadPayloadSha = computeRequestPayloadSha256('/v1/files', {
       target_endpoint: endpoint,
       jsonl_sha256: builtBatch.jsonl_sha256,
     });
     const uploadLogicalId = eff.logicalRequestId ?? params.logical_request_id ?? params.logicalRequestId ?? `upload-req-${generatePiiSafeUuid()}`;
 
-    // P0-01 & P1: Gate POST /v1/files behind atomic pre-upload admission (enabled, !fenced, Stage-4 media, budget headroom)!
     const uploadAttempt = ledger.reserveBillableRequest({
       logicalRequestId: uploadLogicalId,
       accountScope: eff.accountScope,
@@ -5557,10 +5025,9 @@ export class OpenAiClient {
       origin: this.baseOrigin,
       apiBaseUrl: eff.baseUrl,
       payloadSha256: uploadPayloadSha,
-      reservedCents: 1,
+      reservedCents: 0,
       batchManifest: builtBatch.batch_manifest,
       lockedLogicalIds: builtBatch.locked_logical_ids,
-      requireStage4Media: endpoint === '/v1/images/generations',
       credentialFingerprintSha256,
       isLiveTransport: eff.isLiveTransport,
     });
@@ -5727,9 +5194,6 @@ export class OpenAiClient {
     }
 
     const ledger = this._requireBillableLedger(eff);
-    if (endpoint === '/v1/images/generations') {
-      this._assertStage4MediaAuthorized(eff, ledger);
-    }
 
     const { apiKey, credentialFingerprintSha256 } = this._resolveApiKeyAndFingerprint(eff);
 
@@ -5848,8 +5312,8 @@ export class OpenAiClient {
       };
     }
 
-    const batchModel = params.model ?? (endpoint === '/v1/images/generations' ? 'gpt-image-2.6-sunburst' : 'gpt-6.1-terra');
-    resolveModelPricing(batchModel, { allowAstraApi: eff.allowAstraApi, endpoint });
+    const batchModel = params.model ?? 'gpt-6.1-terra';
+    resolveModelPricing(batchModel, { allowAstraApi: eff.allowAstraApi });
 
     const completionWindow = params.completion_window ?? '24h';
     if (completionWindow !== '24h') {
@@ -5885,10 +5349,9 @@ export class OpenAiClient {
       origin: this.baseOrigin,
       apiBaseUrl: eff.baseUrl,
       payloadSha256,
-      reservedCents,
+      reservedCents: 0,
       batchManifest: verifiedManifest,
       lockedLogicalIds: Array.isArray(verifiedManifest.locked_logical_ids) ? verifiedManifest.locked_logical_ids : null,
-      requireStage4Media: endpoint === '/v1/images/generations',
       credentialFingerprintSha256,
       isLiveTransport: eff.isLiveTransport,
     });
@@ -6001,12 +5464,10 @@ export class OpenAiClient {
       const serializedBatchWire = JSON.stringify(batchWire);
       const batchPostSha256 = sha256Hex(Buffer.from(serializedBatchWire, 'utf8'));
 
-      // P0-19 & P1-02: Atomically claim batch creation stage (re-verifying month rollover, enabled, fences, ceiling, & Stage-4)!
       ledger.claimBatchCreationStage(attempt.attempt_id, {
         accountScope: eff.accountScope,
         uploadedFileId: inputFileId,
         batchPostSha256,
-        requireStage4Media: endpoint === '/v1/images/generations',
         monthUtc: eff.monthUtc,
         allowTestClockOverride: eff.allowTestClockOverride,
       });
@@ -6425,714 +5886,6 @@ export class OpenAiClient {
       parsed_output: parsedOutput,
     };
   }
-
-  /**
-   * Opt-in Stage-4 Concept Image Generation (`POST /v1/images/generations`).
-   * HARD-BLOCKED unless BOTH `policy.enableStage4Media === true` AND `policyRow.allow_stage4_media === true`.
-   */
-  async createConceptImage(rawParams, policy = {}) {
-    if (
-      rawParams &&
-      typeof rawParams === 'object' &&
-      (rawParams._offline_draft_only === true || rawParams.offline_draft_only === true)
-    ) {
-      throw new OpenAiPolicyError(
-        'Offline draft request (_offline_draft_only) cannot be dispatched to /v1/images/generations.',
-        { code: 'OFFLINE_DRAFT_NOT_DISPATCHABLE', notDispatched: true },
-      );
-    }
-    const params = snapshotPlainValue(rawParams, 'ConceptImage params');
-    const eff = this._resolveEffectivePolicy(policy);
-    const requestSignal = buildTimeoutSignal(eff.timeoutMs, eff.signal);
-    const ledger = this._requireBillableLedger(eff);
-    this._assertStage4MediaAuthorized(eff, ledger);
-
-    assertPlainObject(params, 'ConceptImage params');
-    const wire = stripLocalKeys(params);
-    defineSafeProp(wire, 'model', wire.model ?? 'gpt-image-2.6-sunburst');
-    const spec = resolveModelPricing(wire.model, { allowAstraApi: eff.allowAstraApi, endpoint: '/v1/images/generations' });
-    if (spec.family !== 'image') {
-      throw new OpenAiValidationError(`createConceptImage requires a gpt-image model (got "${wire.model}").`);
-    }
-    if (typeof wire.prompt !== 'string' || !wire.prompt.trim()) {
-      throw new OpenAiValidationError('createConceptImage requires a nonempty prompt string.');
-    }
-    defineSafeProp(wire, 'n', wire.n ?? 1);
-    if (!Number.isSafeInteger(wire.n) || wire.n < 1 || wire.n > 4) {
-      throw new OpenAiValidationError('createConceptImage n must be an integer between 1 and 4.');
-    }
-    defineSafeProp(wire, 'output_format', wire.output_format ?? 'png');
-    if (!['png', 'jpeg', 'webp'].includes(wire.output_format)) {
-      throw new OpenAiValidationError('createConceptImage output_format must be png, jpeg, or webp.');
-    }
-
-    assertCleanOutgoingPayload(wire, 'concept_image_request');
-
-    const serializedWire = JSON.stringify(wire);
-    const payloadSha256 = computeRequestPayloadSha256('/v1/images/generations', serializedWire);
-    const logicalRequestId = eff.logicalRequestId ?? params.logical_request_id ?? params.logicalRequestId ?? `img-req-${generatePiiSafeUuid()}`;
-    const reservedCents = estimateReservationCents({
-      endpoint: '/v1/images/generations',
-      model: wire.model,
-      serviceTier: 'standard',
-      imageEstimate: {
-        count: wire.n,
-        quality: wire.quality ?? 'high',
-        size: wire.size ?? '1536x1024',
-        textInputTokens: Math.max(250, utf8ByteLength(wire.prompt)),
-      },
-      allowAstraApi: eff.allowAstraApi,
-    });
-
-    const { apiKey, credentialFingerprintSha256 } = this._resolveApiKeyAndFingerprint(eff);
-
-    const attempt = ledger.reserveBillableRequest({
-      logicalRequestId,
-      accountScope: eff.accountScope,
-      monthUtc: eff.monthUtc,
-      allowTestClockOverride: eff.allowTestClockOverride,
-      endpoint: '/v1/images/generations',
-      model: wire.model,
-      serviceTier: 'standard',
-      origin: this.baseOrigin,
-      apiBaseUrl: eff.baseUrl,
-      payloadSha256,
-      reservedCents,
-      requireStage4Media: true,
-      credentialFingerprintSha256,
-      isLiveTransport: eff.isLiveTransport,
-    });
-
-    let res;
-    try {
-      res = await eff.fetchImpl(`${eff.baseUrl}/v1/images/generations`, {
-        method: 'POST',
-        redirect: 'error',
-        headers: {
-          Authorization: formatAuthHeader(apiKey),
-          'Content-Type': 'application/json',
-        },
-        body: serializedWire,
-        signal: requestSignal,
-      });
-    } catch (err) {
-      const reason = `Transport error/timeout/redirect on POST /v1/images/generations (${scrubTextForReceipt(err?.message || 'network_error', apiKey)}).`;
-      ledger.markPendingRecovery(attempt.attempt_id, { reason });
-      throw new OpenAiAmbiguousOutcomeError(reason, {
-        attemptId: attempt.attempt_id,
-        logicalRequestId: attempt.logical_request_id,
-        reservedCents: attempt.reserved_cents,
-      });
-    }
-
-    try {
-      const { okJson, body, sanitizedBody, originalBodySha256, scrubbedRawText, scrubbedRawSha256 } =
-        await this._readJsonResponseSafe(res, apiKey, DEFAULT_MAX_RESPONSE_BYTES, {
-          requireStreamingOrContentLength: eff.isLiveTransport,
-        }).catch(err => {
-          const reason = `Body stream error on POST /v1/images/generations (${scrubTextForReceipt(err?.message || 'stream_error', apiKey)}).`;
-          ledger.markPendingRecovery(attempt.attempt_id, { httpStatus: res.status, reason });
-          throw new OpenAiAmbiguousOutcomeError(reason, {
-            attemptId: attempt.attempt_id,
-            logicalRequestId: attempt.logical_request_id,
-            httpStatus: res.status,
-            reservedCents: attempt.reserved_cents,
-          });
-        });
-
-      const rawImgUsage = sanitizedBody?.usage ?? sanitizedBody?.error?.usage ?? null;
-      let provImgMicros = null;
-      if (rawImgUsage && typeof rawImgUsage === 'object') {
-        try {
-          provImgMicros = computeUsageCostMicros({ model: wire.model, serviceTier: 'standard', usage: rawImgUsage });
-        } catch {
-          provImgMicros = null;
-        }
-      }
-
-      if (isAmbiguousHttpStatus(res.status)) {
-        const reason = `Ambiguous HTTP ${res.status} on POST /v1/images/generations.`;
-        ledger.markPendingRecovery(attempt.attempt_id, {
-          httpStatus: res.status,
-          provisionalUsage: rawImgUsage,
-          provisionalUsageCostMicros: provImgMicros,
-          rawReceipt: sanitizedBody,
-          originalBodySha256,
-          rawBodyText: scrubbedRawText,
-          rawBodySha256: scrubbedRawSha256,
-          reason,
-        });
-        throw new OpenAiAmbiguousOutcomeError(reason, {
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-          httpStatus: res.status,
-          reservedCents: attempt.reserved_cents,
-        });
-      }
-      if (res.status >= 400) {
-        const msg = sanitizedBody?.error?.message ?? `POST /v1/images/generations rejected with HTTP ${res.status}.`;
-        ledger.recordTerminalOutcome(attempt.attempt_id, {
-          status: 'rejected',
-          httpStatus: res.status,
-          usageCostMicros: provImgMicros,
-          usage: rawImgUsage,
-          rawReceipt: sanitizedBody,
-          originalBodySha256,
-          rawBodyText: scrubbedRawText,
-          rawBodySha256: scrubbedRawSha256,
-          diagnosticReason: msg,
-        });
-        throw new OpenAiHttpError(msg, {
-          httpStatus: res.status,
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-        });
-      }
-      if (!okJson || !body || !Array.isArray(body.data)) {
-        const reason = 'POST /v1/images/generations returned HTTP 200 without valid data array.';
-        ledger.markPendingRecovery(attempt.attempt_id, {
-          httpStatus: res.status,
-          provisionalUsage: rawImgUsage,
-          provisionalUsageCostMicros: provImgMicros,
-          originalBodySha256,
-          rawBodyText: scrubbedRawText,
-          rawBodySha256: scrubbedRawSha256,
-          reason,
-        });
-        throw new OpenAiAmbiguousOutcomeError(reason, {
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-          httpStatus: res.status,
-          reservedCents: attempt.reserved_cents,
-        });
-      }
-
-      let usageCostMicros = null;
-      const sanitizedUsage = body.usage ? sanitizeReceiptValue(body.usage, 0, apiKey) : null;
-      if (sanitizedUsage && typeof sanitizedUsage === 'object') {
-        try {
-          usageCostMicros = computeUsageCostMicros({ model: wire.model, serviceTier: 'standard', usage: sanitizedUsage });
-        } catch {
-          usageCostMicros = null;
-        }
-      }
-
-      const rawItems = body.data;
-      let postDispatchInvalidReason = null;
-      const images = [];
-
-      if (rawItems.length !== wire.n) {
-        postDispatchInvalidReason = `POST /v1/images/generations returned ${rawItems.length} image(s); expected n=${wire.n}.`;
-      } else {
-        for (let idx = 0; idx < rawItems.length; idx++) {
-          const entry = rawItems[idx];
-          const decoded = decodeStrictBase64Raster(entry?.b64_json, wire.output_format);
-          if (!decoded) {
-            postDispatchInvalidReason = `Image item ${idx} failed base64 or ${wire.output_format.toUpperCase()} raster header validation.`;
-            break;
-          }
-          images.push({
-            index: idx,
-            format: wire.output_format,
-            width: decoded.width,
-            height: decoded.height,
-            b64_sha256: sha256Hex(decoded.cleanedB64),
-            data_uri: `data:image/${wire.output_format};base64,${decoded.cleanedB64}`,
-            revised_prompt: typeof entry.revised_prompt === 'string'
-              ? scrubTextForReceipt(entry.revised_prompt, apiKey)
-              : null,
-          });
-        }
-      }
-
-      const compactReceipt = sanitizeReceiptValue({
-        created: body.created ?? null,
-        model: wire.model,
-        usage: sanitizedUsage,
-        returned_count: rawItems.length,
-        expected_count: wire.n,
-        images: postDispatchInvalidReason
-          ? []
-          : images.map(img => ({
-              index: img.index,
-              format: img.format,
-              width: img.width,
-              height: img.height,
-              b64_sha256: img.b64_sha256,
-              revised_prompt: img.revised_prompt,
-            })),
-      }, 0, apiKey);
-
-      if (postDispatchInvalidReason) {
-        const postFailureStatus = usageCostMicros !== null && usageCostMicros > 0 ? 'failed_known' : 'pending_recovery';
-        ledger.recordTerminalOutcome(attempt.attempt_id, {
-          status: postFailureStatus,
-          contentStatus: 'invalid',
-          usageCostMicros: postFailureStatus === 'failed_known' ? usageCostMicros : null,
-          usage: postFailureStatus === 'failed_known' ? sanitizedUsage : null,
-          provisionalUsage: postFailureStatus === 'pending_recovery' ? sanitizedUsage : null,
-          provisionalUsageCostMicros: postFailureStatus === 'pending_recovery' ? usageCostMicros : null,
-          providerModel: wire.model,
-          httpStatus: res.status,
-          rawReceipt: compactReceipt,
-          originalBodySha256,
-          diagnosticReason: postDispatchInvalidReason,
-        });
-        return {
-          ok: false,
-          usable: false,
-          status: postFailureStatus,
-          content_status: 'invalid',
-          attempt_id: attempt.attempt_id,
-          logical_request_id: attempt.logical_request_id,
-          model: wire.model,
-          images: [],
-          usage: sanitizedUsage,
-          usage_cost_micros: postFailureStatus === 'failed_known' ? usageCostMicros : null,
-          reserved_cents: attempt.reserved_cents,
-          diagnostic_reason: postDispatchInvalidReason,
-        };
-      }
-
-      const ledgerStatus = usageCostMicros !== null ? 'completed' : 'pending_recovery';
-
-      ledger.recordTerminalOutcome(attempt.attempt_id, {
-        status: ledgerStatus,
-        contentStatus: 'usable',
-        usageCostMicros,
-        usage: sanitizedUsage,
-        providerModel: wire.model,
-        httpStatus: res.status,
-        rawReceipt: compactReceipt,
-        originalBodySha256,
-        diagnosticReason: usageCostMicros === null ? 'Image response omitted usage; retaining reservation.' : null,
-      });
-
-      return {
-        ok: ledgerStatus === 'completed',
-        usable: ledgerStatus === 'completed',
-        status: ledgerStatus,
-        content_status: 'usable',
-        attempt_id: attempt.attempt_id,
-        logical_request_id: attempt.logical_request_id,
-        model: wire.model,
-        images,
-        usage: sanitizedUsage,
-        usage_cost_micros: usageCostMicros,
-        reserved_cents: attempt.reserved_cents,
-      };
-    } catch (err) {
-      this._handlePostDispatchUnexpectedError(err, ledger, attempt, apiKey, res?.status ?? null);
-    }
-  }
-
-  /**
-   * Opt-in Stage-4 Audio Briefing (`POST /v1/audio/speech`).
-   * HARD-BLOCKED unless BOTH `policy.enableStage4Media === true` AND `policyRow.allow_stage4_media === true`.
-   * Enforces canonical TTS tariff (`P0-17`), complete container framing (`P1-03`), header secret scrubbing (`P0-22`),
-   * and holds mismatched or unverified `x-usage-characters` in `pending_recovery` (`SPEECH_USAGE_MISMATCH_HOLD` / `SPEECH_USAGE_UNVERIFIED_HOLD`).
-   */
-  async createSpeechBriefing(rawParams, policy = {}) {
-    if (
-      rawParams &&
-      typeof rawParams === 'object' &&
-      (rawParams._offline_draft_only === true || rawParams.offline_draft_only === true)
-    ) {
-      throw new OpenAiPolicyError(
-        'Offline draft request (_offline_draft_only) cannot be dispatched to /v1/audio/speech.',
-        { code: 'OFFLINE_DRAFT_NOT_DISPATCHABLE', notDispatched: true },
-      );
-    }
-    const params = snapshotPlainValue(rawParams, 'SpeechBriefing params');
-    const eff = this._resolveEffectivePolicy(policy);
-    const requestSignal = buildTimeoutSignal(eff.timeoutMs, eff.signal);
-    const ledger = this._requireBillableLedger(eff);
-    this._assertStage4MediaAuthorized(eff, ledger);
-
-    assertPlainObject(params, 'SpeechBriefing params');
-    const wire = stripLocalKeys(params);
-    defineSafeProp(wire, 'model', wire.model ?? 'gpt-4o-mini-tts');
-    const spec = resolveModelPricing(wire.model, { allowAstraApi: eff.allowAstraApi, endpoint: '/v1/audio/speech' });
-    if (spec.family !== 'tts') {
-      throw new OpenAiValidationError(`createSpeechBriefing requires a TTS model (got "${wire.model}").`);
-    }
-    if (typeof wire.input !== 'string' || !wire.input.trim() || wire.input.length > 4_096) {
-      throw new OpenAiValidationError('createSpeechBriefing requires a nonempty input string (<= 4096 characters).');
-    }
-
-    const verifiedRateMicros = resolveTtsMicrosPer1kChars(wire.model, eff.ttsMicrosPer1kChars, {
-      allowAstraApi: eff.allowAstraApi,
-      allowCustomTariffForTests: eff.allowCustomTariffForTests,
-    });
-
-    defineSafeProp(wire, 'voice', wire.voice ?? 'alloy');
-    const normFormat = wire.response_format !== undefined
-      ? String(wire.response_format).trim().toLowerCase()
-      : 'mp3';
-    if (!ALLOWED_SPEECH_FORMATS.has(normFormat)) {
-      throw new OpenAiValidationError(
-        `createSpeechBriefing response_format must be one of ${[...ALLOWED_SPEECH_FORMATS].join(', ')} (got "${String(wire.response_format)}").`,
-      );
-    }
-    defineSafeProp(wire, 'response_format', normFormat);
-
-    assertCleanOutgoingPayload(wire, 'speech_briefing_request');
-
-    const inputChars = [...wire.input].length;
-    const serializedWire = JSON.stringify(wire);
-    const payloadSha256 = computeRequestPayloadSha256('/v1/audio/speech', serializedWire);
-    const logicalRequestId = eff.logicalRequestId ?? params.logical_request_id ?? params.logicalRequestId ?? `tts-req-${generatePiiSafeUuid()}`;
-    const reservedCents = estimateReservationCents({
-      endpoint: '/v1/audio/speech',
-      model: wire.model,
-      inputChars,
-      ttsMicrosPer1kChars: verifiedRateMicros,
-      allowCustomTariffForTests: eff.allowCustomTariffForTests,
-    });
-
-    const { apiKey, credentialFingerprintSha256 } = this._resolveApiKeyAndFingerprint(eff);
-
-    const attempt = ledger.reserveBillableRequest({
-      logicalRequestId,
-      accountScope: eff.accountScope,
-      monthUtc: eff.monthUtc,
-      allowTestClockOverride: eff.allowTestClockOverride,
-      endpoint: '/v1/audio/speech',
-      model: wire.model,
-      serviceTier: 'standard',
-      origin: this.baseOrigin,
-      apiBaseUrl: eff.baseUrl,
-      payloadSha256,
-      reservedCents,
-      requireStage4Media: true,
-      credentialFingerprintSha256,
-      isLiveTransport: eff.isLiveTransport,
-    });
-
-    let res;
-    try {
-      res = await eff.fetchImpl(`${eff.baseUrl}/v1/audio/speech`, {
-        method: 'POST',
-        redirect: 'error',
-        headers: {
-          Authorization: formatAuthHeader(apiKey),
-          'Content-Type': 'application/json',
-        },
-        body: serializedWire,
-        signal: requestSignal,
-      });
-    } catch (err) {
-      const reason = `Transport error/timeout/redirect on POST /v1/audio/speech (${scrubTextForReceipt(err?.message || 'network_error', apiKey)}).`;
-      ledger.markPendingRecovery(attempt.attempt_id, { reason });
-      throw new OpenAiAmbiguousOutcomeError(reason, {
-        attemptId: attempt.attempt_id,
-        logicalRequestId: attempt.logical_request_id,
-        reservedCents: attempt.reserved_cents,
-      });
-    }
-
-    try {
-      const provisionalMicros = computeTtsCostMicros({
-        model: wire.model,
-        inputChars,
-        ttsMicrosPer1kChars: verifiedRateMicros,
-        allowCustomTariffForTests: eff.allowCustomTariffForTests,
-      });
-
-      if (isAmbiguousHttpStatus(res.status)) {
-        const errBody = await this._readJsonResponseSafe(res, apiKey, DEFAULT_MAX_RESPONSE_BYTES, {
-          requireStreamingOrContentLength: eff.isLiveTransport,
-        }).catch(() => ({
-          sanitizedBody: null,
-          originalBodySha256: null,
-          scrubbedRawText: null,
-          scrubbedRawSha256: null,
-        }));
-        const reason = `Ambiguous HTTP ${res.status} on POST /v1/audio/speech.`;
-        ledger.markPendingRecovery(attempt.attempt_id, {
-          httpStatus: res.status,
-          provisionalUsage: { requested_char_count: inputChars },
-          rawReceipt: errBody.sanitizedBody,
-          originalBodySha256: errBody.originalBodySha256,
-          rawBodyText: errBody.scrubbedRawText,
-          rawBodySha256: errBody.scrubbedRawSha256,
-          reason,
-        });
-        throw new OpenAiAmbiguousOutcomeError(reason, {
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-          httpStatus: res.status,
-          reservedCents: attempt.reserved_cents,
-        });
-      }
-
-      if (res.status >= 400) {
-        const { sanitizedBody: sanitizedErr, originalBodySha256, scrubbedRawText, scrubbedRawSha256 } =
-          await this._readJsonResponseSafe(res, apiKey, DEFAULT_MAX_RESPONSE_BYTES, {
-            requireStreamingOrContentLength: eff.isLiveTransport,
-          }).catch(err => {
-            const reason = `Error stream failure on POST /v1/audio/speech HTTP ${res.status} (${scrubTextForReceipt(err?.message || 'stream_error', apiKey)}).`;
-            ledger.markPendingRecovery(attempt.attempt_id, { httpStatus: res.status, reason });
-            throw new OpenAiAmbiguousOutcomeError(reason, {
-              attemptId: attempt.attempt_id,
-              logicalRequestId: attempt.logical_request_id,
-              httpStatus: res.status,
-              reservedCents: attempt.reserved_cents,
-            });
-          });
-        const msg = sanitizedErr?.error?.message ?? `POST /v1/audio/speech rejected with HTTP ${res.status}.`;
-        ledger.recordTerminalOutcome(attempt.attempt_id, {
-          status: 'rejected',
-          httpStatus: res.status,
-          rawReceipt: sanitizedErr,
-          originalBodySha256,
-          rawBodyText: scrubbedRawText,
-          rawBodySha256: scrubbedRawSha256,
-          diagnosticReason: msg,
-        });
-        throw new OpenAiHttpError(msg, {
-          httpStatus: res.status,
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-        });
-      }
-
-      // P0-22: Scrub Content-Type and x-usage-characters headers against literal API key & secret tokens!
-      const rawContentType = res?.headers && typeof res.headers.get === 'function'
-        ? String(res.headers.get('content-type') ?? '').trim()
-        : '';
-      const scrubbedContentType = scrubTextForReceipt(rawContentType, apiKey);
-      const contentTypeHadSecret =
-        (apiKey && rawContentType.includes(apiKey)) ||
-        containsSecretToken(rawContentType) ||
-        scrubbedContentType !== rawContentType;
-
-      const audioBytes = await readBoundedBytesResponse(res, DEFAULT_MAX_RESPONSE_BYTES, {
-        requireStreamingOrContentLength: eff.isLiveTransport,
-      }).catch(err => {
-        const reason = `Audio stream read error on POST /v1/audio/speech (${scrubTextForReceipt(err?.message || 'stream_error', apiKey)}).`;
-        ledger.markPendingRecovery(attempt.attempt_id, { httpStatus: res.status, reason });
-        throw new OpenAiAmbiguousOutcomeError(reason, {
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-          httpStatus: res.status,
-          reservedCents: attempt.reserved_cents,
-        });
-      });
-
-      const audioOrigSha = audioBytes.length > 0 ? sha256Hex(audioBytes) : null;
-
-      if (contentTypeHadSecret || !VALID_AUDIO_CONTENT_TYPE_RE.test(rawContentType)) {
-        const scrubbedBody = scrubTextForReceipt(audioBytes.toString('utf8'), apiKey);
-        const reason = `POST /v1/audio/speech returned unexpected Content-Type "${scrubbedContentType || 'missing'}"; expected audio/* or application/octet-stream.`;
-        ledger.markPendingRecovery(attempt.attempt_id, {
-          contentStatus: 'invalid',
-          httpStatus: res.status,
-          provisionalUsage: { provisional_char_count: inputChars },
-          provisionalUsageCostMicros: provisionalMicros,
-          originalBodySha256: audioOrigSha,
-          rawBodyText: scrubbedBody,
-          reason,
-        });
-        throw new OpenAiAmbiguousOutcomeError(reason, {
-          code: 'INVALID_AUDIO_CONTENT_TYPE',
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-          httpStatus: res.status,
-          reservedCents: attempt.reserved_cents,
-        });
-      }
-
-      if (!validateAudioFramingAndMagicBytes(audioBytes, wire.response_format)) {
-        const scrubbedPreview = scrubTextForReceipt(audioBytes.subarray(0, 512).toString('utf8'), apiKey);
-        const reason = `POST /v1/audio/speech returned ${audioBytes.length}-byte payload failing "${wire.response_format}" audio framing/magic-byte validation.`;
-        ledger.markPendingRecovery(attempt.attempt_id, {
-          contentStatus: 'invalid',
-          httpStatus: res.status,
-          provisionalUsage: { provisional_char_count: inputChars },
-          provisionalUsageCostMicros: provisionalMicros,
-          originalBodySha256: audioOrigSha,
-          rawBodyText: scrubbedPreview,
-          reason,
-        });
-        throw new OpenAiAmbiguousOutcomeError(reason, {
-          code: 'INVALID_AUDIO_FRAMING',
-          attemptId: attempt.attempt_id,
-          logicalRequestId: attempt.logical_request_id,
-          httpStatus: res.status,
-          reservedCents: attempt.reserved_cents,
-        });
-      }
-
-      const audioSha256 = audioOrigSha;
-
-      const rawUsageCharsHeader = res?.headers && typeof res.headers.get === 'function'
-        ? res.headers.get('x-usage-characters')
-        : null;
-
-      let verifiedProviderChars = null;
-      let invalidUsageHeaderReason = null;
-      if (rawUsageCharsHeader !== null && rawUsageCharsHeader !== undefined && String(rawUsageCharsHeader).trim() !== '') {
-        const trimmedHdr = String(rawUsageCharsHeader).trim();
-        const scrubbedHdr = scrubTextForReceipt(trimmedHdr, apiKey);
-        if (/^\d+$/.test(trimmedHdr)) {
-          const parsedHdr = Number(trimmedHdr);
-          if (Number.isSafeInteger(parsedHdr) && parsedHdr > 0) {
-            verifiedProviderChars = parsedHdr;
-          } else {
-            invalidUsageHeaderReason = `Provider returned non-positive x-usage-characters="${scrubbedHdr}".`;
-          }
-        } else {
-          invalidUsageHeaderReason = `Provider returned malformed x-usage-characters="${scrubbedHdr}".`;
-        }
-      }
-
-      // P0-17: Hold in pending_recovery (SPEECH_USAGE_MISMATCH_HOLD) when x-usage-characters !== inputChars!
-      if (verifiedProviderChars !== null && verifiedProviderChars !== inputChars) {
-        const providerMicros = computeTtsCostMicros({
-          model: wire.model,
-          inputChars: verifiedProviderChars,
-          ttsMicrosPer1kChars: verifiedRateMicros,
-          allowCustomTariffForTests: eff.allowCustomTariffForTests,
-        });
-        const maxObservedMicros = Math.max(provisionalMicros, providerMicros);
-        const mismatchReason = `Provider x-usage-characters (${verifiedProviderChars}) contradicted sent inputChars (${inputChars}); holding in pending_recovery (SPEECH_USAGE_MISMATCH_HOLD).`;
-        ledger.markPendingRecovery(attempt.attempt_id, {
-          contentStatus: 'invalid',
-          httpStatus: res.status,
-          provisionalUsage: {
-            provisional_char_count: inputChars,
-            reported_characters: verifiedProviderChars,
-          },
-          provisionalUsageCostMicros: maxObservedMicros,
-          originalBodySha256: audioSha256,
-          rawReceipt: {
-            model: wire.model,
-            format: wire.response_format,
-            content_type: scrubbedContentType,
-            provisional_char_count: inputChars,
-            reported_characters: verifiedProviderChars,
-            audio_bytes: audioBytes.length,
-            audio_sha256: audioSha256,
-          },
-          reason: mismatchReason,
-        });
-
-        return {
-          ok: false,
-          usable: false,
-          status: 'pending_recovery',
-          hold_code: 'SPEECH_USAGE_MISMATCH_HOLD',
-          content_status: 'invalid',
-          attempt_id: attempt.attempt_id,
-          logical_request_id: attempt.logical_request_id,
-          model: wire.model,
-          format: wire.response_format,
-          provisional_char_count: inputChars,
-          estimated_char_count: inputChars,
-          input_chars: inputChars,
-          usage: { characters: verifiedProviderChars },
-          audio_bytes: audioBytes,
-          audio_sha256: audioSha256,
-          provisional_usage_cost_micros: maxObservedMicros,
-          usage_cost_micros: null,
-          reserved_cents: attempt.reserved_cents,
-        };
-      }
-
-      if (verifiedProviderChars === null && (!eff.testMode || !eff.allowEstimatedSpeechSettlementInTests)) {
-        const holdReason = invalidUsageHeaderReason ??
-          'Speech response omitted verified x-usage-characters header; holding in pending_recovery (SPEECH_USAGE_UNVERIFIED_HOLD) until character billing is reconciled.';
-        ledger.markPendingRecovery(attempt.attempt_id, {
-          contentStatus: 'usable',
-          httpStatus: res.status,
-          provisionalUsage: { provisional_char_count: inputChars },
-          provisionalUsageCostMicros: provisionalMicros,
-          originalBodySha256: audioSha256,
-          rawReceipt: {
-            model: wire.model,
-            format: wire.response_format,
-            content_type: scrubbedContentType,
-            provisional_char_count: inputChars,
-            audio_bytes: audioBytes.length,
-            audio_sha256: audioSha256,
-          },
-          reason: holdReason,
-        });
-
-        return {
-          ok: false,
-          usable: true,
-          status: 'pending_recovery',
-          hold_code: 'SPEECH_USAGE_UNVERIFIED_HOLD',
-          content_status: 'usable',
-          attempt_id: attempt.attempt_id,
-          logical_request_id: attempt.logical_request_id,
-          model: wire.model,
-          format: wire.response_format,
-          provisional_char_count: inputChars,
-          estimated_char_count: inputChars,
-          input_chars: inputChars,
-          usage: null,
-          audio_bytes: audioBytes,
-          audio_sha256: audioSha256,
-          provisional_usage_cost_micros: provisionalMicros,
-          usage_cost_micros: null,
-          reserved_cents: attempt.reserved_cents,
-        };
-      }
-
-      const usageCostMicros = computeTtsCostMicros({
-        model: wire.model,
-        inputChars,
-        ttsMicrosPer1kChars: verifiedRateMicros,
-        allowCustomTariffForTests: eff.allowCustomTariffForTests,
-      });
-      const providerReportedUsage = verifiedProviderChars !== null
-        ? { characters: verifiedProviderChars }
-        : null;
-
-      ledger.recordTerminalOutcome(attempt.attempt_id, {
-        status: 'completed',
-        contentStatus: 'usable',
-        usageCostMicros,
-        usage: providerReportedUsage,
-        providerModel: wire.model,
-        httpStatus: res.status,
-        originalBodySha256: audioSha256,
-        rawReceipt: {
-          model: wire.model,
-          format: wire.response_format,
-          content_type: scrubbedContentType,
-          estimated_char_count: inputChars,
-          verified_characters: verifiedProviderChars,
-          audio_bytes: audioBytes.length,
-          audio_sha256: audioSha256,
-        },
-      });
-
-      return {
-        ok: true,
-        usable: true,
-        status: 'completed',
-        content_status: 'usable',
-        attempt_id: attempt.attempt_id,
-        logical_request_id: attempt.logical_request_id,
-        model: wire.model,
-        format: wire.response_format,
-        provisional_char_count: inputChars,
-        estimated_char_count: inputChars,
-        input_chars: inputChars,
-        usage: providerReportedUsage,
-        audio_bytes: audioBytes,
-        audio_sha256: audioSha256,
-        usage_cost_micros: usageCostMicros,
-        reserved_cents: attempt.reserved_cents,
-      };
-    } catch (err) {
-      this._handlePostDispatchUnexpectedError(err, ledger, attempt, apiKey, res?.status ?? null);
-    }
-  }
 }
 
 // -----------------------------------------------------------------------------
@@ -7179,12 +5932,4 @@ export async function submitBatch(params, policy = {}) {
 
 export async function retrieveBatch(batchId, policy = {}) {
   return new OpenAiClient(policy).retrieveBatch(batchId, policy);
-}
-
-export async function createConceptImage(params, policy = {}) {
-  return new OpenAiClient(policy).createConceptImage(params, policy);
-}
-
-export async function createSpeechBriefing(params, policy = {}) {
-  return new OpenAiClient(policy).createSpeechBriefing(params, policy);
 }

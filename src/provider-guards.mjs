@@ -30,11 +30,12 @@ export function canonicalizeConnectorToolName(toolName) {
   if (!nonemptyStr(toolName)) throw new TypeError('toolName must be a nonempty string.');
   let bare = toolName.trim();
   bare = bare.replace(/^mcp__codex_apps__[a-z0-9]+_mcp_/i, '');
-  bare = bare.replace(/^mcp__codex_apps__(?:sellersprite|sif|exa)_/i, '');
+  bare = bare.replace(/^mcp__codex_apps__(?:sellersprite|sif|exa|sp_api|sp-api|amz_spapi|amazon_sp_api)_/i, '');
   bare = bare.replace(/^mcp__codex_apps__/i, '');
   bare = bare.replace(/^mcp__[a-z0-9_-]+__/i, '');
-  bare = bare.replace(/^(?:sellersprite|sif|exa)[:.]/i, '');
-  bare = bare.replace(/_[0-9a-f]{8}$/i, '');
+  bare = bare.replace(/^(?:sellersprite|sif|exa|sp_api|sp-api|amz_spapi|amazon_sp_api)[:.]/i, '');
+  bare = bare.replace(/^(?:amz_spapi|amazon_sp_api)_/i, '');
+  bare = bare.replace(/_[0-9-a-f]{8}$/i, '');
   return bare.trim().toLowerCase();
 }
 
@@ -259,13 +260,136 @@ export function validateSifCall(toolName, rawParams = {}, options = {}) {
   return result;
 }
 
+const SP_API_READ_ONLY_TOOLS = new Set([
+  'catalogitems_getcatalogitem',
+  'catalogitems_searchcatalogitems',
+  'getcatalogitem',
+  'searchcatalogitems',
+  'productfees_getmyfeesestimateforasin',
+  'productfees_getmyfeesestimateforsku',
+  'productfees_getmyfeesestimates',
+  'getmyfeesestimateforasin',
+  'getmyfeesestimateforsku',
+  'getmyfeesestimates',
+  'listingsrestrictions_getlistingsrestrictions',
+  'getlistingsrestrictions',
+  'definitionsproducttypes_getdefinitionsproducttype',
+  'definitionsproducttypes_searchdefinitionsproducttypes',
+  'getdefinitionsproducttype',
+  'searchdefinitionsproducttypes',
+  'productpricing_getcompetitivepricing',
+  'productpricing_getitemoffers',
+  'productpricing_getitemoffersbatch',
+  'sp_api_explore_catalog',
+  'sp_api_reference',
+  'sp_api_generate_code_sample',
+  'sp_api_migration_assistant',
+  'sp_api_optimize',
+  'zp_director_ok',
+]);
+
+const SP_API_WRITE_PATTERN_RE = /(?:putlistingsitem|patchlistingsitem|deletelistingsitem|createfeed|submitfeed|cancelFeed|createinbound|updateinventory|confirmshipment|submitinvoice|createreturn|updateoffer|createcampaign|updatecampaign|updatebid)/i;
+
 /**
- * Unified connector guard entry point for both SellerSprite and SIF.
+ * Validate SP-API MCP calls for finalist dimension/fee/restriction calibration:
+ *  - Permits read-only catalog, fee-estimate, restriction, and schema-definition lookups.
+ *  - Permits `putListingsItem` ONLY when `mode === "VALIDATION_PREVIEW"` AND `options.allow_validation_preview === true`.
+ *  - Strictly blocks all live store/listing/price/inventory/feed write operations unless explicit per-item owner approval is supplied outside selection automation.
+ */
+export function validateSpApiCall(toolName, rawParams = {}, options = {}) {
+  const canonical = canonicalizeConnectorToolName(toolName);
+  const p = unwrapParams(rawParams);
+  const issues = [];
+  const notices = [];
+  const add = (code, message) => issues.push({ code, message });
+
+  const method = String(p.method ?? p.httpMethod ?? '').trim().toUpperCase();
+  const pathStr = String(p.path ?? p.endpoint ?? p.url ?? '').trim();
+  const opStr = String(p.operation ?? p.operationId ?? canonical).trim();
+  const queryMode = String(p.mode ?? p.query?.mode ?? p.queryParams?.mode ?? '').trim().toUpperCase();
+
+  const isFeeEstimatePost =
+    method === 'POST' &&
+    /\/products\/fees\/v0\/(?:items\/[^/]+\/feesEstimate|feesEstimate)/i.test(pathStr);
+  const isOffersBatchPost =
+    method === 'POST' &&
+    /\/batches\/products\/pricing\/v0\/(?:itemOffers|listingOffers)/i.test(pathStr);
+  const isValidationPreviewPut =
+    (/putlistingsitem/i.test(opStr) || (method === 'PUT' && /\/listings\/\d{4}-\d{2}-\d{2}\/items\//i.test(pathStr))) &&
+    queryMode === 'VALIDATION_PREVIEW' &&
+    options.allow_validation_preview === true;
+
+  if (canonical === 'sp_api_execute') {
+    if (!method && !pathStr && !p.operation) {
+      add('sp_api_missing_operation', 'sp_api_execute requires an explicit method/path or operation.');
+    } else if (method && !['GET', 'POST', 'PUT'].includes(method)) {
+      add(
+        'sp_api_store_write_forbidden',
+        `SP-API HTTP method "${method}" (${pathStr || opStr}) is blocked: all store write operations are strictly prohibited without explicit per-item owner approval.`,
+      );
+    } else if (method === 'POST' && !isFeeEstimatePost && !isOffersBatchPost) {
+      add(
+        'sp_api_store_write_forbidden',
+        `SP-API POST "${pathStr || opStr}" is blocked: only read-only fee-estimate / pricing-batch POST endpoints are allowed in product selection.`,
+      );
+    } else if (method === 'PUT' && !isValidationPreviewPut) {
+      add(
+        'sp_api_store_write_forbidden',
+        `SP-API PUT "${pathStr || opStr}" is blocked: live listing writes are strictly prohibited without explicit per-item owner approval.`,
+      );
+    } else if (!method && SP_API_WRITE_PATTERN_RE.test(`${opStr} ${pathStr}`) && !isValidationPreviewPut) {
+      add(
+        'sp_api_store_write_forbidden',
+        `SP-API write operation "${opStr || pathStr}" is strictly prohibited in product selection.`,
+      );
+    }
+  } else if (!SP_API_READ_ONLY_TOOLS.has(canonical)) {
+    if (isValidationPreviewPut) {
+      notices.push('VALIDATION_PREVIEW dry-run permitted without mutating store listings.');
+    } else if (SP_API_WRITE_PATTERN_RE.test(canonical) || /^(?:post|put|patch|delete)_/i.test(canonical)) {
+      add(
+        'sp_api_store_write_forbidden',
+        `SP-API write tool "${canonical}" is strictly prohibited: all store writes require explicit per-item owner approval.`,
+      );
+    } else {
+      add(
+        'sp_api_unlisted_tool_requires_review',
+        `Unlisted SP-API tool "${canonical}"; product-selection automation permits only read-only catalogItems, productFees, listingsRestrictions, and productType definition lookups.`,
+      );
+    }
+  }
+
+  if ((/listingsrestrictions/i.test(canonical) || /\/listings\/\d{4}-\d{2}-\d{2}\/restrictions/i.test(pathStr)) &&
+    options.is_competitor_branded_asin === true) {
+    notices.push(
+      'Passing a branded competitor ASIN to getListingsRestrictions may surface competitor brand-gating; classify via classifySpApiRestrictionReasons() so competitor brand locks are not mistaken for category gating.',
+    );
+  }
+
+  const result = {
+    valid: issues.length === 0,
+    provider: 'sp_api',
+    canonical_tool: canonical,
+    read_only_verified: issues.length === 0,
+    issues,
+    notices,
+  };
+  if (options.throwOnError && !result.valid) {
+    throw new TypeError(`SP-API guard violation (${canonical}): ${issues.map(i => i.message).join(' ')}`);
+  }
+  return result;
+}
+
+/**
+ * Unified connector guard entry point for SellerSprite, SIF, and SP-API.
  */
 export function validateProviderCall(provider, toolName, params = {}, options = {}) {
   const norm = String(provider || '').trim().toLowerCase();
   if (norm === 'sellersprite') return validateSellerSpriteCall(toolName, params, options);
   if (norm === 'sif') return validateSifCall(toolName, params, options);
+  if (norm === 'sp_api' || norm === 'sp-api' || norm === 'amazon_sp_api' || norm === 'amz_spapi') {
+    return validateSpApiCall(toolName, params, options);
+  }
   return { valid: true, provider: norm, canonical_tool: canonicalizeConnectorToolName(toolName), issues: [] };
 }
 

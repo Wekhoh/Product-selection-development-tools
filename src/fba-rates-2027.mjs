@@ -10,6 +10,7 @@ import {
   resolveConsistentBoolean,
   resolvePackageDimsRat,
   resolveEffectivePricing,
+  computeAmazonCouponRedemptionFee2027,
   toBigRat,
   addBigRat,
   mulBigRat,
@@ -79,18 +80,51 @@ function monthsIn(window) {
   return [...result];
 }
 
+export const FBA_2027_DEFAULT_OFF_PEAK_WINDOW = Object.freeze({ from: '2027-02-01', through: '2027-10-14' });
+export const FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW = Object.freeze({ from: '2027-02-01', through: '2027-09-30' });
+export const FBA_2027_COMPANION_PEAK_STORAGE_WINDOW = Object.freeze({ from: '2027-10-01', through: '2027-12-31' });
+export const FBA_2027_DEFAULT_INBOUND_WINDOW = Object.freeze({ from: '2027-01-15', through: '2027-02-01' });
+export const FBA_2027_UNPUBLISHED_PEAK_WINDOW = Object.freeze({ from: '2027-10-15', through: '2028-01-14' });
+export const UNPUBLISHED_2027_PEAK_MARGIN_NOTE = '待亚马逊公布 2027 旺季费率后补充';
+
+export function isCanonical2027OffPeakWindow(window) {
+  return Boolean(
+    validWindow(window) &&
+    window.from === FBA_2027_DEFAULT_OFF_PEAK_WINDOW.from &&
+    window.through === FBA_2027_DEFAULT_OFF_PEAK_WINDOW.through,
+  );
+}
+
+export function isCanonical2027OffPeakStorageWindow(window) {
+  return Boolean(
+    validWindow(window) &&
+    window.from === FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW.from &&
+    window.through === FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW.through,
+  );
+}
+
 export const FBA_2027_METADATA = Object.freeze({
   version: 'US-FBA-2027-nonpeak-standard-v1',
+  unified_version: 'US-FBA-2027-nonpeak-complete-v2',
   marketplace: 'US',
   currency: 'USD',
   fuel_surcharge_fraction: 0.035,
   non_peak_fulfillment_window: Object.freeze({ from: '2027-01-15', through: '2027-10-14' }),
+  default_off_peak_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+  default_off_peak_storage_window: FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
+  companion_peak_storage_window: FBA_2027_COMPANION_PEAK_STORAGE_WINDOW,
+  default_inbound_window: FBA_2027_DEFAULT_INBOUND_WINDOW,
+  unpublished_holiday_peak_window: FBA_2027_UNPUBLISHED_PEAK_WINDOW,
+  unpublished_holiday_peak_note: UNPUBLISHED_2027_PEAK_MARGIN_NOTE,
   unified_storage_effective_from: '2027-02-01',
   placement_effective_from: '2027-01-15',
   returns_non_apparel_effective_from: '2027-02-01',
   official_sources: Object.freeze({
     announcement: 'https://sellingpartners.aboutamazon.com/update-to-us-referral-and-fulfillment-by-amazon-fees-for-2027',
     fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GABBX6GZPA8MSZGW',
+    apparel_fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GPDC3KPYAGDTVDJP',
+    dangerous_goods_fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GZPA23LMZ9G6699P',
+    bulky_packaging_service: 'https://sellercentral.amazon.com/help/hub/reference/external/GFGVB6C7ZF38285W',
     size_tiers: 'https://sellercentral.amazon.com/gp/help/external/GG5KW835AHDJCH8W',
     storage: 'https://sellercentral.amazon.com/help/hub/reference/external/GVZX6EAEL2KZ3SGA',
     placement: 'https://sellercentral.amazon.com/help/hub/reference/external/GC3Q44PBK8BXQW3Z',
@@ -232,7 +266,7 @@ export const BULKY_2027_TIERS = Object.freeze([
   }),
 ]);
 
-// Official 2027 US FBA 6-tier Oversize non-peak structure (effective 2027-01-15, before 3.5% fuel surcharge).
+// Official 2027 US FBA 6-tier Oversize non-peak structure (effective 2027-01-15, before 3.5% fuel surcharge; shared by Non-Apparel & Apparel).
 export const OVERSIZE_2027_TIERS = Object.freeze([
   Object.freeze({
     size_tier: 'small_oversize',
@@ -240,7 +274,7 @@ export const OVERSIZE_2027_TIERS = Object.freeze([
     max_length_plus_girth_in: 130,
     max_weight_lb: 50,
     base_threshold_lb: 1,
-    under_10: 13.45,
+    under_10: 13.44,
     '10_to_50': 14.22,
     over_50: 14.22,
     step_usd_per_lb: 0.28,
@@ -252,7 +286,7 @@ export const OVERSIZE_2027_TIERS = Object.freeze([
     max_length_plus_girth_in: 130,
     max_weight_lb: 70,
     base_threshold_lb: 51,
-    under_10: 27.38,
+    under_10: 27.36,
     '10_to_50': 28.15,
     over_50: 28.15,
     step_usd_per_lb: 0.56,
@@ -264,7 +298,7 @@ export const OVERSIZE_2027_TIERS = Object.freeze([
     max_length_plus_girth_in: 130,
     max_weight_lb: 150,
     base_threshold_lb: 51,
-    under_10: 37.98,
+    under_10: 37.97,
     '10_to_50': 38.75,
     over_50: 38.75,
     step_usd_per_lb: 0.68,
@@ -276,7 +310,7 @@ export const OVERSIZE_2027_TIERS = Object.freeze([
     max_length_plus_girth_in: 165,
     max_weight_lb: 150,
     base_threshold_lb: 1,
-    under_10: 62.98,
+    under_10: 62.97,
     '10_to_50': 63.75,
     over_50: 63.75,
     step_usd_per_lb: 0.30,
@@ -288,7 +322,7 @@ export const OVERSIZE_2027_TIERS = Object.freeze([
     max_length_plus_girth_in: Infinity,
     max_weight_lb: 150,
     base_threshold_lb: 1,
-    under_10: 71.10,
+    under_10: 71.09,
     '10_to_50': 71.87,
     over_50: 71.87,
     step_usd_per_lb: 0.30,
@@ -300,13 +334,182 @@ export const OVERSIZE_2027_TIERS = Object.freeze([
     max_length_plus_girth_in: Infinity,
     max_weight_lb: Infinity,
     base_threshold_lb: 151,
-    under_10: 190.51,
+    under_10: 190.50,
     '10_to_50': 191.28,
     over_50: 191.28,
     step_usd_per_lb: 0.19,
     unit_weight_only: true,
   }),
 ]);
+
+// Official 2027 US FBA Oversize Flat Product (shortest < 4 in AND median >= 25 in) & Overhang (median > 43 in) Handling Fees
+// (effective 2027-01-15, replacing Overmax; identical across Non-Apparel, Apparel, and Dangerous Goods; cumulative if both apply).
+export const OVERSIZE_HANDLING_2027_FEES = Object.freeze({
+  small_oversize: Object.freeze({ flat_product_usd: 8.40, overhang_usd: 0 }),
+  medium_oversize: Object.freeze({ flat_product_usd: 8.65, overhang_usd: 0 }),
+  large_oversize: Object.freeze({ flat_product_usd: 9.42, overhang_usd: 0 }),
+  long_oversize: Object.freeze({ flat_product_usd: 10.48, overhang_usd: 3.45 }),
+  special_oversize_light: Object.freeze({ flat_product_usd: 21.67, overhang_usd: 5.23 }),
+  special_oversize_heavy: Object.freeze({ flat_product_usd: 29.53, overhang_usd: 10.45 }),
+});
+
+// Official 2027 US FBA Oversize Returns Processing Fee Schedule (GZGEQLTM3RZXUV6T; Non-Apparel from 2027-02-01, Apparel & Shoes from 2027-01-15).
+export const OVERSIZE_RETURNS_2027_TIERS = Object.freeze({
+  small_oversize: Object.freeze({ base_usd: 26.33, base_threshold_lb: 1, step_usd_per_lb: 0.38, unit_weight_only: false }),
+  medium_oversize: Object.freeze({ base_usd: 40.12, base_threshold_lb: 51, step_usd_per_lb: 0.75, unit_weight_only: false }),
+  large_oversize: Object.freeze({ base_usd: 52.45, base_threshold_lb: 71, step_usd_per_lb: 0.75, unit_weight_only: false }),
+  long_oversize: Object.freeze({ base_usd: 52.45, base_threshold_lb: 71, step_usd_per_lb: 0.75, unit_weight_only: false }),
+  special_oversize_light: Object.freeze({ base_usd: 52.45, base_threshold_lb: 71, step_usd_per_lb: 0.75, unit_weight_only: false }),
+  special_oversize_heavy: Object.freeze({ base_usd: 157.35, base_threshold_lb: 151, step_usd_per_lb: 0.19, unit_weight_only: true }),
+});
+
+// Official 2027 US Apparel Standard-Size FBA Fulfillment Fees (GPDC3KPYAGDTVDJP, non-peak 2027-01-15..2027-10-14, before 3.5% fuel surcharge).
+// Note: Bulky & Oversize Apparel share BULKY_2027_TIERS / OVERSIZE_2027_TIERS; Shoes use Non-Apparel fulfillment + Apparel/Shoes returns processing.
+export const SMALL_STANDARD_APPAREL_2027_OZ = Object.freeze([
+  Object.freeze({ max_oz: 2, under_10: 2.83, '10_to_50': 3.92, over_50: 4.54 }),
+  Object.freeze({ max_oz: 4, under_10: 2.85, '10_to_50': 3.95, over_50: 4.57 }),
+  Object.freeze({ max_oz: 6, under_10: 2.90, '10_to_50': 4.01, over_50: 4.62 }),
+  Object.freeze({ max_oz: 8, under_10: 3.03, '10_to_50': 4.11, over_50: 4.72 }),
+  Object.freeze({ max_oz: 10, under_10: 3.17, '10_to_50': 4.25, over_50: 4.74 }),
+  Object.freeze({ max_oz: 12, under_10: 3.27, '10_to_50': 4.43, over_50: 4.92 }),
+  Object.freeze({ max_oz: 14, under_10: 3.38, '10_to_50': 4.55, over_50: 5.03 }),
+  Object.freeze({ max_oz: 16, under_10: 3.48, '10_to_50': 4.60, over_50: 5.08 }),
+]);
+
+export const LARGE_STANDARD_APPAREL_2027_LB = Object.freeze([
+  Object.freeze({ max_lb: 0.25, under_10: 3.53, '10_to_50': 4.36, over_50: 4.93 }),
+  Object.freeze({ max_lb: 0.50, under_10: 3.74, '10_to_50': 4.57, over_50: 5.13 }),
+  Object.freeze({ max_lb: 0.75, under_10: 3.96, '10_to_50': 4.79, over_50: 5.35 }),
+  Object.freeze({ max_lb: 1.00, under_10: 4.42, '10_to_50': 5.25, over_50: 5.81 }),
+  Object.freeze({ max_lb: 1.25, under_10: 5.13, '10_to_50': 5.96, over_50: 6.52 }),
+  Object.freeze({ max_lb: 1.50, under_10: 5.30, '10_to_50': 6.13, over_50: 6.69 }),
+  Object.freeze({ max_lb: 1.75, under_10: 5.40, '10_to_50': 6.23, over_50: 6.80 }),
+  Object.freeze({ max_lb: 2.00, under_10: 5.51, '10_to_50': 6.34, over_50: 6.91 }),
+  Object.freeze({ max_lb: 2.25, under_10: 5.87, '10_to_50': 6.70, over_50: 7.26 }),
+  Object.freeze({ max_lb: 2.50, under_10: 5.99, '10_to_50': 6.82, over_50: 7.38 }),
+  Object.freeze({ max_lb: 2.75, under_10: 6.04, '10_to_50': 6.87, over_50: 7.44 }),
+  Object.freeze({ max_lb: 3.00, under_10: 6.17, '10_to_50': 7.00, over_50: 7.57 }),
+]);
+
+export const LARGE_STANDARD_APPAREL_OVER_3LB = Object.freeze({
+  under_10: 6.24,
+  '10_to_50': 7.07,
+  over_50: 7.64,
+  step_usd_per_half_lb: 0.16,
+});
+
+// Official 2027 US Apparel & Shoes Standard-Size Returns Processing Fees (GZGEQLTM3RZXUV6T, effective 2027-01-15, charged per returned unit with zero threshold).
+export const APPAREL_SHOES_STANDARD_RETURNS_2027 = Object.freeze({
+  small_standard_oz: Object.freeze([
+    Object.freeze({ max_oz: 4, return_fee: 1.65 }),
+    Object.freeze({ max_oz: 8, return_fee: 1.75 }),
+    Object.freeze({ max_oz: 12, return_fee: 1.85 }),
+    Object.freeze({ max_oz: 16, return_fee: 1.95 }),
+  ]),
+  large_standard_lb: Object.freeze([
+    Object.freeze({ max_lb: 0.25, return_fee: 2.04 }),
+    Object.freeze({ max_lb: 0.50, return_fee: 2.12 }),
+    Object.freeze({ max_lb: 0.75, return_fee: 2.19 }),
+    Object.freeze({ max_lb: 1.00, return_fee: 2.27 }),
+    Object.freeze({ max_lb: 1.50, return_fee: 2.62 }),
+    Object.freeze({ max_lb: 2.00, return_fee: 2.98 }),
+    Object.freeze({ max_lb: 2.50, return_fee: 3.33 }),
+    Object.freeze({ max_lb: 3.00, return_fee: 3.69 }),
+  ]),
+  large_standard_over_3lb: Object.freeze({
+    return_base_usd: 3.89,
+    return_step_usd_per_half_lb: 0.10,
+  }),
+});
+
+// Official 2027 US Dangerous Goods (Hazmat) FBA Fulfillment Fees (GZPA23LMZ9G6699P, non-peak 2027-01-15..2027-10-14, before 3.5% fuel surcharge).
+export const SMALL_STANDARD_DG_2027_OZ = Object.freeze([
+  Object.freeze({ max_oz: 2, under_10: 3.57, '10_to_50': 4.59, over_50: 5.15 }),
+  Object.freeze({ max_oz: 4, under_10: 3.62, '10_to_50': 4.61, over_50: 5.17 }),
+  Object.freeze({ max_oz: 6, under_10: 3.69, '10_to_50': 4.75, over_50: 5.32 }),
+  Object.freeze({ max_oz: 8, under_10: 3.71, '10_to_50': 4.80, over_50: 5.37 }),
+  Object.freeze({ max_oz: 10, under_10: 3.74, '10_to_50': 4.88, over_50: 5.45 }),
+  Object.freeze({ max_oz: 12, under_10: 3.75, '10_to_50': 4.97, over_50: 5.54 }),
+  Object.freeze({ max_oz: 14, under_10: 3.79, '10_to_50': 5.01, over_50: 5.57 }),
+  Object.freeze({ max_oz: 16, under_10: 3.83, '10_to_50': 5.04, over_50: 5.60 }),
+]);
+
+export const LARGE_STANDARD_DG_2027_LB = Object.freeze([
+  Object.freeze({ max_lb: 0.25, under_10: 3.73, '10_to_50': 4.62, over_50: 5.18 }),
+  Object.freeze({ max_lb: 0.50, under_10: 3.94, '10_to_50': 4.83, over_50: 5.40 }),
+  Object.freeze({ max_lb: 0.75, under_10: 4.17, '10_to_50': 5.06, over_50: 5.63 }),
+  Object.freeze({ max_lb: 1.00, under_10: 4.37, '10_to_50': 5.27, over_50: 5.83 }),
+  Object.freeze({ max_lb: 1.25, under_10: 4.82, '10_to_50': 5.79, over_50: 6.36 }),
+  Object.freeze({ max_lb: 1.50, under_10: 5.20, '10_to_50': 6.18, over_50: 6.74 }),
+  Object.freeze({ max_lb: 1.75, under_10: 5.35, '10_to_50': 6.33, over_50: 6.90 }),
+  Object.freeze({ max_lb: 2.00, under_10: 5.49, '10_to_50': 6.47, over_50: 7.04 }),
+  Object.freeze({ max_lb: 2.25, under_10: 5.56, '10_to_50': 6.55, over_50: 7.11 }),
+  Object.freeze({ max_lb: 2.50, under_10: 5.74, '10_to_50': 6.73, over_50: 7.29 }),
+  Object.freeze({ max_lb: 2.75, under_10: 5.90, '10_to_50': 6.89, over_50: 7.45 }),
+  Object.freeze({ max_lb: 3.00, under_10: 6.31, '10_to_50': 7.32, over_50: 7.88 }),
+]);
+
+export const LARGE_STANDARD_DG_OVER_3LB = Object.freeze({
+  under_10: 6.61,
+  '10_to_50': 7.63,
+  over_50: 8.20,
+  step_usd: 0.08,
+});
+
+export const BULKY_DG_2027_TIERS = Object.freeze({
+  small_bulky: Object.freeze({ under_10: 7.46, '10_to_50': 8.24, over_50: 8.24, step_usd_per_lb_over_1: 0.39 }),
+  medium_bulky: Object.freeze({ under_10: 7.61, '10_to_50': 8.39, over_50: 8.39, step_usd_per_lb_over_1: 0.39 }),
+  large_bulky: Object.freeze({ under_10: 9.83, '10_to_50': 10.61, over_50: 10.61, step_usd_per_lb_over_1: 0.39 }),
+  extra_large_bulky: Object.freeze({ under_10: 10.04, '10_to_50': 10.82, over_50: 10.82, step_usd_per_lb_over_1: 0.39 }),
+});
+
+export const OVERSIZE_DG_2027_TIERS = Object.freeze({
+  small_oversize: Object.freeze({ under_10: 15.58, '10_to_50': 16.36, over_50: 16.36, base_threshold_lb: 1, step_usd_per_lb: 0.28, unit_weight_only: false }),
+  medium_oversize: Object.freeze({ under_10: 30.62, '10_to_50': 31.40, over_50: 31.40, base_threshold_lb: 51, step_usd_per_lb: 0.56, unit_weight_only: false }),
+  large_oversize: Object.freeze({ under_10: 45.21, '10_to_50': 45.99, over_50: 45.99, base_threshold_lb: 51, step_usd_per_lb: 0.68, unit_weight_only: false }),
+  long_oversize: Object.freeze({ under_10: 70.21, '10_to_50': 70.99, over_50: 70.99, base_threshold_lb: 1, step_usd_per_lb: 0.30, unit_weight_only: false }),
+  special_oversize_light: Object.freeze({ under_10: 78.33, '10_to_50': 79.11, over_50: 79.11, base_threshold_lb: 1, step_usd_per_lb: 0.30, unit_weight_only: false }),
+  special_oversize_heavy: Object.freeze({ under_10: 215.44, '10_to_50': 216.23, over_50: 216.23, base_threshold_lb: 151, step_usd_per_lb: 0.19, unit_weight_only: true }),
+});
+
+// Official 2027 US Dangerous Goods Unified Monthly Storage Rates (GVZX6EAEL2KZ3SGA, 0–180 days, effective 2027-02-01).
+export const DG_STORAGE_2027_RATES = Object.freeze({
+  standard: Object.freeze({ off_peak: 0.99, peak: 3.63 }),
+  bulky_and_oversize: Object.freeze({ off_peak: 0.78, peak: 2.43 }),
+});
+
+// Five fee categories losing <$10 Low-Price FBA eligibility from 2027-01-15 (billed at $10_to_50 when price_usd < $10).
+export const LOW_PRICE_INELIGIBLE_2027_CATEGORIES = Object.freeze([
+  'Automotive and Powersports',
+  'Compact Appliances',
+  'Computers',
+  'Musical Instruments and AV Production',
+  'Media - Books, DVD, Music, Software, Video',
+]);
+
+export function isCategoryLowPriceEligible2027(feeCategory) {
+  if (typeof feeCategory !== 'string' || !feeCategory.trim()) return true;
+  const canonical = lookupVerified2027ReturnThreshold(feeCategory)?.canonical ?? feeCategory.trim();
+  return !LOW_PRICE_INELIGIBLE_2027_CATEGORIES.some(c => c.toLowerCase() === canonical.toLowerCase());
+}
+
+/**
+ * Out-of-table fallback directive: whenever a candidate hits an unlisted new fee category,
+ * tiered referral rule, or future fee schedule announcement, enforce the 3-step verified lookup-and-persist protocol.
+ */
+export function buildOutOfTableLookupDirective({ reason = '', fee_category = null, asin = null } = {}) {
+  return {
+    protocol_id: 'spapi_then_official_seller_central_persist_v1',
+    fee_category: fee_category ?? null,
+    comparable_asin: asin ?? null,
+    reason,
+    required_steps: [
+      '1. Query read-only SP-API (catalogItems_getCatalogItem + productFees_getMyFeesEstimateForASIN + listingsRestrictions) on comparable ASIN(s) for official packaged dimensions, referral percentage, and live FBA baseline.',
+      '2. Search official Amazon Seller Central help pages / 2027+ fee announcements to verify the exact published rate card and effective dates, recording explicit source URLs.',
+      '3. Calculate using the verified official schedule with source attribution and persist the verified table/rule back into src/fba-rates-2027.mjs.',
+    ],
+  };
+}
 
 function computeOversizeOrSpecialHandlingFloor2027(pkgObj, band = '10_to_50') {
   const dims = parsePackage(pkgObj);
@@ -352,30 +555,81 @@ function computeOversizeOrSpecialHandlingFloor2027(pkgObj, band = '10_to_50') {
       const excessNum = billableRat.n - threshBig * billableRat.d;
       const extraLbs = excessNum > 0n ? Number(ceilDivBig(excessNum, billableRat.d)) : 0;
       const baseUsd = round((oTier[band] ?? oTier['10_to_50']) + extraLbs * oTier.step_usd_per_lb);
+      const handlingRule = OVERSIZE_HANDLING_2027_FEES[oTier.size_tier] ?? { flat_product_usd: 0, overhang_usd: 0 };
+      const flatFee = (ratCmp(s3Rat, { n: 4n, d: 1n }) < 0 && ratCmp(s2Rat, { n: 25n, d: 1n }) >= 0) ? handlingRule.flat_product_usd : 0;
+      const overhangFee = ratCmp(s2Rat, { n: 43n, d: 1n }) > 0 ? handlingRule.overhang_usd : 0;
       return {
         size_tier: oTier.size_tier,
-        floor_usd: round(baseUsd * fuelMultiplier),
+        floor_usd: round(round(baseUsd * fuelMultiplier) + flatFee + overhangFee),
       };
     }
   }
   return null;
 }
 
+const FBA_2027_METADATA_R58_FROZEN = Object.freeze({
+  version: 'US-FBA-2027-nonpeak-standard-v1',
+  marketplace: 'US',
+  currency: 'USD',
+  fuel_surcharge_fraction: 0.035,
+  non_peak_fulfillment_window: Object.freeze({ from: '2027-01-15', through: '2027-10-14' }),
+  unified_storage_effective_from: '2027-02-01',
+  placement_effective_from: '2027-01-15',
+  returns_non_apparel_effective_from: '2027-02-01',
+  official_sources: Object.freeze({
+    announcement: 'https://sellingpartners.aboutamazon.com/update-to-us-referral-and-fulfillment-by-amazon-fees-for-2027',
+    fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GABBX6GZPA8MSZGW',
+    size_tiers: 'https://sellercentral.amazon.com/gp/help/external/GG5KW835AHDJCH8W',
+    storage: 'https://sellercentral.amazon.com/help/hub/reference/external/GVZX6EAEL2KZ3SGA',
+    placement: 'https://sellercentral.amazon.com/help/hub/reference/external/GC3Q44PBK8BXQW3Z',
+    returns: 'https://sellercentral.amazon.com/help/hub/reference/external/GZGEQLTM3RZXUV6T',
+  }),
+});
+
 /**
- * Return the live 2027 US Standard-size rate tables & metadata for immutable evaluation fingerprinting.
+ * Return the live 2027 US FBA rate tables & metadata for immutable evaluation fingerprinting.
  * Shares exact live rate objects with lookup functions so any rate-cell change alters evidence_bundle_sha256.
+ * When `profileRevision <= 58` is requested, returns the frozen r58 snapshot for historical SQLite replay parity.
  */
-export function getFba2027RateTableSnapshot() {
+export function getFba2027RateTableSnapshot({ profileRevision = 59 } = {}) {
+  if (Number.isFinite(profileRevision) && profileRevision <= 58) {
+    return {
+      metadata: FBA_2027_METADATA_R58_FROZEN,
+      small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
+      large_standard_2027_lb: LARGE_STANDARD_2027_LB,
+      large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
+      bulky_2027_tiers: BULKY_2027_TIERS,
+      placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
+      placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
+      storage_usd_per_cuft_month: STORAGE_2027_RATES,
+      bulky_storage_usd_per_cuft_month: BULKY_STORAGE_2027_RATES,
+      verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS,
+    };
+  }
   return {
     metadata: FBA_2027_METADATA,
     small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
     large_standard_2027_lb: LARGE_STANDARD_2027_LB,
     large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
     bulky_2027_tiers: BULKY_2027_TIERS,
+    oversize_2027_tiers: OVERSIZE_2027_TIERS,
+    oversize_handling_2027_fees: OVERSIZE_HANDLING_2027_FEES,
+    oversize_returns_2027_tiers: OVERSIZE_RETURNS_2027_TIERS,
+    small_standard_apparel_2027_oz: SMALL_STANDARD_APPAREL_2027_OZ,
+    large_standard_apparel_2027_lb: LARGE_STANDARD_APPAREL_2027_LB,
+    large_standard_apparel_over_3lb: LARGE_STANDARD_APPAREL_OVER_3LB,
+    apparel_shoes_standard_returns_2027: APPAREL_SHOES_STANDARD_RETURNS_2027,
+    small_standard_dg_2027_oz: SMALL_STANDARD_DG_2027_OZ,
+    large_standard_dg_2027_lb: LARGE_STANDARD_DG_2027_LB,
+    large_standard_dg_over_3lb: LARGE_STANDARD_DG_OVER_3LB,
+    bulky_dg_2027_tiers: BULKY_DG_2027_TIERS,
+    oversize_dg_2027_tiers: OVERSIZE_DG_2027_TIERS,
     placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
     placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
     storage_usd_per_cuft_month: STORAGE_2027_RATES,
     bulky_storage_usd_per_cuft_month: BULKY_STORAGE_2027_RATES,
+    dg_storage_usd_per_cuft_month: DG_STORAGE_2027_RATES,
+    low_price_ineligible_2027_categories: LOW_PRICE_INELIGIBLE_2027_CATEGORIES,
     verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS,
   };
 }
@@ -471,30 +725,101 @@ export function classifyStandardSize2027(pkg, { is_apparel, is_dangerous_goods, 
   };
 }
 
+function extraHalfLbStepsRat(lbRat) {
+  const excessNum = lbRat.n - 3n * lbRat.d;
+  if (excessNum <= 0n) return 0;
+  return Number(ceilDivBig(excessNum * 2n, lbRat.d));
+}
+
 /**
- * Classify a complete packaged unit across BOTH 2027 Standard-size AND 2027 Bulky 4 tiers
- * (`small_bulky`, `medium_bulky`, `large_bulky`, `extra_large_bulky`).
- * Keeps `classifyStandardSize2027` strictly Standard-size so legacy callers/tests remain unchanged.
+ * Classify a complete packaged unit across ALL 12 official 2027 US FBA size tiers:
+ *  - Standard (2): `small_standard`, `large_standard`
+ *  - Bulky (4): `small_bulky`, `medium_bulky`, `large_bulky`, `extra_large_bulky`
+ *  - Oversize (6): `small_oversize`, `medium_oversize`, `large_oversize`, `long_oversize`, `special_oversize_light`, `special_oversize_heavy`
+ * Also resolves 2027 Oversize Flat Product (`shortest < 4 in && median >= 25 in`) and Overhang (`median > 43 in`) handling fees.
+ * Keeps `classifyStandardSize2027` strictly Standard-size non-apparel non-DG so `r58` callers/tests remain unchanged.
  */
-export function classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods, is_sipp } = {}) {
-  const std = classifyStandardSize2027(pkg, { is_apparel, is_dangerous_goods, is_sipp });
-  if (std.status === 'verified') return std;
-  const appCheck = resolveConsistentBoolean([is_apparel, pkg?.is_apparel, pkg?.is_apparel_or_shoes]);
+export function classifySizeTier2027(pkg, { is_apparel, is_shoes, is_apparel_or_shoes, is_dangerous_goods, is_sipp } = {}) {
+  const appCheck = resolveConsistentBoolean([is_apparel, pkg?.is_apparel]);
+  const shoesCheck = resolveConsistentBoolean([is_shoes, pkg?.is_shoes]);
+  const comboCheck = resolveConsistentBoolean([is_apparel_or_shoes, pkg?.is_apparel_or_shoes]);
   const dgCheck = resolveConsistentBoolean([is_dangerous_goods, pkg?.is_dangerous_goods]);
   const sippCheck = resolveConsistentBoolean([is_sipp, pkg?.is_sipp]);
-  if (!appCheck.valid || !dgCheck.valid || !sippCheck.valid || appCheck.value || dgCheck.value || sippCheck.value) {
-    return std;
+  if (!appCheck.valid || !shoesCheck.valid || !comboCheck.valid || !dgCheck.valid || !sippCheck.valid ||
+    (comboCheck.present && comboCheck.value === false && (appCheck.value === true || shoesCheck.value === true))) {
+    return {
+      status: 'needs_calculator_verification',
+      reason: 'is_apparel, is_shoes, is_apparel_or_shoes, is_dangerous_goods, and is_sipp must be strict booleans without contradiction.',
+    };
   }
   const dims = parsePackage(pkg);
-  if (!dims) return std;
-  const { s1Rat, s2Rat, s3Rat, wtLbRat } = dims.rawRat;
-  // Official Amazon US Bulky dimensional weight rule (GABBX6GZPA8MSZGW): enforce minimum 2 inches on width & height.
+  if (!dims) {
+    return {
+      status: 'needs_calculator_verification',
+      reason: 'Valid positive packaged length, width, height, and unit weight are required.',
+    };
+  }
+  const { s1Rat, s2Rat, s3Rat, wtLbRat, ozRat, dimLbRat, shipLbRat } = dims.rawRat;
+
+  // 1) Small Standard: unit weight <= 16 oz, longest <= 15 in, median <= 12 in, shortest <= 0.75 in
+  const isSmallStd =
+    ratCmp(ozRat, { n: 16n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 15n, d: 1n }) <= 0 &&
+    ratCmp(s2Rat, { n: 12n, d: 1n }) <= 0 &&
+    ratCmp(s3Rat, { n: 3n, d: 4n }) <= 0;
+  if (isSmallStd) {
+    return {
+      status: 'verified',
+      size_tier: 'small_standard',
+      shipping_weight_lb: dims.unit_weight_lb,
+      shipping_weight_oz: roundBigRat(ozRat.n, ozRat.d, 10),
+      weight_basis: 'unit_weight',
+      special_handling_flags: {
+        flat_surcharge_eligible: false,
+        overhang_surcharge_eligible: false,
+        flat_product_handling_fee_usd: 0,
+        overhang_handling_fee_usd: 0,
+        total_special_handling_usd: 0,
+      },
+      ...dims,
+    };
+  }
+
+  // 2) Large Standard: max(unit, dim) <= 20 lb, longest <= 18 in, median <= 14 in, shortest <= 8 in
+  const isLargeStd =
+    ratCmp(wtLbRat, { n: 20n, d: 1n }) <= 0 &&
+    ratCmp(shipLbRat, { n: 20n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 18n, d: 1n }) <= 0 &&
+    ratCmp(s2Rat, { n: 14n, d: 1n }) <= 0 &&
+    ratCmp(s3Rat, { n: 8n, d: 1n }) <= 0;
+  if (isLargeStd) {
+    const shipOzRat = mulBigRat(shipLbRat, { n: 16n, d: 1n });
+    return {
+      status: 'verified',
+      size_tier: 'large_standard',
+      shipping_weight_lb: roundBigRat(shipLbRat.n, shipLbRat.d, 10),
+      shipping_weight_oz: roundBigRat(shipOzRat.n, shipOzRat.d, 10),
+      weight_basis: ratCmp(dimLbRat, wtLbRat) > 0 ? 'dimensional_weight' : 'unit_weight',
+      special_handling_flags: {
+        flat_surcharge_eligible: false,
+        overhang_surcharge_eligible: false,
+        flat_product_handling_fee_usd: 0,
+        overhang_handling_fee_usd: 0,
+        total_special_handling_usd: 0,
+      },
+      ...dims,
+    };
+  }
+
+  // Official Amazon US Bulky & Oversize dimensional weight rule (GABBX6GZPA8MSZGW): enforce minimum 2 inches on width & height.
   const bulkyS2Rat = ratMax(s2Rat, { n: 2n, d: 1n });
   const bulkyS3Rat = ratMax(s3Rat, { n: 2n, d: 1n });
   const bulkyCubicInRat = mulBigRat(mulBigRat(s1Rat, bulkyS2Rat), bulkyS3Rat);
   const bulkyDimLbRat = divBigRat(bulkyCubicInRat, { n: 139n, d: 1n });
   const bulkyShipLbRat = ratMax(wtLbRat, bulkyDimLbRat);
   const girthPlusLenRat = addBigRat(s1Rat, mulBigRat({ n: 2n, d: 1n }, addBigRat(s2Rat, s3Rat)));
+
+  // 3) Bulky (4 tiers)
   for (const tier of BULKY_2027_TIERS) {
     const fits =
       ratCmp(wtLbRat, toRat(tier.max_weight_lb)) <= 0 &&
@@ -508,6 +833,7 @@ export function classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods, is_s
       return {
         status: 'verified',
         size_tier: tier.size_tier,
+        tier_family: 'bulky',
         tier_rule: tier,
         ...dims,
         dim_weight_lb: roundBigRat(bulkyDimLbRat.n, bulkyDimLbRat.d, 10),
@@ -515,20 +841,88 @@ export function classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods, is_s
         shipping_weight_oz: roundBigRat(shipOzRat.n, shipOzRat.d, 10),
         length_plus_girth_in: roundBigRat(girthPlusLenRat.n, girthPlusLenRat.d, 10),
         weight_basis: ratCmp(bulkyDimLbRat, wtLbRat) > 0 ? 'dimensional_weight' : 'unit_weight',
-        special_handling_flags: { flat_surcharge_eligible: false, overhang_surcharge_eligible: false },
-        rawRat: { ...dims.rawRat, dimLbRat: bulkyDimLbRat, shipLbRat: bulkyShipLbRat },
+        special_handling_flags: {
+          flat_surcharge_eligible: false,
+          overhang_surcharge_eligible: false,
+          flat_product_handling_fee_usd: 0,
+          overhang_handling_fee_usd: 0,
+          total_special_handling_usd: 0,
+        },
+        rawRat: { ...dims.rawRat, dimLbRat: bulkyDimLbRat, shipLbRat: bulkyShipLbRat, girthPlusLenRat },
       };
     }
   }
-  // Official Amazon US Oversize special-handling flags (GG5KW835AHDJCH8W) apply only once a package exceeds Bulky limits.
+
+  // 4) Oversize (6 tiers: small_oversize..special_oversize_heavy) + 2027 Flat Product & Overhang handling fees
   const flatTriggered = ratCmp(s3Rat, { n: 4n, d: 1n }) < 0 && ratCmp(s2Rat, { n: 25n, d: 1n }) >= 0;
   const overhangTriggered = ratCmp(s2Rat, { n: 43n, d: 1n }) > 0;
+  for (const oTier of OVERSIZE_2027_TIERS) {
+    const fitsWt = oTier.max_weight_lb === Infinity || (
+      ratCmp(wtLbRat, toRat(oTier.max_weight_lb)) <= 0 &&
+      ratCmp(bulkyShipLbRat, toRat(oTier.max_weight_lb)) <= 0
+    );
+    const fitsLen = oTier.max_longest_in === Infinity || ratCmp(s1Rat, toRat(oTier.max_longest_in)) <= 0;
+    const fitsGirth = oTier.max_length_plus_girth_in === Infinity || ratCmp(girthPlusLenRat, toRat(oTier.max_length_plus_girth_in)) <= 0;
+    if (fitsWt && fitsLen && fitsGirth) {
+      const billableRat = oTier.unit_weight_only ? wtLbRat : bulkyShipLbRat;
+      const shipOzRat = mulBigRat(billableRat, { n: 16n, d: 1n });
+      const handlingRule = OVERSIZE_HANDLING_2027_FEES[oTier.size_tier] ?? { flat_product_usd: 0, overhang_usd: 0 };
+      const flatFeeUsd = flatTriggered ? handlingRule.flat_product_usd : 0;
+      const overhangFeeUsd = overhangTriggered ? handlingRule.overhang_usd : 0;
+      return {
+        status: 'verified',
+        size_tier: oTier.size_tier,
+        tier_family: 'oversize',
+        tier_rule: oTier,
+        ...dims,
+        dim_weight_lb: roundBigRat(bulkyDimLbRat.n, bulkyDimLbRat.d, 10),
+        shipping_weight_lb: roundBigRat(billableRat.n, billableRat.d, 10),
+        shipping_weight_oz: roundBigRat(shipOzRat.n, shipOzRat.d, 10),
+        length_plus_girth_in: roundBigRat(girthPlusLenRat.n, girthPlusLenRat.d, 10),
+        weight_basis: oTier.unit_weight_only
+          ? 'unit_weight'
+          : (ratCmp(bulkyDimLbRat, wtLbRat) > 0 ? 'dimensional_weight' : 'unit_weight'),
+        special_handling_flags: {
+          flat_surcharge_eligible: flatTriggered,
+          overhang_surcharge_eligible: overhangTriggered && overhangFeeUsd > 0,
+          overhang_dimension_triggered: overhangTriggered,
+          flat_product_handling_fee_usd: flatFeeUsd,
+          overhang_handling_fee_usd: overhangFeeUsd,
+          total_special_handling_usd: round(flatFeeUsd + overhangFeeUsd),
+        },
+        rawRat: { ...dims.rawRat, dimLbRat: bulkyDimLbRat, shipLbRat: billableRat, bulkyShipLbRat, girthPlusLenRat },
+      };
+    }
+  }
   return {
     status: 'needs_calculator_verification',
     size_tier: 'oversize_beyond_bulky',
-    reason: 'Package exceeds 2027 Extra-Large Bulky limits (59 x 33 x 33 in, 130 in L+G, 50 lb); requires 6-tier Oversize calculator verification.',
-    special_handling_flags: { flat_surcharge_eligible: flatTriggered, overhang_surcharge_eligible: overhangTriggered },
+    reason: 'Package could not be classified into any 2027 US FBA size tier.',
     ...dims,
+  };
+}
+
+export function lookupOversizeHandlingFees2027(pkg) {
+  const cls = classifySizeTier2027(pkg);
+  if (cls.status !== 'verified') return cls;
+  const flags = cls.special_handling_flags ?? {
+    flat_surcharge_eligible: false,
+    overhang_surcharge_eligible: false,
+    flat_product_handling_fee_usd: 0,
+    overhang_handling_fee_usd: 0,
+    total_special_handling_usd: 0,
+  };
+  return {
+    status: 'verified',
+    size_tier: cls.size_tier,
+    applicable: flags.total_special_handling_usd > 0,
+    flat_product_applies: Boolean(flags.flat_surcharge_eligible),
+    overhang_applies: Boolean(flags.overhang_surcharge_eligible),
+    flat_product_handling_fee_usd: flags.flat_product_handling_fee_usd ?? 0,
+    overhang_handling_fee_usd: flags.overhang_handling_fee_usd ?? 0,
+    total_usd: flags.total_special_handling_usd ?? 0,
+    effective_from: FBA_2027_METADATA.non_peak_fulfillment_window.from,
+    source_url: FBA_2027_METADATA.official_sources.fulfillment,
   };
 }
 
@@ -546,6 +940,11 @@ const BULKY_NON_SIPP_PACKAGING_FEE_BY_DIM_LB = Object.freeze([
   Object.freeze({ max_dim_lb: Infinity, fee_usd: 4.04 }),
 ]);
 
+/**
+ * Look up the 2027 US Bulky Non-SIPP Packaging Service Fee ($1.51–$4.04 by dimensional weight, GFGVB6C7ZF38285W).
+ * Defaults to non-SIPP (`requires_amazon_packaging = true` when omitted and `is_sipp !== true`) on all 4 Bulky tiers;
+ * only explicit `is_sipp: true` or `requires_amazon_packaging: false` overrides the fee to $0.
+ */
 export function lookupBulkyPackagingServiceFee2027({
   pkg,
   is_sipp = false,
@@ -553,31 +952,58 @@ export function lookupBulkyPackagingServiceFee2027({
   is_apparel,
   is_dangerous_goods,
 } = {}) {
-  const sippVal = is_sipp ?? pkg?.is_sipp ?? false;
-  if (sippVal === true) {
-    return { status: 'verified', applicable: false, fee_usd: 0, reason: 'SIPP-enrolled items are exempt from the Bulky packaging service fee.' };
+  const sippCheck = resolveConsistentBoolean([is_sipp, pkg?.is_sipp]);
+  if (!sippCheck.valid) {
+    return { status: 'needs_calculator_verification', reason: 'is_sipp must be a strict boolean without contradiction.' };
+  }
+  if (sippCheck.value === true) {
+    return {
+      status: 'verified',
+      applicable: false,
+      fee_usd: 0,
+      packaging_service_status: 'sipp_certified_exempt',
+      reason: 'SIPP-enrolled items are exempt from the Bulky packaging service fee.',
+    };
   }
   const reqPkg = requires_amazon_packaging !== undefined ? requires_amazon_packaging : pkg?.requires_amazon_packaging;
+  if (reqPkg !== undefined && typeof reqPkg !== 'boolean') {
+    return {
+      status: 'needs_calculator_verification',
+      reason: 'requires_amazon_packaging must be a boolean when explicitly supplied.',
+    };
+  }
   const cls = classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods, is_sipp: false });
   if (cls.status !== 'verified') return cls;
   if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
-    return { status: 'verified', applicable: false, size_tier: cls.size_tier, fee_usd: 0, reason: 'Standard-size items do not incur the Bulky packaging service fee.' };
-  }
-  if (typeof reqPkg !== 'boolean') {
     return {
-      status: 'needs_calculator_verification',
+      status: 'verified',
+      applicable: false,
       size_tier: cls.size_tier,
-      reason: 'Non-SIPP Bulky items require explicit boolean requires_amazon_packaging (true = $1.51–$4.04 by dimensional weight per GFGVB6C7ZF38285W; false = ships in own compliant packaging).',
+      fee_usd: 0,
+      packaging_service_status: 'not_applicable_standard',
+      reason: 'Standard-size items do not incur the Bulky packaging service fee.',
     };
   }
-  if (!reqPkg) {
+  if (!cls.size_tier.endsWith('_bulky')) {
+    return {
+      status: 'verified',
+      applicable: false,
+      size_tier: cls.size_tier,
+      fee_usd: 0,
+      packaging_service_status: 'not_applicable_oversize',
+      reason: 'Oversize tiers beyond Extra-Large Bulky do not incur the Bulky non-SIPP packaging service fee.',
+    };
+  }
+  const effectiveReqPkg = reqPkg === undefined ? true : reqPkg;
+  if (!effectiveReqPkg) {
     return {
       status: 'verified',
       applicable: false,
       size_tier: cls.size_tier,
       dim_weight_lb: cls.dim_weight_lb,
       fee_usd: 0,
-      source_url: 'https://sellercentral.amazon.com/help/hub/reference/external/GFGVB6C7ZF38285W',
+      packaging_service_status: 'own_compliant_box_exempt',
+      source_url: FBA_2027_METADATA.official_sources.bulky_packaging_service,
     };
   }
   const dimRat = cls.rawRat.dimLbRat;
@@ -592,26 +1018,39 @@ export function lookupBulkyPackagingServiceFee2027({
     size_tier: cls.size_tier,
     dim_weight_lb: cls.dim_weight_lb,
     fee_usd: row.fee_usd,
-    source_url: 'https://sellercentral.amazon.com/help/hub/reference/external/GFGVB6C7ZF38285W',
+    packaging_service_status: reqPkg === undefined ? 'default_non_sipp_merged' : 'charged_non_sipp',
+    source_url: FBA_2027_METADATA.official_sources.bulky_packaging_service,
   };
 }
 
+/**
+ * Unified 2027 US FBA Fulfillment Fee Lookup across ALL 12 size tiers (Standard 2 + Bulky 4 + Oversize 6),
+ * Apparel & Shoes, Dangerous Goods (Hazmat), 5 Low-Price Ineligible Categories, Default Non-SIPP Bulky Merged Packaging Fee,
+ * and 2027 Oversize Flat Product & Overhang Handling Fees (`2027-01-15` through `2027-10-14`).
+ */
 export function lookupBulkyFulfillmentFee2027({
   pkg,
   price_usd,
   sales_window = null,
   include_fuel_surcharge = true,
   is_apparel,
+  is_shoes,
+  is_apparel_or_shoes,
   is_dangerous_goods,
   is_sipp,
+  sipp_discount_usd = 0,
   requires_amazon_packaging = undefined,
   low_price_eligible = true,
+  fee_category = null,
 } = {}) {
   if (typeof include_fuel_surcharge !== 'boolean' || typeof low_price_eligible !== 'boolean') {
     return { status: 'needs_calculator_verification', reason: 'include_fuel_surcharge and low_price_eligible must be booleans.' };
   }
   if (!finite(price_usd) || price_usd <= 0) {
     return { status: 'needs_calculator_verification', reason: 'Positive finite price_usd is required.' };
+  }
+  if (!finite(sipp_discount_usd) || sipp_discount_usd < 0) {
+    return { status: 'needs_calculator_verification', reason: 'sipp_discount_usd must be a nonnegative finite number.' };
   }
   if (sales_window !== null) {
     if (!validWindow(sales_window)) {
@@ -621,65 +1060,239 @@ export function lookupBulkyFulfillmentFee2027({
       sales_window.through > FBA_2027_METADATA.non_peak_fulfillment_window.through) {
       return {
         status: 'needs_calculator_verification',
-        reason: `sales_window ${sales_window.from}..${sales_window.through} falls outside published 2027 non-peak fulfillment window.`,
+        reason: `sales_window ${sales_window.from}..${sales_window.through} falls outside published 2027 non-peak fulfillment window (${FBA_2027_METADATA.non_peak_fulfillment_window.from}..${FBA_2027_METADATA.non_peak_fulfillment_window.through}); ${UNPUBLISHED_2027_PEAK_MARGIN_NOTE}.`,
+        unpublished_peak_note: UNPUBLISHED_2027_PEAK_MARGIN_NOTE,
       };
     }
   }
-  const cls = classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods, is_sipp });
-  if (cls.status !== 'verified') return cls;
-  if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
-    return lookupFulfillmentFee2027({ pkg, price_usd, sales_window, include_fuel_surcharge, is_apparel, is_dangerous_goods, is_sipp, low_price_eligible });
+
+  const explicitAppCheck = resolveConsistentBoolean([is_apparel, pkg?.is_apparel]);
+  const shoesCheck = resolveConsistentBoolean([is_shoes, pkg?.is_shoes]);
+  const appOrShoesCheck = resolveConsistentBoolean([is_apparel_or_shoes, pkg?.is_apparel_or_shoes]);
+  const dgCheck = resolveConsistentBoolean([is_dangerous_goods, pkg?.is_dangerous_goods]);
+  const sippCheck = resolveConsistentBoolean([is_sipp, pkg?.is_sipp]);
+  if (!explicitAppCheck.valid || !shoesCheck.valid || !appOrShoesCheck.valid || !dgCheck.valid || !sippCheck.valid) {
+    return { status: 'needs_calculator_verification', reason: 'Boolean flags (is_apparel, is_shoes, is_dangerous_goods, is_sipp) must be strict booleans without contradiction.' };
   }
-  const effReqPkg = requires_amazon_packaging !== undefined ? requires_amazon_packaging : pkg?.requires_amazon_packaging;
-  if (effReqPkg !== undefined && typeof effReqPkg !== 'boolean') {
+  if (explicitAppCheck.value === true && shoesCheck.value === true) {
+    return { status: 'needs_calculator_verification', reason: 'Conflicting is_apparel: true and is_shoes: true on the same SKU.' };
+  }
+  const catLower = typeof fee_category === 'string' ? fee_category.trim().toLowerCase() : '';
+  const inferredShoesFromCategory = !explicitAppCheck.present && (
+    catLower === 'shoes' || catLower.includes('shoes') || catLower.includes('footwear')
+  );
+  const isShoesSku = shoesCheck.value === true || inferredShoesFromCategory;
+  // Apparel Standard-size uses GPDC3KPYAGDTVDJP; Shoes use Non-Apparel fulfillment (GABBX6GZPA8MSZGW).
+  const usesApparelFulfillmentCard = explicitAppCheck.value === true ||
+    (!isShoesSku && appOrShoesCheck.value === true);
+  const isDg = dgCheck.value === true;
+  const isSipp = sippCheck.value === true;
+
+  const cls = classifySizeTier2027(pkg, {
+    is_apparel: usesApparelFulfillmentCard,
+    is_shoes: isShoesSku,
+    is_dangerous_goods: isDg,
+    is_sipp: isSipp,
+  });
+  if (cls.status !== 'verified') return cls;
+
+  const rawBand = priceBand2027(price_usd);
+  const catLowPriceEligible = isCategoryLowPriceEligible2027(fee_category);
+  if (rawBand === 'under_10' && !low_price_eligible && catLowPriceEligible) {
+    return { status: 'needs_calculator_verification', reason: 'Category is marked ineligible for 2027 Low-Price FBA rates without a listed 2027 fee_category.' };
+  }
+  const lowPriceBumped = rawBand === 'under_10' && !catLowPriceEligible;
+  const band = lowPriceBumped ? '10_to_50' : rawBand;
+  const fuelMultiplier = include_fuel_surcharge ? (1 + FBA_2027_METADATA.fuel_surcharge_fraction) : 1;
+
+  // A) Standard-size (Small Standard & Large Standard): Non-Apparel, Apparel, and Dangerous Goods
+  if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
+    if (isSipp && sipp_discount_usd === 0) {
+      // Standard-size SIPP discount varies by weight/category; require explicit verified sipp_discount_usd or non-SIPP default.
+      return {
+        status: 'needs_calculator_verification',
+        size_tier: cls.size_tier,
+        reason: 'Standard-size SIPP requires an explicit verified sipp_discount_usd or default non-SIPP (is_sipp: false).',
+      };
+    }
+    let baseUsd = null;
+    let weightBracket = null;
+    let extraSteps = 0;
+    if (cls.size_tier === 'small_standard') {
+      const table = isDg
+        ? SMALL_STANDARD_DG_2027_OZ
+        : (usesApparelFulfillmentCard ? SMALL_STANDARD_APPAREL_2027_OZ : SMALL_STANDARD_2027_OZ);
+      const row = table.find(entry => ratCmp(cls.rawRat.ozRat, toRat(entry.max_oz)) <= 0);
+      if (!row) return { status: 'needs_calculator_verification', reason: 'Small Standard weight exceeded 16 oz.' };
+      baseUsd = row[band];
+      weightBracket = `small_standard <= ${row.max_oz} oz`;
+    } else {
+      const lbRat = cls.rawRat.shipLbRat;
+      if (ratCmp(lbRat, toRat(3)) <= 0) {
+        const table = isDg
+          ? LARGE_STANDARD_DG_2027_LB
+          : (usesApparelFulfillmentCard ? LARGE_STANDARD_APPAREL_2027_LB : LARGE_STANDARD_2027_LB);
+        const row = table.find(entry => ratCmp(lbRat, toRat(entry.max_lb)) <= 0);
+        if (!row) return { status: 'needs_calculator_verification', reason: 'Large Standard weight bracket lookup failed.' };
+        baseUsd = row[band];
+        weightBracket = `large_standard <= ${row.max_lb} lb`;
+      } else if (usesApparelFulfillmentCard && !isDg) {
+        extraSteps = extraHalfLbStepsRat(lbRat);
+        baseUsd = round(LARGE_STANDARD_APPAREL_OVER_3LB[band] + extraSteps * LARGE_STANDARD_APPAREL_OVER_3LB.step_usd_per_half_lb);
+        weightBracket = `large_standard_apparel 3+ to 20 lb (${extraSteps} x 0.5 lb intervals above 3 lb)`;
+      } else {
+        extraSteps = extraQuarterLbStepsRat(lbRat);
+        const overRule = isDg ? LARGE_STANDARD_DG_OVER_3LB : LARGE_STANDARD_OVER_3LB;
+        baseUsd = round(overRule[band] + extraSteps * overRule.step_usd);
+        weightBracket = `large_standard 3+ to 20 lb (${extraSteps} x 4 oz intervals above 3 lb)`;
+      }
+    }
+    const netBaseUsd = Math.max(0, round(baseUsd - (isSipp ? sipp_discount_usd : 0)));
+    const fulfillmentWithFuelUsd = round(netBaseUsd * fuelMultiplier);
     return {
-      status: 'needs_calculator_verification',
+      status: 'verified',
+      version: isDg || usesApparelFulfillmentCard || lowPriceBumped
+        ? FBA_2027_METADATA.unified_version
+        : FBA_2027_METADATA.version,
+      schedule_family: isDg ? 'dangerous_goods' : (usesApparelFulfillmentCard ? 'apparel' : 'non_apparel'),
       size_tier: cls.size_tier,
-      reason: 'Non-SIPP Bulky requires_amazon_packaging must be boolean when supplied.',
+      price_band: band,
+      ...(lowPriceBumped ? { low_price_bumped_to_10_to_50: true } : {}),
+      weight_bracket: weightBracket,
+      shipping_weight_lb: cls.shipping_weight_lb,
+      weight_basis: cls.weight_basis,
+      base_usd: netBaseUsd,
+      fulfillment_with_fuel_usd: fulfillmentWithFuelUsd,
+      packaging_service_fee_usd: 0,
+      special_handling_fee_usd: 0,
+      fuel_surcharge_included: Boolean(include_fuel_surcharge),
+      fuel_surcharge_fraction: include_fuel_surcharge ? FBA_2027_METADATA.fuel_surcharge_fraction : 0,
+      total_usd: fulfillmentWithFuelUsd,
+      extra_steps: extraSteps,
+      effective_from: FBA_2027_METADATA.non_peak_fulfillment_window.from,
+      effective_through: FBA_2027_METADATA.non_peak_fulfillment_window.through,
+      source_url: isDg
+        ? FBA_2027_METADATA.official_sources.dangerous_goods_fulfillment
+        : (usesApparelFulfillmentCard
+          ? FBA_2027_METADATA.official_sources.apparel_fulfillment
+          : FBA_2027_METADATA.official_sources.fulfillment),
     };
   }
-  let packagingFeeUsd = 0;
-  if (effReqPkg === true) {
-    const pkgFee = lookupBulkyPackagingServiceFee2027({ pkg, is_sipp, requires_amazon_packaging: true, is_apparel, is_dangerous_goods });
+
+  // B) Bulky (4 tiers): Non-Apparel & Apparel share BULKY_2027_TIERS; DG uses BULKY_DG_2027_TIERS.
+  // Default non-SIPP automatically merges `round(base * 1.035) + non_sipp_packaging_fee($1.51–$4.04)`.
+  if (cls.size_tier.endsWith('_bulky')) {
+    const effReqPkg = requires_amazon_packaging !== undefined ? requires_amazon_packaging : pkg?.requires_amazon_packaging;
+    if (effReqPkg !== undefined && typeof effReqPkg !== 'boolean') {
+      return {
+        status: 'needs_calculator_verification',
+        size_tier: cls.size_tier,
+        reason: 'Non-SIPP Bulky requires_amazon_packaging must be boolean when supplied.',
+      };
+    }
+    const pkgFee = lookupBulkyPackagingServiceFee2027({
+      pkg,
+      is_sipp: isSipp,
+      requires_amazon_packaging: effReqPkg,
+      is_apparel: usesApparelFulfillmentCard,
+      is_dangerous_goods: isDg,
+    });
     if (pkgFee.status !== 'verified') return pkgFee;
-    packagingFeeUsd = pkgFee.fee_usd;
+    const packagingFeeUsd = pkgFee.fee_usd;
+    const shipLbRat = cls.rawRat.shipLbRat;
+    const excessNum = shipLbRat.n - 1n * shipLbRat.d;
+    const extraWholeLbs = excessNum > 0n ? Number(ceilDivBig(excessNum, shipLbRat.d)) : 0;
+    const tier = isDg ? BULKY_DG_2027_TIERS[cls.size_tier] : cls.tier_rule;
+    const rawBaseUsd = round(tier[band] + extraWholeLbs * tier.step_usd_per_lb_over_1);
+    const baseUsd = Math.max(0, round(rawBaseUsd - (isSipp ? sipp_discount_usd : 0)));
+    const fulfillmentWithFuelUsd = round(baseUsd * fuelMultiplier);
+    const totalUsd = round(fulfillmentWithFuelUsd + packagingFeeUsd);
+    const tierFirstLbTotalUsd = round(tier[band] * fuelMultiplier);
+    return {
+      status: 'verified',
+      version: isDg ? FBA_2027_METADATA.unified_version : 'US-FBA-2027-nonpeak-bulky4-v1',
+      schedule_family: isDg ? 'dangerous_goods' : (usesApparelFulfillmentCard ? 'apparel' : 'non_apparel'),
+      size_tier: cls.size_tier,
+      price_band: band,
+      ...(lowPriceBumped ? { low_price_bumped_to_10_to_50: true } : {}),
+      weight_bracket: `${cls.size_tier} (${extraWholeLbs} lb intervals above first 1 lb)`,
+      shipping_weight_lb: cls.shipping_weight_lb,
+      dim_weight_lb: cls.dim_weight_lb,
+      weight_basis: cls.weight_basis,
+      base_usd: baseUsd,
+      fulfillment_with_fuel_usd: fulfillmentWithFuelUsd,
+      packaging_service_fee_usd: packagingFeeUsd,
+      packaging_service_status: pkgFee.packaging_service_status,
+      special_handling_fee_usd: 0,
+      tier_first_lb_total_usd: tierFirstLbTotalUsd,
+      extra_lb_steps: extraWholeLbs,
+      fuel_surcharge_included: Boolean(include_fuel_surcharge),
+      fuel_surcharge_fraction: include_fuel_surcharge ? FBA_2027_METADATA.fuel_surcharge_fraction : 0,
+      total_usd: totalUsd,
+      effective_from: FBA_2027_METADATA.non_peak_fulfillment_window.from,
+      effective_through: FBA_2027_METADATA.non_peak_fulfillment_window.through,
+      source_url: isDg
+        ? FBA_2027_METADATA.official_sources.dangerous_goods_fulfillment
+        : FBA_2027_METADATA.official_sources.fulfillment,
+    };
   }
-  const band = priceBand2027(price_usd);
-  if (band === 'under_10' && !low_price_eligible) {
-    return { status: 'needs_calculator_verification', reason: 'Category is marked ineligible for 2027 Low-Price FBA rates.' };
+
+  // C) Oversize (6 tiers): Non-Apparel & Apparel share OVERSIZE_2027_TIERS; DG uses OVERSIZE_DG_2027_TIERS;
+  // stacks 2027 Flat Product & Overhang handling fees (fuel multiplies base fulfillment only).
+  const oTier = isDg ? OVERSIZE_DG_2027_TIERS[cls.size_tier] : cls.tier_rule;
+  if (!oTier) {
+    return { status: 'needs_calculator_verification', reason: `Unlisted Oversize tier: ${cls.size_tier}` };
   }
-  const shipLbRat = cls.rawRat.shipLbRat;
-  const excessNum = shipLbRat.n - 1n * shipLbRat.d;
-  const extraWholeLbs = excessNum > 0n ? Number(ceilDivBig(excessNum, shipLbRat.d)) : 0;
-  const tier = cls.tier_rule;
-  const baseUsd = round(tier[band] + extraWholeLbs * tier.step_usd_per_lb_over_1);
-  const fuelMultiplier = include_fuel_surcharge ? (1 + FBA_2027_METADATA.fuel_surcharge_fraction) : 1;
+  const billableRat = cls.rawRat.shipLbRat;
+  const threshBig = BigInt(oTier.base_threshold_lb);
+  const excessNum = billableRat.n - threshBig * billableRat.d;
+  const extraWholeLbs = excessNum > 0n ? Number(ceilDivBig(excessNum, billableRat.d)) : 0;
+  const rawBaseUsd = round(oTier[band] + extraWholeLbs * oTier.step_usd_per_lb);
+  const baseUsd = Math.max(0, round(rawBaseUsd - (isSipp ? sipp_discount_usd : 0)));
   const fulfillmentWithFuelUsd = round(baseUsd * fuelMultiplier);
-  const totalUsd = round(fulfillmentWithFuelUsd + packagingFeeUsd);
-  const tierFirstLbTotalUsd = round(tier[band] * fuelMultiplier);
+  const flags = cls.special_handling_flags ?? {};
+  const flatFeeUsd = flags.flat_product_handling_fee_usd ?? 0;
+  const overhangFeeUsd = flags.overhang_handling_fee_usd ?? 0;
+  const specialHandlingUsd = round(flatFeeUsd + overhangFeeUsd);
+  const totalUsd = round(fulfillmentWithFuelUsd + specialHandlingUsd);
+  const tierBaseTotalUsd = round(round(oTier[band] * fuelMultiplier) + specialHandlingUsd);
   return {
     status: 'verified',
-    version: 'US-FBA-2027-nonpeak-bulky4-v1',
+    version: FBA_2027_METADATA.unified_version,
+    schedule_family: isDg ? 'dangerous_goods' : (usesApparelFulfillmentCard ? 'apparel' : 'non_apparel'),
     size_tier: cls.size_tier,
     price_band: band,
-    weight_bracket: `${cls.size_tier} (${extraWholeLbs} lb intervals above first 1 lb)`,
+    ...(lowPriceBumped ? { low_price_bumped_to_10_to_50: true } : {}),
+    weight_bracket: `${cls.size_tier} (${extraWholeLbs} lb intervals above ${oTier.base_threshold_lb} lb)`,
     shipping_weight_lb: cls.shipping_weight_lb,
     dim_weight_lb: cls.dim_weight_lb,
     weight_basis: cls.weight_basis,
     base_usd: baseUsd,
     fulfillment_with_fuel_usd: fulfillmentWithFuelUsd,
-    packaging_service_fee_usd: packagingFeeUsd,
-    packaging_service_status: effReqPkg === undefined ? 'unchecked_caller_responsibility' : (effReqPkg ? 'charged_non_sipp' : 'own_compliant_box_exempt'),
-    tier_first_lb_total_usd: tierFirstLbTotalUsd,
+    packaging_service_fee_usd: 0,
+    packaging_service_status: 'not_applicable_oversize',
+    flat_product_handling_fee_usd: flatFeeUsd,
+    overhang_handling_fee_usd: overhangFeeUsd,
+    special_handling_fee_usd: specialHandlingUsd,
+    tier_first_lb_total_usd: tierBaseTotalUsd,
     extra_lb_steps: extraWholeLbs,
     fuel_surcharge_included: Boolean(include_fuel_surcharge),
     fuel_surcharge_fraction: include_fuel_surcharge ? FBA_2027_METADATA.fuel_surcharge_fraction : 0,
     total_usd: totalUsd,
     effective_from: FBA_2027_METADATA.non_peak_fulfillment_window.from,
     effective_through: FBA_2027_METADATA.non_peak_fulfillment_window.through,
-    source_url: FBA_2027_METADATA.official_sources.fulfillment,
+    source_url: isDg
+      ? FBA_2027_METADATA.official_sources.dangerous_goods_fulfillment
+      : FBA_2027_METADATA.official_sources.fulfillment,
   };
 }
+
+export const lookupUnifiedFulfillmentFee2027 = lookupBulkyFulfillmentFee2027;
+export const lookupOversizeFulfillmentFee2027 = lookupBulkyFulfillmentFee2027;
+export const lookupApparelFulfillmentFee2027 = (params = {}) =>
+  lookupBulkyFulfillmentFee2027({ ...params, is_apparel: params.is_shoes === true ? false : (params.is_apparel ?? true) });
+export const lookupDangerousGoodsFulfillmentFee2027 = (params = {}) =>
+  lookupBulkyFulfillmentFee2027({ ...params, is_dangerous_goods: true });
 
 export function lookupBulkyStorageFee2027({
   pkg,
@@ -687,12 +1300,19 @@ export function lookupBulkyStorageFee2027({
   months = null,
   average_inventory_days = 45,
   inventory_age_days = 45,
+  is_apparel,
   is_dangerous_goods,
 } = {}) {
-  const cls = classifySizeTier2027(pkg, { is_dangerous_goods });
+  const dgCheck = resolveConsistentBoolean([is_dangerous_goods, pkg?.is_dangerous_goods]);
+  if (!dgCheck.valid) {
+    return { status: 'needs_calculator_verification', reason: 'is_dangerous_goods must be a strict boolean without contradiction.' };
+  }
+  const isDg = dgCheck.value === true;
+  const cls = classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods: isDg });
   if (cls.status !== 'verified') return cls;
-  if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
-    return lookupStorageFee2027({ pkg, storage_window, months, average_inventory_days, inventory_age_days, is_dangerous_goods });
+  const isStandard = cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard';
+  if (isStandard && !isDg) {
+    return lookupStorageFee2027({ pkg, storage_window, months, average_inventory_days, inventory_age_days, is_dangerous_goods: false });
   }
   if (!finite(average_inventory_days) || average_inventory_days < 45) {
     return { status: 'needs_calculator_verification', reason: 'average_inventory_days must be at least 45.' };
@@ -705,7 +1325,11 @@ export function lookupBulkyStorageFee2027({
     if (!validWindow(storage_window) || storage_window.from < FBA_2027_METADATA.unified_storage_effective_from || storage_window.through > '2027-12-31') {
       return { status: 'needs_calculator_verification', reason: 'storage_window must lie within 2027-02-01..2027-12-31.' };
     }
-    targetMonths = monthsIn(storage_window);
+    const winMonths = monthsIn(storage_window);
+    if (Array.isArray(months) && (months.some(m => !winMonths.includes(m)) || winMonths.some(m => !months.includes(m)))) {
+      return { status: 'needs_calculator_verification', reason: 'Supplied months conflict with storage_window.' };
+    }
+    targetMonths = winMonths;
   }
   if (!Array.isArray(targetMonths) || targetMonths.length === 0 || targetMonths.some(m => !Number.isInteger(m) || m < 1 || m > 12)) {
     return { status: 'needs_calculator_verification', reason: 'Explicit valid storage_window or months array is required.' };
@@ -713,16 +1337,20 @@ export function lookupBulkyStorageFee2027({
   const hasOffPeak = targetMonths.some(m => m <= 9);
   const hasPeak = targetMonths.some(m => m >= 10);
   if (hasOffPeak && hasPeak) {
-    return { status: 'needs_calculator_verification', reason: 'Storage window mixes Jan–Sep ($0.56) and Oct–Dec ($1.40) bulky rates.' };
+    return { status: 'needs_calculator_verification', reason: 'Storage window mixes Jan–Sep and Oct–Dec rates; evaluate seasons separately.' };
   }
-  const rateUsdPerCuftMonth = hasPeak ? BULKY_STORAGE_2027_RATES.peak : BULKY_STORAGE_2027_RATES.off_peak;
+  const rateCard = isDg
+    ? (isStandard ? DG_STORAGE_2027_RATES.standard : DG_STORAGE_2027_RATES.bulky_and_oversize)
+    : (isStandard ? STORAGE_2027_RATES : BULKY_STORAGE_2027_RATES);
+  const rateUsdPerCuftMonth = hasPeak ? rateCard.peak : rateCard.off_peak;
   const allocatedRat = divBigRat(
     mulBigRat(mulBigRat(cls.rawRat.cubicFtRat, toBigRat(rateUsdPerCuftMonth)), toBigRat(average_inventory_days)),
     { n: 30n, d: 1n },
   );
   return {
     status: 'verified',
-    version: 'US-FBA-2027-nonpeak-bulky4-v1',
+    version: isDg || cls.tier_family === 'oversize' ? FBA_2027_METADATA.unified_version : 'US-FBA-2027-nonpeak-bulky4-v1',
+    schedule_family: isDg ? 'dangerous_goods' : 'general',
     size_tier: cls.size_tier,
     season: hasPeak ? 'peak_oct_dec' : 'off_peak_jan_sep',
     cubic_feet: cls.cubic_feet,
@@ -734,10 +1362,15 @@ export function lookupBulkyStorageFee2027({
   };
 }
 
+export const lookupUnifiedStorageFee2027 = lookupBulkyStorageFee2027;
+export const lookupDangerousGoodsStorageFee2027 = (params = {}) =>
+  lookupBulkyStorageFee2027({ ...params, is_dangerous_goods: true });
+
 export function lookupBulkyPlacementFee2027({
   pkg,
   inbound_window = null,
   split_option = 'minimal_west_conservative',
+  is_apparel,
   is_dangerous_goods,
 } = {}) {
   if (inbound_window !== null) {
@@ -748,10 +1381,55 @@ export function lookupBulkyPlacementFee2027({
       return { status: 'needs_calculator_verification', reason: 'inbound_window precedes 2027-01-15 placement schedule.' };
     }
   }
-  const cls = classifySizeTier2027(pkg, { is_dangerous_goods });
+  const dgCheck = resolveConsistentBoolean([is_dangerous_goods, pkg?.is_dangerous_goods]);
+  if (!dgCheck.valid) {
+    return { status: 'needs_calculator_verification', reason: 'is_dangerous_goods must be a strict boolean without contradiction.' };
+  }
+  const cls = classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods: dgCheck.value });
   if (cls.status !== 'verified') return cls;
   if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
-    return lookupPlacementFee2027({ pkg, inbound_window, split_option, is_dangerous_goods });
+    if (split_option === 'amazon_optimized') {
+      return {
+        status: 'verified',
+        version: FBA_2027_METADATA.version,
+        size_tier: cls.size_tier,
+        split_option,
+        range_usd: [0, 0],
+        selected_usd: 0,
+        note: 'Amazon-optimized splits incur $0 placement fee, but multi-location carrier freight still applies.',
+        effective_from: FBA_2027_METADATA.placement_effective_from,
+        source_url: FBA_2027_METADATA.official_sources.placement,
+      };
+    }
+    const range = cls.size_tier === 'small_standard'
+      ? (PLACEMENT_MINIMAL_SMALL_OZ.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.range ?? null)
+      : (PLACEMENT_MINIMAL_LARGE_LB.find(r => ratCmp(cls.rawRat.shipLbRat, toRat(r.max_lb)) <= 0)?.range ?? null);
+    if (!range) return { status: 'needs_calculator_verification', reason: 'Unlisted placement weight bracket.' };
+    const selectedUsd = split_option === 'minimal_east_low' ? range[0] : range[1];
+    return {
+      status: 'verified',
+      version: FBA_2027_METADATA.version,
+      size_tier: cls.size_tier,
+      split_option,
+      range_usd: [...range],
+      selected_usd: selectedUsd,
+      effective_from: FBA_2027_METADATA.placement_effective_from,
+      source_url: FBA_2027_METADATA.official_sources.placement,
+    };
+  }
+  if (cls.tier_family === 'oversize') {
+    return {
+      status: 'verified',
+      version: FBA_2027_METADATA.unified_version,
+      size_tier: cls.size_tier,
+      split_option,
+      exempt_oversize_tier: true,
+      range_usd: [0, 0],
+      selected_usd: 0,
+      note: '2027 Oversize tiers beyond Extra-Large Bulky are exempt ($0.00) from FBA inbound placement service fees (GC3Q44PBK8BXQW3Z).',
+      effective_from: FBA_2027_METADATA.placement_effective_from,
+      source_url: FBA_2027_METADATA.official_sources.placement,
+    };
   }
   if (split_option === 'amazon_optimized') {
     return {
@@ -788,52 +1466,63 @@ export function lookupBulkyPlacementFee2027({
   };
 }
 
+export const lookupUnifiedPlacementFee2027 = lookupBulkyPlacementFee2027;
+
 export function lookupBulkyReturnsProcessing2027({
   pkg,
   physical_return_fraction,
   fee_category = null,
   return_threshold = null,
   sales_window = null,
+  is_apparel,
+  is_shoes,
   is_apparel_or_shoes,
   is_dangerous_goods,
 } = {}) {
-  const appCheck = resolveConsistentBoolean([is_apparel_or_shoes, pkg?.is_apparel_or_shoes, pkg?.is_apparel]);
-  if (!appCheck.valid) {
-    return { status: 'needs_calculator_verification', reason: 'is_apparel_or_shoes must be a strict boolean without contradiction.' };
+  const appCheck = resolveConsistentBoolean([is_apparel_or_shoes, is_apparel, is_shoes, pkg?.is_apparel_or_shoes, pkg?.is_apparel, pkg?.is_shoes]);
+  const dgCheck = resolveConsistentBoolean([is_dangerous_goods, pkg?.is_dangerous_goods]);
+  if (!appCheck.valid || !dgCheck.valid) {
+    // Allow e.g. is_apparel: false + is_shoes: true without false contradiction!
+    const expApp = resolveConsistentBoolean([is_apparel, pkg?.is_apparel]);
+    const expShoes = resolveConsistentBoolean([is_shoes, pkg?.is_shoes]);
+    const expCombo = resolveConsistentBoolean([is_apparel_or_shoes, pkg?.is_apparel_or_shoes]);
+    if (!expApp.valid || !expShoes.valid || !expCombo.valid || !dgCheck.valid ||
+      (expCombo.present && expCombo.value === false && (expApp.value === true || expShoes.value === true))) {
+      return { status: 'needs_calculator_verification', reason: 'is_apparel_or_shoes / is_apparel / is_shoes / is_dangerous_goods must be strict booleans without contradiction.' };
+    }
   }
+  const catLower = typeof fee_category === 'string' ? fee_category.trim().toLowerCase() : '';
+  const isApparelOrShoes = Boolean(
+    is_apparel_or_shoes === true || is_apparel === true || is_shoes === true ||
+    pkg?.is_apparel_or_shoes === true || pkg?.is_apparel === true || pkg?.is_shoes === true ||
+    catLower === 'apparel' || catLower === 'clothing and accessories' || catLower === 'shoes',
+  );
   if (!finite(physical_return_fraction) || physical_return_fraction < 0 || physical_return_fraction >= 1) {
     return { status: 'needs_calculator_verification', reason: 'physical_return_fraction in [0, 1) is required.' };
   }
-  const cls = classifySizeTier2027(pkg, { is_dangerous_goods });
+  const cls = classifySizeTier2027(pkg, { is_dangerous_goods: dgCheck.value });
   if (cls.status !== 'verified') return cls;
-  if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
-    return lookupReturnsProcessing2027({
-      pkg,
-      physical_return_fraction,
-      fee_category,
-      return_threshold,
-      sales_window,
-      is_apparel_or_shoes,
-      is_dangerous_goods,
-    });
-  }
-  const effectiveFrom = appCheck.value ? '2027-01-15' : FBA_2027_METADATA.returns_non_apparel_effective_from;
+
+  const effectiveFrom = isApparelOrShoes ? '2027-01-15' : FBA_2027_METADATA.returns_non_apparel_effective_from;
   if (sales_window !== null && sales_window !== undefined) {
     if (!validWindow(sales_window) || sales_window.from < effectiveFrom || sales_window.through > '2027-12-31') {
       return {
         status: 'needs_calculator_verification',
-        reason: `sales_window must lie within ${effectiveFrom}..2027-12-31 for the 2027 bulky returns-processing schedule.`,
+        reason: `sales_window must lie within ${effectiveFrom}..2027-12-31 for the 2027 returns-processing schedule.`,
       };
     }
   }
+
   let threshold = 0;
   let canonicalCat = 'Apparel and Shoes';
-  if (!appCheck.value) {
+  if (!isApparelOrShoes) {
     const catMatch = lookupVerified2027ReturnThreshold(fee_category);
     if (!catMatch) {
+      const reason = `A listed 2027 fee_category is required (received ${fee_category ?? 'none'}).`;
       return {
         status: 'needs_calculator_verification',
-        reason: `A listed 2027 fee_category is required (received ${fee_category ?? 'none'}).`,
+        reason,
+        out_of_table_protocol: buildOutOfTableLookupDirective({ reason, fee_category }),
       };
     }
     threshold = catMatch.threshold;
@@ -845,21 +1534,64 @@ export function lookupBulkyReturnsProcessing2027({
       };
     }
   }
-  const shipLbRat = cls.rawRat.shipLbRat;
-  const excessLbNum = shipLbRat.n - 1n * shipLbRat.d;
-  const extraWholeLbs = excessLbNum > 0n ? Number(ceilDivBig(excessLbNum, shipLbRat.d)) : 0;
-  const perReturnFee = round(BULKY_RETURNS_2027_RULE.base_first_lb_usd + extraWholeLbs * BULKY_RETURNS_2027_RULE.step_usd_per_lb_over_1);
-  const excessFraction = appCheck.value ? physical_return_fraction : Math.max(0, round(physical_return_fraction - threshold));
+
+  let perReturnFee = null;
+  let extraWholeLbs = 0;
+  if (cls.size_tier === 'small_standard') {
+    if (isApparelOrShoes) {
+      perReturnFee = APPAREL_SHOES_STANDARD_RETURNS_2027.small_standard_oz.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.return_fee ?? null;
+    } else {
+      perReturnFee = SMALL_STANDARD_2027_OZ.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.return_fee ?? null;
+    }
+  } else if (cls.size_tier === 'large_standard') {
+    const lbRat = cls.rawRat.shipLbRat;
+    if (isApparelOrShoes) {
+      if (ratCmp(lbRat, toRat(3)) <= 0) {
+        perReturnFee = APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_lb.find(r => ratCmp(lbRat, toRat(r.max_lb)) <= 0)?.return_fee ?? null;
+      } else {
+        extraWholeLbs = extraHalfLbStepsRat(lbRat);
+        perReturnFee = round(
+          APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_over_3lb.return_base_usd +
+          extraWholeLbs * APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_over_3lb.return_step_usd_per_half_lb,
+        );
+      }
+    } else if (ratCmp(lbRat, toRat(3)) <= 0) {
+      perReturnFee = LARGE_STANDARD_2027_LB.find(r => ratCmp(lbRat, toRat(r.max_lb)) <= 0)?.return_fee ?? null;
+    } else {
+      extraWholeLbs = extraQuarterLbStepsRat(lbRat);
+      perReturnFee = round(LARGE_STANDARD_OVER_3LB.return_base_usd + extraWholeLbs * LARGE_STANDARD_OVER_3LB.return_step_usd);
+    }
+  } else if (cls.size_tier.endsWith('_bulky')) {
+    const shipLbRat = cls.rawRat.shipLbRat;
+    const excessLbNum = shipLbRat.n - 1n * shipLbRat.d;
+    extraWholeLbs = excessLbNum > 0n ? Number(ceilDivBig(excessLbNum, shipLbRat.d)) : 0;
+    perReturnFee = round(BULKY_RETURNS_2027_RULE.base_first_lb_usd + extraWholeLbs * BULKY_RETURNS_2027_RULE.step_usd_per_lb_over_1);
+  } else if (cls.tier_family === 'oversize') {
+    const retRule = OVERSIZE_RETURNS_2027_TIERS[cls.size_tier];
+    if (!retRule) {
+      return { status: 'needs_calculator_verification', reason: `Unlisted Oversize returns-processing tier: ${cls.size_tier}` };
+    }
+    const billableRat = retRule.unit_weight_only ? cls.rawRat.wtLbRat : cls.rawRat.shipLbRat;
+    const threshBig = BigInt(retRule.base_threshold_lb);
+    const excessLbNum = billableRat.n - threshBig * billableRat.d;
+    extraWholeLbs = excessLbNum > 0n ? Number(ceilDivBig(excessLbNum, billableRat.d)) : 0;
+    perReturnFee = round(retRule.base_usd + extraWholeLbs * retRule.step_usd_per_lb);
+  }
+  if (perReturnFee === null) {
+    return { status: 'needs_calculator_verification', reason: 'Unlisted returns-processing weight bracket.' };
+  }
+  const excessFraction = isApparelOrShoes ? physical_return_fraction : Math.max(0, round(physical_return_fraction - threshold));
   const expectedPerShippedUnit = round(excessFraction * perReturnFee);
   return {
     status: 'verified',
-    version: 'US-FBA-2027-nonpeak-bulky4-v1',
+    version: isApparelOrShoes || cls.tier_family === 'oversize' ? FBA_2027_METADATA.unified_version : (cls.size_tier.endsWith('_bulky') ? 'US-FBA-2027-nonpeak-bulky4-v1' : FBA_2027_METADATA.version),
     size_tier: cls.size_tier,
     shipping_weight_lb: cls.shipping_weight_lb,
     fee_category,
     fee_category_canonical: canonicalCat,
+    is_apparel_or_shoes: isApparelOrShoes,
     r_physical: physical_return_fraction,
-    return_threshold: appCheck.value ? null : threshold,
+    return_threshold: isApparelOrShoes ? null : threshold,
     per_return_fee_usd: perReturnFee,
     extra_lb_steps: extraWholeLbs,
     excess_return_fraction: excessFraction,
@@ -868,6 +1600,8 @@ export function lookupBulkyReturnsProcessing2027({
     source_url: FBA_2027_METADATA.official_sources.returns,
   };
 }
+
+export const lookupUnifiedReturnsProcessing2027 = lookupBulkyReturnsProcessing2027;
 
 /**
  * Validate a public logged-out guest Amazon Revenue Calculator (`https://sellercentral.amazon.com/revcalpublic`)
@@ -941,19 +1675,54 @@ export function validateGuestRevcalReadback(raw = {}) {
 
 /**
  * Compute median packaged specs across `3–5` (or >=1 with low-peer warning) matched Amazon FBA peers.
- * Never overwrites Amazon retail package specs with 1688 nominal box specs; instead flags cliff-crossing
- * 1688 nominal box specs into a stress package + `'拿样必测彩盒压线预警'`.
+ * Prioritizes SP-API official `catalogItems_getCatalogItem` package records over stale SellerSprite cached
+ * dimensions for the same ASIN, and never overwrites Amazon retail package specs with 1688 nominal box specs
+ * (flagging cliff-crossing 1688 nominal box specs with `'拿样必测彩盒压线预警'` without splitting primary scenarios).
  */
 export function computeMatchedPeerMedianPackage(peers = [], { supplier_nominal_pkg = null } = {}) {
   if (!Array.isArray(peers) || peers.length === 0) {
     throw new TypeError('computeMatchedPeerMedianPackage requires a nonempty peers array.');
   }
+  const isSpApiOfficial = p => Boolean(
+    p?.is_sp_api_official === true ||
+    /^sp[-_]?api/i.test(String(p?.source ?? p?.dimension_source ?? '')),
+  );
+  const spApiByAsin = new Map();
+  for (const p of peers) {
+    const asin = typeof p?.asin === 'string' && p.asin.trim() ? p.asin.trim().toUpperCase() : null;
+    if (asin && isSpApiOfficial(p) && parsePackage(p)) {
+      spApiByAsin.set(asin, p);
+    }
+  }
+  const overriddenStaleSellerSpriteAsins = [];
+  const seenSpApiAsins = new Set();
   const parsedPeers = [];
   for (const p of peers) {
+    const asin = typeof p?.asin === 'string' && p.asin.trim() ? p.asin.trim().toUpperCase() : null;
+    const officialOverride = asin ? spApiByAsin.get(asin) : null;
+    if (officialOverride) {
+      if (!isSpApiOfficial(p) && !overriddenStaleSellerSpriteAsins.includes(asin)) {
+        overriddenStaleSellerSpriteAsins.push(asin);
+      }
+      if (seenSpApiAsins.has(asin)) continue;
+      seenSpApiAsins.add(asin);
+      const dims = parsePackage(officialOverride);
+      if (!dims) continue;
+      parsedPeers.push({
+        asin,
+        is_sp_api_official: true,
+        longest_in: dims.longest_in,
+        median_in: dims.median_in,
+        shortest_in: dims.shortest_in,
+        unit_weight_lb: dims.unit_weight_lb,
+      });
+      continue;
+    }
     const dims = parsePackage(p);
     if (!dims) continue;
     parsedPeers.push({
-      asin: typeof p?.asin === 'string' ? p.asin.trim().toUpperCase() : null,
+      asin,
+      is_sp_api_official: isSpApiOfficial(p),
       longest_in: dims.longest_in,
       median_in: dims.median_in,
       shortest_in: dims.shortest_in,
@@ -1001,7 +1770,9 @@ export function computeMatchedPeerMedianPackage(peers = [], { supplier_nominal_p
 
   return {
     peer_count: parsedPeers.length,
-    low_peer_warning: parsedPeers.length < 3,
+    sp_api_official_peer_count: parsedPeers.filter(p => p.is_sp_api_official).length,
+    ...(overriddenStaleSellerSpriteAsins.length > 0 ? { overridden_stale_sellersprite_asins: overriddenStaleSellerSpriteAsins } : {}),
+    low_peer_warning: parsedPeers.length < 3 && parsedPeers.every(p => !p.is_sp_api_official),
     peer_asins: parsedPeers.map(p => p.asin).filter(Boolean),
     median_pkg: medianPkg,
     median_size_tier: peerTier.size_tier,
@@ -1458,6 +2229,21 @@ function validateCalculatorVerifiedOverride(override, {
       reason: 'calculator_verified_override cannot certify pre-2027 historical fee schedules for 2027 evaluation.',
     };
   }
+  const has2026PeakExtrapolation = Boolean(
+    active.extrapolated_from_2026 === true ||
+    active.estimated_from_2026 === true ||
+    active.peak_2026_uplift_estimate === true ||
+    (nonEmpty(active.verified_by) && /2026[-_ ]?peak|2026\s*旺季|extrapolat/i.test(active.verified_by)) ||
+    (nonEmpty(active.evidence_ref) && /2026[-_ ]?peak|2026\s*旺季|extrapolat/i.test(active.evidence_ref)) ||
+    (nonEmpty(active.fee_schedule_version) && /2026[-_ ]?peak|2026\s*旺季|extrapolat/i.test(active.fee_schedule_version)) ||
+    (nonEmpty(active.notes) && /2026[-_ ]?peak|2026\s*旺季.*估|按\s*2026/i.test(active.notes)),
+  );
+  if (has2026PeakExtrapolation) {
+    return {
+      valid: false,
+      reason: `2027 holiday-peak FBA fulfillment fees cannot be extrapolated from 2026 peak uplifts (${UNPUBLISHED_2027_PEAK_MARGIN_NOTE}).`,
+    };
+  }
   if (!finite(active.fulfillment_usd) || active.fulfillment_usd <= 0 ||
     !finite(active.storage_per_unit_usd) || active.storage_per_unit_usd <= 0 ||
     !finite(active.placement_usd) || active.placement_usd < 0 ||
@@ -1476,7 +2262,8 @@ function validateCalculatorVerifiedOverride(override, {
     const isOverForRate = parsedDimsForRate
       ? (parsedDimsForRate.longest_in > 18 || parsedDimsForRate.median_in > 14 || parsedDimsForRate.shortest_in > 8 || parsedDimsForRate.unit_weight_lb > 20)
       : false;
-    const hasPkForRate = validWindow(storage_window) && monthsIn(storage_window).some(m => m >= 10);
+    const hasPkForRate = validWindow(storage_window) &&
+      monthsIn(storage_window).some(m => m >= 10);
     const minRate = hasPkForRate ? (isOverForRate ? 1.40 : 2.40) : (isOverForRate ? 0.56 : 0.78);
     if (explicitStorRate + 1e-6 < minRate) {
       return {
@@ -1515,6 +2302,7 @@ function validateCalculatorVerifiedOverride(override, {
           is_dangerous_goods: undefined,
           is_sipp: undefined,
           is_oversize: undefined,
+          requires_amazon_packaging: undefined,
         }
       : rawOverridePkg;
     if (stdFulCheck.status !== 'verified') {
@@ -1544,16 +2332,17 @@ function validateCalculatorVerifiedOverride(override, {
     });
     if (bulkyFloorCheck.status === 'verified' && String(bulkyFloorCheck.size_tier || '').includes('bulky')) {
       const isGuestRevcal = Boolean(active.guest_readback || nonEmpty(active.url) || active.verified_by === 'guest_revcalpublic');
+      const bulkyBasePlusFuel = bulkyFloorCheck.fulfillment_with_fuel_usd ?? bulkyFloorCheck.total_usd;
       const minBulkyFloorUsd = isGuestRevcal
-        ? bulkyFloorCheck.total_usd
-        : (finite(bulkyFloorCheck.tier_first_lb_total_usd) ? bulkyFloorCheck.tier_first_lb_total_usd : bulkyFloorCheck.total_usd);
+        ? bulkyBasePlusFuel
+        : (finite(bulkyFloorCheck.tier_first_lb_total_usd) ? bulkyFloorCheck.tier_first_lb_total_usd : bulkyBasePlusFuel);
       if (active.fulfillment_usd + 0.01 < minBulkyFloorUsd) {
         return {
           valid: false,
           reason: `calculator_verified_override fulfillment_usd ($${active.fulfillment_usd}) understates 2027 Bulky fee floor ($${minBulkyFloorUsd}).`,
         };
       }
-    } else if (bulkyFloorCheck.size_tier === 'oversize_beyond_bulky' || bulkyFloorCheck.size_tier === 'bulky_special_handling') {
+    } else if (String(bulkyFloorCheck.size_tier || '').includes('oversize') || bulkyFloorCheck.size_tier === 'bulky_special_handling') {
       const computedFloor = computeOversizeOrSpecialHandlingFloor2027(floorPkg, targetBand);
       const xlTier = BULKY_2027_TIERS[BULKY_2027_TIERS.length - 1];
       const minOversizeFloorUsd = computedFloor
@@ -1733,13 +2522,38 @@ function estimateGate1AWithLandedCost({
   domestic_freight_usd = null,
   min_landed_domestic_usd = null,
   is_apparel,
+  is_shoes,
+  is_apparel_or_shoes,
   is_dangerous_goods,
   is_sipp,
+  sipp_discount_usd = 0,
   requires_amazon_packaging = undefined,
   low_price_eligible = true,
-  allow_bulky_2027 = false,
+  allow_bulky_2027 = undefined,
+  allow_all_2027_tiers = false,
+  use_default_2027_off_peak_window = false,
+  profile_revision = 59,
+  coupon_campaign_units = 100,
+  coupon_redemption_share = 1,
+  include_coupon_fee = undefined,
+  include_coupon_campaign_flat = true,
   calculator_verified_override = null,
 } = {}, exactLandedUsd = null) {
+  const isR59OrDefaultWin = Boolean((profile_revision ?? 0) >= 59 || use_default_2027_off_peak_window === true);
+  const effectiveSalesWindow = sales_window === undefined && isR59OrDefaultWin
+    ? FBA_2027_DEFAULT_OFF_PEAK_WINDOW
+    : sales_window;
+  const effectiveStorageWindow = storage_window === undefined && isR59OrDefaultWin
+    ? FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW
+    : storage_window;
+  const effectiveInboundWindow = inbound_window === undefined && isR59OrDefaultWin
+    ? FBA_2027_DEFAULT_INBOUND_WINDOW
+    : inbound_window;
+  const useUnified2027Tiers = Boolean(
+    ((profile_revision ?? 0) >= 59 || allow_bulky_2027 === true || allow_all_2027_tiers === true) &&
+    allow_bulky_2027 !== false,
+  );
+
   const pricing = resolveEffectivePricing({
     price_usd,
     list_price_usd,
@@ -1762,18 +2576,18 @@ function estimateGate1AWithLandedCost({
     !finite(margin_floor) || margin_floor < 0.3 || margin_floor >= 1) {
     return { status: 'needs_calculator_verification', reason: 'Missing or invalid numeric Gate 1A inputs.' };
   }
-  if (!validWindow(sales_window) || !validWindow(storage_window) || !validWindow(inbound_window)) {
+  if (!validWindow(effectiveSalesWindow) || !validWindow(effectiveStorageWindow) || !validWindow(effectiveInboundWindow)) {
     return { status: 'needs_calculator_verification', reason: 'Valid sales_window, storage_window, and inbound_window are all required for Gate 1A.' };
   }
-  if (sales_window.from.slice(0, 4) !== sales_window.through.slice(0, 4) ||
-    storage_window.from.slice(0, 4) !== storage_window.through.slice(0, 4) ||
-    sales_window.from.slice(0, 4) !== storage_window.from.slice(0, 4)) {
+  if (effectiveSalesWindow.from.slice(0, 4) !== effectiveSalesWindow.through.slice(0, 4) ||
+    effectiveStorageWindow.from.slice(0, 4) !== effectiveStorageWindow.through.slice(0, 4) ||
+    effectiveSalesWindow.from.slice(0, 4) !== effectiveStorageWindow.from.slice(0, 4)) {
     return { status: 'needs_calculator_verification', reason: 'sales_window and storage_window must share a single target year (2027).' };
   }
-  if (inbound_window.from > sales_window.through) {
+  if (effectiveInboundWindow.from > effectiveSalesWindow.through) {
     return { status: 'needs_calculator_verification', reason: 'inbound_window cannot begin after sales_window ends.' };
   }
-  if (inbound_window.from < FBA_2027_METADATA.placement_effective_from) {
+  if (effectiveInboundWindow.from < FBA_2027_METADATA.placement_effective_from) {
     return { status: 'needs_calculator_verification', reason: 'inbound_window precedes 2027-01-15 placement schedule.' };
   }
   if (min_landed_domestic_usd !== null && min_landed_domestic_usd !== undefined &&
@@ -1784,17 +2598,23 @@ function estimateGate1AWithLandedCost({
     ? refund_fraction
     : physical_return_fraction;
 
+  const hasOngoingCoupon = ((ongoing_coupon_usd ?? 0) > 0 || (ongoing_coupon_pct ?? 0) > 0);
+  const hasPrimeDiscount = ((prime_exclusive_discount_usd ?? 0) > 0 || (prime_exclusive_discount_pct ?? 0) > 0);
+  const isR59Coupon = Boolean((profile_revision ?? 0) >= 59 && hasOngoingCoupon);
+  // Under official Amazon US Coupon rules (r59), $10/$50 FBA fulfillment tier is determined by standard list price when a Coupon is active.
+  const fulfillmentTierPriceUsd = isR59Coupon && !hasPrimeDiscount ? pricing.list_price_usd : effectivePriceUsd;
+
   let fulfillment, storage, placement, returns;
   let overrideReceipt = null;
   if (calculator_verified_override !== null && calculator_verified_override !== undefined) {
     const ov = validateCalculatorVerifiedOverride(calculator_verified_override, {
-      price_usd: effectivePriceUsd,
+      price_usd: fulfillmentTierPriceUsd,
       pkg,
-      sales_window,
-      storage_window,
+      sales_window: effectiveSalesWindow,
+      storage_window: effectiveStorageWindow,
       rPhysical,
       fee_category,
-      is_apparel,
+      is_apparel: is_apparel ?? is_apparel_or_shoes,
       is_dangerous_goods,
       is_sipp,
     });
@@ -1810,37 +2630,53 @@ function estimateGate1AWithLandedCost({
     const effReqPkg = requires_amazon_packaging !== undefined ? requires_amazon_packaging : pkg?.requires_amazon_packaging;
     fulfillment = lookupBulkyFulfillmentFee2027({
       pkg,
-      price_usd: effectivePriceUsd,
-      sales_window,
+      price_usd: fulfillmentTierPriceUsd,
+      sales_window: effectiveSalesWindow,
       is_apparel,
+      is_shoes,
+      is_apparel_or_shoes,
       is_dangerous_goods,
       is_sipp,
+      sipp_discount_usd,
       requires_amazon_packaging: effReqPkg,
       low_price_eligible,
+      fee_category,
     });
     if (fulfillment.status !== 'verified') return fulfillment;
-    const isBulkyTier = fulfillment.size_tier !== 'small_standard' && fulfillment.size_tier !== 'large_standard';
-    if (allow_bulky_2027 === true && isBulkyTier && (is_sipp ?? pkg?.is_sipp ?? false) !== true && typeof effReqPkg !== 'boolean') {
-      return {
-        status: 'needs_calculator_verification',
-        size_tier: fulfillment.size_tier,
-        reason: 'Non-SIPP Bulky Gate 1A / forward pricing requires explicit boolean requires_amazon_packaging (GFGVB6C7ZF38285W $1.51–$4.04 packaging service fee).',
-      };
-    }
-    storage = lookupBulkyStorageFee2027({ pkg, storage_window, average_inventory_days, is_dangerous_goods });
+    storage = lookupBulkyStorageFee2027({
+      pkg,
+      storage_window: effectiveStorageWindow,
+      average_inventory_days,
+      is_apparel,
+      is_dangerous_goods,
+    });
     if (storage.status !== 'verified') return storage;
     placement = finite(placement_usd) && placement_usd >= 0
       ? { status: 'verified', selected_usd: round(placement_usd), range_usd: [round(placement_usd), round(placement_usd)], split_option: 'explicit' }
-      : (allow_bulky_2027 === true
-        ? lookupBulkyPlacementFee2027({ pkg, inbound_window, split_option: placement_split_option, is_dangerous_goods })
-        : lookupPlacementFee2027({ pkg, inbound_window, split_option: placement_split_option, is_dangerous_goods }));
+      : (useUnified2027Tiers
+        ? lookupBulkyPlacementFee2027({ pkg, inbound_window: effectiveInboundWindow, split_option: placement_split_option, is_apparel, is_dangerous_goods })
+        : lookupPlacementFee2027({ pkg, inbound_window: effectiveInboundWindow, split_option: placement_split_option, is_dangerous_goods }));
     if (placement.status !== 'verified') return placement;
-    returns = allow_bulky_2027 === true
+    returns = useUnified2027Tiers
       ? lookupBulkyReturnsProcessing2027({
-        pkg, physical_return_fraction: rPhysical, fee_category, return_threshold, sales_window, is_apparel_or_shoes: is_apparel, is_dangerous_goods,
+        pkg,
+        physical_return_fraction: rPhysical,
+        fee_category,
+        return_threshold,
+        sales_window: effectiveSalesWindow,
+        is_apparel,
+        is_shoes,
+        is_apparel_or_shoes,
+        is_dangerous_goods,
       })
       : lookupReturnsProcessing2027({
-        pkg, physical_return_fraction: rPhysical, fee_category, return_threshold, sales_window, is_apparel_or_shoes: is_apparel, is_dangerous_goods,
+        pkg,
+        physical_return_fraction: rPhysical,
+        fee_category,
+        return_threshold,
+        sales_window: effectiveSalesWindow,
+        is_apparel_or_shoes: is_apparel_or_shoes ?? is_apparel,
+        is_dangerous_goods,
       });
     if (returns.status !== 'verified') return returns;
   }
@@ -1852,6 +2688,17 @@ function estimateGate1AWithLandedCost({
     return { status: 'needs_calculator_verification', reason: err.message };
   }
 
+  const couponFee = isR59Coupon && include_coupon_fee !== false
+    ? computeAmazonCouponRedemptionFee2027({
+      net_effective_price_usd: effectivePriceUsd,
+      ongoing_coupon_usd,
+      ongoing_coupon_pct,
+      coupon_redemption_share,
+      coupon_campaign_units,
+      include_campaign_flat_usd: include_coupon_campaign_flat,
+    })
+    : { applicable: false, per_unit_usd: 0, variable_2_5pct_usd: 0, campaign_flat_per_unit_usd: 0, exact_usd_rational: { n: 0n, d: 1n } };
+
   const netRevenue = effectivePriceUsd * (1 - refund_fraction);
   const amazonDeductions = [
     referral.net_usd,
@@ -1859,6 +2706,7 @@ function estimateGate1AWithLandedCost({
     placement.selected_usd,
     storage.per_unit_usd,
     returns.expected_fee_per_shipped_unit_usd,
+    ...(couponFee.applicable && couponFee.per_unit_usd > 0 ? [couponFee.per_unit_usd] : []),
     ...(other_payee === 'amazon' && other_applicable_usd > 0 ? [other_applicable_usd] : []),
   ];
   const payout = collectionFromDisbursement({
@@ -1875,6 +2723,7 @@ function estimateGate1AWithLandedCost({
     placement.selected_usd +
     storage.per_unit_usd +
     returns.expected_fee_per_shipped_unit_usd +
+    couponFee.per_unit_usd +
     payout.collection_usd +
     other_applicable_usd,
   );
@@ -1900,6 +2749,7 @@ function estimateGate1AWithLandedCost({
     placement.selected_usd,
     storage.per_unit_usd,
     returns.expected_fee_per_shipped_unit_usd,
+    couponFee.per_unit_usd,
     payout.collection_usd,
     other_applicable_usd,
   ];
@@ -1924,6 +2774,10 @@ function estimateGate1AWithLandedCost({
     } : {}),
     size_tier: fulfillment.size_tier,
     price_band: fulfillment.price_band,
+    ...(isR59Coupon ? {
+      fulfillment_tier_price_basis: !hasPrimeDiscount ? 'list_price_usd' : 'net_effective_price_usd',
+      coupon_fee_usd: couponFee.per_unit_usd,
+    } : {}),
     net_revenue_usd: round(netRevenue),
     fx_cny_per_usd,
     non_domestic_cost_a_usd: nonDomesticCostA,
@@ -1939,6 +2793,16 @@ function estimateGate1AWithLandedCost({
       placement,
       storage,
       returns_processing: returns,
+      ...(couponFee.applicable ? {
+        coupon_fee: {
+          applicable: true,
+          per_unit_usd: couponFee.per_unit_usd,
+          variable_2_5pct_usd: couponFee.variable_2_5pct_usd,
+          campaign_flat_per_unit_usd: couponFee.campaign_flat_per_unit_usd,
+          coupon_campaign_units: couponFee.coupon_campaign_units,
+          coupon_redemption_share: couponFee.coupon_redemption_share,
+        },
+      } : {}),
       collection: payout,
       headhaul_usd: round(headhaul_usd),
       other_applicable_usd: round(other_applicable_usd),
@@ -2514,4 +3378,511 @@ export function computeOrderPlan({
     moq_capital_alert: allocatedSets >= 300 || actualCompleteSets >= 300,
     sku_lines: linesWithRemainders,
   };
+}
+
+const SIZE_TIER_RANK_2027 = Object.freeze({
+  small_standard: 1,
+  large_standard: 2,
+  small_bulky: 3,
+  medium_bulky: 4,
+  large_bulky: 5,
+  extra_large_bulky: 6,
+  small_oversize: 7,
+  medium_oversize: 8,
+  large_oversize: 9,
+  long_oversize: 10,
+  special_oversize_light: 11,
+  special_oversize_heavy: 12,
+});
+
+const AXIS_LABEL_ZH = Object.freeze({
+  length: '长度',
+  width: '宽度',
+  height: '高度',
+});
+
+const ROLE_LABEL_ZH = Object.freeze({
+  longest: '最长边',
+  median: '次长边',
+  shortest: '最短边',
+});
+
+function subBigRatLocal(a, b) {
+  return addBigRat(a, { n: -b.n, d: b.d });
+}
+
+function floorBigRatDecimal(r, decimals = 8) {
+  if (r.n <= 0n || r.d <= 0n) return 0;
+  const scale = 10n ** BigInt(decimals);
+  const scaled = (r.n * scale) / r.d;
+  return Number(scaled) / Number(scale);
+}
+
+function ceilBigRatDecimal(r, decimals = 8) {
+  if (r.n <= 0n || r.d <= 0n) return 0;
+  const scale = 10n ** BigInt(decimals);
+  const scaled = ceilDivBig(r.n * scale, r.d);
+  return Number(scaled) / Number(scale);
+}
+
+/**
+ * Packaging Down-Tier Rescuable Check (`packaging_redesign_shortlist`, peer-level with `negotiation_shortlist`).
+ * For a candidate about to be rejected (`margin < 30%`), checks whether:
+ *   1) Compressing a SINGLE package side (`length`, `width`, or `height`) by `> 0 mm` and `<= 10 mm` (`1 cm`,
+ *      exact rational `50/127 in`) crosses a discrete 2027 FBA size-tier, special-handling, or dimensional-fee boundary
+ *      into a lower FBA bracket (leaving the other two sides and unit weight unchanged); AND
+ *   2) Under that single-side `<= 10 mm` compression, 2027 off-peak pre-ad margin reaches `>= 30%`.
+ * Preserves primary margin `< 30%` (`counts_toward_target: false`) and outputs actionable millimeter/savings diagnostics.
+ */
+export function computePackagingRedesignShortlist2027({
+  pkg,
+  price_usd,
+  list_price_usd = undefined,
+  net_effective_price_usd = undefined,
+  ongoing_coupon_usd = undefined,
+  ongoing_coupon_pct = undefined,
+  prime_exclusive_discount_usd = undefined,
+  prime_exclusive_discount_pct = undefined,
+  promo_basis_already_net = false,
+  landed_domestic_usd = null,
+  landed_domestic_cny = null,
+  fx_cny_per_usd = undefined,
+  refund_fraction = undefined,
+  physical_return_fraction = null,
+  fee_category = null,
+  return_threshold = null,
+  referral_terms = undefined,
+  headhaul_usd = undefined,
+  recompute_headhaul_fn = null,
+  collection_rate = undefined,
+  other_applicable_usd = 0,
+  other_payee = 'external',
+  sales_window = FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+  storage_window = FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
+  inbound_window = FBA_2027_DEFAULT_INBOUND_WINDOW,
+  average_inventory_days = 45,
+  placement_split_option = 'minimal_west_conservative',
+  is_apparel,
+  is_shoes,
+  is_apparel_or_shoes,
+  is_dangerous_goods,
+  is_sipp,
+  sipp_discount_usd = 0,
+  requires_amazon_packaging = undefined,
+  low_price_eligible = true,
+  min_retail_price_usd = 29.99,
+  margin_floor = 0.30,
+  max_single_side_overshoot_mm = 10,
+} = {}) {
+  if (!pkg || typeof pkg !== 'object') {
+    return { eligible: false, reason: 'Valid package object is required.' };
+  }
+  if (!finite(max_single_side_overshoot_mm) || max_single_side_overshoot_mm <= 0 || max_single_side_overshoot_mm > 10) {
+    return { eligible: false, reason: 'max_single_side_overshoot_mm must be in (0, 10] mm (hard ceiling 10 mm / 1 cm).' };
+  }
+  if (!finite(fx_cny_per_usd) || fx_cny_per_usd <= 0) {
+    return { eligible: false, reason: 'Explicit positive finite fx_cny_per_usd is required.' };
+  }
+  if (!finite(refund_fraction) || refund_fraction < 0 || refund_fraction >= 1) {
+    return { eligible: false, reason: 'Explicit finite refund_fraction in [0, 1) is required.' };
+  }
+  if (!finite(headhaul_usd) || headhaul_usd < 0) {
+    return { eligible: false, reason: 'Explicit nonnegative finite headhaul_usd is required.' };
+  }
+  if (!finite(collection_rate) || collection_rate < 0 || collection_rate >= 1) {
+    return { eligible: false, reason: 'Explicit finite collection_rate in [0, 1) is required (do not rely on hidden 0.5% default; supply account rate such as 0.006).' };
+  }
+  if (!referral_terms || typeof referral_terms !== 'object') {
+    return { eligible: false, reason: 'Explicit referral_terms object is required.' };
+  }
+  const hasUsd = landed_domestic_usd !== null && landed_domestic_usd !== undefined;
+  const hasCny = landed_domestic_cny !== null && landed_domestic_cny !== undefined;
+  if (!hasUsd && !hasCny) {
+    return { eligible: false, reason: 'landed_domestic_usd or landed_domestic_cny is required.' };
+  }
+  if ((hasUsd && (!finite(landed_domestic_usd) || landed_domestic_usd < 0)) ||
+    (hasCny && (!finite(landed_domestic_cny) || landed_domestic_cny < 0))) {
+    return { eligible: false, reason: 'Landed domestic cost must be a nonnegative finite number.' };
+  }
+  const landedUsdRat = hasUsd ? toBigRat(landed_domestic_usd) : divBigRat(toBigRat(landed_domestic_cny), toBigRat(fx_cny_per_usd));
+  const landedUsd = roundBigRat(landedUsdRat.n, landedUsdRat.d, 10);
+
+  const pricing = resolveEffectivePricing({
+    price_usd,
+    list_price_usd,
+    net_effective_price_usd,
+    ongoing_coupon_usd,
+    ongoing_coupon_pct,
+    prime_exclusive_discount_usd,
+    prime_exclusive_discount_pct,
+    promo_basis_already_net,
+  });
+  if (!pricing.valid || pricing.net_effective_price_usd < min_retail_price_usd) {
+    return { eligible: false, reason: pricing.reason ?? `Effective retail price ($${pricing.net_effective_price_usd}) is below $${min_retail_price_usd} floor.` };
+  }
+
+  const inKeys = ['length_in', 'width_in', 'height_in'];
+  const cmKeys = ['length_cm', 'width_cm', 'height_cm'];
+  const hasIn = inKeys.every(k => finite(pkg[k]) && pkg[k] > 0);
+  const hasCm = cmKeys.every(k => finite(pkg[k]) && pkg[k] > 0);
+  if (!hasIn && !hasCm) {
+    return { eligible: false, reason: 'Package requires complete positive (length, width, height) in inches or cm.' };
+  }
+  const origDims = resolvePackageDimsRat(pkg);
+  if (!origDims || !origDims.wtLbRat) {
+    return { eligible: false, reason: 'Package requires valid positive dimensions and unit weight.' };
+  }
+  const preferCm = !hasIn && hasCm;
+  const cmPerInRat = { n: 127n, d: 50n }; // exact 2.54 cm/in
+  const mmPerInRat = { n: 127n, d: 5n }; // exact 25.4 mm/in
+  const maxMmRat = toBigRat(max_single_side_overshoot_mm);
+  const maxTrimInRat = divBigRat(maxMmRat, mmPerInRat); // for 10 mm: exact 50/127 in
+
+  const baseEvalParams = {
+    price_usd,
+    list_price_usd,
+    net_effective_price_usd,
+    ongoing_coupon_usd,
+    ongoing_coupon_pct,
+    prime_exclusive_discount_usd,
+    prime_exclusive_discount_pct,
+    promo_basis_already_net,
+    fx_cny_per_usd,
+    refund_fraction,
+    physical_return_fraction,
+    fee_category,
+    return_threshold,
+    referral_terms,
+    collection_rate,
+    other_applicable_usd,
+    other_payee,
+    sales_window,
+    storage_window,
+    inbound_window,
+    average_inventory_days,
+    placement_usd: null,
+    placement_split_option,
+    margin_floor,
+    is_apparel,
+    is_shoes,
+    is_apparel_or_shoes,
+    is_dangerous_goods,
+    is_sipp,
+    sipp_discount_usd,
+    requires_amazon_packaging,
+    low_price_eligible,
+    allow_bulky_2027: true,
+    allow_all_2027_tiers: true,
+    profile_revision: 59,
+  };
+
+  const origEst = estimateGate1AWithLandedCost({
+    ...baseEvalParams,
+    pkg,
+    headhaul_usd,
+  }, landedUsdRat);
+  if (origEst.status !== 'verified') {
+    return { eligible: false, reason: origEst.reason };
+  }
+  if (!origEst.zero_browser_fail) {
+    return { eligible: false, reason: 'Scenario already meets or exceeds the 30% margin floor on original package.' };
+  }
+
+  const origContribUsd = round(origEst.net_revenue_usd - (origEst.non_domestic_cost_a_usd + landedUsd));
+  const origMargin = origContribUsd / origEst.net_revenue_usd;
+  const origFul = origEst.components.fulfillment;
+  const origPlc = origEst.components.placement;
+  const origSto = origEst.components.storage;
+  const origRet = origEst.components.returns_processing;
+  const origFbaTotalUsd = round(
+    origFul.total_usd +
+    origPlc.selected_usd +
+    origSto.per_unit_usd +
+    origRet.expected_fee_per_shipped_unit_usd,
+  );
+  const origTierRank = SIZE_TIER_RANK_2027[origEst.size_tier] ?? 99;
+
+  const axes = [
+    {
+      axis: 'length',
+      inKey: 'length_in',
+      cmKey: 'length_cm',
+      inRat: preferCm ? divBigRat(toBigRat(pkg.length_cm), cmPerInRat) : toBigRat(pkg.length_in),
+    },
+    {
+      axis: 'width',
+      inKey: 'width_in',
+      cmKey: 'width_cm',
+      inRat: preferCm ? divBigRat(toBigRat(pkg.width_cm), cmPerInRat) : toBigRat(pkg.width_in),
+    },
+    {
+      axis: 'height',
+      inKey: 'height_in',
+      cmKey: 'height_cm',
+      inRat: preferCm ? divBigRat(toBigRat(pkg.height_cm), cmPerInRat) : toBigRat(pkg.height_in),
+    },
+  ];
+  const sortedIdx = [0, 1, 2].sort((a, b) => ratCmp(axes[b].inRat, axes[a].inRat));
+  axes[sortedIdx[0]].role = 'longest';
+  axes[sortedIdx[1]].role = 'median';
+  axes[sortedIdx[2]].role = 'shortest';
+
+  // Direct inclusive single-axis ceilings in inches across all 12 official 2027 US FBA tiers + Flat/Overhang handling boundaries
+  const directBoundariesIn = [
+    { n: 3n, d: 4n },   // 0.75 in Small Standard shortest
+    { n: 4n, d: 1n },   // 4 in Oversize Flat Product shortest
+    { n: 8n, d: 1n },   // 8 in Large Standard shortest
+    { n: 10n, d: 1n },  // 10 in auxiliary boundary
+    { n: 12n, d: 1n },  // 12 in Small Standard median
+    { n: 14n, d: 1n },  // 14 in Large Standard median
+    { n: 15n, d: 1n },  // 15 in Small Standard longest
+    { n: 16n, d: 1n },  // 16 in auxiliary boundary
+    { n: 18n, d: 1n },  // 18 in Large Standard longest
+    { n: 20n, d: 1n },  // 20 in Small/Medium Bulky shortest
+    { n: 22n, d: 1n },  // 22 in auxiliary boundary
+    { n: 24n, d: 1n },  // 24 in Small Bulky median
+    { n: 25n, d: 1n },  // 25 in Oversize Flat Product median
+    { n: 26n, d: 1n },  // 26 in auxiliary boundary
+    { n: 28n, d: 1n },  // 28 in Small Bulky longest / Medium Bulky median / Large Bulky median & shortest
+    { n: 30n, d: 1n },  // 30 in auxiliary boundary
+    { n: 32n, d: 1n },  // 32 in auxiliary boundary
+    { n: 33n, d: 1n },  // 33 in Extra-Large Bulky median & shortest
+    { n: 36n, d: 1n },  // 36 in auxiliary boundary
+    { n: 37n, d: 1n },  // 37 in Medium Bulky longest
+    { n: 40n, d: 1n },  // 40 in auxiliary boundary
+    { n: 43n, d: 1n },  // 43 in Oversize Overhang median
+    { n: 46n, d: 1n },  // 46 in auxiliary boundary
+    { n: 47n, d: 1n },  // 47 in auxiliary boundary
+    { n: 49n, d: 1n },  // 49 in auxiliary boundary
+    { n: 52n, d: 1n },  // 52 in Large Bulky longest
+    { n: 59n, d: 1n },  // 59 in Extra-Large Bulky longest
+    { n: 60n, d: 1n },  // 60 in auxiliary boundary
+    { n: 61n, d: 1n },  // 61 in auxiliary boundary
+    { n: 70n, d: 1n },  // 70 in auxiliary boundary
+    { n: 72n, d: 1n },  // 72 in Small Oversize longest
+    { n: 78n, d: 1n },  // 78 in Medium Oversize longest
+    { n: 96n, d: 1n },  // 96 in Large Oversize longest
+    { n: 108n, d: 1n }, // 108 in Long Oversize longest
+  ];
+  // Strict `< 25 in` median boundary for Oversize Flat Product (`shortest < 4 && median >= 25`)
+  const strictEpsIn = { n: 1n, d: 2540n }; // 0.01 mm
+
+  const validCandidates = [];
+
+  for (let i = 0; i < 3; i++) {
+    const ax = axes[i];
+    const other1 = axes[(i + 1) % 3].inRat;
+    const other2 = axes[(i + 2) % 3].inRat;
+    const minAllowedInRat = subBigRatLocal(ax.inRat, maxTrimInRat);
+    if (minAllowedInRat.n <= 0n) continue;
+
+    const candidateRats = [];
+    const pushIfInWindow = targetInRat => {
+      if (!targetInRat || targetInRat.d <= 0n || targetInRat.n <= 0n) return;
+      if (ratCmp(targetInRat, ax.inRat) < 0 && ratCmp(targetInRat, minAllowedInRat) >= 0) {
+        candidateRats.push(targetInRat);
+      }
+    };
+
+    // 1) Direct dimensional boundaries + strict `< 25 in` Flat Product boundary
+    for (const b of directBoundariesIn) pushIfInWindow(b);
+    pushIfInWindow(subBigRatLocal({ n: 25n, d: 1n }, strictEpsIn));
+
+    // 2) Length + Girth boundaries (`130 in` and `165 in`)
+    const otherMax = ratMax(other1, other2);
+    const otherMin = ratCmp(other1, other2) <= 0 ? other1 : other2;
+    for (const gCap of [130n, 165n]) {
+      // Case A: candidate remains >= otherMax (`cand + 2*(other1 + other2) <= gCap`)
+      pushIfInWindow(subBigRatLocal({ n: gCap, d: 1n }, mulBigRat({ n: 2n, d: 1n }, addBigRat(other1, other2))));
+      // Case B: `otherMax` becomes longest (`otherMax + 2*(cand + otherMin) <= gCap => cand <= (gCap - otherMax)/2 - otherMin`)
+      pushIfInWindow(subBigRatLocal(divBigRat(subBigRatLocal({ n: gCap, d: 1n }, otherMax), { n: 2n, d: 1n }), otherMin));
+    }
+
+    // 3) Standard dim-weight quarter-lb boundaries `(ax' * other1 * other2) / 139 <= k / 4`
+    const prodOthers = mulBigRat(other1, other2);
+    const origStdDim4 = divBigRat(mulBigRat(mulBigRat(ax.inRat, prodOthers), { n: 4n, d: 1n }), { n: 139n, d: 1n });
+    const minStdDim4 = divBigRat(mulBigRat(mulBigRat(minAllowedInRat, prodOthers), { n: 4n, d: 1n }), { n: 139n, d: 1n });
+    const maxQuarterK = Number((origStdDim4.n - 1n) / origStdDim4.d);
+    const minQuarterK = Math.max(1, Number(ceilDivBig(minStdDim4.n, minStdDim4.d)));
+    if (maxQuarterK >= minQuarterK && (maxQuarterK - minQuarterK) <= 64) {
+      for (let k = maxQuarterK; k >= minQuarterK; k--) {
+        const wCapRat = { n: BigInt(k), d: 4n };
+        pushIfInWindow(divBigRat(mulBigRat({ n: 139n, d: 1n }, wCapRat), prodOthers));
+      }
+    }
+
+    // 4) Bulky/Oversize 2-inch-clamped dim-weight whole-lb boundaries + strict `< 45 lb` packaging boundary
+    // Case A: `ax'` is longest (`s1 = ax'`, `s2 = max(otherMax, 2)`, `s3 = max(otherMin, 2)`)
+    const bulkyProdOthersLongest = mulBigRat(ratMax(otherMax, { n: 2n, d: 1n }), ratMax(otherMin, { n: 2n, d: 1n }));
+    // Case B: `otherMax` is longest (`s1 = otherMax`, `otherMinClamped = max(otherMin, 2)`, `ax' >= 2`)
+    const bulkyProdOthersSub = mulBigRat(otherMax, ratMax(otherMin, { n: 2n, d: 1n }));
+    for (const denomProd of [bulkyProdOthersLongest, bulkyProdOthersSub]) {
+      const origDimLb = divBigRat(mulBigRat(ax.inRat, denomProd), { n: 139n, d: 1n });
+      const minDimLb = divBigRat(mulBigRat(minAllowedInRat, denomProd), { n: 139n, d: 1n });
+      const maxWholeLb = Number((origDimLb.n - 1n) / origDimLb.d);
+      const minWholeLb = Math.max(1, Number(ceilDivBig(minDimLb.n, minDimLb.d)));
+      if (maxWholeLb >= minWholeLb && (maxWholeLb - minWholeLb) <= 64) {
+        for (let lb = maxWholeLb; lb >= minWholeLb; lb--) {
+          pushIfInWindow(divBigRat({ n: 139n * BigInt(lb), d: 1n }, denomProd));
+        }
+      }
+      // Strict `< 45 lb` Bulky non-SIPP packaging boundary ($3.80 vs $4.04)
+      pushIfInWindow(subBigRatLocal(divBigRat({ n: 139n * 45n, d: 1n }, denomProd), strictEpsIn));
+    }
+
+    // 5) Also include the exact maximum legal `<= max_single_side_overshoot_mm` trim point
+    pushIfInWindow(minAllowedInRat);
+
+    // Deduplicate converted decimal candidates on this axis
+    const seenVals = new Set();
+    for (const targetInRat of candidateRats) {
+      let candPkg;
+      if (preferCm) {
+        const targetCmRat = mulBigRat(targetInRat, cmPerInRat);
+        // Use floor to stay at/below cliff, falling back to ceil(minAllowedCm) if floor slightly overshoots max_mm
+        let candCm = floorBigRatDecimal(targetCmRat, 8);
+        const minAllowedCm = ceilBigRatDecimal(mulBigRat(minAllowedInRat, cmPerInRat), 8);
+        if (candCm < minAllowedCm) candCm = minAllowedCm;
+        if (!(candCm > 0 && candCm < pkg[ax.cmKey])) continue;
+        if (seenVals.has(candCm)) continue;
+        seenVals.add(candCm);
+        candPkg = { ...pkg };
+        delete candPkg.length_in;
+        delete candPkg.width_in;
+        delete candPkg.height_in;
+        candPkg[ax.cmKey] = candCm;
+      } else {
+        let candIn = floorBigRatDecimal(targetInRat, 8);
+        const minAllowedIn = ceilBigRatDecimal(minAllowedInRat, 8);
+        if (candIn < minAllowedIn) candIn = minAllowedIn;
+        if (!(candIn > 0 && candIn < pkg[ax.inKey])) continue;
+        if (seenVals.has(candIn)) continue;
+        seenVals.add(candIn);
+        candPkg = { ...pkg };
+        delete candPkg.length_cm;
+        delete candPkg.width_cm;
+        delete candPkg.height_cm;
+        candPkg[ax.inKey] = candIn;
+      }
+
+      const candAxisInRat = preferCm
+        ? divBigRat(toBigRat(candPkg[ax.cmKey]), cmPerInRat)
+        : toBigRat(candPkg[ax.inKey]);
+      const deltaInRat = subBigRatLocal(ax.inRat, candAxisInRat);
+      const overshootMmRat = mulBigRat(deltaInRat, mmPerInRat);
+      if (ratCmp(overshootMmRat, { n: 0n, d: 1n }) <= 0 || ratCmp(overshootMmRat, maxMmRat) > 0) {
+        continue;
+      }
+
+      const candHeadhaulUsd = typeof recompute_headhaul_fn === 'function'
+        ? recompute_headhaul_fn(candPkg)
+        : headhaul_usd;
+      const candEst = estimateGate1AWithLandedCost({
+        ...baseEvalParams,
+        pkg: candPkg,
+        headhaul_usd: candHeadhaulUsd,
+      }, landedUsdRat);
+      if (candEst.status !== 'verified' || candEst.zero_browser_fail) {
+        continue;
+      }
+
+      // Enforce that the single-side trim genuinely crossed into a lower discrete FBA tier, handling rule, or fee bracket
+      // (reject pure continuous storage cubic-foot shaves that cross zero FBA bracket boundaries).
+      const candFul = candEst.components.fulfillment;
+      const candPlc = candEst.components.placement;
+      const candSto = candEst.components.storage;
+      const candRet = candEst.components.returns_processing;
+      const candTierRank = SIZE_TIER_RANK_2027[candEst.size_tier] ?? 99;
+      const sizeTierDropped = candTierRank < origTierRank;
+      const specialHandlingDropped = (candFul.special_handling_fee_usd ?? 0) + 1e-6 < (origFul.special_handling_fee_usd ?? 0);
+      const discreteBracketDropped =
+        candFul.total_usd + 1e-6 < origFul.total_usd ||
+        candPlc.selected_usd + 1e-6 < origPlc.selected_usd ||
+        (candRet.per_return_fee_usd ?? 0) + 1e-6 < (origRet.per_return_fee_usd ?? 0);
+      if (!sizeTierDropped && !specialHandlingDropped && !discreteBracketDropped) {
+        continue;
+      }
+
+      const candFbaTotalUsd = round(
+        candFul.total_usd +
+        candPlc.selected_usd +
+        candSto.per_unit_usd +
+        candRet.expected_fee_per_shipped_unit_usd,
+      );
+      const fbaSavingsUsd = round(origFbaTotalUsd - candFbaTotalUsd);
+      if (fbaSavingsUsd <= 0) continue;
+
+      const candContribUsd = round(candEst.net_revenue_usd - (candEst.non_domestic_cost_a_usd + landedUsd));
+      const candMargin = candContribUsd / candEst.net_revenue_usd;
+      const jumpKind = sizeTierDropped
+        ? 'size_tier_drop'
+        : (specialHandlingDropped ? 'special_handling_drop' : 'weight_or_packaging_bracket_drop');
+      const jumpPriority = sizeTierDropped ? 1 : (specialHandlingDropped ? 2 : 3);
+      const origAxisCmRat = mulBigRat(ax.inRat, cmPerInRat);
+      const candAxisCmRat = mulBigRat(candAxisInRat, cmPerInRat);
+      const overshootMm = roundBigRat(overshootMmRat.n, overshootMmRat.d, 4);
+      const overshootIn = roundBigRat(deltaInRat.n, deltaInRat.d, 6);
+      const sideLabelZh = `${AXIS_LABEL_ZH[ax.axis]}（${ROLE_LABEL_ZH[ax.role]}）`;
+
+      const summaryZh = `单边压线可救：${sideLabelZh} 仅超红线 ${overshootMm.toFixed(2).replace(/\.?0+$/, '')} mm（≤${max_single_side_overshoot_mm} mm），缩至 ${roundBigRat(candAxisCmRat.n, candAxisCmRat.d, 2)} cm（${roundBigRat(candAxisInRat.n, candAxisInRat.d, 2)} in）降入 ${candEst.size_tier} 档，单件省 FBA 费 $${fbaSavingsUsd.toFixed(2)}，2027 淡季毛利率由 ${(origMargin * 100).toFixed(2)}% 升至 ${(candMargin * 100).toFixed(2)}%（原主毛利仍如实标 <30%，交主人看实物结构拍板）。`;
+
+      validCandidates.push({
+        jumpPriority,
+        overshootMmRat,
+        candMargin,
+        payload: {
+          eligible: true,
+          advisory_pool: 'packaging_redesign_shortlist',
+          counts_toward_target: false,
+          primary_margin_preserved_below_floor: true,
+          price_usd: pricing.net_effective_price_usd,
+          offending_axis: ax.axis,
+          offending_role: ax.role,
+          offending_side: ax.role,
+          offending_side_label_zh: sideLabelZh,
+          original_dim_in: roundBigRat(ax.inRat.n, ax.inRat.d, 4),
+          original_dim_cm: roundBigRat(origAxisCmRat.n, origAxisCmRat.d, 4),
+          target_dim_in: roundBigRat(candAxisInRat.n, candAxisInRat.d, 4),
+          target_dim_cm: roundBigRat(candAxisCmRat.n, candAxisCmRat.d, 4),
+          overshoot_in: overshootIn,
+          overshoot_mm: overshootMm,
+          max_allowed_overshoot_mm: max_single_side_overshoot_mm,
+          tier_jump_kind: jumpKind,
+          original_size_tier: origEst.size_tier,
+          target_size_tier: candEst.size_tier,
+          trimmed_size_tier: candEst.size_tier,
+          original_weight_bracket: origFul.weight_bracket ?? null,
+          target_weight_bracket: candFul.weight_bracket ?? null,
+          original_fba_total_usd: origFbaTotalUsd,
+          target_fba_total_usd: candFbaTotalUsd,
+          fba_fee_savings_usd: fbaSavingsUsd,
+          original_margin: round(origMargin),
+          redesigned_margin: round(candMargin),
+          trimmed_margin: round(candMargin),
+          original_contribution_usd: origContribUsd,
+          redesigned_contribution_usd: candContribUsd,
+          redesigned_pkg: candPkg,
+          summary_zh: summaryZh,
+          note: summaryZh,
+        },
+      });
+    }
+  }
+
+  if (validCandidates.length === 0) {
+    return {
+      eligible: false,
+      original_size_tier: origEst.size_tier,
+      original_margin: round(origMargin),
+      max_allowed_overshoot_mm: max_single_side_overshoot_mm,
+      reason: `No single-side package trim <= ${max_single_side_overshoot_mm} mm drops an FBA tier/bracket into >= ${(margin_floor * 100).toFixed(0)}% 2027 off-peak margin.`,
+    };
+  }
+
+  validCandidates.sort((a, b) =>
+    a.jumpPriority - b.jumpPriority ||
+    ratCmp(a.overshootMmRat, b.overshootMmRat) ||
+    b.candMargin - a.candMargin,
+  );
+  return validCandidates[0].payload;
 }

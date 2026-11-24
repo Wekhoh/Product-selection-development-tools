@@ -291,7 +291,7 @@ def render_contact_sheet(
         reviews = item.get("reviews", item.get("review_count", item.get("ratings")))
         rating = item.get("rating")
         rating_str = f"{rating:.1f}*" if isinstance(rating, (int, float)) else "-"
-        fulfill = safe_text(item.get("fulfillment_channel", item.get("fulfillment")), "FBA")
+        fulfill = safe_text(item.get("fulfillment_channel", item.get("fulfillment")), "UNKNOWN")
         fba_fee = item.get("fba_fee_usd")
         fba_str = f"FBA {fmt_money(fba_fee)}" if isinstance(fba_fee, (int, float)) else fulfill
         raw_dims = safe_text(item.get("pkgDimensions", item.get("pkg_dimensions")), "")

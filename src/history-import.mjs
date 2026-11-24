@@ -558,7 +558,8 @@ export function replayBatchIntoStore(store, {
   if (!batch || typeof batch !== 'object') throw new TypeError('batch object is required.');
   if (!profile || typeof profile !== 'object') throw new TypeError('profile object is required.');
 
-  const effectiveFeeSnapshot = fee_table_snapshot ?? getFba2027RateTableSnapshot();
+  const effectiveRev = Number(profile.revision ?? batch.profile_revision ?? 58);
+  const effectiveFeeSnapshot = fee_table_snapshot ?? getFba2027RateTableSnapshot({ profileRevision: effectiveRev });
   const manifest = discovery ? prepareDiscovery(discovery.pool, discovery.decisions) : null;
   const boundBatch = manifest ? attachDiscovery(batch, manifest) : batch;
   const result = scoreBatch(boundBatch, profile);
@@ -690,6 +691,7 @@ export function replayBatchIntoStore(store, {
           html_sha256: batchHtmlSha,
           receipt: {
             profile_revision: profile.revision,
+            form_spec_sha256: replaySpecSha,
             batch_result_sha256: batchResultSha,
             batch_html_sha256: batchHtmlSha,
             summary: result.summary,

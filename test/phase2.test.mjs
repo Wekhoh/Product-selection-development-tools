@@ -68,6 +68,7 @@ async function withTempDirAsync(fn) {
 
 function makeStandardGate1AScenario(overrides = {}) {
   return {
+    profile_revision: 58,
     id: 'off-peak-standard',
     pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
     price_usd: 54.99,
@@ -1053,6 +1054,7 @@ test('Phase 2 Gate 1A never zero-browser rejects when fee lookup returns needs_c
   });
   const res = runGate1AForForm(store, {
     form_id: 'form-bulky-unknown',
+    profile_revision: 58,
     scenarios: [makeStandardGate1AScenario({
       price_usd: 49.99,
       pkg: { length_in: 30, width_in: 20, height_in: 10, weight_lb: 25 },
@@ -1228,6 +1230,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   // Builder trying to forge goods_cny_per_unit: 1 is overridden by authoritative ¥222 persisted quote!
   const forgedRes = await runGate1BForForm(store, {
     form_id: 'f-forge-cost',
+    profile_revision: 58,
     existing_quote: storedExpQuote,
     early_screen_builder: makeEarlyScreenBuilder(54.99, 1, 0),
   });
@@ -1267,6 +1270,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   }).quote;
   const multiRes = await runGate1BForForm(store, {
     form_id: 'f-multi-scen',
+    profile_revision: 58,
     existing_quote: qMulti,
     early_screen_builder: ({ order_plan }) => {
       // #10: Reusing cached verified quote MUST pass a recomputed non-null order_plan!
@@ -1294,6 +1298,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   });
   runGate1AForForm(store, {
     form_id: 'f-multi-allpass',
+    profile_revision: 58,
     scenarios: [
       makeStandardGate1AScenario({ id: 'p55', price_usd: 54.99 }),
       makeStandardGate1AScenario({ id: 'p60', price_usd: 60 }),
@@ -1314,6 +1319,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   }).quote;
   const multiAllPassRes = await runGate1BForForm(store, {
     form_id: 'f-multi-allpass',
+    profile_revision: 58,
     existing_quote: qMultiPass,
     early_screen_builder: () => [
       makeEarlyScreenBuilder(54.99, 100, 2)(),
@@ -1334,6 +1340,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   });
   runGate1AForForm(store, {
     form_id: 'f-date-def',
+    profile_revision: 58,
     scenarios: [makeStandardGate1AScenario({ price_usd: 54.99 })],
   });
   const qDef = store.recordSourcingQuote1688({
@@ -1351,6 +1358,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   }).quote;
   const defRes = await runGate1BForForm(store, {
     form_id: 'f-date-def',
+    profile_revision: 58,
     existing_quote: qDef,
     early_screen_builder: () => ({ ...makeEarlyScreenBuilder(54.99, 80, 1)(), strong_date_dependency: true }),
   });
@@ -2058,6 +2066,7 @@ test('Round-2 Codex Regressions #4, #5, #6, #7: sticky rights conflict, Gate 1A/
     }).quote;
     const negRes = await runGate1BForForm(store, {
       form_id: 'f-neg-best',
+      profile_revision: 58,
       existing_quote: qNeg,
       early_screen_builder: () => [
         makeEarlyScreenBuilder(42, 120, 2)(),
@@ -2156,6 +2165,7 @@ test('Round-2 Codex Regressions #4, #5, #6, #7: sticky rights conflict, Gate 1A/
     let cachedPlanSeen = null;
     await runGate1BForForm(store, {
       form_id: 'f-arr-comp',
+      profile_revision: 58,
       existing_quote: remRec.quote,
       early_screen_builder: ({ order_plan }) => {
         cachedPlanSeen = order_plan;

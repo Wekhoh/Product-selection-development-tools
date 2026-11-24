@@ -115,7 +115,7 @@ export const DISCOVERY_CHANNELS = Object.freeze({
     route: 'in_site_product_market',
     entry_group: 'in_site',
     provider: 'sellersprite',
-    tool_hint: 'asin_list (rating 3.2-4.1, sales >= 150/mo, price >= $35)',
+    tool_hint: 'asin_list (rating 3.2-4.1, steady organic sales, price >= $29.99)',
     non_keyword_origin: true,
     default_opportunity_types: Object.freeze(['supply_gap']),
   }),
@@ -215,7 +215,7 @@ export const DISCOVERY_CHANNELS = Object.freeze({
     route: 'in_site_product_market',
     entry_group: 'in_site',
     provider: 'sellersprite',
-    tool_hint: 'asin_list (sellerNation=US, steady sales, price >= $35)',
+    tool_hint: 'asin_list (sellerNation=US, steady sales, price >= $29.99)',
     non_keyword_origin: true,
     default_opportunity_types: Object.freeze(['steady', 'supply_gap']),
   }),
@@ -404,7 +404,10 @@ function readTableColumns(db, tableName) {
  * and non-keyword origins from the SQLite store (strictly read-only).
  * Reports anti-convergence alerts as diagnostics — NEVER imposes forced quotas.
  */
-export function auditDiscoveryCoverage(store, { as_of_date = new Date().toISOString().slice(0, 10) } = {}) {
+export function auditDiscoveryCoverage(store, {
+  as_of_date = new Date().toISOString().slice(0, 10),
+  profile_revision = 59,
+} = {}) {
   if (!store || !store.db) throw new TypeError('A SelectionStore instance is required.');
   const leadCols = readTableColumns(store.db, 'raw_leads');
   const formCols = readTableColumns(store.db, 'candidate_forms');
@@ -538,7 +541,7 @@ export function auditDiscoveryCoverage(store, { as_of_date = new Date().toISOStr
         message: `All ${totalLeads} leads come from only 1 route (${activeRoutes.join(', ')}); add cross-platform social, supply-gap, or trend discovery.`,
       });
     }
-    if (categorizedLeadsOrForms >= 3) {
+    if (profile_revision < 59 && categorizedLeadsOrForms >= 3) {
       const sortedLeaves = Object.entries(byLeafCategory).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
       const [topLeaf, topLeafCount] = sortedLeaves[0];
       if ((topLeafCount / categorizedLeadsOrForms) > 0.70) {
