@@ -9,7 +9,7 @@ import { openOpenAiBudgetLedger } from '../src/openai/budget-ledger.mjs';
 import { renderReport } from '../src/report.mjs';
 import { scoreBatch } from '../src/scoring.mjs';
 import { buildEvergreen2027OffPeakEconomics } from '../src/raw-ingest.mjs';
-import { estimateGate1A2027 } from '../src/fba-rates-2027.mjs';
+import { estimateGate1A2027 } from '../src/fba-calculator.mjs';
 
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const r59Profile = JSON.parse(readFileSync(join(REPO_ROOT, 'docs', 'design', 'reference-profile.r59.draft.json'), 'utf8'));

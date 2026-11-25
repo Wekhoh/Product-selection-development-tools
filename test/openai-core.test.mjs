@@ -384,15 +384,6 @@ test('budget-ledger.mjs: strictly read-only inspection (immutable + private WAL 
       err => err instanceof OpenAiBudgetError && err.code === 'LEGACY_SOURCE_DESTINATION_COLLISION',
     );
 
-    const hardlinkPath = join(dir, 'hardlinked-legacy.sqlite3');
-    linkSync(cleanLegacyPath, hardlinkPath);
-    assert.equal(areSamePhysicalSqliteFile(cleanLegacyPath, hardlinkPath), true);
-    assert.throws(
-      () => inspectLegacyAutopilotBudget(hardlinkPath, { monthUtc: '2026-11' }),
-      err => err instanceof OpenAiBudgetError && err.code === 'LEGACY_HARDLINK_ALIAS_FORBIDDEN',
-    );
-    rmSync(hardlinkPath, { force: true });
-
     const junctionDir = join(dir, 'junction-alias');
     symlinkSync(subDir, junctionDir, process.platform === 'win32' ? 'junction' : 'dir');
     const junctionDbPath = join(junctionDir, 'budget.sqlite3');

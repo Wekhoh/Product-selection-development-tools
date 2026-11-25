@@ -6,7 +6,7 @@ import { scoreBatch } from '../src/scoring.mjs';
 
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-discovery.json', import.meta.url), 'utf8'));
 const batchFixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 
 test('exact normalized phrases merge without losing original source metrics or form support', () => {
   const original = structuredClone(fixture);

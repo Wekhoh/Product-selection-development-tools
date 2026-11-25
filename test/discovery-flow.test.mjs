@@ -12,7 +12,7 @@ import { prepareDiscovery, attachDiscovery } from '../src/discovery.mjs';
 
 const path = name => fileURLToPath(new URL(name, import.meta.url));
 const batchPath = path('../fixtures/synthetic-batch.json');
-const profilePath = path('../docs/design/reference-profile.draft.json');
+const profilePath = path('../docs/design/reference-profile.r59.draft.json');
 const discoveryPath = path('../fixtures/synthetic-discovery.json');
 const load = async name => JSON.parse(await readFile(name, 'utf8'));
 

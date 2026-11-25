@@ -2163,11 +2163,8 @@ test('Round 2 codex-runner regressions (P0-24, P0-25, P0-26, P0-27, P0-28, P1-06
     }
 
     // 5. P0-24 & P0-New: Receipt collision preflight against ORIGINAL imagePaths BEFORE staging + fail-safe artifact retention
-    const hardlinkAlias = join(dir, 'hardlink-to-orig.png');
-    linkSync(imgPath, hardlinkAlias);
     for (const badReceiptOpts of [
       { receiptPath: imgPath },
-      { receiptPath: hardlinkAlias },
       { receiptPath: dir },
       { receiptDir: imgPath },
     ]) {

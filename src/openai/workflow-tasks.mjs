@@ -1,3 +1,4 @@
+import { BUSINESS_THRESHOLDS } from '../business-thresholds.mjs';
 /**
  * Six first-principles OpenAI workflow task builders, strict deep-frozen JSON Schemas, and post-validators.
  *
@@ -1214,7 +1215,7 @@ function extractTileBindingsFromRequests(requests) {
  * ONLY when actual contact-sheet images were attached (never inferring sheets from `responses.length`).
  */
 export function parseStage1DecisionsResponses(candidates, responses, {
-  prohibitedThreshold = 0.7,
+  prohibitedThreshold = BUSINESS_THRESHOLDS.luna_prohibited_threshold,
   gate0Config = {},
   requests = null,
   contactSheetDataUrl = null,
@@ -1392,7 +1393,7 @@ export function parseStage1DecisionsResponses(candidates, responses, {
       (typeof softAvoidAns.probability === 'number' && softAvoidAns.probability >= 0.5) ||
       softAvoidAns.value === true
     );
-    const isProbReviewWatch = (modelProhibited === false && prohibitedProb !== null && prohibitedProb >= 0.5 && prohibitedProb < prohibitedThreshold) || softAvoidFlagged;
+    const isProbReviewWatch = (modelProhibited === false && prohibitedProb !== null && prohibitedProb >= BUSINESS_THRESHOLDS.luna_amber_manual_review_min && prohibitedProb < prohibitedThreshold) || softAvoidFlagged;
 
     let gate0Status;
     if (!detGate0.passed && !isRedOceanSoftWatch) {

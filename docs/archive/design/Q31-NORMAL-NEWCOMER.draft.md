@@ -2,7 +2,7 @@
 
 建立：2026-11-11；更新：2026-11-13。状态：3／2／4／1 分配与四项完整试评规则均已确认，具体真实样本、取数可得性、判断准确度和跨类目校准仍待验证。本稿不是正式算法实现或运行配置。原 2／2／3／3 未获采用。
 
-Current numerical source: [reference-profile.r59.draft.json](reference-profile.r59.draft.json) (`revision: 59`) alongside frozen [reference-profile.draft.json](reference-profile.draft.json) (`revision: 58`). Older dated sections preserve revision 50–58 history and exact replay. The single recovery entry is [STATE.md](../STATE.md).
+Current numerical source: [reference-profile.r59.draft.json](../../design/reference-profile.r59.draft.json) (`revision: 59`) alongside frozen [reference-profile.draft.json](reference-profile.r58.archived.json) (`revision: 58`). Older dated sections preserve revision 50–58 history and exact replay. The single recovery entry is [STATE.md](../../STATE.md).
 
 ## Revision 59 `target_child_units` 3-tier grain, `NEAR_30_DAYS` rolling SellerSprite window, review-origin breakdown & 3-tier listing-age alignment (2026-11-24, updating 2026-11-23)
 
@@ -53,7 +53,7 @@ Owner clarification, 2026-11-14: old reviews clearly predating a purported recen
 
 Use one relevant SellerSprite native market report, explicitly three-month newcomers, for both count-share 3 and unit-sales-share 2. Keep the actual source population, latest-30-day window and family basis; a source sales-ranked sample is not a current BSR snapshot. These inputs supersede the prior niche-filtered current-list 3/2 basis for this trial. Select source relevance before scoring, preserve niche context separately, and do not switch inputs to obtain a higher score. All curves remain unchanged.
 
-The 4-point reference remains the observed genuinely comparable, supported normal-start BSR-newcomer cohort, including current in-list and still-qualified exited entrants. For this batch use current rating counts and compatible latest-30-day sales consistently, with newcomer age at the observation date; keep entry-time history separate. The existing stage-comparability, no-extrapolation and unknown/zero rules remain. Rank complete example scores before rounding; resolve equality by frozen family identifier then ASIN ascending. The same pair supplies natural visibility, with both providers' keyword counts checked as described below. See [the accepted shared package](DECISIONS.md#accepted-shared-scoring-and-q31-references-revision-50).
+The 4-point reference remains the observed genuinely comparable, supported normal-start BSR-newcomer cohort, including current in-list and still-qualified exited entrants. For this batch use current rating counts and compatible latest-30-day sales consistently, with newcomer age at the observation date; keep entry-time history separate. The existing stage-comparability, no-extrapolation and unknown/zero rules remain. Rank complete example scores before rounding; resolve equality by frozen family identifier then ASIN ascending. The same pair supplies natural visibility, with both providers' keyword counts checked as described below. See [the accepted shared package](../../design/DECISIONS.md#accepted-shared-scoring-and-q31-references-revision-50).
 
 ## Bounded source feasibility observation (2026-11-13)
 
@@ -151,7 +151,7 @@ Latest owner scope (2026-11-13): normal-start research uses observable seller ID
 
 实施方对最新复杂度顾虑的处理建议：先用本页和整体算例讲清已定规则，再把剩余问题集中到会改变业务取舍、证据含义或验收结果的选择；常规实现与事实核查由实施方承担，实际质量／耗时留给已规划的有界验证。无法核清的具体数据如实待补证，不为了输出完整分数无限增加推断层。该建议不替主人批准未决评分、删减 23 项、缩减主动发现交付或提前启动正式开发。
 
-既有 [第一版验证安排](FIRST-RELEASE.draft.md) 和 [开发流程](../DEVELOPMENT.md) 继续适用。先前规则整理与合成算例之后，主人另行明确授权了下方的真实SIF小批试跑；其覆盖和评分缺口如实记录，尚无跨类目校准结论或正式产品实现。
+既有 [第一版验证安排](FIRST-RELEASE.draft.md) 和 [开发流程](../../DEVELOPMENT.md) 继续适用。先前规则整理与合成算例之后，主人另行明确授权了下方的真实SIF小批试跑；其覆盖和评分缺口如实记录，尚无跨类目校准结论或正式产品实现。
 
 ## Real-data workflow update, 2026-11-12
 

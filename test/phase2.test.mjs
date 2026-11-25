@@ -12,7 +12,7 @@ import {
   validateRedactedDestination,
 } from '../src/contracts.mjs';
 import {
-  openSelectionStore,
+  openSelectionStore as rawOpenSelectionStore,
   computeEvidenceBundleHash,
   sha256Hex,
 } from '../src/store.mjs';
@@ -27,9 +27,23 @@ import {
   runPhase2Batch,
 } from '../src/pipeline.mjs';
 import { runPhase2Cli } from '../src/phase2-cli.mjs';
-import { FBA_2027_METADATA, getFba2027RateTableSnapshot } from '../src/fba-rates-2027.mjs';
+import { FBA_2027_METADATA, getFba2027RateTableSnapshot } from '../src/fba-calculator.mjs';
 
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const DEFAULT_R59_UI_READBACK = {
+  logged_in: true,
+  viewport_width_px: 1440,
+  selected_sku_row_visible: true,
+  settlement_bar_visible: true,
+  applied_quantity_confirmed: true,
+};
+function openSelectionStore(dbPath, opts) {
+  const s = rawOpenSelectionStore(dbPath, opts);
+  const orig = s.recordSourcingQuote1688.bind(s);
+  s.recordSourcingQuote1688 = q => orig(q && typeof q === 'object' && q.ui_readback === undefined ? { ...q, ui_readback: DEFAULT_R59_UI_READBACK } : q);
+  return s;
+}
+
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
 
 function withTempDir(fn) {
@@ -68,7 +82,7 @@ async function withTempDirAsync(fn) {
 
 function makeStandardGate1AScenario(overrides = {}) {
   return {
-    profile_revision: 58,
+    profile_revision: 59,
     id: 'off-peak-standard',
     pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
     price_usd: 54.99,
@@ -137,7 +151,7 @@ function alignMockCandidateToQuote(cand, { priceUsd = 54.99, goodsCnyTotal = 100
 
 function makeEarlyScreenBuilder(priceUsd, goodsCnyPerUnit, domesticFreightCnyPerUnit) {
   return () => ({
-    profile_revision: 58,
+    profile_revision: 59,
     id: 'phase2-screen',
     saleable_unit: '1 complete tool set',
     price_usd: priceUsd,
@@ -600,7 +614,7 @@ test('Phase 2 Lead Deduplication, Variant Coexistence, and Immutable Versioned E
   const ev1 = store.recordEvaluation({
     form_id: form.form_id,
     period_id: 'off_peak',
-    profile_revision: 58,
+    profile_revision: 59,
     evidence_bundle_sha256: h1,
     qualification: { counts_toward_target: false, mode: 'none' },
     queue_bucket: 'pending',
@@ -616,7 +630,7 @@ test('Phase 2 Lead Deduplication, Variant Coexistence, and Immutable Versioned E
   const ev1Dup = store.recordEvaluation({
     form_id: form.form_id,
     period_id: 'off_peak',
-    profile_revision: 58,
+    profile_revision: 59,
     evidence_bundle_sha256: h1,
     qualification: { counts_toward_target: false, mode: 'none' },
     queue_bucket: 'pending',
@@ -633,7 +647,7 @@ test('Phase 2 Lead Deduplication, Variant Coexistence, and Immutable Versioned E
   assert.throws(() => store.recordEvaluation({
     form_id: form.form_id,
     period_id: 'off_peak',
-    profile_revision: 58,
+    profile_revision: 59,
     evidence_bundle_sha256: h1,
     qualification: { counts_toward_target: true, mode: 'seasonal_eligible' },
     queue_bucket: 'comparable',
@@ -655,7 +669,7 @@ test('Phase 2 Lead Deduplication, Variant Coexistence, and Immutable Versioned E
   store.recordEvaluation({
     form_id: form.form_id,
     period_id: 'off_peak',
-    profile_revision: 58,
+    profile_revision: 59,
     evidence_bundle_sha256: h2,
     qualification: { counts_toward_target: false, mode: 'none' },
     queue_bucket: 'pending',
@@ -883,20 +897,19 @@ test('Phase 2 End-to-End Pipeline: non-Amazon lead Gate 1A 0-call rejection, Gat
     const g1aCliff = batchOut.gate1a.find(x => x.form_id === 'form-captcha-trigger');
     assert.ok(g1aCliff.scenarios[0].price_cliff_50);
 
-    // Assert Gate 1B rejection triggered 0 Gate 2/3 requests and computed negotiation shortlist!
+    // Assert Gate 1B rejection triggered 0 Gate 2/3 requests and retired negotiation_shortlist in r59!
     assert.equal(store.getCandidateForm('form-g1b-reject').lifecycle_status, 'gate1b_rejected');
     assert.equal(store.countIncrementalRequestsForForm('form-g1b-reject', ['gate2_3']), 0);
     const g1bRej = batchOut.gate1b.find(x => x.form_id === 'form-g1b-reject');
-    assert.ok(g1bRej.negotiation_shortlist);
+    assert.equal(g1bRej.negotiation_shortlist, null);
 
-    // Assert CAPTCHA_PAUSED stopped form-behind-captcha (zero calls!) while form-already-quoted completed Stage 3!
+    // Assert CAPTCHA_PAUSED immediately stops the r59 batch (Emergency Stop #1: zero calls to form-behind-captcha!)
     assert.deepEqual(sourcingCalls, ['form-g1b-reject', 'form-captcha-trigger']);
-    assert.deepEqual(deepResearchCalls, ['form-already-quoted']);
+    assert.deepEqual(deepResearchCalls, []);
+    assert.equal(batchOut.batch_paused, true);
     assert.equal(batchOut.queue_state.status, 'CAPTCHA_PAUSED');
     assert.equal(store.getCandidateForm('form-captcha-trigger').lifecycle_status, 'gate1b_queued');
     assert.equal(store.getCandidateForm('form-behind-captcha').lifecycle_status, 'gate1b_queued');
-    assert.equal(store.getCandidateForm('form-already-quoted').lifecycle_status, 'evaluated');
-    assert.equal(store.getEvaluationsForForm('form-already-quoted').length, 1);
     store.close();
 
     // Restart persistence check: CAPTCHA_PAUSED survives restart and requires full verification to resume!
@@ -951,7 +964,7 @@ test('Phase 2 CLI real entry point: init, replay synthetic r58 batch, status, tr
       'replay',
       '--db', dbPath,
       '--batch', 'fixtures/synthetic-batch.json',
-      '--profile', 'docs/design/reference-profile.draft.json',
+      '--profile', 'docs/design/reference-profile.r59.draft.json',
     ]);
     assert.equal(replayOut.code, 0, replayOut.stderr);
     const replayJson = JSON.parse(replayOut.stdout);
@@ -980,12 +993,10 @@ test('Phase 2 CLI real entry point: init, replay synthetic r58 batch, status, tr
   });
 });
 
-test('Phase 2 Local Historical Import & Frozen r57 Replay (when local .local/ trials exist)', () => {
+test('Phase 2 Local Historical Recovery & Ledger Import (when local .local/ trials exist)', () => {
   const recoveryPath = new URL('../.local/trials/20261115-next-cards/request-recovery.json', import.meta.url);
   const ledger20261116 = new URL('../.local/trials/20261116-next-cards/request-ledger.json', import.meta.url);
-  const closureDir = new URL('../.local/trials/20261118-r57-closure/', import.meta.url);
-  const r57BatchPath = new URL('batch.r57.json', closureDir);
-  if (!existsSync(recoveryPath) || !existsSync(r57BatchPath)) return; // Clean CI clone without .local/
+  if (!existsSync(recoveryPath)) return; // Clean CI clone without .local/
 
   withTempDir(dir => {
     const dbPath = join(dir, 'local-replay.sqlite');
@@ -1003,24 +1014,9 @@ test('Phase 2 Local Historical Import & Frozen r57 Replay (when local .local/ tr
       const ledRes2 = importRequestLedgerFile(store, ledger20261116);
       assert.equal(ledRes2.inserted, 0);
     }
-
-    // 2. Replay frozen r57 batch byte-for-byte into SQLite!
-    const r57Profile = structuredClone(profile);
-    r57Profile.revision = r57Profile.workflow.scoring_and_ordering.revision = 57;
-    const r57Batch = JSON.parse(readFileSync(r57BatchPath, 'utf8'));
-    const r57Disc = JSON.parse(readFileSync(new URL('discovery-bundle.json', closureDir), 'utf8'));
-    const replay = replayBatchIntoStore(store, {
-      batch: r57Batch,
-      profile: r57Profile,
-      discovery: r57Disc,
-      expected_result_sha256: 'bd450fc8e10b7fd3efb8f4ea85f0e52e6b281611f1285f475406d1e38a2d2e4e',
-      expected_html_sha256: '8c44f80d99b897a0a90d4e6f2d5163b46d9c6825233c674ea03c2e2fc6fbe81b',
-    });
-    assert.equal(replay.summary.seasonal_eligible, 2);
-    assert.ok(replay.evaluations_recorded >= 6);
     store.close();
 
-    // 3. Reopen after restart and confirm real 101 lock still blocks alternative wrapper & alias!
+    // 2. Reopen after restart and confirm real 101 lock still blocks alternative wrapper & alias!
     const recoveryRaw = JSON.parse(readFileSync(recoveryPath, 'utf8'));
     const reopened = openSelectionStore(dbPath);
     const blocked = reopened.reserveRequestAttempt({
@@ -1033,12 +1029,6 @@ test('Phase 2 Local Historical Import & Frozen r57 Replay (when local .local/ tr
     assert.equal(blocked.allowed, false);
     assert.equal(blocked.reason, 'permanently_locked');
     assert.equal(blocked.blocking_attempt_id, recoveryRaw.original_request.id);
-    // Confirm r57 per-card qualification in SQLite accurately matches summary.seasonal_eligible === 2!
-    const allEvals = reopened.db.prepare('SELECT form_id, qualification_json FROM evaluations').all();
-    const qualifyingForms = new Set(
-      allEvals.filter(r => JSON.parse(r.qualification_json).counts_toward_target === true).map(r => r.form_id),
-    );
-    assert.equal(qualifyingForms.size, 2);
     reopened.close();
   });
 });
@@ -1054,9 +1044,10 @@ test('Phase 2 Gate 1A never zero-browser rejects when fee lookup returns needs_c
   });
   const res = runGate1AForForm(store, {
     form_id: 'form-bulky-unknown',
-    profile_revision: 58,
+    profile_revision: 59,
     scenarios: [makeStandardGate1AScenario({
       price_usd: 49.99,
+      sales_window: { from: '2027-10-15', through: '2027-12-31' },
       pkg: { length_in: 30, width_in: 20, height_in: 10, weight_lb: 25 },
     })],
   });
@@ -1230,14 +1221,14 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   // Builder trying to forge goods_cny_per_unit: 1 is overridden by authoritative ¥222 persisted quote!
   const forgedRes = await runGate1BForForm(store, {
     form_id: 'f-forge-cost',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: storedExpQuote,
     early_screen_builder: makeEarlyScreenBuilder(54.99, 1, 0),
   });
   assert.equal(forgedRes.status, 'gate1b_rejected');
   assert.equal(forgedRes.proceed_to_gate2_3, false);
-  // #11a: Negotiation shortlist persisted in SQLite and readable from traceFormLineage!
-  assert.ok(store.traceFormLineage('f-forge-cost').negotiation_shortlist);
+  // #11a: Under r59, negotiation_shortlist is retired (null in traceFormLineage)!
+  assert.equal(store.traceFormLineage('f-forge-cost').negotiation_shortlist, null);
 
   // #8b (P0-1 upgraded): Multi-scenario Gate 1B ($40 fail + $60 pass) crosses 30%:
   // MUST NOT falsely reject AND MUST NOT blindly auto-pass; parks pending with owner_review_required!
@@ -1270,7 +1261,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   }).quote;
   const multiRes = await runGate1BForForm(store, {
     form_id: 'f-multi-scen',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: qMulti,
     early_screen_builder: ({ order_plan }) => {
       // #10: Reusing cached verified quote MUST pass a recomputed non-null order_plan!
@@ -1283,8 +1274,8 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   });
   assert.equal(multiRes.status, 'gate1b_pending');
   assert.equal(multiRes.margin_interval_verdict, 'crosses_30pct');
-  assert.equal(multiRes.owner_review_required, true);
-  assert.equal(multiRes.proceed_to_gate2_3, false);
+  assert.equal(multiRes.second_factory_quote_needed, true);
+  assert.equal(multiRes.proceed_to_gate2_3, true);
   assert.deepEqual(multiRes.passing_prices_usd, [60]);
   assert.deepEqual(multiRes.failing_prices_usd, [40]);
 
@@ -1298,7 +1289,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   });
   runGate1AForForm(store, {
     form_id: 'f-multi-allpass',
-    profile_revision: 58,
+    profile_revision: 59,
     scenarios: [
       makeStandardGate1AScenario({ id: 'p55', price_usd: 54.99 }),
       makeStandardGate1AScenario({ id: 'p60', price_usd: 60 }),
@@ -1319,7 +1310,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   }).quote;
   const multiAllPassRes = await runGate1BForForm(store, {
     form_id: 'f-multi-allpass',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: qMultiPass,
     early_screen_builder: () => [
       makeEarlyScreenBuilder(54.99, 100, 2)(),
@@ -1340,7 +1331,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   });
   runGate1AForForm(store, {
     form_id: 'f-date-def',
-    profile_revision: 58,
+    profile_revision: 59,
     scenarios: [makeStandardGate1AScenario({ price_usd: 54.99 })],
   });
   const qDef = store.recordSourcingQuote1688({
@@ -1358,7 +1349,7 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   }).quote;
   const defRes = await runGate1BForForm(store, {
     form_id: 'f-date-def',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: qDef,
     early_screen_builder: () => ({ ...makeEarlyScreenBuilder(54.99, 80, 1)(), strong_date_dependency: true }),
   });
@@ -2066,7 +2057,7 @@ test('Round-2 Codex Regressions #4, #5, #6, #7: sticky rights conflict, Gate 1A/
     }).quote;
     const negRes = await runGate1BForForm(store, {
       form_id: 'f-neg-best',
-      profile_revision: 58,
+      profile_revision: 59,
       existing_quote: qNeg,
       early_screen_builder: () => [
         makeEarlyScreenBuilder(42, 120, 2)(),
@@ -2074,9 +2065,8 @@ test('Round-2 Codex Regressions #4, #5, #6, #7: sticky rights conflict, Gate 1A/
       ],
     });
     assert.equal(negRes.status, 'gate1b_rejected');
-    assert.equal(negRes.negotiation_shortlist.eligible, true);
-    assert.ok(negRes.negotiation_shortlist.required_discount_fraction <= 0.12);
-    assert.equal(store.traceFormLineage('f-neg-best').negotiation_shortlist.eligible, true);
+    assert.equal(negRes.negotiation_shortlist, null);
+    assert.equal(store.traceFormLineage('f-neg-best').negotiation_shortlist, null);
 
     // R2-6: Array-form saleable_set_composition, Shanghai rejected, missing readback rejected, and allow_remainder 120/100 plan preserved verbatim!
     store.upsertCandidateForm({
@@ -2165,7 +2155,7 @@ test('Round-2 Codex Regressions #4, #5, #6, #7: sticky rights conflict, Gate 1A/
     let cachedPlanSeen = null;
     await runGate1BForForm(store, {
       form_id: 'f-arr-comp',
-      profile_revision: 58,
+      profile_revision: 59,
       existing_quote: remRec.quote,
       early_screen_builder: ({ order_plan }) => {
         cachedPlanSeen = order_plan;
@@ -2306,18 +2296,15 @@ test('Round-2 Codex Regressions #8, #9, #10: primary_discovery admissibility & c
   assert.equal(corrobBatch.gate2_3[0].status, 'blocked_inadmissible_leads');
   assert.equal(store.getEvaluationsForForm('f-corrob-only').length, 0);
 
-  // R2-9a: Storage rate in getFba2027RateTableSnapshot shares the exact live STORAGE_2027_RATES object with lookupStorageFee2027!
+  // R2-9a: Storage rate in getFba2027RateTableSnapshot is deep-frozen and computeEvidenceBundleHash tracks fee_table_snapshot changes!
   const liveSnap = getFba2027RateTableSnapshot();
   const origOffPeak = liveSnap.storage_usd_per_cuft_month.off_peak;
   assert.equal(origOffPeak, 0.78);
-  const hashBefore = computeEvidenceBundleHash({ form_spec_sha256: 'abc', candidate_input: { id: 'x' }, profile_snapshot: { revision: 58 }, fee_table_snapshot: getFba2027RateTableSnapshot() });
-  try {
-    liveSnap.storage_usd_per_cuft_month.off_peak = 0.88;
-    const hashAfter = computeEvidenceBundleHash({ form_spec_sha256: 'abc', candidate_input: { id: 'x' }, profile_snapshot: { revision: 58 }, fee_table_snapshot: getFba2027RateTableSnapshot() });
-    assert.notEqual(hashBefore, hashAfter);
-  } finally {
-    liveSnap.storage_usd_per_cuft_month.off_peak = origOffPeak;
-  }
+  assert.throws(() => { liveSnap.storage_usd_per_cuft_month.off_peak = 0.88; }, TypeError);
+  const hashBefore = computeEvidenceBundleHash({ form_spec_sha256: 'abc', candidate_input: { id: 'x' }, profile_snapshot: { revision: 59 }, fee_table_snapshot: liveSnap });
+  const modifiedSnap = { ...liveSnap, storage_usd_per_cuft_month: { ...liveSnap.storage_usd_per_cuft_month, off_peak: 0.88 } };
+  const hashAfter = computeEvidenceBundleHash({ form_spec_sha256: 'abc', candidate_input: { id: 'x' }, profile_snapshot: { revision: 59 }, fee_table_snapshot: modifiedSnap });
+  assert.notEqual(hashBefore, hashAfter);
 
   // R2-9b & R2-9c: Replaying 3-card batch then 1-card batch records BOTH batch receipts AND merges new source_attempt_ids!
   const cand0Id = fixture.candidates[0].id;

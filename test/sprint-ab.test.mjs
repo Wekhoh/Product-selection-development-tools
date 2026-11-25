@@ -10,14 +10,14 @@ import {
   lookupVerified2027ReturnThreshold,
   resolveEffectivePricing,
   validateFeeBasis,
-} from '../src/fee-basis.mjs';
+} from '../src/fba-calculator.mjs';
 import {
   estimateGate1A2027,
   solveMinPriceForMargin2027,
   lookupReturnsProcessing2027,
-} from '../src/fba-rates-2027.mjs';
+} from '../src/fba-calculator.mjs';
 import { calculateEconomics } from '../src/economics.mjs';
-import { evaluateEarlyScreen } from '../src/early-screen.mjs';
+import { evaluateEarlyScreen } from '../src/economics.mjs';
 import {
   evaluateGate0CategoryBoundary,
   analyzeMainstreamPriceBand,
@@ -38,15 +38,29 @@ import {
   auditDiscoveryCoverage,
   planDiscoveryBatch,
 } from '../src/discovery-channels.mjs';
-import { openSelectionStore } from '../src/store.mjs';
+import { openSelectionStore as rawOpenSelectionStore } from '../src/store.mjs';
 import { replayBatchIntoStore } from '../src/history-import.mjs';
 import { attachGate1APriceCliffStress, runGate1AForForm, runGate1BForForm, runPhase2Batch } from '../src/pipeline.mjs';
 import { attachStoreDiscoveryProvenance } from '../src/discovery.mjs';
 import { scoreBatch, scoreCandidate } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
 
+const DEFAULT_R59_UI_READBACK = {
+  logged_in: true,
+  viewport_width_px: 1440,
+  selected_sku_row_visible: true,
+  settlement_bar_visible: true,
+  applied_quantity_confirmed: true,
+};
+function openSelectionStore(dbPath, opts) {
+  const s = rawOpenSelectionStore(dbPath, opts);
+  const orig = s.recordSourcingQuote1688.bind(s);
+  s.recordSourcingQuote1688 = q => orig(q && typeof q === 'object' && q.ui_readback === undefined ? { ...q, ui_readback: DEFAULT_R59_UI_READBACK } : q);
+  return s;
+}
+
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
-const PROFILE_PATH = join(REPO_ROOT, 'docs', 'design', 'reference-profile.draft.json');
+const PROFILE_PATH = join(REPO_ROOT, 'docs', 'design', 'reference-profile.r59.draft.json');
 const FIXTURE_PATH = join(REPO_ROOT, 'fixtures', 'synthetic-batch.json');
 const CLI_PATH = join(REPO_ROOT, 'src', 'phase2-cli.mjs');
 
@@ -73,7 +87,7 @@ async function withTempDirAsync(fn) {
 
 function makeGate1AScenario(overrides = {}) {
   return {
-    profile_revision: 58,
+    profile_revision: 59,
     id: 'std-offpeak',
     pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
     price_usd: 54.99,
@@ -96,7 +110,7 @@ function makeGate1AScenario(overrides = {}) {
 
 function makeScreenScenario(priceUsd, overrides = {}) {
   return {
-    profile_revision: 58,
+    profile_revision: 59,
     id: `screen-${priceUsd}`,
     saleable_unit: '1 complete set',
     price_usd: priceUsd,
@@ -145,13 +159,13 @@ test('P0-1: Gate 1B 30%-crossing interval, FBA tier parity, Stage 3 quote/price 
   const ledgerNoBond = structuredClone(baseCand.economics.scenarios[0].cost_ledger);
   const hhLine = ledgerNoBond.lines.find(l => l.id === 'headhaul');
   hhLine.components = ['ocean_freight', 'customs_duty']; // omits carrier_bond
-  const vNoBond = validateFeeBasis(ledgerNoBond, { profileRevision: 58, evidenceIds: baseCand.evidence.map(e => e.id) });
+  const vNoBond = validateFeeBasis(ledgerNoBond, { profileRevision: 59, evidenceIds: baseCand.evidence.map(e => e.id) });
   assert.equal(vNoBond.status, 'needs_evidence');
   assert.ok(vNoBond.issues.some(i => i.code === 'missing_carrier_bond'));
 
   // With explicit bond_exemption -> passes
   hhLine.bond_exemption = { reason: 'DDP single-entry bond billed separately on customs receipt', evidence: [baseCand.evidence[0].id] };
-  const vExempt = validateFeeBasis(ledgerNoBond, { profileRevision: 58, evidenceIds: baseCand.evidence.map(e => e.id) });
+  const vExempt = validateFeeBasis(ledgerNoBond, { profileRevision: 59, evidenceIds: baseCand.evidence.map(e => e.id) });
   assert.equal(vExempt.issues.some(i => i.code === 'missing_carrier_bond'), false);
 
   // 2) Gate 1B FBA tier parity rejects fabricated fulfillment_usd
@@ -172,7 +186,7 @@ test('P0-1: Gate 1B 30%-crossing interval, FBA tier parity, Stage 3 quote/price 
   }).quote;
   const badParity = await runGate1BForForm(store, {
     form_id: 'f-parity',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: qParity,
     early_screen_builder: () => makeScreenScenario(54.99, { fulfillment_usd: 3.10 }), // fabricated cheap FBA fee!
   });
@@ -180,17 +194,17 @@ test('P0-1: Gate 1B 30%-crossing interval, FBA tier parity, Stage 3 quote/price 
   assert.equal(badParity.proceed_to_gate2_3, false);
   assert.match(badParity.reason, /FBA tier parity/);
 
-  // 3) Rights conflict blocks negotiation_shortlist AND blocks Stage 3 BEFORE dispatch (0 deep-research calls)
-  const rightsEv = evaluateEarlyScreen(makeScreenScenario(42, { goods_cny_per_unit: 120, specific_rights_conflict: true }), { profileRevision: 58 });
+  // 3) Rights conflict & low price block Stage 3 BEFORE dispatch (0 deep-research calls; negotiation_shortlist retired in r59)
+  const rightsEv = evaluateEarlyScreen(makeScreenScenario(42, { goods_cny_per_unit: 120, specific_rights_conflict: true }), { profileRevision: 59 });
   assert.equal(rightsEv.gate_status, 'fail');
-  assert.equal(rightsEv.negotiation_shortlist, null);
-  const lowPriceEv = evaluateEarlyScreen(makeScreenScenario(28.99, { goods_cny_per_unit: 60 }), { profileRevision: 58 });
+  assert.equal(rightsEv.negotiation_shortlist, undefined);
+  const lowPriceEv = evaluateEarlyScreen(makeScreenScenario(28.99, { goods_cny_per_unit: 60 }), { profileRevision: 59 });
   assert.equal(lowPriceEv.gate_status, 'fail');
-  assert.equal(lowPriceEv.negotiation_shortlist, null);
+  assert.equal(lowPriceEv.negotiation_shortlist, undefined);
 
   let deepResearchDispatched = 0;
   store.upsertCandidateForm({ form_id: 'f-rights-block', label: 'Rights Block', buyer_task: 'Task', saleable_set_composition: { qty: 1 } });
-  runGate1AForForm(store, { form_id: 'f-rights-block', profile_revision: 58, scenarios: [makeGate1AScenario({ price_usd: 54.99 })] });
+  runGate1AForForm(store, { form_id: 'f-rights-block', profile_revision: 59, scenarios: [makeGate1AScenario({ price_usd: 54.99 })] });
   const qRights = store.recordSourcingQuote1688({
     form_id: 'f-rights-block',
     observed_at: '2026-11-20',
@@ -206,7 +220,7 @@ test('P0-1: Gate 1B 30%-crossing interval, FBA tier parity, Stage 3 quote/price 
   }).quote;
   const g1bRights = await runGate1BForForm(store, {
     form_id: 'f-rights-block',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: qRights,
     early_screen_builder: () => makeScreenScenario(54.99, { specific_rights_conflict: true }),
   });
@@ -361,14 +375,15 @@ test('P0-2: Official 2027 cross-category return thresholds, calculator override 
   assert.equal(petRet.return_threshold, 0.102);
   assert.ok(petRet.expected_fee_per_shipped_unit_usd > 0);
 
-  // 2) Evidenced calculator_verified_override seam for bulky/oversize/DG items
+  // 2) Official 2027 Bulky schedule is verified in r59, while unpublished Q4 peak requires verification & evidenced calculator_verified_override seam works
   const bulkyBase = makeGate1AScenario({
-    pkg: { length_in: 24, width_in: 18, height_in: 10, weight_lb: 22 }, // oversize!
+    pkg: { length_in: 24, width_in: 18, height_in: 10, weight_lb: 22 }, // Bulky!
     price_usd: 79.99,
     fee_category: 'Home and Kitchen',
     physical_return_fraction: 0.10, // > 0.081 threshold!
   });
-  assert.equal(estimateGate1A2027(bulkyBase).status, 'needs_calculator_verification');
+  assert.equal(estimateGate1A2027(bulkyBase).status, 'verified');
+  assert.equal(estimateGate1A2027({ ...bulkyBase, sales_window: { from: '2027-10-15', through: '2027-12-31' } }).status, 'needs_calculator_verification');
 
   // Unexempted zero returns_processing_usd when r_physical > threshold MUST be rejected!
   const badOverride = estimateGate1A2027({
@@ -852,8 +867,7 @@ test('P1-2/P1-3/P1-4: 6 deterministic operational disclosures, break_even_click_
   assert.match(html, /id="filter-pending"/);
   assert.match(html, /淘汰／暂缓/);
   assert.match(html, /data-section="review-notes"/);
-  assert.match(html, /data-section="negotiation-shortlist"/);
-  assert.match(html, /Close-Margin Wrench/);
+  assert.doesNotMatch(html, /data-section="negotiation-shortlist"/);
   assert.doesNotMatch(html, /Too Expensive/);
   assert.doesNotMatch(html, /Patented Item/);
   // Stale r51-57 Q31 copy must NOT appear in r58 HTML
@@ -904,7 +918,7 @@ test('P1-1: Real subprocess CLI tests for phase2-cli (init, price-band, gate1a, 
     const g1bPath = join(dir, 'g1b.json');
     writeFileSync(g1bPath, JSON.stringify({
       form_id: 'cli-form-1',
-      profile_revision: 58,
+      profile_revision: 59,
       quote: {
         observed_at: '2026-11-20',
         redacted_destination: '广东深圳',
@@ -916,6 +930,7 @@ test('P1-1: Real subprocess CLI tests for phase2-cli (init, price-band, gate1a, 
         actual_complete_sets: 100,
         goods_cny_total: 8500,
         domestic_freight_cny_total: 200,
+        ui_readback: DEFAULT_R59_UI_READBACK,
       },
       early_screen_scenarios: [makeScreenScenario(54.99)],
     }), 'utf8');
@@ -999,7 +1014,7 @@ test('GPT Review Regressions C1-C3: scenario-ID preservation, authoritative quot
 
   const droppedLosing = await runGate1BForForm(store, {
     form_id: 'f-c1-sameprice',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: qDual,
     early_screen_builder: () => [makeScreenScenario(40.00, { id: 'h-low', headhaul: { usd_per_unit: 2.00, bond_included: true } })],
   });
@@ -1009,7 +1024,7 @@ test('GPT Review Regressions C1-C3: scenario-ID preservation, authoritative quot
   // Submitting BOTH shows crossing 30% interval cleanly (pending, owner_review_required)
   const bothDual = await runGate1BForForm(store, {
     form_id: 'f-c1-sameprice',
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: qDual,
     early_screen_builder: () => [
       makeScreenScenario(40.00, { id: 'h-low', headhaul: { usd_per_unit: 2.00, bond_included: true } }),
@@ -1260,12 +1275,12 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
       assert.ok(cappedSolve.feasible_min_price_usd <= 49.99);
     }
 
-    // HIGH #3: Payable USD cent rounding ($54.35 less 8% -> $50.00, NOT $50.002!) + Gate 1B $0.019 FBA drift rejected!
+    // HIGH #3: Payable USD cent rounding ($54.35 less 8% -> $50.00, NOT $50.002!) + r59 Coupon $50 list-price FBA tier ('over_50') + Gate 1B $0.019 FBA drift rejected!
     const pctRound = resolveEffectivePricing({ list_price_usd: 54.35, ongoing_coupon_pct: 0.08 });
     assert.equal(pctRound.valid, true);
     assert.equal(pctRound.net_effective_price_usd, 50.00);
     const estAt50 = estimateGate1A2027(makeGate1AScenario({ list_price_usd: 54.35, ongoing_coupon_pct: 0.08, price_usd: undefined }));
-    assert.equal(estAt50.price_band, '10_to_50');
+    assert.equal(estAt50.price_band, 'over_50');
 
     const sTight = openSelectionStore(':memory:');
     sTight.upsertCandidateForm({ form_id: 'f-tight-fba', label: 'Tight FBA', buyer_task: 'Task', saleable_set_composition: { qty: 1 } });
@@ -1285,7 +1300,7 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
     }).quote;
     const drift019 = await runGate1BForForm(sTight, {
       form_id: 'f-tight-fba',
-      profile_revision: 58,
+      profile_revision: 59,
       existing_quote: qTight,
       early_screen_builder: () => makeScreenScenario(54.99, { fulfillment_usd: 6.3359 }), // $0.019 below $6.3549!
     });
@@ -1303,7 +1318,7 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
       evidence: ['synthetic-evidence'],
       components: ['carrier_bond'],
     });
-    const creditBondCheck = validateFeeBasis(creditBondLedger, { profileRevision: 58 });
+    const creditBondCheck = validateFeeBasis(creditBondLedger, { profileRevision: 59 });
     assert.equal(creditBondCheck.status, 'needs_evidence');
     assert.ok(creditBondCheck.issues.some(i => i.code === 'missing_carrier_bond'));
 
@@ -1408,15 +1423,16 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
     sTight.upsertCandidateForm({ form_id: 'f-wide-g1a', label: 'Desk Shelf', buyer_task: 'Organize desk', saleable_set_composition: { qty: 1 } });
     const g1aWide = runGate1AForForm(sTight, {
       form_id: 'f-wide-g1a',
-      profile_revision: 58,
+      profile_revision: 59,
       scenarios: [makeGate1AScenario({ price_usd: 54.99 })],
       price_band_analysis: [
-        { asin: 'W1', price_usd: 25, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400 },
-        { asin: 'W2', price_usd: 75, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400 },
+        { asin: 'W1', price_usd: 25, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400, keepa_price_steady: true },
+        { asin: 'W2', price_usd: 75, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400, keepa_price_steady: true },
       ],
     });
-    assert.equal(g1aWide.gate_status, 'gate1a_needs_verification');
-    assert.equal(g1aWide.proceed_to_gate1b, false);
+    assert.equal(g1aWide.gate_status, 'gate1a_passed');
+    assert.equal(g1aWide.price_band_guardrail.width_alarm, true);
+    assert.equal(g1aWide.price_band_guardrail.advisory_only, true);
 
     // HIGH #1 + HIGH #8 + Harness-to-Ledger: 4-lane reopen invariance, no_retry lock preservation, stale reimport protection, and trusted not_dispatched preflight!
     const db4Lane = join(dir, 'lanes.sqlite');
@@ -1516,7 +1532,7 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
       fee_category: 'Pet Products',
       physical_return_fraction: 0.05,
     });
-    const aliasCheck = validateFeeBasis(aliasLedger, { profileRevision: 58 });
+    const aliasCheck = validateFeeBasis(aliasLedger, { profileRevision: 59 });
     assert.equal(aliasCheck.issues.some(i => i.code === 'conflicting_fee_category'), false);
 
     // HIGH #10 & MEDIUM #6: No private numeric freight surcharges, AMZ seller.type=AMZ detection, stored order_plan & unknown bundle compliance!
@@ -1591,8 +1607,8 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
         metadata: { leaf_node_id: 'leaf-A' },
       });
     }
-    const leafAudit = auditDiscoveryCoverage(sProv, { profile_revision: 58 });
-    assert.ok(leafAudit.anti_convergence_alerts.some(a => a.code === 'single_leaf_concentration'));
+    const leafAudit = auditDiscoveryCoverage(sProv, { profile_revision: 59 });
+    assert.equal(leafAudit.anti_convergence_alerts.some(a => a.code === 'single_leaf_concentration'), false);
     sProv.close();
 
     // MEDIUM #8 & #9: Contact sheet renders price-band rows cleanly AND blocks loopback HTTP URLs!
@@ -1701,7 +1717,7 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
 test('Post-Remediation Audit Regressions (B1-B18): Gate-0 red-ocean, low-peer guardrail, seasonal & FBA Stage-3 binding, cross-script link_note, partial-override solver, Shenzhen/SKU/coverage/HTML/CLI & concurrent SQLite hardening', async () => {
   const pkg = { length_in: 10, width_in: 6, height_in: 3, weight_lb: 1.5 };
   const baseG1A = {
-    profile_revision: 58,
+    profile_revision: 59,
     pkg,
     price_usd: 54.99,
     fx_cny_per_usd: 7.0,
@@ -1757,46 +1773,38 @@ test('Post-Remediation Audit Regressions (B1-B18): Gate-0 red-ocean, low-peer gu
     },
   });
 
-  // B1: Gate 0 red-ocean default filter MUST block in runGate1AForForm (and allow when explicitly disabled)
+  // B1: Under r59 (4 hard kill lines only), non-children Apparel is soft-avoid advisory (not hard-killed), while <=12y children's items are hard-rejected!
   {
     const s = openSelectionStore(':memory:');
     s.upsertCandidateForm({ form_id: 'f-b1-apparel', label: 'Cotton T-Shirt Hoodie', buyer_task: 'Everyday clothing', saleable_set_composition: { qty: 1 } });
-    const blocked = runGate1AForForm(s, {
+    const softAvoid = runGate1AForForm(s, {
       form_id: 'f-b1-apparel',
-      profile_revision: 58,
+      profile_revision: 59,
       scenarios: [{ id: 'p55', ...baseG1A }],
       category_check: { title: 'Cotton T-Shirt Hoodie', root_category: 'Clothing, Shoes & Jewelry' },
     });
-    assert.equal(blocked.gate_status, 'gate1a_rejected');
-    assert.equal(blocked.proceed_to_gate1b, false);
-    const allowedOverride = runGate1AForForm(s, {
-      form_id: 'f-b1-apparel',
-      profile_revision: 58,
-      scenarios: [{ id: 'p55', ...baseG1A }],
-      category_check: { title: 'Cotton T-Shirt Hoodie', root_category: 'Clothing, Shoes & Jewelry' },
-      gate0_options: { avoid_red_ocean: { apparel: false } },
-    });
-    assert.equal(allowedOverride.gate_status, 'gate1a_passed');
+    assert.equal(softAvoid.gate_status, 'gate1a_passed');
+    assert.equal(softAvoid.proceed_to_gate1b, true);
+    assert.equal(softAvoid.gate0.hard_exclusion, false);
     s.close();
   }
 
-  // B2: Stage-1 price_band_analysis with 0 mainstream peers (low_peer_count) MUST hold at gate1a_needs_verification
+  // B2: Under r59, low_peer_count is advisory non-blocking when an explicit regular scenario >= $29.99 is supplied
   {
     const s = openSelectionStore(':memory:');
     s.upsertCandidateForm({ form_id: 'f-b2-lowpeer', label: 'Garden Bracket', buyer_task: 'Mount hose bracket', saleable_set_composition: { qty: 1 } });
     const pb = analyzeMainstreamPriceBand([
       { asin: 'SYNTH00008', price_usd: 45, fulfillment: 'FBM', monthly_units: 50 },
       { asin: 'SYNTH00009', price_usd: 48, fulfillment: 'FBA', monthly_units: 3 },
-    ], { profile_revision: 58 });
+    ], { profile_revision: 59 });
     assert.equal(pb.mainstream_count, 0);
-    const held = runGate1AForForm(s, {
+    const nonBlocking = runGate1AForForm(s, {
       form_id: 'f-b2-lowpeer',
-      profile_revision: 58,
+      profile_revision: 59,
       scenarios: [{ id: 'p55', ...baseG1A }],
       price_band_analysis: pb,
     });
-    assert.equal(held.gate_status, 'gate1a_needs_verification');
-    assert.equal(held.proceed_to_gate1b, false);
+    assert.equal(nonBlocking.price_band_guardrail.low_peer_blocks_gate1a, false);
     s.close();
   }
 
@@ -1841,7 +1849,7 @@ test('Post-Remediation Audit Regressions (B1-B18): Gate-0 red-ocean, low-peer gu
         allow_crossing_to_gate2_3: true,
         sourcing_executor: async () => mkQuote(),
         early_screen_builder: () => [mkEs('p40', 40, est40), mkEs('p60', 60, est60)],
-        deep_research_executor: async () => ({ batch: { schema_version: 1, profile_revision: 58, candidates: [baseCand] } }),
+        deep_research_executor: async () => ({ batch: { schema_version: 1, profile_revision: 59, candidates: [baseCand] } }),
       }],
     });
     assert.equal(out.gate2_3[0].status, 'gate2_3_error');
@@ -1901,7 +1909,7 @@ test('Post-Remediation Audit Regressions (B1-B18): Gate-0 red-ocean, low-peer gu
           gate1a_scenarios: [{ id: 'p55', ...baseG1A }],
           sourcing_executor: async () => mkQuote(),
           early_screen_builder: () => mkEs('p55', 54.99, est55),
-          deep_research_executor: async () => ({ batch: { schema_version: 1, profile_revision: 58, candidates: [validCand] } }),
+          deep_research_executor: async () => ({ batch: { schema_version: 1, profile_revision: 59, candidates: [validCand] } }),
         },
         {
           form: { form_id: 'f-b13-fba', label: 'Garden Bracket Forged FBA', buyer_task: 'Mount hose bracket', saleable_set_composition: { qty: 1 } },
@@ -1909,7 +1917,7 @@ test('Post-Remediation Audit Regressions (B1-B18): Gate-0 red-ocean, low-peer gu
           gate1a_scenarios: [{ id: 'p55', ...baseG1A }],
           sourcing_executor: async () => mkQuote(),
           early_screen_builder: () => mkEs('p55', 54.99, est55),
-          deep_research_executor: async () => ({ batch: { schema_version: 1, profile_revision: 58, candidates: [forgedFbaCand] } }),
+          deep_research_executor: async () => ({ batch: { schema_version: 1, profile_revision: 59, candidates: [forgedFbaCand] } }),
         },
       ],
     });
@@ -2008,9 +2016,9 @@ test('Post-Remediation Audit Regressions (B1-B18): Gate-0 red-ocean, low-peer gu
       s.upsertCandidateForm({ form_id: `fb10-${i}`, label: `Form ${i}`, buyer_task: `Task ${i}`, saleable_set_composition: { qty: 1 }, leaf_node_path: '100:200:300' });
       s.linkLeadToForm({ lead_id: `lb10-${i}`, form_id: `fb10-${i}`, link_role: 'primary_discovery' });
     }
-    const cov = auditDiscoveryCoverage(s, { profile_revision: 58 });
+    const cov = auditDiscoveryCoverage(s, { profile_revision: 59 });
     assert.equal(cov.leaf_categories['100:200:300'], 4);
-    assert.ok(cov.anti_convergence_alerts.some(a => a.code === 'single_leaf_concentration'));
+    assert.equal(cov.anti_convergence_alerts.some(a => a.code === 'single_leaf_concentration'), false);
     s.close();
   }
 
@@ -2372,7 +2380,7 @@ test('Phase 3 audit: a present [10,11,12] peak panel with pending cost inputs is
 test('Phase 3 audit: r58 headline pending count matches the 待补证 filter pill and names seasonal pending cards', () => {
   const batch = {
     schema_version: 1,
-    profile_revision: 58,
+    profile_revision: 59,
     candidates: [
       makeAuditSeasonalCandidate('synthetic-hdr-seasonal-pending', { peakProcurementPending: true }),
       makeAuditSeasonalCandidate('synthetic-hdr-seasonal-ok'),
@@ -2386,7 +2394,7 @@ test('Phase 3 audit: r58 headline pending count matches the 待补证 filter pil
   assert.match(html, /id="filter-pending">待补证 1</);
 
   // Without seasonal pending cards the headline carries no seasonal qualifier.
-  const flat = { schema_version: 1, profile_revision: 58, candidates: [structuredClone(fixture.candidates[0])] };
+  const flat = { schema_version: 1, profile_revision: 59, candidates: [structuredClone(fixture.candidates[0])] };
   const flatHtml = renderReport(scoreBatch(flat, profile), flat);
   assert.match(flatHtml.match(/<p class="batch-counts">本轮[^<]*<\/p>/)?.[0] ?? '', /待补证 0 个。/);
 });
@@ -2420,7 +2428,7 @@ test('Phase 3 audit: synthetic 4-card mixed seasonal batch preserves 2-SKU bundl
 
   const batch = {
     schema_version: 1,
-    profile_revision: 58,
+    profile_revision: 59,
     candidates: [bundleControl, candA, candB, candC],
   };
   const res = scoreBatch(batch, profile);
@@ -2550,7 +2558,7 @@ test('Phase 3 Round-3 audit: seasonal candidate with excluded or deferred primar
 
   const batch = {
     schema_version: 1,
-    profile_revision: 58,
+    profile_revision: 59,
     candidates: [elig, pend1, pend2, pend3, excl],
   };
   const res = scoreBatch(batch, profile);
@@ -2573,7 +2581,7 @@ test('Phase 3 Round-3 audit: seasonal candidate with excluded or deferred primar
   // Seasonal card with strong_date_dependency = true on off_peak also routes to hold bucket.
   const def = makeAuditSeasonalCandidate('synthetic-r3-seasonal-deferred');
   def.screening.strong_date_dependency = { value: true, unit: 'boolean', evidence: ['synthetic-evidence'] };
-  const defBatch = { schema_version: 1, profile_revision: 58, candidates: [def] };
+  const defBatch = { schema_version: 1, profile_revision: 59, candidates: [def] };
   const defRes = scoreBatch(defBatch, profile);
   assert.equal(defRes.candidates[0].operating_periods.find(p => p.id === 'off_peak').queue, 'deferred');
   const defHtml = renderReport(defRes, defBatch);
@@ -2581,7 +2589,7 @@ test('Phase 3 Round-3 audit: seasonal candidate with excluded or deferred primar
   assert.match(defHtml, /id="filter-hold">淘汰／暂缓 1</);
 });
 
-test('Phase 3 Round-3 audit: phase2-cli export-report admits only gate1b_rejected all_below_30pct into negotiation_shortlist and excludes crossing-30% pending forms', () => {
+test('Phase 3 Round-3 audit (r59): phase2-cli export-report admits only gate1b_rejected all_below_30pct into packaging_redesign_shortlist and excludes crossing-30% pending & rights-conflict forms', () => {
   withTempDir(dir => {
     const dbPath = join(dir, 'shortlist-filter.sqlite');
     const s = openSelectionStore(dbPath);
@@ -2593,7 +2601,7 @@ test('Phase 3 Round-3 audit: phase2-cli export-report admits only gate1b_rejecte
     }).form;
     s.updateFormLifecycle(fCross.form_id, 'gate1b_pending', {
       gate1b_result: { status: 'gate1b_pending', margin_interval_verdict: 'crosses_30pct', spec_sha256: fCross.spec_sha256 },
-      negotiation_shortlist: { eligible: true, required_discount_fraction: 0.0384, price_usd: 54.99, current_cost_usd: 14.59, target_cost_usd: 14.03 },
+      packaging_redesign_shortlist: { eligible: true, overshoot_mm: 5, current_margin: 0.27, redesigned_margin: 0.32, current_tier_id: 'small_bulky', target_tier_id: 'large_standard' },
     });
 
     const fRights = s.upsertCandidateForm({
@@ -2604,7 +2612,7 @@ test('Phase 3 Round-3 audit: phase2-cli export-report admits only gate1b_rejecte
     }).form;
     s.updateFormLifecycle(fRights.form_id, 'gate1b_rejected', {
       gate1b_result: { status: 'gate1b_rejected', margin_interval_verdict: 'rights_conflict', specific_rights_conflict_proven: true, spec_sha256: fRights.spec_sha256 },
-      negotiation_shortlist: { eligible: true, required_discount_fraction: 0.04, price_usd: 49.99, current_cost_usd: 12.0, target_cost_usd: 11.52 },
+      packaging_redesign_shortlist: { eligible: true, overshoot_mm: 5, current_margin: 0.27, redesigned_margin: 0.32, current_tier_id: 'small_bulky', target_tier_id: 'large_standard' },
     });
 
     const fBelow = s.upsertCandidateForm({
@@ -2615,7 +2623,7 @@ test('Phase 3 Round-3 audit: phase2-cli export-report admits only gate1b_rejecte
     }).form;
     s.updateFormLifecycle(fBelow.form_id, 'gate1b_rejected', {
       gate1b_result: { status: 'gate1b_rejected', margin_interval_verdict: 'all_below_30pct', spec_sha256: fBelow.spec_sha256 },
-      negotiation_shortlist: { eligible: true, required_discount_fraction: 0.055, price_usd: 49.99, current_cost_usd: 13.0, target_cost_usd: 12.285 },
+      packaging_redesign_shortlist: { eligible: true, overshoot_mm: 5, current_margin: 0.27, redesigned_margin: 0.32, current_tier_id: 'small_bulky', target_tier_id: 'large_standard' },
     });
     s.close();
 
@@ -2623,7 +2631,7 @@ test('Phase 3 Round-3 audit: phase2-cli export-report admits only gate1b_rejecte
     const cliRes = spawnSync(process.execPath, [CLI_PATH, 'export-report', '--db', dbPath, '--batch', FIXTURE_PATH, '--profile', PROFILE_PATH, '--output', outDir], { encoding: 'utf8' });
     assert.equal(cliRes.status, 0, cliRes.stderr);
     const resJson = JSON.parse(readFileSync(join(outDir, 'result.json'), 'utf8'));
-    assert.deepEqual((resJson.negotiation_shortlist ?? []).map(x => x.form_id), ['synthetic-rej-allbelow']);
+    assert.deepEqual((resJson.packaging_redesign_shortlist ?? []).map(x => x.form_id), ['synthetic-rej-allbelow']);
     const html = readFileSync(join(outDir, 'index.html'), 'utf8');
     assert.match(html, /All Below Floor Form/);
     assert.doesNotMatch(html, /Crossing Margin Form/);

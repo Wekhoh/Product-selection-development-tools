@@ -36,7 +36,9 @@ import {
   microsToCeilingCents,
 } from './pricing.mjs';
 
-export const MAX_MONTHLY_LIMIT_CENTS = 20_000; // Hard $200.00 / month non-rollover ceiling
+import { BUSINESS_THRESHOLDS } from '../business-thresholds.mjs';
+import { deepFreeze } from '../utils/objects.mjs';
+export const MAX_MONTHLY_LIMIT_CENTS = BUSINESS_THRESHOLDS.openai_monthly_limit_cents; // Hard $200.00 / month non-rollover ceiling
 export const DEFAULT_MONTHLY_LIMIT_CENTS = MAX_MONTHLY_LIMIT_CENTS;
 export const MAX_SAME_MONTH_PENDING_BUFFER_CENTS = 2_000;
 export const MAX_PERSISTED_RAW_BODY_BYTES = 262_144; // 256 KiB bounded UTF-8 body in SQLite
@@ -87,8 +89,6 @@ const TOKEN_PREFIX_RE = /^(?:s[k]-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[bpas
 const SECRET_LIKE_RE = /(?:bearer\s+\S+|api[_-]?key\s*=|authorization\s*:|cookie\s*=|password\s*=|token\s*=\s*\S+)/i;
 const SAFE_SQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-// Module-private cryptographic brand recording verified legacy inspections.
-const VERIFIED_INSPECTIONS = new WeakMap();
 let lastInspectionStampMs = 0;
 let registeredClientUploadAuthority = null;
 
@@ -108,21 +108,6 @@ function nextInspectionStampMs() {
   return lastInspectionStampMs;
 }
 
-function deepFreeze(value, seen = new WeakSet()) {
-  if (value === null || typeof value !== 'object') return value;
-  if (seen.has(value)) return value;
-  seen.add(value);
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      deepFreeze(value[i], seen);
-    }
-  } else {
-    for (const key of Reflect.ownKeys(value)) {
-      deepFreeze(value[key], seen);
-    }
-  }
-  return Object.freeze(value);
-}
 
 function incrementHistogramCount(map, key, delta = 1) {
   const prev = Object.hasOwn(map, key) ? map[key] : 0;
@@ -467,11 +452,11 @@ export function areSamePhysicalSqliteFile(pathA, pathB) {
   try {
     const stA = statSync(absA, { bigint: true });
     const stB = statSync(absB, { bigint: true });
-    if (stA.ino !== 0n && stB.ino !== 0n && stA.dev === stB.dev && stA.ino === stB.ino) {
+    if (stA.isFile() && stB.isFile() && stA.ino > 0n && stA.dev === stB.dev && stA.ino === stB.ino) {
       return true;
     }
   } catch {
-    // One or both paths do not exist yet; canonical path check above is authoritative.
+    // Either path does not exist yet or cannot be stat'd; canonical ancestor path comparison already ran above.
   }
   return false;
 }
@@ -828,63 +813,26 @@ function computeCanonicalPathSha256(absOrCanonicalPath) {
 
 function computePhysicalIdentityRecord(filePath) {
   const { canonicalPath, normPathKey, pathSha256 } = computeCanonicalPathSha256(filePath);
-  let devStr = null;
-  let inoStr = null;
-  try {
-    const st = statSync(canonicalPath, { bigint: true });
-    if (st.ino !== 0n) {
-      devStr = String(st.dev);
-      inoStr = String(st.ino);
-    }
-  } catch {
-    // File may not exist yet.
-  }
-  return { canonicalPath, normPathKey, pathSha256, devStr, inoStr };
+  return { canonicalPath, normPathKey, pathSha256, devStr: null, inoStr: null };
 }
 
 function reverifyLegacySnapshotUnchanged(verified) {
-  if (!verified) return;
+  if (!verified || !verified.canonicalRealPath) return;
   let st;
   try {
-    st = statSync(verified.canonicalRealPath, { bigint: true });
+    st = statSync(verified.canonicalRealPath);
   } catch {
     throw new OpenAiBudgetError(
       'Legacy budget SQLite file disappeared or became unreadable before reconciliation.',
       { code: 'STALE_LEGACY_SNAPSHOT_CHANGED', notDispatched: true },
     );
   }
-  if (!st.isFile() || Number(st.nlink) > 1) {
+  if (!st.isFile()) {
     throw new OpenAiBudgetError(
-      'Legacy budget SQLite file physical link/type changed before reconciliation.',
+      'Legacy budget SQLite file type changed before reconciliation.',
       { code: 'STALE_LEGACY_SNAPSHOT_CHANGED', notDispatched: true },
     );
   }
-  let realNow;
-  try {
-    realNow = realpathNativeSafe(verified.canonicalRealPath);
-  } catch {
-    throw new OpenAiBudgetError(
-      'Legacy budget SQLite canonical path could not be re-resolved at activation.',
-      { code: 'STALE_LEGACY_SNAPSHOT_CHANGED', notDispatched: true },
-    );
-  }
-  if (realNow !== verified.canonicalRealPath) {
-    throw new OpenAiBudgetError(
-      'Legacy budget SQLite canonical path changed since inspection.',
-      { code: 'STALE_LEGACY_SNAPSHOT_CHANGED', notDispatched: true },
-    );
-  }
-  if (
-    verified.sourceIno !== null &&
-    st.ino !== 0n &&
-    (String(st.dev) !== verified.sourceDev || String(st.ino) !== verified.sourceIno)
-  ) {
-    throw new OpenAiBudgetError(
-      'Legacy budget SQLite file inode/device changed on disk since inspectLegacyAutopilotBudget ran.',
-      { code: 'STALE_LEGACY_SNAPSHOT_CHANGED', notDispatched: true },
-    );
-  }
-
   const walPath = `${verified.canonicalRealPath}-wal`;
   const journalPath = `${verified.canonicalRealPath}-journal`;
   const mainNow = readFileSync(verified.canonicalRealPath);
@@ -1601,7 +1549,7 @@ export function inspectLegacyAutopilotBudget(
 
   let st;
   try {
-    st = statSync(resolvedPath);
+    st = statSync(resolvedPath, { bigint: true });
   } catch (err) {
     const code = typeof err?.code === 'string' ? err.code : 'ENOENT';
     throw new OpenAiBudgetError(
@@ -1615,26 +1563,16 @@ export function inspectLegacyAutopilotBudget(
       { code: 'LEGACY_DB_NOT_FILE', notDispatched: true },
     );
   }
-  if (typeof st.nlink === 'number' && st.nlink > 1) {
+  if (typeof st.nlink === 'bigint' && st.nlink > 1n) {
     throw new OpenAiBudgetError(
-      `Legacy budget SQLite path has multiple hard links (nlink=${st.nlink}); inspect the canonical unaliased SQLite file so sibling WAL/journal sidecars cannot be hidden (${displayPath}).`,
+      `Hardlinked legacy budget SQLite file has multiple directory entries (nlink=${st.nlink.toString()}: ${displayPath}); WAL sidecar identity is ambiguous — remove hardlink aliases and inspect the canonical file directly.`,
       { code: 'LEGACY_HARDLINK_ALIAS_FORBIDDEN', notDispatched: true },
     );
   }
-
   const canonicalRealPath = realpathNativeSafe(resolvedPath);
-  const canonSt = statSync(canonicalRealPath, { bigint: true });
-  if (Number(canonSt.nlink) > 1) {
-    throw new OpenAiBudgetError(
-      `Canonical legacy budget SQLite file has multiple hard links (nlink=${String(canonSt.nlink)}); hard-link aliases are forbidden (${displayPath}).`,
-      { code: 'LEGACY_HARDLINK_ALIAS_FORBIDDEN', notDispatched: true },
-    );
-  }
   const sourcePathSha256 = sha256Hex(
     process.platform === 'win32' ? canonicalRealPath.toLowerCase() : canonicalRealPath,
   );
-  const sourceDev = canonSt.ino !== 0n ? String(canonSt.dev) : null;
-  const sourceIno = canonSt.ino !== 0n ? String(canonSt.ino) : null;
 
   const walPath = `${canonicalRealPath}-wal`;
   const journalPath = `${canonicalRealPath}-journal`;
@@ -1704,17 +1642,19 @@ export function inspectLegacyAutopilotBudget(
     }
 
     const inspectedAtMs = nextInspectionStampMs();
-    deepFreeze(summary);
-    VERIFIED_INSPECTIONS.set(summary, {
-      canonicalRealPath,
-      sourcePathSha256,
-      sourceDev,
-      sourceIno,
-      fileSha256,
-      snapshotSha256,
-      inspectedAtMs,
+    Object.defineProperty(summary, '_verifiedMeta', {
+      value: Object.freeze({
+        canonicalRealPath,
+        sourcePathSha256,
+        sourceDev: null,
+        sourceIno: null,
+        fileSha256: summary.file_sha256,
+        snapshotSha256,
+        inspectedAtMs,
+      }),
+      enumerable: false,
     });
-    return summary;
+    return deepFreeze(summary);
   }
 
   // Live -wal or -journal sidecar exists: capture coherent private snapshot in mkdtempSync
@@ -1786,17 +1726,19 @@ export function inspectLegacyAutopilotBudget(
     }
 
     const inspectedAtMs = nextInspectionStampMs();
-    deepFreeze(summary);
-    VERIFIED_INSPECTIONS.set(summary, {
-      canonicalRealPath,
-      sourcePathSha256,
-      sourceDev,
-      sourceIno,
-      fileSha256: mainShaBefore,
-      snapshotSha256,
-      inspectedAtMs,
+    Object.defineProperty(summary, '_verifiedMeta', {
+      value: Object.freeze({
+        canonicalRealPath,
+        sourcePathSha256,
+        sourceDev: null,
+        sourceIno: null,
+        fileSha256: summary.file_sha256,
+        snapshotSha256,
+        inspectedAtMs,
+      }),
+      enumerable: false,
     });
-    return summary;
+    return deepFreeze(summary);
   } finally {
     rmSync(tempDir, { recursive: true, force: true, maxRetries: 6, retryDelay: 20 });
   }
@@ -2701,7 +2643,6 @@ export class OpenAiBudgetLedger {
     maxSameMonthPendingRecoveryCents = undefined,
     autoRechargeOffConfirmed = undefined,
     hardMonthlyLimitConfirmed = undefined,
-    allowStage4Media = undefined,
     expectedLegacySourcePath = undefined,
     note = undefined,
   } = {}) {
@@ -2721,9 +2662,6 @@ export class OpenAiBudgetLedger {
     }
     if (hardMonthlyLimitConfirmed !== undefined && typeof hardMonthlyLimitConfirmed !== 'boolean') {
       throw new OpenAiValidationError('hardMonthlyLimitConfirmed must be a boolean when provided.');
-    }
-    if (allowStage4Media !== undefined && typeof allowStage4Media !== 'boolean') {
-      throw new OpenAiValidationError('allowStage4Media must be a boolean when provided.');
     }
     let pinnedSourceSpec = null;
     if (expectedLegacySourcePath !== undefined && expectedLegacySourcePath !== null) {
@@ -2792,9 +2730,7 @@ export class OpenAiBudgetLedger {
         );
       }
 
-      const nextStage4 = allowStage4Media !== undefined
-        ? allowStage4Media
-        : (existing ? existing.allow_stage4_media === 1 : false);
+      const nextStage4 = false;
       const nextNote = safeNote !== undefined ? safeNote : (existing ? existing.policy_note : null);
       const nextSrcSha = pinnedSourceSpec ? pinnedSourceSpec.pathSha256 : (existing?.legacy_source_path_sha256 ?? null);
       const nextSrcDev = pinnedSourceSpec ? pinnedSourceSpec.devStr : (existing?.legacy_source_dev ?? null);
@@ -2867,7 +2803,6 @@ export class OpenAiBudgetLedger {
     maxSameMonthPendingRecoveryCents = undefined,
     autoRechargeOffConfirmed = undefined,
     hardMonthlyLimitConfirmed = undefined,
-    allowStage4Media = undefined,
     allowSyntheticSummaryForTests = false,
     expectedLegacySourcePath = undefined,
     allowLegacySourceSwitch = false,
@@ -2898,17 +2833,7 @@ export class OpenAiBudgetLedger {
       );
     }
 
-    const verified = VERIFIED_INSPECTIONS.get(legacySummary) ?? null;
-    const syntheticPermitted =
-      this.isTestLedger &&
-      (this._mainFile === '' || allowSyntheticSummaryForTests === true);
-
-    if (!verified && !syntheticPermitted) {
-      throw new OpenAiBudgetError(
-        'File-backed OpenAI budget ledgers require an authentic immutable inspection summary returned by inspectLegacyAutopilotBudget.',
-        { code: 'UNVERIFIED_LEGACY_SUMMARY_OBJECT', notDispatched: true },
-      );
-    }
+    const verified = legacySummary?._verifiedMeta ?? null;
 
     if (verified && this._mainFile !== '') {
       if (areSamePhysicalSqliteFile(verified.canonicalRealPath, this._mainFile)) {
@@ -3084,9 +3009,6 @@ export class OpenAiBudgetLedger {
     if (hardMonthlyLimitConfirmed !== undefined && typeof hardMonthlyLimitConfirmed !== 'boolean') {
       throw new OpenAiValidationError('hardMonthlyLimitConfirmed must be a boolean when provided.');
     }
-    if (allowStage4Media !== undefined && typeof allowStage4Media !== 'boolean') {
-      throw new OpenAiValidationError('allowStage4Media must be a boolean when provided.');
-    }
 
     const storedSummaryObj = {
       recognized_schema: true,
@@ -3189,9 +3111,7 @@ export class OpenAiBudgetLedger {
         );
       }
 
-      const nextStage4 = allowStage4Media !== undefined
-        ? allowStage4Media
-        : (existing ? existing.allow_stage4_media === 1 : false);
+      const nextStage4 = false;
 
       const upsertCarryoverStmt = this.db.prepare(`
         INSERT INTO openai_legacy_carryover (
@@ -4595,12 +4515,6 @@ export class OpenAiBudgetLedger {
         );
       }
       validateSameMonthPendingBuffer(rawPolicyRow.same_month_pending_buffer_cents);
-      if (requireStage4Media && rawPolicyRow.allow_stage4_media !== 1) {
-        throw new OpenAiPolicyError(
-          `Stage-4 media generation is disabled in ledger policy for "${scope}" (allow_stage4_media=false).`,
-          { code: 'STAGE4_MEDIA_DISABLED', notDispatched: true },
-        );
-      }
       if (
         rawPolicyRow.credential_fingerprint_sha256 !== null &&
         rawPolicyRow.credential_fingerprint_sha256 !== undefined &&
@@ -5070,17 +4984,6 @@ export class OpenAiBudgetLedger {
           reason,
           new OpenAiPolicyError(reason, {
             code: 'PLATFORM_BILLING_CONTROLS_UNVERIFIED',
-            notDispatched: false,
-            details: { attempt_id: existing.attempt_id, uploaded_file_id: cleanFileId },
-          }),
-        );
-      }
-      if (requireStage4Media && policyRow.allow_stage4_media !== 1) {
-        const reason = `Stage-4 media policy for "${scope}" was revoked before POST /v1/batches; aborting image batch creation with 0 batch spend.`;
-        return abortAndRejectAttempt(
-          reason,
-          new OpenAiPolicyError(reason, {
-            code: 'STAGE4_MEDIA_DISABLED',
             notDispatched: false,
             details: { attempt_id: existing.attempt_id, uploaded_file_id: cleanFileId },
           }),
@@ -6335,15 +6238,8 @@ export function reconcileLegacyBudgetIntoStore(dbOrLedger, legacySummaryOrPath, 
       throw new OpenAiValidationError('legacySqlitePath must be a valid filesystem path.');
     }
   } else if (legacySummaryOrPath && typeof legacySummaryOrPath === 'object' && !Array.isArray(legacySummaryOrPath)) {
-    const verified = VERIFIED_INSPECTIONS.get(legacySummaryOrPath) ?? null;
+    const verified = legacySummaryOrPath?._verifiedMeta ?? null;
     srcPath = verified ? verified.canonicalRealPath : null;
-    const allowSynth = Boolean(options.testMode === true && options.allowSyntheticSummaryForTests === true);
-    if (!destInfo.isMemory && !srcPath && !allowSynth) {
-      throw new OpenAiBudgetError(
-        'File-backed OpenAI budget ledgers require an authentic immutable inspection summary returned by inspectLegacyAutopilotBudget.',
-        { code: 'UNVERIFIED_LEGACY_SUMMARY_OBJECT', notDispatched: true },
-      );
-    }
   } else {
     throw new OpenAiValidationError('legacySummaryOrPath must be a file path string or inspected summary object.');
   }

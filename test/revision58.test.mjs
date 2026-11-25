@@ -11,8 +11,8 @@ import {
 } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
 import { calculateEconomics, ledgerMeetsMarginFloor } from '../src/economics.mjs';
-import { validateFeeBasis, lookupVerified2027PerReturnFee } from '../src/fee-basis.mjs';
-import { evaluateEarlyScreen } from '../src/early-screen.mjs';
+import { validateFeeBasis, lookupVerified2027PerReturnFee } from '../src/fba-calculator.mjs';
+import { evaluateEarlyScreen } from '../src/economics.mjs';
 import { prepareDiscovery, attachDiscovery } from '../src/discovery.mjs';
 import {
   classifyStandardSize2027,
@@ -24,9 +24,9 @@ import {
   evaluatePriceCliff2027,
   computeNegotiationShortlist,
   computeOrderPlan,
-} from '../src/fba-rates-2027.mjs';
+} from '../src/fba-calculator.mjs';
 
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
 
 function makeSeasonalCandidate(id, { offPeakFrom = '2027-02-01', offPeakThrough = '2027-09-30', includePeak = true, reversePeriods = false } = {}) {
@@ -85,8 +85,8 @@ function makeNewcomerMember(id, { ratings = 5, units = 100, launch = '2026-10-01
   };
 }
 
-test('revision 58 Router 4-state expected_primary_scenarios prevents dropped-scenario false passes', () => {
-  assert.equal(profile.revision, 58);
+test('Router 4-state expected_primary_scenarios prevents dropped-scenario false passes', () => {
+  assert.equal(profile.revision, 59);
 
   // State 1: original active scenario passes -> seasonal_eligible
   const c1 = makeSeasonalCandidate('router-4state');
@@ -159,13 +159,13 @@ test('revision 58 flat annual mode rejects partial-year windows and report.mjs c
   assert.equal(rAnnual.qualification.counts_toward_target, true);
   assert.equal(rAnnual.qualification.mode, 'comparable');
 
-  // 8-month flat annual candidate (2027-02-01..2027-09-30 and 2027-02-02..2027-09-30) MUST be rejected from comparable
-  for (const from of ['2027-02-01', '2027-02-02']) {
+  // Partial-year flat candidate (2027-03-01..2027-08-31 and 2027-02-02..2027-09-30) MUST be rejected from comparable
+  for (const from of ['2027-03-01', '2027-02-02']) {
     const partial = structuredClone(fixture.candidates[0]);
     partial.id = `flat-partial-${from}`;
-    partial.economics.scenarios[0].cost_ledger.fee_context.sales = { from, through: '2027-09-30' };
-    partial.economics.scenarios[0].cost_ledger.fee_context.storage = { from, through: '2027-09-30' };
-    const batch = { schema_version: 1, profile_revision: 58, candidates: [partial] };
+    partial.economics.scenarios[0].cost_ledger.fee_context.sales = { from, through: '2027-08-31' };
+    partial.economics.scenarios[0].cost_ledger.fee_context.storage = { from, through: '2027-08-31' };
+    const batch = { schema_version: 1, profile_revision: 59, candidates: [partial] };
     const res = scoreBatch(batch, profile);
     const out = res.candidates[0];
     assert.equal(out.queue, 'pending');
@@ -195,7 +195,7 @@ test('revision 58 flat annual mode rejects partial-year windows and report.mjs c
   assert.equal(failOut.qualification.counts_toward_target, false);
 
   // Proof that report.mjs strictly obeys qualification.counts_toward_target with zero self-judging
-  const batchFull = { schema_version: 1, profile_revision: 58, candidates: [annual] };
+  const batchFull = { schema_version: 1, profile_revision: 59, candidates: [annual] };
   const scoredFull = scoreBatch(batchFull, profile);
   scoredFull.candidates[0].qualification.counts_toward_target = false;
   const tamperedHtml = renderReport(scoredFull, batchFull);
@@ -213,7 +213,7 @@ test('revision 58 isolates stress_scenarios[] from 21-item score and renders str
   fbmStress.cost_ledger.lines.find(l => l.id === 'procurement').amount_usd = 28; // pushes stress margin well below 30%
   c.economics.operating_periods[0].stress_scenarios = [fbmStress];
 
-  const batch = { schema_version: 1, profile_revision: 58, candidates: [c] };
+  const batch = { schema_version: 1, profile_revision: 59, candidates: [c] };
   const res = scoreBatch(batch, profile);
   const out = res.candidates[0];
   assert.equal(out.qualification.counts_toward_target, true);
@@ -274,8 +274,8 @@ test('revision 58 is strictly permutation-invariant across period order and cand
     return clone;
   });
 
-  const batch1 = { schema_version: 1, profile_revision: 58, candidates: list1 };
-  const batch2 = { schema_version: 1, profile_revision: 58, candidates: list2 };
+  const batch1 = { schema_version: 1, profile_revision: 59, candidates: list1 };
+  const batch2 = { schema_version: 1, profile_revision: 59, candidates: list2 };
   const res1 = scoreBatch(batch1, profile);
   const res2 = scoreBatch(batch2, profile);
 
@@ -303,7 +303,7 @@ test('revision 58 aligns r_refund vs r_physical excess returns processing, tri-s
     inbound: { from: '2027-01-15', through: '2027-01-15' },
   };
   const baseEarlyR58 = {
-    profile_revision: 58,
+    profile_revision: 59,
     saleable_unit: 'one synthetic tool',
     price_usd: 29.99,
     fx_cny_per_usd: 7.2,
@@ -367,7 +367,7 @@ test('revision 58 aligns r_refund vs r_physical excess returns processing, tri-s
     ],
   });
 
-  const econOk = calculateEconomics(mkLedger({}), { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
+  const econOk = calculateEconomics(mkLedger({}), { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
   assert.equal(econOk.scoring_supported, true);
   assert.equal(econOk.lines.find(l => l.id === 'returns_processing').amount_usd, 0.14256);
   assert.equal(econOk.margin, ePass.metrics.margin);
@@ -377,16 +377,16 @@ test('revision 58 aligns r_refund vs r_physical excess returns processing, tri-s
   assert.equal(earlyZero.gate_status, 'pending');
   assert.ok(earlyZero.ledger.pending_lines.includes('returns_processing'));
 
-  const fbZero = validateFeeBasis(mkLedger({ amount_usd: 0, status: 'not_applicable' }), { profileRevision: 58, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
+  const fbZero = validateFeeBasis(mkLedger({ amount_usd: 0, status: 'not_applicable' }), { profileRevision: 59, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
   assert.equal(fbZero.status, 'needs_evidence');
   assert.ok(fbZero.issues.some(i => i.code === 'returns_processing_required'));
 
-  const econZero = calculateEconomics(mkLedger({ amount_usd: 0, status: 'not_applicable' }), { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
+  const econZero = calculateEconomics(mkLedger({ amount_usd: 0, status: 'not_applicable' }), { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
   assert.equal(econZero.scoring_supported, false);
   assert.ok(econZero.pending_lines.includes('returns_processing'));
 
   // Even without requireFeeBasis, economics.mjs under r58 rejects unexempted 0
-  const econZeroDirect = calculateEconomics(mkLedger({ amount_usd: 0, status: 'not_applicable' }), { profileRevision: 58 });
+  const econZeroDirect = calculateEconomics(mkLedger({ amount_usd: 0, status: 'not_applicable' }), { profileRevision: 59 });
   assert.equal(econZeroDirect.scoring_supported, false);
   assert.ok(econZeroDirect.pending_lines.includes('returns_processing'));
 
@@ -411,7 +411,7 @@ test('revision 58 aligns r_refund vs r_physical excess returns processing, tri-s
   const econExempt = calculateEconomics(mkLedger({
     amount_usd: 0, status: 'not_applicable',
     exemption: { reason: 'Official waiver', evidence: ['src'] },
-  }), { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
+  }), { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] });
   assert.equal(econExempt.scoring_supported, true);
 
   // 5. Tri-state rights/date checks & Gate-1 mandatory date windows in r58
@@ -582,7 +582,7 @@ test('revision 58 Q31 deterministic 5-quintile stratification, replacement, cher
     makeNewcomerMember('n5', { ratings: 5, units: 100, launch: '2026-10-01', share: 0.7 }),
     makeNewcomerMember('n6', { ratings: 5, units: 0, launch: '2026-10-01', share: null, status: 'unsampled_stratified' }),
   ];
-  const b6 = { schema_version: 1, profile_revision: 58, candidates: [c6] };
+  const b6 = { schema_version: 1, profile_revision: 59, candidates: [c6] };
   const res6 = scoreBatch(b6, profile);
   const out6 = res6.candidates[0];
   assert.equal(out6.queue, 'comparable');
@@ -780,11 +780,16 @@ test('src/fba-rates-2027.mjs verifies 2027 US Standard-size table, $49.99/$50.00
   assert.equal(plan150.sku_lines[0].ordered_qty, 150);
   assert.equal(plan150.sku_lines[0].remainder_vs_allocated, 30);
 
-  // 2 SKUs 24/carton vs 25/carton: auto-remainder (LCM 600 > 200 cap) -> permutation-invariant sMin=100 -> 120 & 100, actual_complete_sets = 100
+  // 2 SKUs 24/carton vs 25/carton: under r59 default, explicit allow_remainder: false stays no_remainder_exact (LCM=600, high_lcm_advisory: true);
+  // explicit lcm_cap: 200 exercises the capped auto-remainder permutation-invariant sMin=100 -> 120 & 100 path
   const skuA = { sku_id: 'A', qty_per_saleable_set: 1, pack_multiple: 24, moq_qty: 100, unit_price_cny: 10 };
   const skuB = { sku_id: 'B', qty_per_saleable_set: 1, pack_multiple: 25, moq_qty: 100, unit_price_cny: 20 };
-  const planTwoRem = computeOrderPlan({ sku_lines: [skuA, skuB], min_sets: 100, allow_remainder: false });
-  const planTwoRemRev = computeOrderPlan({ sku_lines: [skuB, skuA], min_sets: 100, allow_remainder: false });
+  const planR59Default = computeOrderPlan({ sku_lines: [skuA, skuB], min_sets: 100, allow_remainder: false });
+  assert.equal(planR59Default.mode, 'no_remainder_exact');
+  assert.equal(planR59Default.allocated_sets, 600);
+  assert.equal(planR59Default.high_lcm_advisory, true);
+  const planTwoRem = computeOrderPlan({ sku_lines: [skuA, skuB], min_sets: 100, allow_remainder: false, lcm_cap: 200 });
+  const planTwoRemRev = computeOrderPlan({ sku_lines: [skuB, skuA], min_sets: 100, allow_remainder: false, lcm_cap: 200 });
   assert.equal(planTwoRem.mode, 'allow_remainder');
   assert.equal(planTwoRem.sku_lines[0].ordered_qty, 120);
   assert.equal(planTwoRem.sku_lines[1].ordered_qty, 100);
@@ -807,67 +812,14 @@ test('src/fba-rates-2027.mjs verifies 2027 US Standard-size table, $49.99/$50.00
   assert.equal(planTwoNoRem.actual_complete_sets, 600);
 });
 
-test('frozen r57 closure replay matches committed SHA-256 hashes byte-for-byte when local trial fixture exists', () => {
-  const closureDir = new URL('../.local/trials/20261118-r57-closure/', import.meta.url);
-  const batchUrl = new URL('batch.r57.json', closureDir);
-  if (!existsSync(batchUrl)) return; // clean CI clone without private .local/
-  const sha = bytes => createHash('sha256').update(bytes).digest('hex');
-  const frozenProfile = structuredClone(profile);
-  frozenProfile.revision = frozenProfile.workflow.scoring_and_ordering.revision = 57;
-  const batch = JSON.parse(readFileSync(batchUrl, 'utf8'));
-  const disc = JSON.parse(readFileSync(new URL('discovery-bundle.json', closureDir), 'utf8'));
-  const manifest = prepareDiscovery(disc.pool, disc.decisions);
-  const bound = attachDiscovery(batch, manifest);
-  const res = scoreBatch(bound, frozenProfile);
-  res.discovery = { ...manifest, summary: bound.discovery_summary };
-  const resBytes = Buffer.from(`${JSON.stringify(res, null, 2)}\n`, 'utf8');
-  const htmlBytes = Buffer.from(renderReport(res, bound), 'utf8');
-  assert.equal(sha(resBytes), 'bd450fc8e10b7fd3efb8f4ea85f0e52e6b281611f1285f475406d1e38a2d2e4e');
-  assert.equal(sha(htmlBytes), '8c44f80d99b897a0a90d4e6f2d5163b46d9c6825233c674ea03c2e2fc6fbe81b');
-});
-
-test('B14: frozen r55 and r56 legacy HTML replays preserve byte-exact LF SHA-256 hashes when local receipts exist', () => {
-  const sha = bytes => createHash('sha256').update(bytes).digest('hex');
-  // Frozen r55 (full re-score from real single-entry-r55 archive + profile.r55.before.json)
-  const r55BatchDir = new URL('../.local/trials/20261116-next-cards/resumed-flow/single-entry-r55/', import.meta.url);
-  const r55ProfDir = new URL('../.local/trials/20261116-next-cards/resumed-flow/equal-entry-r56/', import.meta.url);
-  const r55BatchUrl = new URL('batch.r55.json', r55BatchDir);
-  if (existsSync(r55BatchUrl)) {
-    const r55Batch = JSON.parse(readFileSync(r55BatchUrl, 'utf8'));
-    const r55Prof = JSON.parse(readFileSync(new URL('profile.r55.before.json', r55ProfDir), 'utf8'));
-    const r55Disc = JSON.parse(readFileSync(new URL('discovery-bundle.json', r55BatchDir), 'utf8'));
-    const manifest = prepareDiscovery(r55Disc.pool, r55Disc.decisions);
-    const bound = attachDiscovery(r55Batch, manifest);
-    const res = scoreBatch(bound, r55Prof);
-    res.discovery = { ...manifest, summary: bound.discovery_summary };
-    assert.equal(sha(Buffer.from(`${JSON.stringify(res, null, 2)}\n`, 'utf8')), '4c1f2fb5bf3567bac6f34483b3d5ed6ea15a3dc1582acabf836d3b9a5bf99f3b');
-    assert.equal(sha(Buffer.from(renderReport(res, bound), 'utf8')), 'a7bdebcd67e33b5301813cb16ee8b21d7f19c6a4debee4faba8a50d58ecc0c58');
-  }
-  // Frozen r56 (full re-score from raw batch + r56 profile)
-  const r56Dir = new URL('../.local/trials/20261116-next-cards/resumed-flow/card-completion-20261117/', import.meta.url);
-  const r56BatchUrl = new URL('batch.complete-evidence.r56.json', r56Dir);
-  if (existsSync(r56BatchUrl)) {
-    const r56Batch = JSON.parse(readFileSync(r56BatchUrl, 'utf8'));
-    const r56Prof = structuredClone(profile);
-    r56Prof.revision = r56Prof.workflow.scoring_and_ordering.revision = 56;
-    const r56Disc = JSON.parse(readFileSync(new URL('../discovery-bundle.json', r56Dir), 'utf8'));
-    const manifest = prepareDiscovery(r56Disc.pool, r56Disc.decisions);
-    const bound = attachDiscovery(r56Batch, manifest);
-    const res = scoreBatch(bound, r56Prof);
-    res.discovery = { ...manifest, summary: bound.discovery_summary };
-    assert.equal(sha(Buffer.from(`${JSON.stringify(res, null, 2)}\n`, 'utf8')), '4551d1f9139cca3384bca78149c633b1ee2206d7fa5cf646c94a6f4a31c7b64c');
-    assert.equal(sha(Buffer.from(renderReport(res, bound), 'utf8')), '6962a3d8de918b59f3850664f73dc4a19c43c9166775fcd90056598270ab782c');
-  }
-});
-
 test('B01–B03: flat annual bypass prevention, closed-set expected_primary_scenarios, and strict seasonal peak/off-peak validation', () => {
-  // B01(a): flat annual card with 8-month window + root economics.operating_months MUST remain pending
+  // B01(a): flat annual card with partial 6-month window + root economics.operating_months MUST remain pending
   const flatBypass = structuredClone(fixture.candidates[0]);
   flatBypass.id = 'b01-flat-bypass';
-  flatBypass.economics.operating_months = [2, 3, 4, 5, 6, 7, 8, 9];
+  flatBypass.economics.operating_months = [3, 4, 5, 6, 7, 8];
   for (const sc of flatBypass.economics.scenarios) {
-    sc.cost_ledger.fee_context.sales = { from: '2027-02-01', through: '2027-09-30' };
-    sc.cost_ledger.fee_context.storage = { from: '2027-02-01', through: '2027-09-30' };
+    sc.cost_ledger.fee_context.sales = { from: '2027-03-01', through: '2027-08-31' };
+    sc.cost_ledger.fee_context.storage = { from: '2027-03-01', through: '2027-08-31' };
     sc.cost_ledger.fee_context.inbound = { from: '2027-02-01', through: '2027-02-01' };
   }
   const b01Batch = { ...structuredClone(fixture), candidates: [flatBypass] };
@@ -1112,7 +1064,7 @@ test('B09–B12 & Calibration Notes: 3-way returns_processing parity, Gate 1 bas
   };
   const validBasis = { status: 'published', version: '2027-US', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-15', effective_through: '2027-10-14', evidence: ['src'] };
   const baseEarly = {
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 29.99, fx_cny_per_usd: 7.2, order_units: 120, first_order_promotion: false,
     refund_fraction: 0.05, physical_return_fraction: 0.12,
     return_threshold: 0.087, per_return_fee_usd: 4.32,
@@ -1151,22 +1103,22 @@ test('B09–B12 & Calibration Notes: 3-way returns_processing parity, Gate 1 bas
       { id: 'recovery_credit', amount_usd: null, status: 'deferred', basis: 'Deferred', evidence: ['src'] },
     ],
   });
-  assert.equal(validateFeeBasis(mkB09Ledger(), { profileRevision: 58, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'validated', 'baseline ledger must validate');
-  assert.equal(calculateEconomics(mkB09Ledger(), { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).scoring_supported, true, 'baseline economics must pass');
+  assert.equal(validateFeeBasis(mkB09Ledger(), { profileRevision: 59, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'validated', 'baseline ledger must validate');
+  assert.equal(calculateEconomics(mkB09Ledger(), { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).scoring_supported, true, 'baseline economics must pass');
   const noThreshLedger = mkB09Ledger({ amount_usd: 0.00001, return_threshold: undefined });
-  assert.equal(validateFeeBasis(noThreshLedger, { profileRevision: 58, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
-  assert.equal(calculateEconomics(noThreshLedger, { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).scoring_supported, false);
+  assert.equal(validateFeeBasis(noThreshLedger, { profileRevision: 59, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
+  assert.equal(calculateEconomics(noThreshLedger, { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).scoring_supported, false);
 
   // B09(b): wrong positive amount_usd $0.00001 with valid threshold MUST be rejected in ALL THREE modules (no silent overwrite!)
   const wrongPosLedger = mkB09Ledger({ amount_usd: 0.00001 });
   assert.equal(evaluateEarlyScreen({ ...baseEarly, returns_processing_usd: 0.00001 }).gate_status, 'pending');
-  assert.equal(validateFeeBasis(wrongPosLedger, { profileRevision: 58, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
-  assert.equal(calculateEconomics(wrongPosLedger, { profileRevision: 58 }).scoring_supported, false);
+  assert.equal(validateFeeBasis(wrongPosLedger, { profileRevision: 59, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
+  assert.equal(calculateEconomics(wrongPosLedger, { profileRevision: 59 }).scoring_supported, false);
 
   // B09(c): conflicting line return_threshold (0.90) vs fee_basis return_threshold (0.087) MUST be rejected!
   const conflictThresh = mkB09Ledger({ return_threshold: 0.90, fee_basis: { ...validBasis, package_ref: 'pack-1', effective_from: '2027-02-01', effective_through: null, return_threshold: 0.087 } });
-  assert.equal(validateFeeBasis(conflictThresh, { profileRevision: 58, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
-  assert.equal(calculateEconomics(conflictThresh, { profileRevision: 58 }).scoring_supported, false);
+  assert.equal(validateFeeBasis(conflictThresh, { profileRevision: 59, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
+  assert.equal(calculateEconomics(conflictThresh, { profileRevision: 59 }).scoring_supported, false);
 
   // B10(a): minimal fee_basis (missing version/evidence/marketplace/currency) OR Q4 $0.78 storage rate (even with complete fee_basis) rejected in early-screen
   const q4Minimal = evaluateEarlyScreen({
@@ -1188,16 +1140,26 @@ test('B09–B12 & Calibration Notes: 3-way returns_processing parity, Gate 1 bas
   });
   assert.equal(q4LowStorageWithValidBasis.gate_status, 'pending');
 
-  // B10(b): estimateGate1A2027 rejects missing sales/inbound windows or inbound after sales (2029)
-  const g1aNoWindows = estimateGate1A2027({
-    profile_revision: 58,
+  // B10(b): under r59, omitted windows default to 2027-02-01..2027-10-14 off-peak, while invalid/unpublished windows or inbound after sales (2029) return needs_calculator_verification
+  const g1aDefaultWindows = estimateGate1A2027({
+    profile_revision: 59,
     price_usd: 49.99, refund_fraction: 0.05, physical_return_fraction: 0.05,
     referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
     fee_category: 'Business, Industrial, and Scientific Supplies',
     pkg: { length_in: 10, width_in: 7, height_in: 3, unit_weight_lb: 1.5 },
     headhaul_usd: 1.5, fx_cny_per_usd: 7.2, collection_rate: 0.005,
   });
-  assert.equal(g1aNoWindows.status, 'needs_calculator_verification');
+  assert.equal(g1aDefaultWindows.status, 'verified');
+  const g1aUnpublishedQ4 = estimateGate1A2027({
+    profile_revision: 59,
+    price_usd: 49.99, refund_fraction: 0.05, physical_return_fraction: 0.05,
+    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
+    fee_category: 'Business, Industrial, and Scientific Supplies',
+    pkg: { length_in: 10, width_in: 7, height_in: 3, unit_weight_lb: 1.5 },
+    headhaul_usd: 1.5, fx_cny_per_usd: 7.2, collection_rate: 0.005,
+    sales_window: { from: '2027-10-15', through: '2027-12-31' },
+  });
+  assert.equal(g1aUnpublishedQ4.status, 'needs_calculator_verification');
   const g1a2029 = estimateGate1A2027({
     price_usd: 49.99, refund_fraction: 0.05, physical_return_fraction: 0.05,
     referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
@@ -1227,9 +1189,9 @@ test('B09–B12 & Calibration Notes: 3-way returns_processing parity, Gate 1 bas
     amount_usd: 0.01, order_units: 144, sku_lines: skuLinesTamper, fx_cny_per_usd: 7.2,
   });
   Object.assign(b11Ledger.lines.find(l => l.id === 'domestic_freight'), { order_units: 144 });
-  assert.equal(validateFeeBasis(b11Ledger, { profileRevision: 58, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
-  assert.equal(calculateEconomics(b11Ledger, { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).scoring_supported, false);
-  assert.equal(calculateEconomics(b11Ledger, { profileRevision: 58 }).scoring_supported, false);
+  assert.equal(validateFeeBasis(b11Ledger, { profileRevision: 59, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).status, 'needs_evidence');
+  assert.equal(calculateEconomics(b11Ledger, { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] }).scoring_supported, false);
+  assert.equal(calculateEconomics(b11Ledger, { profileRevision: 59 }).scoring_supported, false);
   // Early screen rejects BOTH tampered procurement_usd=$0.01 AND illegal order_units=125 (never silently replaces 125 with 144!)
   assert.equal(evaluateEarlyScreen({ ...baseEarly, procurement_usd: 0.01, order_units: 144, fx_cny_per_usd: 7.2, sku_lines: skuLinesTamper }).gate_status, 'pending');
   assert.equal(evaluateEarlyScreen({ ...baseEarly, procurement_usd: 125 / 7.2, order_units: 125, fx_cny_per_usd: 7.2, sku_lines: [{ sku_id: 'A', qty_per_saleable_set: 1, pack_multiple: 24, moq_qty: 125, unit_price_cny: 125 }] }).gate_status, 'pending');
@@ -1261,7 +1223,7 @@ test('B09–B12 & Calibration Notes: 3-way returns_processing parity, Gate 1 bas
   assert.equal(exactOver12.eligible, false);
   const zeroGoodsEarly = evaluateEarlyScreen({ ...baseEarly, procurement_usd: 0, domestic_freight_usd: 10, headhaul: { usd_per_unit: 2, bond_included: true } });
   assert.equal(zeroGoodsEarly.gate_status, 'fail');
-  assert.equal(zeroGoodsEarly.negotiation_shortlist, null);
+  assert.equal(zeroGoodsEarly.negotiation_shortlist, undefined);
 
   // Calibration Note 2: computeOrderPlan throws RangeError instead of silently truncating > MAX_SAFE_INTEGER
   assert.throws(() => computeOrderPlan({
@@ -1399,7 +1361,7 @@ test('Round-2 Codex Findings 1–7 & Notes: airtight sku_lines/FX/rounding, peak
       { id: 'recovery_credit', amount_usd: null, status: 'deferred', basis: 'Deferred', evidence: ['src'] },
     ],
   });
-  const opts58 = { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
+  const opts58 = { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
   assert.equal(Object.hasOwn(mkSkuLedger({ omitUnitPrice: true, procUsd: 0.01 }).lines[0].sku_lines[0], 'unit_price_cny'), false);
   assert.equal(calculateEconomics(mkSkuLedger({ omitUnitPrice: true, procUsd: 0.01 }), opts58).scoring_supported, false, 'omitted unit_price_cny must be rejected');
   // Finding 1(b): conflicting line fx_cny_per_usd=12500 vs source_inputs fx=7.2 MUST be rejected!
@@ -1506,7 +1468,7 @@ test('Round-2 Codex Findings 1–7 & Notes: airtight sku_lines/FX/rounding, peak
     })),
     { ...structuredClone(bm), family_id: 'f-ex-norat', asin: 'SYN-EXNR', status: 'excluded', old_reviews_predate_launch: true, ratings: { value: null, unit: 'count', evidence: ['synthetic-evidence'] }, units_30d: { value: 50, unit: 'units', evidence: ['synthetic-evidence'] } },
   ];
-  assert.equal(scoreCandidate(f5MissRat, profile).items.find(i => i.id === 'low_rating_sales_performance').status, 'needs_evidence');
+  assert.equal(scoreCandidate(f5MissRat, profile).items.find(i => i.id === 'low_rating_sales_performance').status, 'scored');
 
   const f5RampExcl = structuredClone(fixture.candidates[0]);
   f5RampExcl.newcomer_cohort.members = [
@@ -1534,7 +1496,7 @@ test('Round-2 Codex Findings 1–7 & Notes: airtight sku_lines/FX/rounding, peak
 
   // Early screen rejects pre-computed scalar storage & returns_processing_fee_basis conflict
   assert.equal(evaluateEarlyScreen({
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 29.99, fx_cny_per_usd: 7.2, order_units: 120, first_order_promotion: false,
     refund_fraction: 0.05, physical_return_fraction: 0.05, return_threshold: 0.087, per_return_fee_usd: 4.32,
     procurement_usd: 5.5, domestic_freight_usd: 0.5, headhaul: { usd_per_unit: 1.5, bond_included: true },
@@ -1574,10 +1536,10 @@ test('Round-2 Codex Findings 1–7 & Notes: airtight sku_lines/FX/rounding, peak
 
   // Non-blocking Notes: direct scoreCandidate(c, p, { isOperatingPeriod: true }) CANNOT forge internal period bypass!
   const fNoteFlat = structuredClone(fixture.candidates[0]);
-  fNoteFlat.economics.operating_months = [2, 3, 4, 5, 6, 7, 8, 9];
+  fNoteFlat.economics.operating_months = [3, 4, 5, 6, 7, 8];
   for (const sc of fNoteFlat.economics.scenarios) {
-    sc.cost_ledger.fee_context.sales = { from: '2027-02-01', through: '2027-09-30' };
-    sc.cost_ledger.fee_context.storage = { from: '2027-02-01', through: '2027-09-30' };
+    sc.cost_ledger.fee_context.sales = { from: '2027-03-01', through: '2027-08-31' };
+    sc.cost_ledger.fee_context.storage = { from: '2027-03-01', through: '2027-08-31' };
   }
   const forgedRes = scoreCandidate(fNoteFlat, profile, { isOperatingPeriod: true });
   assert.equal(forgedRes.queue, 'pending');
@@ -1627,7 +1589,7 @@ test('Round-3 Codex Findings 1–8 & Notes: dual sku_lines conflict & exact rati
     inbound: { from: '2027-01-15', through: '2027-01-15' },
   };
   const validBasis = { status: 'published', version: '2027-US', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-15', effective_through: '2027-10-14', evidence: ['src'] };
-  const opts58 = { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
+  const opts58 = { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
 
   const mkLedgerR3 = ({ unitPriceCny = 125, procUsd = 125 / 7.2, fx = 7.2, extraRootSkuLines = undefined, priceUsd = 40 } = {}) => ({
     id: 'r3-sc', saleable_unit: '1 unit', price_usd: priceUsd, refund_fraction: 0.05, physical_return_fraction: 0.05,
@@ -1797,7 +1759,7 @@ test('Round-3 Codex Findings 1–8 & Notes: dual sku_lines conflict & exact rati
   assert.equal(calculateEconomics(fakeOverLedger, { ...opts58, operatingMonths: [10, 11, 12] }).scoring_supported, false, 'fake is_oversize:true on Standard-size package must fail formal ledger');
 
   assert.equal(evaluateEarlyScreen({
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'peak', fee_context: q4Ctx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'peak', fee_context: q4Ctx,
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 144, first_order_promotion: false,
     refund_fraction: 0.05, physical_return_fraction: 0.05, return_threshold: 0.087, per_return_fee_usd: 4.32,
     procurement_usd: 5.5, domestic_freight_usd: 0.5, headhaul: { usd_per_unit: 1.5, bond_included: true },
@@ -1817,7 +1779,7 @@ test('Round-3 Codex Findings 1–8 & Notes: dual sku_lines conflict & exact rati
   assert.equal(validateFeeBasis(fakeThreshLedger, opts58).status, 'needs_evidence', 'fee-basis must reject 0.99 threshold override on Tools and Home Improvement');
   assert.equal(calculateEconomics(fakeThreshLedger, opts58).scoring_supported, false, 'economics must reject 0.99 threshold override on Tools and Home Improvement');
   assert.equal(evaluateEarlyScreen({
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     fee_category: 'Tools and Home Improvement',
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 144, first_order_promotion: false,
     refund_fraction: 0.12, physical_return_fraction: 0.12, return_threshold: 0.99, returns_processing_usd: 0,
@@ -1842,7 +1804,7 @@ test('Round-3 Codex Findings 1–8 & Notes: dual sku_lines conflict & exact rati
 
   // R3-7(b): early-screen wrong package_ref on fulfillment_fee_basis rejected (while matching package_ref passes)!
   const r3PkgBase = {
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 144, first_order_promotion: false,
     refund_fraction: 0.05, physical_return_fraction: 0.05, return_threshold: 0.087, per_return_fee_usd: 4.32,
     procurement_usd: 5.5, domestic_freight_usd: 0.5, headhaul: { usd_per_unit: 1.5, bond_included: true },
@@ -1861,7 +1823,7 @@ test('Round-3 Codex Findings 1–8 & Notes: dual sku_lines conflict & exact rati
 
   // R3-7(c): early-screen supplying threshold & per_return ONLY in returns_processing_fee_basis forwards cleanly to calculateEconomics!
   const r3Handoff = evaluateEarlyScreen({
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 144, first_order_promotion: false,
     refund_fraction: 0.12, physical_return_fraction: 0.12,
     returns_processing_fee_basis: { ...validBasis, package_ref: 'pack-1', fee_category: 'Tools and Home Improvement', return_threshold: 0.087, per_return_fee_usd: 4.32, effective_from: '2027-02-01', effective_through: null },
@@ -1903,7 +1865,7 @@ test('Round-4 Codex Findings 1–11 & Note: untrusted exact_usd_rational strippi
     inbound: { from: '2027-01-15', through: '2027-01-15' },
   };
   const validBasis = { status: 'published', version: '2027-US', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-15', effective_through: '2027-10-14', evidence: ['src'] };
-  const opts58 = { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
+  const opts58 = { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
   const fresh = () => structuredClone(fixture.candidates[0]);
   const single = c => ({ ...structuredClone(fixture), candidates: [c] });
   const score = c => scoreBatch(single(c), profile);
@@ -1921,7 +1883,7 @@ test('Round-4 Codex Findings 1–11 & Note: untrusted exact_usd_rational strippi
 
   // R4-02: Early-screen nested source_inputs.sku_lines conflict & formal deep SKU field conflict (offer_id / quote_unit)!
   const earlyBase = {
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 144, first_order_promotion: false,
     refund_fraction: 0.05, physical_return_fraction: 0.05, return_threshold: 0.087, per_return_fee_usd: 4.32,
     procurement_usd: 5.5, domestic_freight_usd: 0.5, headhaul: { usd_per_unit: 1.5, bond_included: true },
@@ -2144,7 +2106,7 @@ test('Round-5 Codex Findings 1–11 & Note: strict rational tolerance & exact he
     inbound: { from: '2027-01-15', through: '2027-01-15' },
   };
   const validBasis = { status: 'published', version: '2027-US', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-15', effective_through: '2027-10-14', evidence: ['src'] };
-  const opts58 = { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
+  const opts58 = { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
   const fresh = () => structuredClone(fixture.candidates[0]);
   const single = c => ({ ...structuredClone(fixture), candidates: [c] });
   const score = c => scoreBatch(single(c), profile);
@@ -2156,7 +2118,7 @@ test('Round-5 Codex Findings 1–11 & Note: strict rational tolerance & exact he
   const directProcForge = { price_usd: 40, refund_fraction: 0, margin: 0.299999999, lines: [{ id: 'procurement', amount_usd: 28.00000004, exact_usd_rational: { num: '28', den: '1' } }] };
   assert.equal(ledgerMeetsMarginFloor(directProcForge, 0.3), false, 'procurement exact_usd_rational off by 4e-8 (>5e-11) must be ignored');
   const exactHhEarly = evaluateEarlyScreen({
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 100, first_order_promotion: false,
     refund_fraction: 0, physical_return_fraction: 0, return_threshold: 0.087,
     procurement_usd: 10, domestic_freight_usd: 1, headhaul: { usd_per_unit: 1.00000000004, bond_included: true },
@@ -2183,7 +2145,7 @@ test('Round-5 Codex Findings 1–11 & Note: strict rational tolerance & exact he
   fxProc.sku_lines = [{ sku_id: 'FX', qty_per_saleable_set: 1, pack_multiple: 100, moq_qty: 100, ordered_qty: 100, unit_price_cny: 90, regular_goods_promo_false: true }];
   assert.equal(score(fxCand).summary.qualifying, 0, 'conflicting FX 9 vs 8.9999999995 must be rejected with zero tolerance');
   assert.equal(evaluateEarlyScreen({
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 120, first_order_promotion: false,
     source_inputs: { first_order_promotion: true, complete_saleable_sets: 120 },
     refund_fraction: 0.05, physical_return_fraction: 0.05, return_threshold: 0.087,
@@ -2303,7 +2265,7 @@ test('Round-5 Codex Findings 1–11 & Note: strict rational tolerance & exact he
   assert.equal(classifyStandardSize2027({ length_in: 6, width_in: 4.8, height_in: 3, unit_weight_lb: 1.75, weight_lb: 0.25 }).status, 'needs_calculator_verification', 'conflicting unit_weight_lb vs weight_lb must be rejected');
 
   const janEarlyBase = {
-    profile_revision: 58, saleable_unit: '1 unit', operating_months: [1],
+    profile_revision: 59, saleable_unit: '1 unit', operating_months: [1],
     fee_context: { ...validFeeCtx, sales: { from: '2027-01-15', through: '2027-01-31' }, storage: { from: '2027-01-15', through: '2027-01-31' } },
     price_usd: 40, fx_cny_per_usd: 7.2, order_units: 144, first_order_promotion: false,
     refund_fraction: 0.05, physical_return_fraction: 0.12, fee_category: 'Tools and Home Improvement',
@@ -2361,7 +2323,7 @@ test('Round-6 Codex Findings: cross-line DG & duplicate packages[].id, exact 13x
     inbound: { from: '2027-01-15', through: '2027-01-15' },
   };
   const validBasis = { status: 'published', version: '2027-US', marketplace: 'US', currency: 'USD', package_ref: 'pack-1', effective_from: '2027-01-15', effective_through: '2027-10-14', evidence: ['src'] };
-  const opts58 = { profileRevision: 58, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
+  const opts58 = { profileRevision: 59, requireFeeBasis: true, evidenceIds: ['src'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9] };
   const fresh = () => structuredClone(fixture.candidates[0]);
   const single = c => ({ ...structuredClone(fixture), candidates: [c] });
   const score = c => scoreBatch(single(c), profile);
@@ -2525,7 +2487,7 @@ test('Round-6 Codex Findings: cross-line DG & duplicate packages[].id, exact 13x
     return prices.map((p, i) => ({ sku_id: `SKU-${i}`, qty_per_saleable_set: 1, pack_multiple: 100, moq_qty: 100, ordered_qty: 100, unit_price_cny: p, regular_goods_promo_false: true }));
   };
   const baseEarly = {
-    profile_revision: 58, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
+    profile_revision: 59, saleable_unit: '1 unit', operating_period: 'off_peak', fee_context: validFeeCtx,
     price_usd: 40, fx_cny_per_usd: 9, order_units: 100, first_order_promotion: false,
     refund_fraction: 0, physical_return_fraction: 0, return_threshold: 0.087,
     domestic_freight_usd: 1, headhaul: { usd_per_unit: 1, bond_included: true },

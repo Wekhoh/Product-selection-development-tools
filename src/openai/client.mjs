@@ -22,6 +22,10 @@ import {
 } from '../contracts.mjs';
 import { canonicalJson, sha256Hex } from '../store.mjs';
 import {
+  assertSupportedStrictJsonSchema,
+  validateJsonAgainstStrictSchema,
+} from '../utils/json-schema.mjs';
+import {
   DEFAULT_TERRA_MAX_OUTPUT_TOKENS,
   DEFAULT_UNCAPPED_WEB_SEARCH_RESERVATION_CALLS,
   OpenAiError,
@@ -126,35 +130,6 @@ const LOCAL_ONLY_REQUEST_KEYS = new Set([
 const SENSITIVE_KEY_NAME_RE =
   /^(?:api[_-]?key|apikey|authorization|secret[_-]?key|access[_-]?token|refresh[_-]?token|cookie|password)$/i;
 
-const SUPPORTED_JSON_SCHEMA_KEYWORDS = new Set([
-  'type',
-  'properties',
-  'required',
-  'additionalProperties',
-  'items',
-  'minItems',
-  'maxItems',
-  'enum',
-  'const',
-  'anyOf',
-  'oneOf',
-  'allOf',
-  'not',
-  'minLength',
-  'maxLength',
-  'pattern',
-  'minimum',
-  'maximum',
-  'exclusiveMinimum',
-  'exclusiveMaximum',
-  'nullable',
-  'title',
-  'description',
-  '$schema',
-  'default',
-  'examples',
-  'strict',
-]);
 
 export class OpenAiHttpError extends OpenAiError {
   constructor(message, {
@@ -1177,256 +1152,31 @@ function validateDecisionAnswerAgainstQuestion(item, matchedEntry) {
  * Validate that a JSON Schema uses only supported recursive keywords (`P1-01`).
  * Rejects `$ref` or unknown keywords explicitly rather than silently marking unvalidated output `usable: true`.
  */
-export function validateSupportedJsonSchemaDialect(schema, pathLabel = 'schema', depth = 0) {
-  if (depth > 48) {
-    throw new OpenAiValidationError(`${pathLabel} exceeds maximum JSON Schema nesting depth.`);
-  }
-  if (typeof schema === 'boolean') return;
-  if (!isPlainObject(schema)) {
-    throw new OpenAiValidationError(`${pathLabel} must be a plain JSON Schema object or boolean.`);
-  }
-  for (const key of Object.keys(schema)) {
-    if (!Object.hasOwn(schema, key)) continue;
-    if (!SUPPORTED_JSON_SCHEMA_KEYWORDS.has(key)) {
-      throw new OpenAiValidationError(
-        `Unsupported JSON Schema keyword "${sanitizeDiagnosticText(key)}" at ${pathLabel}; only local self-contained JSON Schemas are supported.`,
-        { code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' },
-      );
-    }
-  }
-  if (schema.properties !== undefined) {
-    assertPlainObject(schema.properties, `${pathLabel}.properties`);
-    for (const propKey of Object.keys(schema.properties)) {
-      if (Object.hasOwn(schema.properties, propKey)) {
-        validateSupportedJsonSchemaDialect(schema.properties[propKey], `${pathLabel}.properties.${propKey}`, depth + 1);
-      }
-    }
-  }
-  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== 'boolean') {
-    validateSupportedJsonSchemaDialect(schema.additionalProperties, `${pathLabel}.additionalProperties`, depth + 1);
-  }
-  if (schema.items !== undefined) {
-    if (Array.isArray(schema.items)) {
-      throw new OpenAiValidationError(`${pathLabel}.items tuple array is unsupported; use a single item schema.`, {
-        code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD',
-      });
-    }
-    validateSupportedJsonSchemaDialect(schema.items, `${pathLabel}.items`, depth + 1);
-  }
-  for (const combKey of ['anyOf', 'oneOf', 'allOf']) {
-    if (schema[combKey] !== undefined) {
-      if (!Array.isArray(schema[combKey]) || schema[combKey].length === 0) {
-        throw new OpenAiValidationError(`${pathLabel}.${combKey} must be a nonempty array of schemas.`);
-      }
-      schema[combKey].forEach((sub, idx) => validateSupportedJsonSchemaDialect(sub, `${pathLabel}.${combKey}[${idx}]`, depth + 1));
-    }
-  }
-  if (schema.not !== undefined) {
-    validateSupportedJsonSchemaDialect(schema.not, `${pathLabel}.not`, depth + 1);
-  }
+export function validateSupportedJsonSchemaDialect(schema, pathLabel = 'schema') {
+  assertSupportedStrictJsonSchema(schema, pathLabel, {
+    ErrorClass: OpenAiValidationError,
+    strictCodexDialect: false,
+    maxDepth: 48,
+  });
 }
 
-function deepJsonEqual(a, b) {
-  if (Object.is(a, b)) return true;
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
-  if (Array.isArray(a) !== Array.isArray(b)) return false;
-  if (Array.isArray(a)) {
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      if (!deepJsonEqual(a[i], b[i])) return false;
-    }
-    return true;
-  }
-  const keysA = Object.keys(a).filter(k => Object.hasOwn(a, k));
-  const keysB = Object.keys(b).filter(k => Object.hasOwn(b, k));
-  if (keysA.length !== keysB.length) return false;
-  for (const k of keysA) {
-    if (!Object.hasOwn(b, k) || !deepJsonEqual(a[k], b[k])) return false;
-  }
-  return true;
-}
-
-function matchesSingleJsonType(val, expectedType) {
-  switch (expectedType) {
-    case 'null':
-      return val === null;
-    case 'boolean':
-      return typeof val === 'boolean';
-    case 'string':
-      return typeof val === 'string';
-    case 'number':
-      return typeof val === 'number' && Number.isFinite(val);
-    case 'integer':
-      return typeof val === 'number' && Number.isInteger(val);
-    case 'array':
-      return Array.isArray(val);
-    case 'object':
-      return isPlainObject(val);
-    default:
-      return false;
-  }
-}
-
-/**
- * Recursive JSON Schema validator (`P1-01`).
- * Returns `null` when `value` satisfies `schema`, or a diagnostic string explaining the first mismatch.
- */
-export function validateValueAgainstJsonSchema(value, schema, pathLabel = '$', depth = 0) {
-  if (depth > 64) {
-    return `${pathLabel} exceeded maximum schema validation depth.`;
-  }
-  if (schema === true) return null;
-  if (schema === false) return `${pathLabel} is disallowed by boolean false schema.`;
-  if (!isPlainObject(schema)) {
-    return `${pathLabel} schema is not a valid object.`;
-  }
-
-  for (const key of Object.keys(schema)) {
-    if (Object.hasOwn(schema, key) && !SUPPORTED_JSON_SCHEMA_KEYWORDS.has(key)) {
-      return `${pathLabel} schema uses unsupported keyword "${sanitizeDiagnosticText(key)}".`;
-    }
-  }
-
-  if (schema.nullable === true && value === null) {
+export function validateValueAgainstJsonSchema(value, schema, pathLabel = '$') {
+  try {
+    validateJsonAgainstStrictSchema(value, schema, pathLabel, {
+      ErrorClass: OpenAiValidationError,
+      strictCodexDialect: false,
+      maxDepth: 48,
+    });
     return null;
+  } catch (err) {
+    if (err instanceof OpenAiValidationError && err.code === 'UNSUPPORTED_JSON_SCHEMA_KEYWORD') {
+      throw err;
+    }
+    if (err instanceof OpenAiValidationError && /maximum JSON Schema/.test(err.message)) {
+      throw err;
+    }
+    return sanitizeDiagnosticText(err?.message ?? String(err));
   }
-
-  if (schema.type !== undefined) {
-    const allowedTypes = Array.isArray(schema.type) ? schema.type : [schema.type];
-    const matchedType = allowedTypes.some(t => typeof t === 'string' && matchesSingleJsonType(value, t));
-    if (!matchedType) {
-      return `${pathLabel} failed type check (expected ${allowedTypes.join('|')}).`;
-    }
-  }
-
-  if (Object.hasOwn(schema, 'const')) {
-    if (!deepJsonEqual(value, schema.const)) {
-      return `${pathLabel} did not match const constraint.`;
-    }
-  }
-
-  if (Array.isArray(schema.enum)) {
-    if (!schema.enum.some(candidate => deepJsonEqual(value, candidate))) {
-      return `${pathLabel} is not one of allowed enum values.`;
-    }
-  }
-
-  if (Array.isArray(schema.allOf)) {
-    for (let i = 0; i < schema.allOf.length; i++) {
-      const subErr = validateValueAgainstJsonSchema(value, schema.allOf[i], `${pathLabel}(allOf[${i}])`, depth + 1);
-      if (subErr) return subErr;
-    }
-  }
-
-  if (Array.isArray(schema.anyOf)) {
-    const anyMatched = schema.anyOf.some(sub => validateValueAgainstJsonSchema(value, sub, pathLabel, depth + 1) === null);
-    if (!anyMatched) {
-      return `${pathLabel} failed all anyOf branches.`;
-    }
-  }
-
-  if (Array.isArray(schema.oneOf)) {
-    let matchCount = 0;
-    for (const sub of schema.oneOf) {
-      if (validateValueAgainstJsonSchema(value, sub, pathLabel, depth + 1) === null) {
-        matchCount++;
-      }
-    }
-    if (matchCount !== 1) {
-      return `${pathLabel} matched ${matchCount} oneOf branches (expected 1).`;
-    }
-  }
-
-  if (schema.not !== undefined) {
-    if (validateValueAgainstJsonSchema(value, schema.not, pathLabel, depth + 1) === null) {
-      return `${pathLabel} matched forbidden "not" schema.`;
-    }
-  }
-
-  if (typeof value === 'string') {
-    const codePointLen = [...value].length;
-    if (typeof schema.minLength === 'number' && codePointLen < schema.minLength) {
-      return `${pathLabel} string length (${codePointLen}) < minLength (${schema.minLength}).`;
-    }
-    if (typeof schema.maxLength === 'number' && codePointLen > schema.maxLength) {
-      return `${pathLabel} string length (${codePointLen}) > maxLength (${schema.maxLength}).`;
-    }
-    if (typeof schema.pattern === 'string') {
-      try {
-        const re = new RegExp(schema.pattern, 'u');
-        if (!re.test(value)) {
-          return `${pathLabel} string did not match pattern.`;
-        }
-      } catch {
-        return `${pathLabel} schema has invalid RegExp pattern.`;
-      }
-    }
-  }
-
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    if (typeof schema.minimum === 'number' && value < schema.minimum) {
-      return `${pathLabel} (${value}) < minimum (${schema.minimum}).`;
-    }
-    if (typeof schema.maximum === 'number' && value > schema.maximum) {
-      return `${pathLabel} (${value}) > maximum (${schema.maximum}).`;
-    }
-    if (typeof schema.exclusiveMinimum === 'number' && value <= schema.exclusiveMinimum) {
-      return `${pathLabel} (${value}) <= exclusiveMinimum (${schema.exclusiveMinimum}).`;
-    }
-    if (typeof schema.exclusiveMaximum === 'number' && value >= schema.exclusiveMaximum) {
-      return `${pathLabel} (${value}) >= exclusiveMaximum (${schema.exclusiveMaximum}).`;
-    }
-  }
-
-  if (Array.isArray(value)) {
-    if (typeof schema.minItems === 'number' && value.length < schema.minItems) {
-      return `${pathLabel} array length (${value.length}) < minItems (${schema.minItems}).`;
-    }
-    if (typeof schema.maxItems === 'number' && value.length > schema.maxItems) {
-      return `${pathLabel} array length (${value.length}) > maxItems (${schema.maxItems}).`;
-    }
-    if (schema.items !== undefined) {
-      for (let i = 0; i < value.length; i++) {
-        const itemErr = validateValueAgainstJsonSchema(value[i], schema.items, `${pathLabel}[${i}]`, depth + 1);
-        if (itemErr) return itemErr;
-      }
-    }
-  }
-
-  if (isPlainObject(value)) {
-    if (Array.isArray(schema.required)) {
-      for (const reqKey of schema.required) {
-        if (!Object.hasOwn(value, reqKey) || value[reqKey] === undefined) {
-          return `${pathLabel} omitted required field "${sanitizeDiagnosticText(String(reqKey))}".`;
-        }
-      }
-    }
-    const props = isPlainObject(schema.properties) ? schema.properties : null;
-    for (const key of Object.keys(value)) {
-      if (!Object.hasOwn(value, key)) continue;
-      if (props && Object.hasOwn(props, key)) {
-        const propErr = validateValueAgainstJsonSchema(
-          value[key],
-          props[key],
-          `${pathLabel}.${sanitizeDiagnosticText(key)}`,
-          depth + 1,
-        );
-        if (propErr) return propErr;
-      } else if (schema.additionalProperties === false) {
-        return `${pathLabel} contains unexpected additional property "${sanitizeDiagnosticText(key)}".`;
-      } else if (isPlainObject(schema.additionalProperties)) {
-        const addErr = validateValueAgainstJsonSchema(
-          value[key],
-          schema.additionalProperties,
-          `${pathLabel}.${sanitizeDiagnosticText(key)}`,
-          depth + 1,
-        );
-        if (addErr) return addErr;
-      }
-    }
-  }
-
-  return null;
 }
 
 function validateAndBoundResponsesInputTree(input) {
@@ -2598,7 +2348,6 @@ export class OpenAiClient {
     assertOptionalBoolean(p.allowInsecureLocalBaseUrl, 'allowInsecureLocalBaseUrl');
     assertOptionalBoolean(p.testMode, 'testMode');
     assertOptionalBoolean(p.allowAstraApi, 'allowAstraApi');
-    assertOptionalBoolean(p.enableStage4Media, 'enableStage4Media');
     assertOptionalBoolean(p.allowEnvKey, 'allowEnvKey');
     assertOptionalBoolean(p.deleteAfterPersist, 'deleteAfterPersist');
     assertOptionalBoolean(p.cleanupAfterPersist, 'cleanupAfterPersist');
@@ -2700,7 +2449,6 @@ export class OpenAiClient {
       allowEnvKey: p.allowEnvKey !== undefined ? p.allowEnvKey : this.allowEnvKey,
       env: p.env ?? this.env,
       allowAstraApi: p.allowAstraApi === true,
-      enableStage4Media: p.enableStage4Media === true,
       deleteAfterPersist: Boolean(p.deleteAfterPersist === true || p.cleanupAfterPersist === true),
       verify404Readback: p.verify404Readback,
       downloadOutput: p.downloadOutput === true,

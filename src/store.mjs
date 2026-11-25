@@ -31,7 +31,8 @@ import {
   resolveChannelMeta,
 } from './discovery-channels.mjs';
 import { canonicalizeConnectorToolName, validateProviderCall } from './provider-guards.mjs';
-import { bindSourcingQuotePricingInputs } from './fba-rates-2027.mjs';
+import { bindSourcingQuotePricingInputs } from './fba-calculator.mjs';
+import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
@@ -2687,7 +2688,51 @@ export class SelectionStore {
       ? quote.factory_id.trim()
       : (nonemptyStr(quote.supplier_id)
         ? quote.supplier_id.trim()
-        : (distinctFactoryIds.size === 1 ? [...distinctFactoryIds][0] : null));
+        : (nonemptyStr(quote.seller_member_id)
+          ? quote.seller_member_id.trim()
+          : (nonemptyStr(quote.company_name)
+            ? quote.company_name.trim()
+            : (nonemptyStr(quote.shop_url)
+              ? quote.shop_url.trim()
+              : (distinctFactoryIds.size === 1 ? [...distinctFactoryIds][0] : null)))));
+
+    if (
+      quoteStatus === 'verified' &&
+      quote.goods_first_order_promotion !== true &&
+      quote.freight_first_order_promotion !== true &&
+      resolvedFactoryId
+    ) {
+      const maxFactoriesCap = BUSINESS_THRESHOLDS.max_1688_factories_to_check;
+      const prospectiveQuoteId = nonemptyStr(quote.quote_id) ? quote.quote_id.trim() : null;
+      const prospectiveSpecVer = quote.spec_version ?? form.spec_version;
+      const existingNonPromo = this.getQuotesForForm(form.form_id).filter(
+        eq => eq.spec_version === prospectiveSpecVer &&
+          eq.quote_id !== prospectiveQuoteId &&
+          eq.goods_first_order_promotion === 0 &&
+          eq.freight_first_order_promotion === 0 &&
+          (eq.quote_status === 'verified' || eq.quote_status === 'superseded_uncompetitive'),
+      );
+      const extractRowFac = eq => {
+        for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
+          if (nonemptyStr(eq?.[k])) return eq[k].trim().toLowerCase();
+        }
+        if (Array.isArray(eq?.sku_lines)) {
+          for (const sl of eq.sku_lines) {
+            for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
+              if (nonemptyStr(sl?.[k])) return sl[k].trim().toLowerCase();
+            }
+          }
+        }
+        return null;
+      };
+      const seenFacs = new Set(existingNonPromo.map(extractRowFac).filter(Boolean));
+      seenFacs.add(resolvedFactoryId.toLowerCase());
+      if (seenFacs.size > maxFactoriesCap) {
+        throw new TypeError(
+          `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesCap} per form (would reach ${seenFacs.size} on ${form.form_id}).`,
+        );
+      }
+    }
 
     const contractStatus = quoteStatus === 'verified'
       ? 'verified'
@@ -2876,7 +2921,53 @@ export class SelectionStore {
     if (!Array.isArray(quotes) || quotes.length === 0) {
       throw new TypeError('quotes must be a nonempty array.');
     }
+    const maxFactoriesCap = BUSINESS_THRESHOLDS.max_1688_factories_to_check;
+    if (quotes.length > maxFactoriesCap) {
+      throw new TypeError(
+        `Revision 59 1688 stop rule caps checked quotes/factories at ${maxFactoriesCap} per form (received ${quotes.length} quotes in batch).`,
+      );
+    }
+    const extractVerifiedFactoryKey = qObj => {
+      if (!qObj || typeof qObj !== 'object') return null;
+      for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
+        if (nonemptyStr(qObj[k])) return `${k}:${qObj[k].trim().toLowerCase()}`;
+      }
+      if (Array.isArray(qObj.sku_lines)) {
+        for (const sl of qObj.sku_lines) {
+          for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
+            if (nonemptyStr(sl?.[k])) return `${k}:${sl[k].trim().toLowerCase()}`;
+          }
+        }
+      }
+      return null;
+    };
     return this._withImmediateTx(() => {
+      const factoriesByFormSpec = new Map();
+      for (const qObj of quotes) {
+        if (!qObj || typeof qObj !== 'object' || !nonemptyStr(qObj.form_id)) continue;
+        const fId = qObj.form_id.trim();
+        const formRow = this.getCandidateForm(fId);
+        const sVer = Number.isInteger(qObj.spec_version) ? qObj.spec_version : (formRow?.spec_version ?? 1);
+        const mapKey = `${fId}::${sVer}`;
+        let set = factoriesByFormSpec.get(mapKey);
+        if (!set) {
+          const existing = this.getQuotesForForm(fId).filter(
+            eq => eq.spec_version === sVer &&
+              eq.goods_first_order_promotion === 0 &&
+              eq.freight_first_order_promotion === 0 &&
+              (eq.quote_status === 'verified' || eq.quote_status === 'superseded_uncompetitive'),
+          );
+          set = new Set(existing.map(extractVerifiedFactoryKey).filter(Boolean));
+          factoriesByFormSpec.set(mapKey, set);
+        }
+        const fk = extractVerifiedFactoryKey(qObj);
+        if (fk) set.add(fk);
+        if (set.size > maxFactoriesCap) {
+          throw new TypeError(
+            `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesCap} per form (would reach ${set.size} on ${fId}).`,
+          );
+        }
+      }
       const prevOuter = this._inOuterTx;
       this._inOuterTx = true;
       try {

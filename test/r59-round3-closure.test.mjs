@@ -12,10 +12,10 @@ import {
   computeOrderPlan,
   estimateGate1A2027,
   lookupFulfillmentFee2027,
-} from '../src/fba-rates-2027.mjs';
-import { computeHeadhaulWithA4Rules } from '../src/fee-basis.mjs';
+} from '../src/fba-calculator.mjs';
+import { computeHeadhaulWithA4Rules } from '../src/fba-calculator.mjs';
 import { calculateEconomics } from '../src/economics.mjs';
-import { evaluateEarlyScreen } from '../src/early-screen.mjs';
+import { evaluateEarlyScreen } from '../src/economics.mjs';
 import { containsSecretToken, sanitizeDiagnosticText } from '../src/contracts.mjs';
 import { openSelectionStore, sha256Hex } from '../src/store.mjs';
 import { replayBatchIntoStore } from '../src/history-import.mjs';
@@ -46,7 +46,7 @@ import {
   verifySavedCodexReceipt,
 } from '../src/openai/index.mjs';
 
-const r58Profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const r58Profile = JSON.parse(readFileSync(new URL('../docs/archive/design/reference-profile.r58.archived.json', import.meta.url), 'utf8'));
 
 const r59Profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const synthBatch = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
@@ -694,8 +694,23 @@ test('Step 1.3: Q31 90d & review anomaly advisory, leafRank/LCM advisories, #17 
       },
     });
     assert.equal(observedArgs.includes('-m'), false, 'Omitting model inherits ~/.codex/config.toml without -m');
-    assert.equal(observedArgs.some(a => a.startsWith('model_reasoning_effort=')), false, 'Omitting reasoningEffort inherits ~/.codex/config.toml');
+    assert.equal(observedArgs.includes('model_reasoning_effort="max"'), true, 'Omitting reasoningEffort enforces approved default max');
     assert.equal(mdRes.model, null);
+
+    let explicitNullEffortArgs = null;
+    await runCodexExecMarkdown({
+      prompt: 'Inspect synthetic fixture with explicit null effort.',
+      reasoningEffort: null,
+      testMode: true,
+      cwd: dir,
+      receiptPath: join(dir, 'markdown-null-effort-receipt.json'),
+      mockExecutor: async ({ args, outputFilePath }) => {
+        explicitNullEffortArgs = args;
+        writeFileSync(outputFilePath, 'Clean review output.\n', 'utf8');
+        return { exitCode: 0 };
+      },
+    });
+    assert.equal(explicitNullEffortArgs.some(a => a.startsWith('model_reasoning_effort=')), false, 'Explicit reasoningEffort: null inherits ~/.codex/config.toml');
     const savedRec = JSON.parse(readFileSync(receiptPath, 'utf8'));
     assert.equal(String(savedRec.stderr_scrubbed).includes(marker), false, 'JSON refresh_token in stderr_scrubbed is scrubbed');
     assert.equal(containsSecretToken(JSON.stringify({ refresh_token: marker })), true);
@@ -855,11 +870,7 @@ test('Step 1.4: second-order counterexamples (explicit $0 placement, early-scree
       { asin: 'B0Q75A0002', title: 'Bin', price_usd: 60, monthly_units: 25, fulfillment: 'FBA', age_days: 400, keepa_price_steady: true },
     ], { profile_revision: 59, as_of_date: '2026-11-24' });
     assert.equal(b75R59.band.p75_usd, 30);
-    const b80R58 = analyzeMainstreamPriceBand([
-      { asin: 'B0Q80A0001', title: 'Bin', price_usd: 30, monthly_units: 80, fulfillment: 'FBA', age_days: 400, keepa_price_steady: true },
-      { asin: 'B0Q80A0002', title: 'Bin', price_usd: 60, monthly_units: 20, fulfillment: 'FBA', age_days: 400, keepa_price_steady: true },
-    ], { profile_revision: 58, as_of_date: '2026-11-24' });
-    assert.equal(b80R58.band.p75_usd, 51);
+    assert.throws(() => analyzeMainstreamPriceBand([], { profile_revision: 58 }), /retired/i);
 
     // 5) Wire schema exposes applies_to_target_spec & legal_status; 429 / trademark failure blocks prescreen_completed; expired prose conflict rejected
     assert.deepEqual(
@@ -959,10 +970,10 @@ test('Step 1.4: second-order counterexamples (explicit $0 placement, early-scree
     // 9, 10, 11, 12) r58 replay idempotence, M4 material check, Gate-4 omitted inheritance, escaped JSON stderr scrub, & shareable HTML PII
     const stReplay58 = openSelectionStore(':memory:');
     try {
-      const b58 = { ...structuredClone(synthBatch), profile_revision: 58 };
-      replayBatchIntoStore(stReplay58, { batch: b58, profile: r58Profile });
+      const b59 = { ...structuredClone(synthBatch), profile_revision: 59 };
+      replayBatchIntoStore(stReplay58, { batch: b59, profile: r59Profile });
       const c1 = stReplay58.db.prepare('SELECT COUNT(*) AS n FROM evaluations').get().n;
-      replayBatchIntoStore(stReplay58, { batch: b58, profile: r58Profile });
+      replayBatchIntoStore(stReplay58, { batch: b59, profile: r59Profile });
       const c2 = stReplay58.db.prepare('SELECT COUNT(*) AS n FROM evaluations').get().n;
       assert.equal(c1, c2);
     } finally {
@@ -1004,7 +1015,7 @@ test('Step 1.4: second-order counterexamples (explicit $0 placement, early-scree
       },
     });
     assert.equal(gate4Args.includes('-m'), false);
-    assert.equal(gate4Args.some(a => a.startsWith('model_reasoning_effort=')), false);
+    assert.equal(gate4Args.includes('model_reasoning_effort="max"'), true);
     assert.equal(g4Out.model, null);
     assert.equal(verifySavedCodexReceipt(g4Out, { receiptStoreDir: recDirInh, allowTestDouble: true }).model, null);
 

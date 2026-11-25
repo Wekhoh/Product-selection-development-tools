@@ -8,8 +8,8 @@
  *  3. Stage-2 visual cluster band tightening (tightenClusterBands).
  * Pure deterministic module; performs zero I/O or network calls.
  */
-import { classifySizeTier2027, estimateGate1A2027 } from './fba-rates-2027.mjs';
-import { toBigRat } from './fee-basis.mjs';
+import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
+import { classifySizeTier2027, estimateGate1A2027, toBigRat } from './fba-calculator.mjs';
 
 const finite = v => typeof v === 'number' && Number.isFinite(v);
 const round = (v, digits = 4) => Math.round((v + Number.EPSILON) * (10 ** digits)) / (10 ** digits);
@@ -23,7 +23,14 @@ const ADULT_CAREGIVER_EXEMPTION_RE = /\b(?:diaper\s+(?:bag|backpack|tote|caddy|o
 const CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE = /\b(?:baby\s+(?:blue|pink|breath|greens?|spinach|corn|back\s+ribs|oil|powder\s+scent|alpaca|goat)|kid\s+(?:leather|skin|gloves?|suede)|child[- ]?(?:resistant|proof|lock\w*))\b/gi;
 const CHILDRENS_NEGATION_OR_WARNING_RE = /\b(?:not\s+(?:for|intended\s+for|suitable\s+for|designed\s+for|a\s+toy\s+for)|keep\s+(?:away\s+from|out\s+of\s+(?:the\s+)?reach\s+of)|out\s+of\s+(?:the\s+)?reach\s+of|for\s+adults?\s+only[^.;,|]*not\s+for)\s+(?:all\s+|young\s+|small\s+)?(?:children|kids?|babies|infants?|toddlers?|minors?)(?:\s+and\s+(?:pets?|animals?|children|kids?))?\b|(?:非儿童(?:用品|玩具|产品)?|不适合儿童|勿让儿童(?:接触|触碰|玩耍)?|请勿让儿童(?:接触|触碰|使用)?|儿童勿[用近触碰]|远离儿童|放在儿童接触不到的地方|仅供成人)/gi;
 
+function assertActiveRevision59(rev, fnName) {
+  if (rev !== undefined && rev !== null && (!Number.isInteger(rev) || rev < 59)) {
+    throw new TypeError(`${fnName}: profile_revision ${rev} (< 59) is retired; use Git tag archive/r50-r58-frozen-replay-20261125 for historical replay.`);
+  }
+}
+
 function matchesChildrensStatutoryBoundary(item, textBlob, { profileRevision = 59 } = {}) {
+  assertActiveRevision59(profileRevision, 'evaluateGate0CategoryBoundary');
   if (item?.is_childrens_product === true || item?.is_children_product === true || item?.cpc_required === true) {
     return true;
   }
@@ -35,7 +42,7 @@ function matchesChildrensStatutoryBoundary(item, textBlob, { profileRevision = 5
     return false;
   }
   // US CPSC / CPC statutory boundary: <= 12 years of age.
-  if (finite(item?.max_target_age_years) && item.max_target_age_years > 0 && item.max_target_age_years <= 12) {
+  if (finite(item?.max_target_age_years) && item.max_target_age_years > 0 && item.max_target_age_years <= BUSINESS_THRESHOLDS.children_statutory_max_age_years) {
     return true;
   }
   if (item?.is_childrens_product === false && item?.cpc_required === false) {
@@ -448,8 +455,8 @@ export function splitSearchPageSubForms(rawItems = [], subFormDefinitions = []) 
   };
 }
 
-const DEFAULT_NEWCOMER_MAX_AGE_DAYS = 90;
-const DEFAULT_HEAVY_COUPON_THRESHOLD = 0.20;
+const DEFAULT_NEWCOMER_MAX_AGE_DAYS = BUSINESS_THRESHOLDS.newcomer_max_age_days;
+const DEFAULT_HEAVY_COUPON_THRESHOLD = BUSINESS_THRESHOLDS.heavy_single_coupon_pct_threshold;
 
 function historicalPrices(raw) {
   return ['keepa_90d_median_usd', 'historical_regular_price_usd']
@@ -457,7 +464,7 @@ function historicalPrices(raw) {
     .map(source => ({ price_usd: raw[source], source }));
 }
 
-const DEFAULT_VETERAN_MATURE_MIN_AGE_DAYS = 365;
+const DEFAULT_VETERAN_MATURE_MIN_AGE_DAYS = BUSINESS_THRESHOLDS.veteran_min_age_days;
 
 /**
  * Qualitative/structured flag check for veteran clearance / price-war volatility ("老品清仓／恶战波动").
@@ -468,6 +475,8 @@ export function detectKeepaVeteranClearanceOrWar(raw) {
   if (!raw || typeof raw !== 'object') return false;
   if (
     raw.keepa_sustained_drop === true ||
+    raw.sustained_drop_or_clearance_watch === true ||
+    raw.keepa?.sustained_drop_or_clearance_watch === true ||
     raw.keepa_clearance === true ||
     raw.keepa_price_war === true ||
     raw.keepa_90d_unstable === true ||
@@ -489,12 +498,11 @@ export function resolveHolidayPromoReference(raw, netPrice, {
   heavy_coupon_threshold = DEFAULT_HEAVY_COUPON_THRESHOLD,
   profile_revision = 59,
 } = {}) {
+  assertActiveRevision59(profile_revision, 'resolveHolidayPromoReference');
   const age = resolveAgeDays(raw, as_of_date);
-  const isR59 = (profile_revision ?? 59) >= 59;
-  const minAgeCheck = isR59 ? spiral_max_age_days + 1 : spiral_max_age_days;
-  if (age === null || age < minAgeCheck || !finite(netPrice) || netPrice <= 0) return null;
-  if (isR59 && detectKeepaVeteranClearanceOrWar(raw)) return null;
-  if (isR59 && (raw?.ai_qualitative_bucket === 'temporary_event_promo' || raw?.temporary_event_promo === true)) {
+  if (age === null || age < spiral_max_age_days + 1 || !finite(netPrice) || netPrice <= 0) return null;
+  if (detectKeepaVeteranClearanceOrWar(raw)) return null;
+  if (raw?.ai_qualitative_bucket === 'temporary_event_promo' || raw?.temporary_event_promo === true) {
     return historicalPrices(raw)[0] ?? null;
   }
   const priceRes = resolveListingNetPrice(raw);
@@ -512,10 +520,7 @@ export function resolveHolidayPromoReference(raw, netPrice, {
   const listRat = priceRes.valid && finite(priceRes.list_price_usd) && priceRes.list_price_usd > 0
     ? toBigRat(priceRes.list_price_usd)
     : null;
-  // In r59, historical event-promo reference aligns with the confirmed >=20% (<=80%) indicator; r58 preserves 85% replay.
-  const promoKeepRatioPct = isR59
-    ? BigInt(Math.round((1 - heavy_coupon_threshold) * 100))
-    : 85n;
+  const promoKeepRatioPct = BigInt(Math.round((1 - heavy_coupon_threshold) * 100));
   for (const reference of historicalPrices(raw)) {
     const regular = toBigRat(reference.price_usd);
     if (isRoutineSmallCoupon && listRat && listRat.n * regular.d * 100n > regular.n * listRat.d * promoKeepRatioPct) {
@@ -657,27 +662,25 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     profile_revision = 59,
     observation_date = null,
     as_of_date = observation_date ?? new Date().toISOString().slice(0, 10),
-    min_monthly_units = 10,
+    min_monthly_units = BUSINESS_THRESHOLDS.zombie_min_monthly_sales,
     veteran_min_age_days = DEFAULT_VETERAN_MATURE_MIN_AGE_DAYS,
-    spiral_discount_vs_median = 0.20,
-    mature_heavy_coupon_threshold = 0.20,
     isolate_heavy_coupon_outliers = true,
     include_amz_1p = true,
     target_size_tier = null,
     target_pkg = null,
-    max_width_ratio = 1.35,
-    max_margin_spread_pp = 12,
-    minimum_price_floor_usd = 29.99,
+    max_width_ratio = BUSINESS_THRESHOLDS.advisory_band_spread_ratio,
+    minimum_price_floor_usd = BUSINESS_THRESHOLDS.minimum_reference_price_usd,
     gate0_config = {},
     market_observation_result = null,
   } = options;
-  const isR59 = (profile_revision ?? 59) >= 59;
+  assertActiveRevision59(profile_revision, 'analyzeMainstreamPriceBand');
+  const isR59 = true;
   const hasAnyKnownAge = Array.isArray(listings) && listings.some(r => r && resolveAgeDays(r, as_of_date) !== null);
   const strict_mature_only = options.strict_mature_only !== undefined
     ? Boolean(options.strict_mature_only)
-    : Boolean(isR59 && hasAnyKnownAge);
-  const spiral_max_age_days = options.spiral_max_age_days ?? (isR59 ? DEFAULT_NEWCOMER_MAX_AGE_DAYS : 120);
-  const heavy_coupon_threshold = options.heavy_coupon_threshold ?? (isR59 ? DEFAULT_HEAVY_COUPON_THRESHOLD : 0.15);
+    : Boolean(hasAnyKnownAge);
+  const spiral_max_age_days = options.spiral_max_age_days ?? DEFAULT_NEWCOMER_MAX_AGE_DAYS;
+  const heavy_coupon_threshold = options.heavy_coupon_threshold ?? DEFAULT_HEAVY_COUPON_THRESHOLD;
 
   const marketJudgeByAsin = new Map();
   if (market_observation_result && Array.isArray(market_observation_result.peer_observations)) {
@@ -891,7 +894,15 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       heavy_coupon_threshold,
       profile_revision,
     });
-    const steadyKeepaRef = (!isR59 || !detectKeepaVeteranClearanceOrWar(raw)) ? (regularReference ?? historicalPrices(raw)[0] ?? null) : null;
+    const explicitKeepaUnsteady = Boolean(
+      raw?.keepa_price_steady === false ||
+      raw?.keepa_90d_steady === false ||
+      raw?.keepa?.price_steady === false ||
+      raw?.keepa?.keepa_90d_steady === false,
+    );
+    const steadyKeepaRef = (!isR59 || (!detectKeepaVeteranClearanceOrWar(raw) && !explicitKeepaUnsteady))
+      ? (regularReference ?? historicalPrices(raw)[0] ?? null)
+      : null;
     const isAiNewcomerRef = rawAiBucket !== null && ['newcomer_reference', 'newcomer_launch_reference', 'newcomer_le_90d_launch_ref'].includes(rawAiBucket);
     const isNewcomerR59 = isR59
       ? ((ageDays !== null && ageDays <= spiral_max_age_days) || (ageDays === null && isAiNewcomerRef))
@@ -901,11 +912,13 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     );
     const hasExplicitKeepaSteady = Boolean(
       !isVeteranClearanceOrWar &&
-      raw?.keepa_price_steady !== false &&
-      raw?.keepa?.price_steady !== false &&
+      !explicitKeepaUnsteady &&
       (
         raw?.keepa_price_steady === true ||
+        raw?.keepa_90d_steady === true ||
         raw?.keepa?.price_steady === true ||
+        raw?.keepa?.keepa_90d_steady === true ||
+        aiBucket === 'primary_comparable' ||
         steadyKeepaRef !== null ||
         ['steady', 'stable', 'flat'].includes(
           String(raw?.keepa_trajectory ?? raw?.keepa_90d_stability ?? raw?.keepa?.trajectory ?? raw?.keepa?.stability ?? '')
@@ -936,7 +949,7 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
         ...(hasExplicitKeepaSteady ? { keepa_steady_verified: true } : {}),
         ...(isVeteranClearanceOrWar ? { veteran_clearance_or_war_watch: true, watch_label_zh: aiReasonZh ?? '老品清仓／恶战波动' } : {}),
         ...(aiBucket ? { ai_qualitative_bucket: aiBucket, ...(aiReasonZh ? { ai_reason_zh: aiReasonZh } : {}) } : {}),
-        ...(raw?.keepa_price_steady === false ? { keepa_price_unsteady: true } : {}),
+        ...(explicitKeepaUnsteady ? { keepa_price_unsteady: true } : {}),
         ...(seedMergedUnverified ? { seed_merged_unverified_price: true } : {}),
         monthly_units: monthlyUnits,
         age_days: ageDays,
@@ -961,8 +974,11 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
         e.hasExplicitKeepaSteady ||
         e.cand.keepa_price_unsteady === true ||
         e.isVeteranClearanceOrWar === true ||
+        e.raw?.keepa_package_only === true ||
         e.raw?.keepa !== undefined ||
+        e.raw?.keepa_trend !== undefined ||
         e.raw?.keepa_price_steady !== undefined ||
+        e.raw?.keepa_90d_steady !== undefined ||
         e.raw?.keepa_trajectory !== undefined ||
         e.raw?.keepa_90d_stability !== undefined,
       )
@@ -1055,151 +1071,6 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     candidates.push(entry.cand);
   }
 
-  // Legacy r58 path preserved verbatim for byte-exact r58 regressions
-  if (!isR59) {
-    const maturePeers = candidates.filter(c =>
-      !c.seed_merged_unverified_price &&
-      !c.veteran_clearance_or_war_watch &&
-      (strict_mature_only ? (c.age_days !== null && c.age_days >= spiral_max_age_days) : (c.age_days === null || c.age_days >= spiral_max_age_days)),
-    );
-    const referencePeers = (maturePeers.length > 0 ? maturePeers : candidates)
-      .filter(c => !c.regular_price_reference && !c.seed_merged_unverified_price && !c.veteran_clearance_or_war_watch);
-    const referenceMedian = unweightedMedian(referencePeers.map(c => c.net_price_usd));
-
-    const spiralWatch = [];
-    const veteranClearanceWatch = [];
-    const mainstreamPool = [];
-    const allYoungNiche = candidates.length > 0 && maturePeers.length === 0;
-
-    for (const item of candidates) {
-      const watchReasons = [];
-      if (item.veteran_clearance_or_war_watch) watchReasons.push('veteran_clearance_or_war_watch');
-      if (item.regular_price_reference) watchReasons.push('holiday_or_event_promo_outlier');
-      if (item.seed_merged_unverified_price) watchReasons.push('seed_merged_unverified_regular_price');
-      const isYoung = item.age_days !== null && item.age_days < spiral_max_age_days;
-      if (strict_mature_only && (isYoung || item.age_days === null)) {
-        watchReasons.push(isYoung ? 'young_newcomer_launch_band_only' : 'unknown_age_excluded_from_mature_band');
-      }
-      const isBelowMedianSpiral = referenceMedian !== null &&
-        item.net_price_usd < referenceMedian * (1 - spiral_discount_vs_median);
-      if (isYoung && isBelowMedianSpiral && !allYoungNiche) {
-        watchReasons.push('launch_spiral_low_price');
-      }
-      if (isYoung && item.discount_fraction >= heavy_coupon_threshold) {
-        watchReasons.push('young_heavy_coupon_outlier');
-      } else if (!isYoung && isolate_heavy_coupon_outliers && item.discount_fraction >= mature_heavy_coupon_threshold) {
-        watchReasons.push('heavy_coupon_outlier');
-      }
-      if (watchReasons.length > 0) {
-        const watchedRow = { ...item, watch_reasons: watchReasons };
-        spiralWatch.push(watchedRow);
-        if (item.veteran_clearance_or_war_watch) veteranClearanceWatch.push(watchedRow);
-      } else {
-        mainstreamPool.push(item);
-      }
-    }
-
-    const matureRegularRows = candidates
-      .filter(c => c.age_days !== null && c.age_days >= spiral_max_age_days && !c.seed_merged_unverified_price)
-      .map(c => ({
-        asin: c.asin,
-        net_price_usd: c.regular_price_reference ? c.regular_price_reference.price_usd : c.net_price_usd,
-        monthly_units: c.monthly_units,
-      }));
-    const matureRegularBand = matureRegularRows.length > 0 ? {
-      basis: 'mature_peers_ge_120d_regular_net',
-      peer_count: matureRegularRows.length,
-      p25_usd: weightedQuantile(matureRegularRows, 0.25, { profileRevision: profile_revision }),
-      p50_usd: weightedQuantile(matureRegularRows, 0.50, { profileRevision: profile_revision }),
-      p75_usd: weightedQuantile(matureRegularRows, 0.75, { profileRevision: profile_revision }),
-      min_usd: Math.min(...matureRegularRows.map(r => r.net_price_usd)),
-      max_usd: Math.max(...matureRegularRows.map(r => r.net_price_usd)),
-    } : null;
-
-    const newcomerLaunchRows = candidates
-      .filter(c => c.age_days !== null && c.age_days < spiral_max_age_days && !c.seed_merged_unverified_price);
-    const newcomerLaunchBand = {
-      basis: 'true_newcomers_lt_120d_advisory_only',
-      advisory_only: true,
-      never_triggers_elimination: true,
-      peer_count: newcomerLaunchRows.length,
-      p25_usd: weightedQuantile(newcomerLaunchRows, 0.25, { profileRevision: profile_revision }),
-      p50_usd: weightedQuantile(newcomerLaunchRows, 0.50, { profileRevision: profile_revision }),
-      p75_usd: weightedQuantile(newcomerLaunchRows, 0.75, { profileRevision: profile_revision }),
-      min_usd: newcomerLaunchRows.length ? Math.min(...newcomerLaunchRows.map(r => r.net_price_usd)) : null,
-      max_usd: newcomerLaunchRows.length ? Math.max(...newcomerLaunchRows.map(r => r.net_price_usd)) : null,
-    };
-
-    const prices = mainstreamPool.map(r => r.net_price_usd);
-    const p25 = weightedQuantile(mainstreamPool, 0.25, { profileRevision: profile_revision });
-    const p50 = weightedQuantile(mainstreamPool, 0.50, { profileRevision: profile_revision });
-    const p75 = weightedQuantile(mainstreamPool, 0.75, { profileRevision: profile_revision });
-    const minPrice = prices.length ? Math.min(...prices) : null;
-    const maxPrice = prices.length ? Math.max(...prices) : null;
-    const widthRatio = p25 !== null && p25 > 0 && p75 !== null ? round(p75 / p25, 4) : null;
-    const impliedMarginSpreadPp = computeImpliedMarginSpreadPp(p25, p75, options);
-
-    const alarmReasons = [];
-    if (widthRatio !== null && widthRatio > max_width_ratio) {
-      alarmReasons.push(`P75/P25 ratio (${widthRatio}x) exceeds ${max_width_ratio}x guardrail; pool likely mixes disparate sub-forms.`);
-    }
-    if (impliedMarginSpreadPp !== null && impliedMarginSpreadPp > max_margin_spread_pp) {
-      alarmReasons.push(`Implied margin spread (${impliedMarginSpreadPp}pp) exceeds ${max_margin_spread_pp}pp guardrail.`);
-    }
-    if (mainstreamPool.length < 2) {
-      alarmReasons.push(`Mainstream pool has only ${mainstreamPool.length} peer(s); insufficient distribution breadth.`);
-    }
-    const widthAlarm = (widthRatio !== null && widthRatio > max_width_ratio) ||
-      (impliedMarginSpreadPp !== null && impliedMarginSpreadPp > max_margin_spread_pp);
-    const band = {
-      p25_usd: p25,
-      p50_usd: p50,
-      p75_usd: p75,
-      min_usd: minPrice,
-      max_usd: maxPrice,
-      width_ratio: widthRatio,
-      implied_margin_spread_pp: impliedMarginSpreadPp,
-      below_floor_warning: p75 !== null && p75 < minimum_price_floor_usd,
-    };
-    return {
-      input_count: asinDeduped.length,
-      excluded_count: excluded.length,
-      spiral_watch_count: spiralWatch.length,
-      mainstream_count: mainstreamPool.length,
-      all_young_niche: allYoungNiche,
-      strict_mature_only: Boolean(strict_mature_only),
-      spiral_fallback_used: false,
-      amazon_1p_offers: amazon1pOffers,
-      band,
-      mature_regular_band: matureRegularBand,
-      newcomer_launch_band: newcomerLaunchBand,
-      regular_band_reference: historicalPeers.length ? {
-        basis: 'observed_historical_regular_prices',
-        peer_count: historicalPeers.length,
-        p25_usd: weightedQuantile(historicalPeers, 0.25, { profileRevision: profile_revision }),
-        p50_usd: weightedQuantile(historicalPeers, 0.50, { profileRevision: profile_revision }),
-        p75_usd: weightedQuantile(historicalPeers, 0.75, { profileRevision: profile_revision }),
-        min_usd: Math.min(...historicalPeers.map(p => p.net_price_usd)),
-        max_usd: Math.max(...historicalPeers.map(p => p.net_price_usd)),
-        sources: Object.fromEntries(['keepa_90d_median_usd', 'historical_regular_price_usd']
-          .map(source => [source, historicalPeers.filter(p => p.source === source).length])),
-      } : (matureRegularBand ?? { ...band, basis: 'current_mainstream_prices', peer_count: mainstreamPool.length }),
-      guardrail: {
-        max_width_ratio,
-        max_margin_spread_pp,
-        width_alarm: widthAlarm,
-        requires_visual_clustering: widthAlarm,
-        advisory_only: false,
-        never_triggers_elimination: false,
-        low_peer_count: mainstreamPool.length < 2,
-        reasons: alarmReasons,
-      },
-      mainstream_pool: mainstreamPool,
-      spiral_watch: spiralWatch,
-      ...(veteranClearanceWatch.length > 0 ? { veteran_clearance_watch: veteranClearanceWatch } : {}),
-      excluded,
-    };
-  }
 
   // =========================================================================
   // Revision 59 Three-Tier Listing Age Priority + Ultra-New <90d Blue Ocean
@@ -1535,7 +1406,8 @@ export function tightenClusterBands(analysisOrListings, clusters, options = {}) 
     throw new TypeError('analysisOrListings must be a listings array or output from analyzeMainstreamPriceBand().');
   }
   const effectiveRev = options.profile_revision ?? baseAnalysis.profile_revision ?? 59;
-  const isR59 = effectiveRev >= 59;
+  assertActiveRevision59(effectiveRev, 'tightenClusterBands');
+  const isR59 = true;
 
   // Keep spiral_watch rows strictly outside authoritative cluster price bands; report them separately!
   const mainstreamByAsin = new Map();

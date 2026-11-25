@@ -4,8 +4,7 @@ import { readFileSync } from 'node:fs';
 import { scoreCandidate } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
 
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
-profile.revision = profile.workflow.scoring_and_ordering.revision = 55;
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const evidence = [{ id: 'synthetic-entry', source: 'Synthetic researched main-entry evidence', observed_at: '2026-11-17' }];
 const reading = (value, unit, more = {}) => ({ value, unit, evidence: ['synthetic-entry'], ...more });
 const candidate = () => ({
@@ -31,8 +30,8 @@ test('one researched main entry uses its native exact point without inventing mo
   assert.equal(bid.entries[0].source_label, 'sif_only');
   assert.deepEqual(bid.range_scenarios.sif.bid_range_usd, [0.59, 1.33]);
   assert.equal(bid.range_scenarios.sellersprite, null);
-  const html = renderReport({ profile_revision: 55, candidates: [result] },
-    { schema_version: 1, profile_revision: 55, candidates: [input] });
+  const html = renderReport({ profile_revision: 59, candidates: [result] },
+    { schema_version: 1, profile_revision: 59, candidates: [input] });
   assert.match(html, /单个主购买词直接参考/);
   assert.match(html, /本项不需要月搜索量，缺失时保留未知/);
 });
@@ -62,8 +61,11 @@ test('multiple genuine entries still need every monthly weight and retain their 
   assert.equal(bidItem(input).reference_bid_usd, 1.25);
   assert.equal(bidItem(input).score, 10.5);
   assert.equal(bidItem(input).aggregation_method, 'monthly_search_weighted');
+  const missingOneVol = structuredClone(input);
+  missingOneVol.bids.entries[1].volume.value = null;
+  assert.equal(bidItem(missingOneVol).aggregation_method, 'equal_main_entries');
+  assert.equal(bidItem(missingOneVol).score, 9);
   for (const change of [
-    x => { x.bids.entries[1].volume.value = null; },
     x => { x.bids.entries[1].sif.value = null; },
     x => { x.bids.entries[1].volume.period = '2026-09'; },
     x => { delete x.bids.volume_period; },
@@ -75,13 +77,10 @@ test('multiple genuine entries still need every monthly weight and retain their 
   }
 });
 
-test('revision50 through54 keep the former single-entry volume requirement', () => {
-  const input = candidate();
-  input.bids.volume_period = '2026-10';
-  for (const revision of [50, 51, 52, 53, 54]) {
-    const frozen = structuredClone(profile);
-    frozen.revision = frozen.workflow.scoring_and_ordering.revision = revision;
-    assert.equal(bidItem(input, frozen).score, null);
-    assert.equal(bidItem(input, frozen).aggregation_method, undefined);
+test('retired revisions < 59 are rejected at profile validation boundary', () => {
+  for (const rev of [50, 54, 58]) {
+    const retired = structuredClone(profile);
+    retired.revision = retired.workflow.scoring_and_ordering.revision = rev;
+    assert.throws(() => scoreCandidate(candidate(), retired), TypeError);
   }
 });

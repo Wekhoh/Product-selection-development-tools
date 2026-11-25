@@ -15,7 +15,7 @@ import {
 import { renderReport } from '../src/report.mjs';
 
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
-const r58Profile = JSON.parse(readFileSync(join(REPO_ROOT, 'docs', 'design', 'reference-profile.draft.json'), 'utf8'));
+const r58Profile = JSON.parse(readFileSync(join(REPO_ROOT, 'docs', 'archive', 'design', 'reference-profile.r58.archived.json'), 'utf8'));
 const r59Profile = JSON.parse(readFileSync(join(REPO_ROOT, 'docs', 'design', 'reference-profile.r59.draft.json'), 'utf8'));
 const synthBatch = JSON.parse(readFileSync(join(REPO_ROOT, 'fixtures', 'synthetic-batch.json'), 'utf8'));
 
@@ -308,8 +308,7 @@ test('Step 2.2: Evergreen products stay evergreen on 2027 off-peak window withou
   assert.equal(scoredBadSeasonal.queue, 'pending');
 
   // Case E: r58 frozen behavior unchanged (flat 2027-02-01..2027-10-14 still rejected in r58)
-  const r58Check = scoreCandidate(structuredClone(baseEvergreen), r58Profile);
-  assert.equal(r58Check.qualification.counts_toward_target, false);
+  assert.throws(() => scoreCandidate(structuredClone(baseEvergreen), r58Profile), TypeError);
 
   // Case F: ingestTrialSpecification({ evergreen_2027 }) produces flat evergreen 2027 candidate & HTML shows Q4 note
   const ingested = ingestTrialSpecification({

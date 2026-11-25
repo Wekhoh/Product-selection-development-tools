@@ -60,6 +60,17 @@ import {
 } from '../contracts.mjs';
 import { canonicalJson, sha256Hex } from '../store.mjs';
 import {
+  ALLOWED_GATE4_EFFORTS,
+  MAX_RECEIPT_FILE_BYTES,
+  formatReviewerLabel,
+  getDefaultTestReceiptStoreDir,
+  verifySavedCodexReceipt,
+} from '../receipt-verifier.mjs';
+import {
+  assertSupportedStrictJsonSchema,
+  validateJsonAgainstStrictSchema,
+} from '../utils/json-schema.mjs';
+import {
   EVIDENCE_REVIEW_JSON_SCHEMA,
   SCHEMA_VERSION,
   assertAuthorizedReviewExecutionPolicy,
@@ -67,10 +78,12 @@ import {
   freezeEvidenceReviewPacket,
   validateEvidenceReviewOutput,
 } from './evidence-review.mjs';
+import { BUSINESS_THRESHOLDS } from '../business-thresholds.mjs';
 
 export const DEFAULT_CODEX_MODEL = 'gpt-6.2-astra';
+export const DEFAULT_CODEX_SERVICE_TIER = BUSINESS_THRESHOLDS.codex_default_service_tier;
+export const DEFAULT_CODEX_REASONING_EFFORT = BUSINESS_THRESHOLDS.codex_default_reasoning_effort;
 export const ALLOWED_CODEX_EFFORTS = Object.freeze(['high', 'xhigh', 'max']);
-export const ALLOWED_GATE4_EFFORTS = Object.freeze(['xhigh', 'max']);
 export const ALLOWED_CODEX_WEB_SEARCH = Object.freeze(['disabled', 'live']);
 export const ALLOWED_CODEX_SERVICE_TIERS = Object.freeze(['default', 'standard', 'fast', 'ultrafast']);
 export const ALLOWED_CODEX_IMAGE_EXTS = Object.freeze(['.png', '.jpg', '.jpeg', '.webp']);
@@ -78,150 +91,39 @@ export const ALLOWED_CODEX_IMAGE_EXTS = Object.freeze(['.png', '.jpg', '.jpeg', 
 const SAFE_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
 export const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
-const MAX_RECEIPT_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_AUTH_FILE_BYTES = 1024 * 1024;
 const MAX_ENTITLEMENT_STDERR_CHARS = 2048;
 const MODULE_WORKSPACE_ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 
-const DEFAULT_TEST_RECEIPT_STORE_DIR = join(tmpdir(), `codex-evrev-test-store-${process.pid}`);
-let registeredTestStoreCleanup = false;
-function getDefaultTestReceiptStoreDir() {
-  if (!registeredTestStoreCleanup) {
-    registeredTestStoreCleanup = true;
-    process.once('exit', () => {
-      try {
-        rmSync(DEFAULT_TEST_RECEIPT_STORE_DIR, { recursive: true, force: true });
-      } catch {
-        // Best-effort cleanup of process-scoped synthetic test receipt store.
-      }
-    });
-  }
-  return DEFAULT_TEST_RECEIPT_STORE_DIR;
-}
-
 const ULTRAFAST_ENTITLEMENT_ERROR_RE =
   /\b(?:service[_ -]?tier|tier)\b[^\r\n]{0,80}\b(?:not\s+(?:supported|allowed|available|enabled|entitled)|unsupported|invalid_value|requires\s+pro(?:-?500)?)/i;
+const CODEX_USER_PROMPT_ECHO_BLOCK_RE =
+  /^-{4,}\nuser\n[\s\S]*?(?=^(?:warning:|mcp(?:\s+startup)?:|hook:\s*SessionStart\b|ERROR\b|error:|codex$|thinking$|assistant$|exec$|tool_call\b|hook:\s*PreToolUse\b|turn\/start|tokens\s+used\b))/im;
+const CODEX_STARTUP_BANNER_LINE_RE =
+  /^\s*(?:OpenAI\s+Codex\b.*|-{4,}|(?:workdir|model|provider|approval|sandbox|reasoning\s+effort|reasoning\s+summaries|session\s+id|mcp(?:\s+startup)?)\s*:.*|warning:\s*(?:Codex\s+is\s+ignoring|Under-development\s+features\s+enabled).*|user\s*\([^\r\n]*is\s+ignored\.|hook:\s*SessionStart(?:\s+Completed)?\s*)$/gim;
 const TRANSPORT_OR_TURN_STARTED_STDERR_RE =
-  /\b(?:connection|connect|network|socket|dns|tls|ssl|timeout|timed\s+out|reset|econn\w*|etimedout|enotfound|ehostunreach|epipe|50[0234]|5\d\d\s+(?:bad|service|gateway|internal)|turn\/start(?:ed)?|turn\/complet(?:ed)?|stream(?:ing)?|disconnected|aborted|hang\s*up|rate[_ -]?limit|429)\b/i;
+  /\b(?:connection|connect|network|socket|dns|tls|ssl|timeout|timed\s+out|reset|econn\w*|etimedout|enotfound|ehostunreach|epipe|(?:http[\/\s]*\d*(?:\.\d+)?\s+|status(?:\s+code)?[:=\s]+)50[0234]|5\d\d\s+(?:bad|service|gateway|internal)|turn\/start(?:ed)?|turn\/complet(?:ed)?|stream(?:ing)?|disconnected|aborted|hang\s*up|rate[_ -]?limit|429)\b/i;
 const GENERATION_PROGRESS_MARKER_RE =
-  /\b(?:session\s+id|thinking|assistant|tool_call|exec_command|turn\/completed|turn\/started|turn\/start|tokens\s+used)\b/i;
+  /(?:^\s*(?:codex|thinking|assistant|exec)\s*$|\b(?:thinking|assistant|tool_call|exec_command|hook:\s*PreToolUse|turn\/completed|turn\/started|turn\/start|tokens\s+used)\b)/im;
 
-const SUPPORTED_JSON_SCHEMA_KEYWORDS = new Set([
-  '$schema',
-  '$id',
-  'title',
-  'description',
-  'default',
-  'type',
-  'enum',
-  'const',
-  'anyOf',
-  'properties',
-  'required',
-  'additionalProperties',
-  'minProperties',
-  'maxProperties',
-  'items',
-  'minItems',
-  'maxItems',
-  'uniqueItems',
-  'minLength',
-  'maxLength',
-  'pattern',
-  'minimum',
-  'maximum',
-  'exclusiveMinimum',
-  'exclusiveMaximum',
-  'multipleOf',
-]);
+function extractPostEchoCodexDiagnosticStderr(stderrText, promptText = '') {
+  if (typeof stderrText !== 'string' || !stderrText) return '';
+  let norm = stderrText.replace(/\r\n/g, '\n');
+  norm = norm.replace(CODEX_USER_PROMPT_ECHO_BLOCK_RE, '');
+  if (typeof promptText === 'string' && promptText.trim().length > 0) {
+    const normPrompt = promptText.replace(/\r\n/g, '\n').trim();
+    if (normPrompt.length > 0) {
+      const userEchoNeedle = `\nuser\n${normPrompt}`;
+      const idx = norm.indexOf(userEchoNeedle);
+      if (idx !== -1) {
+        norm = norm.slice(0, idx) + norm.slice(idx + userEchoNeedle.length);
+      }
+    }
+  }
+  return norm.replace(CODEX_STARTUP_BANNER_LINE_RE, '').trim();
+}
 
-const UNSUPPORTED_JSON_SCHEMA_KEYWORDS = new Set([
-  '$ref',
-  '$dynamicRef',
-  '$recursiveRef',
-  '$defs',
-  'definitions',
-  'oneOf',
-  'allOf',
-  'not',
-  'patternProperties',
-  'if',
-  'then',
-  'else',
-  'dependentSchemas',
-  'dependentRequired',
-  'dependencies',
-  'propertyNames',
-  'unevaluatedProperties',
-  'unevaluatedItems',
-  'contains',
-  'minContains',
-  'maxContains',
-  'prefixItems',
-  'additionalItems',
-  'format',
-]);
-
-const ALLOWED_CHILD_ENV_KEYS = Object.freeze([
-  'PATH',
-  'SystemRoot',
-  'SYSTEMROOT',
-  'WINDIR',
-  'ProgramFiles',
-  'PROGRAMFILES',
-  'ProgramFiles(x86)',
-  'PROGRAMFILES(X86)',
-  'COMSPEC',
-  'PATHEXT',
-  'TEMP',
-  'TMP',
-  'TMPDIR',
-  'HOME',
-  'USERPROFILE',
-  'APPDATA',
-  'LOCALAPPDATA',
-  'CODEX_HOME',
-  'LANG',
-  'LC_ALL',
-  'NO_COLOR',
-  'HTTPS_PROXY',
-  'HTTP_PROXY',
-  'ALL_PROXY',
-  'NO_PROXY',
-  'SSL_CERT_FILE',
-  'NODE_EXTRA_CA_CERTS',
-]);
-
-const ALLOWED_CHILD_ENV_EXACT = new Set(ALLOWED_CHILD_ENV_KEYS);
-const ALLOWED_CHILD_ENV_BY_UPPER = new Map([
-  ['PATH', 'PATH'],
-  ['SYSTEMROOT', 'SystemRoot'],
-  ['WINDIR', 'WINDIR'],
-  ['PROGRAMFILES', 'ProgramFiles'],
-  ['PROGRAMFILES(X86)', 'ProgramFiles(x86)'],
-  ['COMSPEC', 'COMSPEC'],
-  ['PATHEXT', 'PATHEXT'],
-  ['TEMP', 'TEMP'],
-  ['TMP', 'TMP'],
-  ['TMPDIR', 'TMPDIR'],
-  ['HOME', 'HOME'],
-  ['USERPROFILE', 'USERPROFILE'],
-  ['APPDATA', 'APPDATA'],
-  ['LOCALAPPDATA', 'LOCALAPPDATA'],
-  ['CODEX_HOME', 'CODEX_HOME'],
-  ['LANG', 'LANG'],
-  ['LC_ALL', 'LC_ALL'],
-  ['NO_COLOR', 'NO_COLOR'],
-  ['HTTPS_PROXY', 'HTTPS_PROXY'],
-  ['HTTP_PROXY', 'HTTP_PROXY'],
-  ['ALL_PROXY', 'ALL_PROXY'],
-  ['NO_PROXY', 'NO_PROXY'],
-  ['SSL_CERT_FILE', 'SSL_CERT_FILE'],
-  ['NODE_EXTRA_CA_CERTS', 'NODE_EXTRA_CA_CERTS'],
-]);
-
-const FORBIDDEN_ENV_NAME_RE = /(?:API_KEY|SECRET|TOKEN|PASSWORD)/i;
 
 function generatePiiSafeUuid() {
   for (let i = 0; i < 64; i++) {
@@ -410,36 +312,6 @@ function safeResolveRealOrLexical(candidatePath, realpathFn, platform) {
   }
 }
 
-function evaluateCodexInstallLocation(realTargetPath, {
-  platform = process.platform,
-  realpathFn = realpathSync,
-  cwd = process.cwd(),
-} = {}) {
-  if (typeof realTargetPath !== 'string' || !isTrustedAbsolutePath(realTargetPath, platform)) {
-    return { approved: false, reason: 'Target path is not a trusted absolute path.' };
-  }
-  if (typeof cwd === 'string' && isTrustedAbsolutePath(cwd, platform)) {
-    const realCwd = safeResolveRealOrLexical(cwd.trim(), realpathFn, platform);
-    if (isSameOrInsideDirectory(realCwd, realTargetPath, platform)) {
-      return {
-        approved: false,
-        reason: 'Refusing to execute Codex binary directly from current working directory.',
-      };
-    }
-  }
-  return { approved: true, reason: null };
-}
-
-export function isApprovedInstallLocation(realTargetPath, options = {}) {
-  return evaluateCodexInstallLocation(realTargetPath, options).approved;
-}
-
-export function assertApprovedCodexInstallLocation(realTargetPath, options = {}) {
-  const check = evaluateCodexInstallLocation(realTargetPath, options);
-  if (!check.approved) {
-    throw new CodexRunnerError(check.reason, { code: 'CODEX_UNTRUSTED_INSTALL_LOCATION' });
-  }
-}
 
 function resolveNpmCmdShimTarget(cmdPath, {
   arch = process.arch,
@@ -599,21 +471,12 @@ export function resolveCodexCommand(codexBin = 'codex', {
   };
 
   const finalizeResolved = ({ command, prefixArgs, resolvedShimPath = null, resolvedTargetPath }) => {
-    if (testMode !== true) {
-      const installOpts = {
-        platform,
-        env,
-        realpathFn,
-        cwd,
-        tempDirRoot,
-      };
-      if (resolvedShimPath) {
-        assertApprovedCodexInstallLocation(resolvedShimPath, installOpts);
-      }
-      assertApprovedCodexInstallLocation(resolvedTargetPath, installOpts);
-      if (command !== resolvedTargetPath && command !== process.execPath) {
-        const realCustomExec = safeResolveRealOrLexical(command, realpathFn, platform);
-        assertApprovedCodexInstallLocation(realCustomExec, installOpts);
+    if (testMode !== true && typeof cwd === 'string' && isTrustedAbsolutePath(cwd, platform)) {
+      const realCwd = safeResolveRealOrLexical(cwd.trim(), realpathFn, platform);
+      if (isSameOrInsideDirectory(realCwd, resolvedTargetPath, platform)) {
+        throw new CodexRunnerError('Refusing to execute Codex binary directly from current working directory.', {
+          code: 'CODEX_BIN_NOT_FOUND',
+        });
       }
     }
     const protectedPaths = [];
@@ -798,7 +661,7 @@ export function resolveCodexCommand(codexBin = 'codex', {
       if (!belongsToFilteredPathDirs(realTarget)) {
         throw new CodexRunnerError(
           'where.exe fallback resolved outside filtered PATH directories.',
-          { code: 'CODEX_UNTRUSTED_INSTALL_LOCATION' },
+          { code: 'CODEX_BIN_NOT_FOUND' },
         );
       }
       return finalizeResolved({
@@ -814,7 +677,7 @@ export function resolveCodexCommand(codexBin = 'codex', {
       if (!belongsToFilteredPathDirs(resolvedShim.resolvedShimPath)) {
         throw new CodexRunnerError(
           'where.exe shim fallback resolved outside filtered PATH directories.',
-          { code: 'CODEX_UNTRUSTED_INSTALL_LOCATION' },
+          { code: 'CODEX_BIN_NOT_FOUND' },
         );
       }
       return finalizeResolved(resolvedShim);
@@ -1144,9 +1007,9 @@ function resolveValidatedCwd(cwd) {
  */
 export function buildCodexExecArgs({
   model = DEFAULT_CODEX_MODEL,
-  reasoningEffort = 'xhigh',
+  reasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
   webSearch = 'live',
-  serviceTier = null,
+  serviceTier = DEFAULT_CODEX_SERVICE_TIER,
   imagePaths = [],
   cwd = null,
   skipGitRepoCheck = false,
@@ -1835,13 +1698,8 @@ function preflightPrivateReceiptDestination({
     if (typeof rawProt !== 'string' || !rawProt.trim()) continue;
     const absProt = resolve(rawProt.trim());
     let realProt = absProt;
-    let dev = null;
-    let ino = null;
     try {
       realProt = realpathSync(absProt);
-      const st = statSync(absProt, { bigint: true });
-      dev = st.dev;
-      ino = st.ino;
     } catch {
       realProt = absProt;
     }
@@ -1850,30 +1708,13 @@ function preflightPrivateReceiptDestination({
       realPath: realProt,
       normReal: normalizePathForCompare(realProt),
       normAbs: normalizePathForCompare(absProt),
-      dev,
-      ino,
     });
   }
 
-  const collidesWithProtected = (candidateAbs, candidateReal = null, candidateStatBig = null) => {
+  const collidesWithProtected = (candidateAbs, candidateReal = null) => {
     const normAbs = normalizePathForCompare(candidateAbs);
     const normReal = candidateReal ? normalizePathForCompare(candidateReal) : normAbs;
-    return protectedEntries.some((entry) => {
-      if (entry.normAbs === normAbs || entry.normReal === normReal || entry.normReal === normAbs) {
-        return true;
-      }
-      if (
-        candidateStatBig &&
-        entry.dev !== null &&
-        entry.ino !== null &&
-        entry.ino !== 0n &&
-        candidateStatBig.dev === entry.dev &&
-        candidateStatBig.ino === entry.ino
-      ) {
-        return true;
-      }
-      return false;
-    });
+    return protectedEntries.some(entry => entry.normAbs === normAbs || entry.normReal === normReal || entry.normReal === normAbs);
   };
 
   if (receiptPath !== null && receiptPath !== undefined) {
@@ -2251,245 +2092,6 @@ function writePrivateCodexReceipt({
  *    `gpt-6.2-astra`, `['xhigh', 'max']` effort, and `execution_provenance` (`live_subscription_codex` unless `allowTestDouble === true`).
  *  - Never throws; returns `{ verified: true, ... }` or `{ verified: false, reason }`.
  */
-export function verifySavedCodexReceipt(envelope, {
-  receiptStoreDir = null,
-  allowTestDouble = false,
-  expectedCandidateId = null,
-  expectedFormSpecSha256 = null,
-  allowStaleSpec = false,
-  expectedPacketSha256 = null,
-  expectedAttachmentSha256s = null,
-} = {}) {
-  try {
-    if (typeof allowTestDouble !== 'boolean') {
-      return Object.freeze({ verified: false, reason: 'allowTestDouble must be a boolean.' });
-    }
-    if (!isPlainObject(envelope)) {
-      return Object.freeze({ verified: false, reason: 'Review envelope must be a plain object.' });
-    }
-    const expectedReceiptSha = typeof envelope.receipt_sha256 === 'string' ? envelope.receipt_sha256.trim() : '';
-    if (!HEX_SHA256_RE.test(expectedReceiptSha)) {
-      return Object.freeze({ verified: false, reason: 'Missing or invalid envelope.receipt_sha256.' });
-    }
-    if (
-      envelope.private_receipt_ref !== undefined &&
-      envelope.private_receipt_ref !== null &&
-      envelope.private_receipt_ref !== `codex-receipt:${expectedReceiptSha}`
-    ) {
-      return Object.freeze({ verified: false, reason: 'envelope.private_receipt_ref does not match receipt_sha256.' });
-    }
-
-    const candidateDirs = [];
-    if (receiptStoreDir !== null && receiptStoreDir !== undefined) {
-      if (typeof receiptStoreDir !== 'string' || !receiptStoreDir.trim() || /[\0\r\n]/.test(receiptStoreDir)) {
-        return Object.freeze({ verified: false, reason: 'Invalid receiptStoreDir option.' });
-      }
-      candidateDirs.push(resolve(receiptStoreDir.trim()));
-    } else {
-      candidateDirs.push(resolve(process.cwd(), '.local', 'receipts', 'codex-evidence-review'));
-      if (allowTestDouble === true) {
-        candidateDirs.push(getDefaultTestReceiptStoreDir());
-      }
-    }
-
-    let receiptBytes = null;
-    for (const dir of candidateDirs) {
-      const candidateFile = join(dir, `receipt-${expectedReceiptSha}.json`);
-      let lst = null;
-      try {
-        lst = lstatSync(candidateFile);
-      } catch {
-        lst = null;
-      }
-      if (!lst || lst.isSymbolicLink() || !lst.isFile() || lst.size <= 0 || lst.size > MAX_RECEIPT_FILE_BYTES) {
-        continue;
-      }
-      receiptBytes = readFileSync(candidateFile);
-      break;
-    }
-
-    if (!receiptBytes) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex execution receipt file was not found in receipt store.' });
-    }
-    if (sha256Hex(receiptBytes) !== expectedReceiptSha) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt file SHA-256 does not match envelope.receipt_sha256.' });
-    }
-
-    const rec = JSON.parse(receiptBytes.toString('utf8'));
-    if (!isPlainObject(rec) || rec.kind !== 'codex_exec_receipt') {
-      return Object.freeze({ verified: false, reason: 'Saved receipt JSON is not a valid codex_exec_receipt object.' });
-    }
-    if (rec.status !== 'completed' || rec.error_code !== null || rec.validation_error !== null || rec.termination_uncertain !== false) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt does not record a clean completed validation.' });
-    }
-    if (typeof rec.raw_output_sha256 !== 'string' || !HEX_SHA256_RE.test(rec.raw_output_sha256)) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt lacks a valid raw_output_sha256.' });
-    }
-    if (envelope.raw_output_sha256 !== undefined && envelope.raw_output_sha256 !== rec.raw_output_sha256) {
-      return Object.freeze({ verified: false, reason: 'Envelope raw_output_sha256 does not match saved receipt.' });
-    }
-    if (typeof rec.raw_output_original_base64 !== 'string' || rec.raw_output_original_base64.length === 0) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt lacks raw_output_original_base64.' });
-    }
-
-    const decodedRawBytes = Buffer.from(rec.raw_output_original_base64, 'base64');
-    if (decodedRawBytes.length === 0 || decodedRawBytes.toString('base64') !== rec.raw_output_original_base64) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt raw_output_original_base64 is corrupt.' });
-    }
-    if (sha256Hex(decodedRawBytes) !== rec.raw_output_sha256) {
-      return Object.freeze({ verified: false, reason: 'Decoded raw_output_original_base64 SHA-256 does not match raw_output_sha256.' });
-    }
-
-    const parsedRawReview = JSON.parse(decodedRawBytes.toString('utf8').trim());
-    validateJsonAgainstStrictSchema(parsedRawReview, EVIDENCE_REVIEW_JSON_SCHEMA, '$');
-
-    if (typeof envelope.review_id !== 'string' || rec.review_id !== envelope.review_id || parsedRawReview.review_id !== rec.review_id) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt review_id does not match envelope.' });
-    }
-    if (typeof envelope.packet_sha256 !== 'string' || rec.packet_sha256 !== envelope.packet_sha256 || parsedRawReview.packet_sha256 !== rec.packet_sha256) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt packet_sha256 does not match envelope.' });
-    }
-    if (expectedPacketSha256 !== null && expectedPacketSha256 !== undefined && rec.packet_sha256 !== String(expectedPacketSha256).trim()) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt packet_sha256 does not match expectedPacketSha256.' });
-    }
-
-    const envAtts = Array.isArray(envelope.attachment_sha256s) ? envelope.attachment_sha256s : [];
-    if (
-      !Array.isArray(rec.attachment_sha256s) ||
-      rec.attachment_sha256s.length !== envAtts.length ||
-      rec.attachment_sha256s.some((sha, idx) => sha !== envAtts[idx])
-    ) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt attachment_sha256s does not match envelope.' });
-    }
-    if (Array.isArray(expectedAttachmentSha256s)) {
-      if (
-        rec.attachment_sha256s.length !== expectedAttachmentSha256s.length ||
-        rec.attachment_sha256s.some((sha, idx) => sha !== expectedAttachmentSha256s[idx])
-      ) {
-        return Object.freeze({ verified: false, reason: 'Saved Codex receipt attachment_sha256s does not match expectedAttachmentSha256s.' });
-      }
-    }
-
-    if (typeof rec.bound_candidate_id === 'string' && rec.bound_candidate_id.trim()) {
-      const boundCand = rec.bound_candidate_id.trim();
-      if (typeof envelope.candidate_id === 'string' && envelope.candidate_id.trim() && envelope.candidate_id.trim() !== boundCand) {
-        return Object.freeze({ verified: false, reason: 'Envelope candidate_id does not match receipt bound_candidate_id.' });
-      }
-      if (typeof expectedCandidateId === 'string' && expectedCandidateId.trim() && expectedCandidateId.trim() !== boundCand) {
-        return Object.freeze({ verified: false, reason: 'Receipt bound_candidate_id does not match expectedCandidateId.' });
-      }
-    } else if (typeof expectedCandidateId === 'string' && expectedCandidateId.trim()) {
-      const wantCand = expectedCandidateId.trim();
-      const envCand = typeof envelope.candidate_id === 'string' && envelope.candidate_id.trim() ? envelope.candidate_id.trim() : null;
-      const subjCand = typeof rec.candidate_subject_id === 'string' && rec.candidate_subject_id.trim() ? rec.candidate_subject_id.trim() : null;
-      if ((envCand && envCand !== wantCand) || (!envCand && subjCand && subjCand !== wantCand)) {
-        return Object.freeze({ verified: false, reason: 'Candidate identity does not match expectedCandidateId.' });
-      }
-    }
-
-    let staleSpec = false;
-    let actualReviewedSpec = null;
-    if (typeof rec.bound_form_spec_sha256 === 'string' && rec.bound_form_spec_sha256.trim()) {
-      const boundSpec = rec.bound_form_spec_sha256.trim();
-      actualReviewedSpec = boundSpec;
-      if (typeof envelope.form_spec_sha256 === 'string' && envelope.form_spec_sha256.trim() && envelope.form_spec_sha256.trim() !== boundSpec) {
-        return Object.freeze({ verified: false, reason: 'Envelope form_spec_sha256 does not match receipt bound_form_spec_sha256.' });
-      }
-      if (typeof expectedFormSpecSha256 === 'string' && expectedFormSpecSha256.trim() && expectedFormSpecSha256.trim() !== boundSpec) {
-        if (allowStaleSpec === true && HEX_SHA256_RE.test(boundSpec)) {
-          staleSpec = true;
-        } else {
-          return Object.freeze({ verified: false, reason: 'Receipt bound_form_spec_sha256 does not match expectedFormSpecSha256.' });
-        }
-      }
-    } else if (typeof expectedFormSpecSha256 === 'string' && expectedFormSpecSha256.trim()) {
-      const wantSpec = expectedFormSpecSha256.trim();
-      const envSpec = typeof envelope.form_spec_sha256 === 'string' && envelope.form_spec_sha256.trim() ? envelope.form_spec_sha256.trim() : null;
-      actualReviewedSpec = envSpec;
-      if (envSpec && envSpec !== wantSpec) {
-        if (allowStaleSpec === true && HEX_SHA256_RE.test(envSpec)) {
-          staleSpec = true;
-        } else {
-          return Object.freeze({ verified: false, reason: 'Envelope form_spec_sha256 does not match expectedFormSpecSha256.' });
-        }
-      }
-    } else if (typeof envelope.form_spec_sha256 === 'string' && envelope.form_spec_sha256.trim()) {
-      actualReviewedSpec = envelope.form_spec_sha256.trim();
-    }
-
-    if (!isPlainObject(envelope.review) || canonicalJson(parsedRawReview) !== canonicalJson(envelope.review)) {
-      return Object.freeze({ verified: false, reason: 'Envelope review body is missing or differs from verified receipt original output.' });
-    }
-
-    const resolvedRecModel = rec.model === null
-      ? null
-      : (typeof rec.model === 'string' ? rec.model.trim() : '');
-    if ((resolvedRecModel !== null && !SAFE_MODEL_ID_RE.test(resolvedRecModel)) ||
-      (envelope.model !== undefined && (
-        resolvedRecModel === null
-          ? envelope.model !== null
-          : (envelope.model === null || String(envelope.model).trim() !== resolvedRecModel)
-      ))) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt lacks a valid matching model identifier.' });
-    }
-    const resolvedRecEffort = rec.reasoning_effort === null || rec.reasoning_effort === 'default'
-      ? null
-      : rec.reasoning_effort;
-    const envEffortNorm = envelope.reasoning_effort === undefined
-      ? undefined
-      : (envelope.reasoning_effort === null || envelope.reasoning_effort === 'default' ? null : envelope.reasoning_effort);
-    if ((resolvedRecEffort !== null && !ALLOWED_GATE4_EFFORTS.includes(resolvedRecEffort)) ||
-      (envEffortNorm !== undefined && envEffortNorm !== resolvedRecEffort)) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt reasoning_effort must be xhigh, max, or null (inherited config).' });
-    }
-
-    const prov = rec.execution_provenance;
-    if (envelope.execution_provenance !== undefined && envelope.execution_provenance !== prov) {
-      return Object.freeze({ verified: false, reason: 'Envelope execution_provenance does not match saved receipt.' });
-    }
-    const provenanceAllowed =
-      prov === 'live_subscription_codex' ||
-      (allowTestDouble === true && prov === 'synthetic_test_double');
-    if (!provenanceAllowed) {
-      return Object.freeze({
-        verified: false,
-        reason: prov === 'synthetic_test_double'
-          ? 'Receipt provenance is synthetic_test_double, which is rejected when allowTestDouble=false.'
-          : `Unrecognized receipt execution_provenance "${String(prov)}".`,
-      });
-    }
-
-    const reviewerLabel = formatReviewerLabel(resolvedRecModel, resolvedRecEffort, prov);
-
-    return Object.freeze({
-      verified: true,
-      stale_spec: staleSpec,
-      reviewed_at: typeof rec.recorded_at === 'string' && rec.recorded_at.trim()
-        ? rec.recorded_at.trim()
-        : (typeof envelope.reviewed_at === 'string' && envelope.reviewed_at.trim() ? envelope.reviewed_at.trim() : null),
-      reviewed_spec_sha256: actualReviewedSpec ?? rec.candidate_spec_sha256 ?? null,
-      receipt_sha256: expectedReceiptSha,
-      execution_provenance: prov,
-      model: resolvedRecModel,
-      reasoning_effort: resolvedRecEffort,
-      reviewer_label: reviewerLabel,
-      review_id: rec.review_id,
-      packet_sha256: rec.packet_sha256,
-      candidate_subject_id: rec.candidate_subject_id ?? null,
-      candidate_spec_sha256: rec.candidate_spec_sha256 ?? null,
-      bound_candidate_id: rec.bound_candidate_id ?? null,
-      bound_form_spec_sha256: rec.bound_form_spec_sha256 ?? null,
-      attachment_sha256s: Object.freeze([...rec.attachment_sha256s]),
-      raw_review: parsedRawReview,
-    });
-  } catch (err) {
-    return Object.freeze({
-      verified: false,
-      reason: sanitizeDiagnosticText(`Receipt verification failed: ${String(err?.message || err)}`),
-    });
-  }
-}
-
 function snapshotSchemaOnce(node, label = 'codex_schema', depth = 0, seen = new Set()) {
   if (depth > 64) {
     throw new RangeError(`${label} exceeds maximum JSON Schema nesting depth.`);
@@ -2576,277 +2178,6 @@ function assertSafeSchemaDeep(node, label = 'codex_schema', depth = 0, seen = ne
  * `if`/`then`/`else`, boolean `false` root schemas, or unknown keywords (`UNSUPPORTED_JSON_SCHEMA_KEYWORD`)
  * BEFORE spawning `codex` (`P2-schema`).
  */
-function assertSupportedStrictJsonSchema(schemaNode, path = 'codex_schema') {
-  if (schemaNode === false) {
-    throw new CodexRunnerError(
-      `${path} is a boolean false schema that rejects all values.`,
-      { code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' },
-    );
-  }
-  if (schemaNode === true) {
-    return;
-  }
-  if (!schemaNode || typeof schemaNode !== 'object' || Array.isArray(schemaNode)) {
-    throw new TypeError(`${path} must be a JSON Schema object or boolean.`);
-  }
-
-  for (const key of Object.keys(schemaNode)) {
-    if (UNSUPPORTED_JSON_SCHEMA_KEYWORDS.has(key) || !SUPPORTED_JSON_SCHEMA_KEYWORDS.has(key)) {
-      throw new CodexRunnerError(
-        `${path} contains unsupported JSON Schema keyword "${key}"; only strict locally-validated keywords are permitted.`,
-        { code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' },
-      );
-    }
-  }
-
-  if (schemaNode.pattern !== undefined) {
-    if (typeof schemaNode.pattern !== 'string') {
-      throw new TypeError(`${path}.pattern must be a regular expression string.`);
-    }
-    try {
-      // Verify valid ECMA-262 regex syntax upfront.
-      new RegExp(schemaNode.pattern, 'u');
-    } catch {
-      try {
-        new RegExp(schemaNode.pattern);
-      } catch (reErr) {
-        throw new TypeError(`${path}.pattern is not a valid regular expression: ${reErr.message}`);
-      }
-    }
-  }
-
-  if (Array.isArray(schemaNode.anyOf)) {
-    if (schemaNode.anyOf.length === 0) {
-      throw new TypeError(`${path}.anyOf must be a nonempty array.`);
-    }
-    schemaNode.anyOf.forEach((branch, idx) => {
-      assertSupportedStrictJsonSchema(branch, `${path}.anyOf[${idx}]`);
-    });
-  }
-
-  if (schemaNode.properties !== undefined) {
-    if (!isPlainObject(schemaNode.properties)) {
-      throw new TypeError(`${path}.properties must be a plain object.`);
-    }
-    for (const [propKey, propSubSchema] of Object.entries(schemaNode.properties)) {
-      if (propSubSchema !== false) {
-        assertSupportedStrictJsonSchema(propSubSchema, `${path}.properties.${propKey}`);
-      }
-    }
-  }
-
-  if (schemaNode.additionalProperties !== undefined && typeof schemaNode.additionalProperties !== 'boolean') {
-    assertSupportedStrictJsonSchema(schemaNode.additionalProperties, `${path}.additionalProperties`);
-  }
-
-  if (schemaNode.items !== undefined && schemaNode.items !== false) {
-    if (Array.isArray(schemaNode.items)) {
-      throw new CodexRunnerError(
-        `${path}.items tuple array form is unsupported; supply a single items schema object.`,
-        { code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' },
-      );
-    }
-    assertSupportedStrictJsonSchema(schemaNode.items, `${path}.items`);
-  }
-}
-
-function jsonDeepEqual(a, b) {
-  if (Object.is(a, b)) return true;
-  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false;
-  return canonicalJson(a) === canonicalJson(b);
-}
-
-function compileSchemaPattern(pattern, path) {
-  try {
-    return new RegExp(pattern, 'u');
-  } catch {
-    try {
-      return new RegExp(pattern);
-    } catch (err) {
-      throw new TypeError(`${path}.pattern is invalid: ${err.message}`);
-    }
-  }
-}
-
-function matchesJsonSchemaType(value, expectedType) {
-  switch (expectedType) {
-    case 'null':
-      return value === null;
-    case 'boolean':
-      return typeof value === 'boolean';
-    case 'string':
-      return typeof value === 'string';
-    case 'number':
-      return typeof value === 'number' && Number.isFinite(value);
-    case 'integer':
-      return typeof value === 'number' && Number.isInteger(value);
-    case 'array':
-      return Array.isArray(value);
-    case 'object':
-      return isPlainObject(value);
-    default:
-      return false;
-  }
-}
-
-export function validateJsonAgainstStrictSchema(value, schemaNode, path = '$') {
-  if (schemaNode === false) {
-    throw new TypeError(`${path} failed validation: boolean false schema rejects all values.`);
-  }
-  if (schemaNode === true) {
-    return { valid: true };
-  }
-  if (!schemaNode || typeof schemaNode !== 'object' || Array.isArray(schemaNode)) {
-    throw new TypeError(`${path} schema must be a plain JSON Schema object or boolean.`);
-  }
-
-  for (const key of Object.keys(schemaNode)) {
-    if (UNSUPPORTED_JSON_SCHEMA_KEYWORDS.has(key) || !SUPPORTED_JSON_SCHEMA_KEYWORDS.has(key)) {
-      throw new CodexRunnerError(
-        `${path} schema uses unsupported JSON Schema keyword "${key}".`,
-        { code: 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' },
-      );
-    }
-  }
-
-  if (Array.isArray(schemaNode.anyOf)) {
-    const matched = schemaNode.anyOf.some((branch) => {
-      try {
-        validateJsonAgainstStrictSchema(value, branch, path);
-        return true;
-      } catch {
-        return false;
-      }
-    });
-    if (!matched) {
-      throw new TypeError(`${path} did not match any allowed anyOf schema branch.`);
-    }
-  }
-
-  if (schemaNode.type !== undefined) {
-    const allowedTypes = Array.isArray(schemaNode.type) ? schemaNode.type : [schemaNode.type];
-    if (!allowedTypes.some(t => matchesJsonSchemaType(value, t))) {
-      throw new TypeError(`${path} failed JSON Schema type check (expected ${JSON.stringify(schemaNode.type)}).`);
-    }
-  }
-
-  if (Array.isArray(schemaNode.enum)) {
-    if (!schemaNode.enum.some(allowed => jsonDeepEqual(allowed, value))) {
-      throw new TypeError(`${path} value is not permitted by schema enum.`);
-    }
-  }
-
-  if (Object.hasOwn(schemaNode, 'const') && !jsonDeepEqual(value, schemaNode.const)) {
-    throw new TypeError(`${path} value does not match schema const.`);
-  }
-
-  if (typeof value === 'string') {
-    const codePointLen = Array.from(value).length;
-    if (typeof schemaNode.minLength === 'number' && codePointLen < schemaNode.minLength) {
-      throw new TypeError(`${path} string length (${codePointLen}) is below minLength (${schemaNode.minLength}).`);
-    }
-    if (typeof schemaNode.maxLength === 'number' && codePointLen > schemaNode.maxLength) {
-      throw new TypeError(`${path} string length (${codePointLen}) exceeds maxLength (${schemaNode.maxLength}).`);
-    }
-    if (typeof schemaNode.pattern === 'string') {
-      const re = compileSchemaPattern(schemaNode.pattern, path);
-      if (!re.test(value)) {
-        throw new TypeError(`${path} string value did not match schema pattern /${schemaNode.pattern}/.`);
-      }
-    }
-  }
-
-  if (typeof value === 'number') {
-    if (typeof schemaNode.minimum === 'number' && value < schemaNode.minimum) {
-      throw new TypeError(`${path} number (${value}) is below minimum (${schemaNode.minimum}).`);
-    }
-    if (typeof schemaNode.maximum === 'number' && value > schemaNode.maximum) {
-      throw new TypeError(`${path} number (${value}) exceeds maximum (${schemaNode.maximum}).`);
-    }
-    if (typeof schemaNode.exclusiveMinimum === 'number' && value <= schemaNode.exclusiveMinimum) {
-      throw new TypeError(`${path} number (${value}) must be > exclusiveMinimum (${schemaNode.exclusiveMinimum}).`);
-    }
-    if (typeof schemaNode.exclusiveMaximum === 'number' && value >= schemaNode.exclusiveMaximum) {
-      throw new TypeError(`${path} number (${value}) must be < exclusiveMaximum (${schemaNode.exclusiveMaximum}).`);
-    }
-    if (typeof schemaNode.multipleOf === 'number' && schemaNode.multipleOf > 0) {
-      const quotient = value / schemaNode.multipleOf;
-      if (Math.abs(quotient - Math.round(quotient)) > 1e-12) {
-        throw new TypeError(`${path} number (${value}) is not a multipleOf (${schemaNode.multipleOf}).`);
-      }
-    }
-  }
-
-  if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
-    if (!isPlainObject(value)) {
-      throw new TypeError(`${path} must be a plain JSON object.`);
-    }
-    const ownKeys = Object.keys(value);
-    if (typeof schemaNode.minProperties === 'number' && ownKeys.length < schemaNode.minProperties) {
-      throw new TypeError(`${path} property count (${ownKeys.length}) is below minProperties (${schemaNode.minProperties}).`);
-    }
-    if (typeof schemaNode.maxProperties === 'number' && ownKeys.length > schemaNode.maxProperties) {
-      throw new TypeError(`${path} property count (${ownKeys.length}) exceeds maxProperties (${schemaNode.maxProperties}).`);
-    }
-    if (Array.isArray(schemaNode.required)) {
-      for (const reqKey of schemaNode.required) {
-        if (!Object.hasOwn(value, reqKey) || value[reqKey] === undefined) {
-          throw new TypeError(`${path} is missing schema-required property "${reqKey}".`);
-        }
-      }
-    }
-    const propsSpec = isPlainObject(schemaNode.properties) ? schemaNode.properties : null;
-    if (schemaNode.additionalProperties === false) {
-      for (const ownKey of ownKeys) {
-        if (!propsSpec || !Object.hasOwn(propsSpec, ownKey)) {
-          throw new TypeError(`${path} contains disallowed additional property "${ownKey}".`);
-        }
-      }
-    } else if (isPlainObject(schemaNode.additionalProperties)) {
-      for (const ownKey of ownKeys) {
-        if ((!propsSpec || !Object.hasOwn(propsSpec, ownKey)) && value[ownKey] !== undefined) {
-          validateJsonAgainstStrictSchema(value[ownKey], schemaNode.additionalProperties, `${path}.${ownKey}`);
-        }
-      }
-    }
-    if (propsSpec) {
-      for (const [propKey, propSchema] of Object.entries(propsSpec)) {
-        if (Object.hasOwn(value, propKey) && value[propKey] !== undefined) {
-          validateJsonAgainstStrictSchema(value[propKey], propSchema, `${path}.${propKey}`);
-        }
-      }
-    }
-  }
-
-  if (Array.isArray(value)) {
-    if (typeof schemaNode.minItems === 'number' && value.length < schemaNode.minItems) {
-      throw new TypeError(`${path} array length (${value.length}) is below minItems (${schemaNode.minItems}).`);
-    }
-    if (typeof schemaNode.maxItems === 'number' && value.length > schemaNode.maxItems) {
-      throw new TypeError(`${path} array length (${value.length}) exceeds maxItems (${schemaNode.maxItems}).`);
-    }
-    if (schemaNode.uniqueItems === true) {
-      const seenItems = new Set();
-      for (let i = 0; i < value.length; i++) {
-        const key = canonicalJson(value[i]);
-        if (seenItems.has(key)) {
-          throw new TypeError(`${path}[${i}] violates uniqueItems.`);
-        }
-        seenItems.add(key);
-      }
-    }
-    if (schemaNode.items === false && value.length > 0) {
-      throw new TypeError(`${path} non-empty array rejected by items: false.`);
-    }
-    if (schemaNode.items && typeof schemaNode.items === 'object' && !Array.isArray(schemaNode.items)) {
-      for (let i = 0; i < value.length; i++) {
-        validateJsonAgainstStrictSchema(value[i], schemaNode.items, `${path}[${i}]`);
-      }
-    }
-  }
-
-  return { valid: true };
-}
 
 /**
  * Execute `codex exec` in a fresh stateless read-only sandbox with a strict `--output-schema`,
@@ -2857,9 +2188,9 @@ export async function runCodexExecJson({
   schema = null,
   outputFormat = undefined,
   model = null,
-  reasoningEffort = null,
+  reasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
   webSearch = 'live',
-  serviceTier = null,
+  serviceTier = DEFAULT_CODEX_SERVICE_TIER,
   allowStandardTierFallback = true,
   allowTierFallback = undefined,
   imagePaths = [],
@@ -2990,7 +2321,7 @@ export async function runCodexExecJson({
       throw new TypeError('codex_schema contains a secret or credential token; redact before invoking Codex CLI.');
     }
     assertSafeSchemaDeep(frozenSchema, 'codex_schema');
-    assertSupportedStrictJsonSchema(frozenSchema, 'codex_schema');
+    assertSupportedStrictJsonSchema(frozenSchema, 'codex_schema', { ErrorClass: CodexRunnerError });
   }
 
   const resolvedCwd = resolveValidatedCwd(cwd);
@@ -3138,6 +2469,7 @@ export async function runCodexExecJson({
       (receiptPath ? dirname(resolve(receiptPath.trim())) : (testMode === true ? getDefaultTestReceiptStoreDir() : resolve(process.cwd(), '.local', 'receipts', 'codex-evidence-review')));
 
     const firstStderr = firstRun.procRes.stderr;
+    const firstStderrWithoutBanner = extractPostEchoCodexDiagnosticStderr(firstStderr, prompt);
     const canFallbackToStandard =
       serviceTier === 'ultrafast' &&
       effectiveAllowFallback === true &&
@@ -3150,12 +2482,12 @@ export async function runCodexExecJson({
       !fsImpl.existsSync(firstRun.tempOutputPath) &&
       firstRun.outputInfo.outputReadError === null &&
       firstRun.procRes.totalStderrBytes > 0 &&
-      firstRun.procRes.totalStderrBytes <= MAX_ENTITLEMENT_STDERR_CHARS &&
-      firstStderr.length > 0 &&
-      firstStderr.length <= MAX_ENTITLEMENT_STDERR_CHARS &&
-      !GENERATION_PROGRESS_MARKER_RE.test(firstStderr) &&
-      !TRANSPORT_OR_TURN_STARTED_STDERR_RE.test(firstStderr) &&
-      ULTRAFAST_ENTITLEMENT_ERROR_RE.test(firstStderr);
+      firstRun.procRes.totalStderrBytes <= MAX_CAPTURE_BYTES &&
+      firstStderrWithoutBanner.length > 0 &&
+      firstStderrWithoutBanner.length <= MAX_ENTITLEMENT_STDERR_CHARS &&
+      !GENERATION_PROGRESS_MARKER_RE.test(firstStderrWithoutBanner) &&
+      !TRANSPORT_OR_TURN_STARTED_STDERR_RE.test(firstStderrWithoutBanner) &&
+      ULTRAFAST_ENTITLEMENT_ERROR_RE.test(firstStderrWithoutBanner);
 
     if (canFallbackToStandard) {
       // P0-27: Persist distinct first-attempt failure receipt BEFORE launching standard-tier fallback!
@@ -3472,7 +2804,7 @@ export async function runCodexExecJson({
     }
 
     try {
-      validateJsonAgainstStrictSchema(parsed, frozenSchema, '$');
+      validateJsonAgainstStrictSchema(parsed, frozenSchema, '$', { ErrorClass: CodexRunnerError });
     } catch (schemaErr) {
       const cleanSchemaReason = sanitizeDiagnosticText(
         `JSON Schema validation rejected Codex output: ${String(schemaErr?.message || schemaErr)}`,
@@ -3536,16 +2868,6 @@ export async function runCodexExecJson({
   }
 }
 
-function formatReviewerLabel(model, effort, executionProvenance = 'live_subscription_codex') {
-  const effDisp = effort || 'inherited';
-  if (executionProvenance === 'synthetic_test_double') {
-    return `Synthetic Test Double · ${effDisp}`;
-  }
-  const rawModel = String(model || '').trim();
-  const m = rawModel.toLowerCase();
-  const displayModel = !rawModel ? 'Codex CLI' : (m === 'gpt-6.2-astra' ? 'GPT-6.2 Astra' : rawModel);
-  return `${displayModel} · ${effDisp}`;
-}
 
 export async function runCodexExecMarkdown(options = {}) {
   return runCodexExecJson({
@@ -3562,9 +2884,9 @@ export async function runCodexExecMarkdown(options = {}) {
  */
 export async function runCodexEvidenceReview(packetInput, {
   model = null,
-  reasoningEffort = null,
+  reasoningEffort = DEFAULT_CODEX_REASONING_EFFORT,
   webSearch = 'live',
-  serviceTier = null,
+  serviceTier = DEFAULT_CODEX_SERVICE_TIER,
   allowStandardTierFallback = true,
   allowTierFallback = undefined,
   imagePaths = [],
@@ -4171,7 +3493,6 @@ export async function runCodexEvidenceReview(packetInput, {
       errCode === 'CODEX_SUBSCRIPTION_AUTH_REQUIRED' ||
       errCode === 'CODEX_BIN_NOT_FOUND' ||
       errCode === 'CODEX_UNSAFE_SHIM' ||
-      errCode === 'CODEX_UNTRUSTED_INSTALL_LOCATION' ||
       errCode === 'CODEX_GUARD_BYPASS_FORBIDDEN' ||
       errCode === 'TEST_MODE_REQUIRES_IN_PROCESS_DOUBLE' ||
       errCode === 'UNSUPPORTED_JSON_SCHEMA_KEYWORD' ||
@@ -4444,3 +3765,5 @@ export async function runCodexEvidenceReview(packetInput, {
 
   return readyEnvelope;
 }
+
+export { ALLOWED_GATE4_EFFORTS, verifySavedCodexReceipt, validateJsonAgainstStrictSchema };

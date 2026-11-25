@@ -9,7 +9,7 @@ import { prepareDiscovery, attachDiscovery } from './discovery.mjs';
 import { resolveChannelMeta } from './discovery-channels.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
-import { getFba2027RateTableSnapshot, getHistoricalFba2027RateTableSnapshots } from './fba-rates-2027.mjs';
+import { getFba2027RateTableSnapshot, getHistoricalFba2027RateTableSnapshots } from './fba-calculator.mjs';
 import {
   canonicalJson,
   computeEvidenceBundleHash,

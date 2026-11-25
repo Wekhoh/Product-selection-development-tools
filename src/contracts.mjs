@@ -5,8 +5,8 @@
  */
 import { crc32, inflateSync } from 'node:zlib';
 import { validEvidenceDate } from './observations.mjs';
-import { computeOrderPlan } from './fba-rates-2027.mjs';
-import { toBigRat, addBigRat, mulBigRat, roundBigRat, ratCmp } from './fee-basis.mjs';
+import { computeOrderPlan } from './fba-calculator.mjs';
+import { toBigRat, addBigRat, mulBigRat, roundBigRat, ratCmp } from './fba-calculator.mjs';
 
 export const ALLOWED_DISPOSITIONS = Object.freeze([
   'product',
@@ -730,6 +730,8 @@ export function validateSourcingVerifier1688Output(output, { expected_components
         sku_lines: normalizedInputSkuLines,
         allow_remainder: Boolean(output.allow_remainder ?? false),
         target_sets: output.target_sets ?? 100,
+        lcm_cap: output.lcm_cap,
+        profile_revision: output.profile_revision ?? 59,
       });
     }
     return {
@@ -777,6 +779,8 @@ export function validateSourcingVerifier1688Output(output, { expected_components
     sku_lines: normalizedInputSkuLines,
     allow_remainder: allowRemainder,
     target_sets: targetSets,
+    lcm_cap: output.lcm_cap,
+    profile_revision: output.profile_revision ?? 59,
   });
   if (cartonPackUnverifiedStage1) {
     orderPlan.carton_pack_unverified_stage1 = true;

@@ -1,10 +1,10 @@
 # Discovery methods reuse review — 2026-11-14
 
-Status: source research, with proposed adaptations below. No package was installed and no product, supplier, store or model request was made by this research subtask. Current owner decisions and execution status remain in [STATE](../STATE.md), not this report.
+Status: source research, with proposed adaptations below. No package was installed and no product, supplier, store or model request was made by this research subtask. Current owner decisions and execution status remain in [STATE](../../STATE.md), not this report.
 
 ## Finding and reuse boundary
 
-Existing methods support broader discovery without adding more initial scoring dimensions. The project already preserves five routes and three opportunity hypotheses in [PRODUCT](../PRODUCT.md#discovery-and-analysis). Reuse focused research moves that produce concrete product hypotheses, then test purchase demand and economics. Source diversity is a batch property; each lead need not traverse every route.
+Existing methods support broader discovery without adding more initial scoring dimensions. The project already preserves five routes and three opportunity hypotheses in [PRODUCT](../../PRODUCT.md#discovery-and-analysis). Reuse focused research moves that produce concrete product hypotheses, then test purchase demand and economics. Source diversity is a batch property; each lead need not traverse every route.
 
 The upstream SeaLeap default-branch head inspected on 2026-11-14 was `1283764556e61cbe56c600bbe504b8731b2254cb`, authored 2026-10-16, matching the retained migration map. The repository was not archived. A later metadata update is not a later code release. This focused review reused unchanged migration work rather than auditing the whole library again. [Commits](https://api.github.com/repos/xjli360/sealeap-amazon-skills/commits?per_page=2), [repository metadata](https://api.github.com/repos/xjli360/sealeap-amazon-skills)
 

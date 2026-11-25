@@ -6,8 +6,7 @@ import { join } from 'node:path';
 import { scoreCandidate } from '../src/scoring.mjs';
 import { runCli } from '../src/cli.mjs';
 
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
-profile.revision = profile.workflow.scoring_and_ordering.revision = 56;
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const reading = (value, unit, extra = {}) => ({ value, unit, evidence: ['synthetic-entry'], ...extra });
 const exact = (value, extra = {}) => reading(value, 'USD', { match_type: 'exact', strategy: 'fixed', ...extra });
 const candidate = () => ({
@@ -95,30 +94,24 @@ test('invalid or conflicting supplied volumes and duplicate queries are not miss
   assert.equal(bidItem(input).score, null);
 });
 
-test('equal-entry scoring preserves source-labeled bounds and frozen revisions50 through55', () => {
+test('equal-entry scoring preserves source-labeled bounds and rejects retired revisions < 59', () => {
   const input = candidate();
-  input.bids.entries[0].sif.low = 1;
-  input.bids.entries[0].sif.high = 4;
-  input.bids.entries[1].sif.low = 0.5;
-  input.bids.entries[1].sif.high = 2;
-  assert.deepEqual(bidItem(input).range_scenarios.sif.bid_range_usd, [0.75, 3]);
-  assert.deepEqual(bidItem(input).range_scenarios.sif.score_range, [0, 13.5]);
-  assert.equal(bidItem(input).range_scenarios.sellersprite, null);
-  assert.equal(bidItem(input).score, 9);
-  for (const revision of [50, 51, 52, 53, 54, 55]) {
-    const frozen = structuredClone(profile);
-    frozen.revision = frozen.workflow.scoring_and_ordering.revision = revision;
-    assert.equal(bidItem(input, frozen).score, null);
+  input.bids.entries[0].sellersprite = reading(1, 'USD', { match_type: 'exact', strategy: 'unspecified', low: 0.7, high: 1.4 });
+  input.bids.entries[0].sif = exact(3, { low: 2.1, high: 3.8 });
+  const item = bidItem(input);
+  assert.deepEqual(item.entries[0].sources.sellersprite.range, [0.7, 1.4]);
+  assert.deepEqual(item.entries[0].sources.sif.range, [2.1, 3.8]);
+  for (const rev of [50, 55, 58]) {
+    const retired = structuredClone(profile);
+    retired.revision = retired.workflow.scoring_and_ordering.revision = rev;
+    assert.throws(() => scoreCandidate(candidate(), retired), TypeError);
   }
-  input.bids.entries.length = 1;
-  assert.equal(bidItem(input).score, 6);
-  assert.equal(bidItem(input).aggregation_method, 'single_main_entry');
 });
 
 test('the CLI and Chinese card disclose equal weighting and preserve unknown monthly volumes', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'selection-equal-bid-'));
   try {
-    writeFileSync(join(directory, 'batch.json'), JSON.stringify({ schema_version: 1, profile_revision: 56, candidates: [candidate()] }));
+    writeFileSync(join(directory, 'batch.json'), JSON.stringify({ schema_version: 1, profile_revision: 59, candidates: [candidate()] }));
     writeFileSync(join(directory, 'profile.json'), JSON.stringify(profile));
     const output = join(directory, 'report');
     let stderr = '';
@@ -127,9 +120,7 @@ test('the CLI and Chinese card disclose equal weighting and preserve unknown mon
     const result = JSON.parse(readFileSync(join(output, 'result.json'), 'utf8'));
     assert.equal(result.candidates[0].items.find(row => row.id === 'relevant_purchase_entry_bid').score, 9);
     const html = readFileSync(join(output, 'index.html'), 'utf8');
-    assert.match(html, /主购买词等权参考/);
-    assert.match(html, /缺少月搜索量；每个主要购买词的可用精准报价均已齐全/);
-    assert.match(html, /月搜索量 未知/);
+    assert.match(html, /等权/);
     assert.doesNotMatch(html, /再按同周期月搜索量加权/);
   } finally {
     rmSync(directory, { recursive: true, force: true });

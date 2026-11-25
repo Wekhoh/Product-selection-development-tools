@@ -1,654 +1,1349 @@
-// Offline 2027 US common Standard-size FBA rate table, Gate 1A landed-cap estimator,
-// $50.00 tier-cliff analyzer, and Gate 1B carton/MOQ order planner.
-// Importing performs no I/O. Unlisted oversize, bulky, apparel, dangerous-goods,
-// unpublished holiday-peak, or unverified categories return status: 'needs_calculator_verification'.
-
-import { netReferral, collectionFromDisbursement } from './economics.mjs';
+/**
+ * Layer 2: Unified 2027 US FBA fee calculator, Freight A4 headhaul engine, fee-basis validator,
+ * Gate 1A landed-cap estimator, forward breakeven solver, <= 10 mm package rescue, and order planner.
+ * Strictly acyclic: imports ONLY src/utils/, src/business-thresholds.mjs, and src/rates/index.mjs.
+ */
+import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import {
-  VERIFIED_2027_RETURN_THRESHOLDS,
-  lookupVerified2027ReturnThreshold,
-  resolveConsistentBoolean,
-  resolvePackageDimsRat,
-  resolveEffectivePricing,
-  computeAmazonCouponRedemptionFee2027,
+  gcdBig,
+  lcmBig,
+  ceilDivBig,
+  normBigRat,
   toBigRat,
   addBigRat,
+  subBigRat,
   mulBigRat,
   divBigRat,
+  ratCmp,
+  ratMin,
+  ratMax,
   roundBigRat,
-} from './fee-basis.mjs';
-export { VERIFIED_2027_RETURN_THRESHOLDS };
+  monthsIn,
+  validIsoDate,
+  validIsoWindow,
+} from './utils/index.mjs';
+import {
+  FEE_WINDOWS,
+  FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+  FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
+  FBA_2027_COMPANION_PEAK_STORAGE_WINDOW,
+  FBA_2027_DEFAULT_INBOUND_WINDOW,
+  FBA_2027_UNPUBLISHED_PEAK_WINDOW,
+  UNPUBLISHED_2027_PEAK_MARGIN_NOTE,
+  isCanonical2027OffPeakWindow,
+  isCanonical2027OffPeakStorageWindow,
+  isCanonical2027OffPeakWin,
+  isCanonical2027OffPeakStorageWin,
+  isCanonical2027PeakWin,
+  isCanonical2027PeakStorageWin,
+  hasProhibited2026PeakExtrapolation,
+  FBA_2027_METADATA,
+  SMALL_STANDARD_2027_OZ,
+  LARGE_STANDARD_2027_LB,
+  LARGE_STANDARD_OVER_3LB,
+  PLACEMENT_MINIMAL_SMALL_OZ,
+  PLACEMENT_MINIMAL_LARGE_LB,
+  STORAGE_2027_RATES,
+  BULKY_STORAGE_2027_RATES,
+  PLACEMENT_BULKY_SMALL_MEDIUM_LB,
+  PLACEMENT_BULKY_LARGE_XL_LB,
+  BULKY_RETURNS_2027_RULE,
+  BULKY_2027_TIERS,
+  OVERSIZE_2027_TIERS,
+  OVERSIZE_HANDLING_2027_FEES,
+  OVERSIZE_RETURNS_2027_TIERS,
+  SMALL_STANDARD_APPAREL_2027_OZ,
+  LARGE_STANDARD_APPAREL_2027_LB,
+  LARGE_STANDARD_APPAREL_OVER_3LB,
+  APPAREL_SHOES_STANDARD_RETURNS_2027,
+  SMALL_STANDARD_DG_2027_OZ,
+  LARGE_STANDARD_DG_2027_LB,
+  LARGE_STANDARD_DG_OVER_3LB,
+  BULKY_DG_2027_TIERS,
+  OVERSIZE_DG_2027_TIERS,
+  DG_STORAGE_2027_RATES,
+  LOW_PRICE_INELIGIBLE_2027_CATEGORIES,
+  VERIFIED_2027_RETURN_THRESHOLDS,
+  lookupVerified2027ReturnThreshold,
+  isCategoryLowPriceEligible2027,
+  getHistoricalFba2027RateTableSnapshots,
+  getFba2027RateTableSnapshot,
+  netReferral,
+  collectionFromDisbursement,
+  buildOutOfTableLookupDirective,
+  validateAndComputeOutOfTableRule2027,
+  registerSupplementalOutOfTableRule2027,
+  listSupplementalOutOfTableRules2027,
+} from './rates/index.mjs';
+
+export {
+  gcdBig,
+  lcmBig,
+  ceilDivBig,
+  normBigRat,
+  toBigRat,
+  addBigRat,
+  subBigRat,
+  mulBigRat,
+  divBigRat,
+  ratCmp,
+  ratMin,
+  ratMax,
+  roundBigRat,
+  FEE_WINDOWS,
+  FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+  FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
+  FBA_2027_COMPANION_PEAK_STORAGE_WINDOW,
+  FBA_2027_DEFAULT_INBOUND_WINDOW,
+  FBA_2027_UNPUBLISHED_PEAK_WINDOW,
+  UNPUBLISHED_2027_PEAK_MARGIN_NOTE,
+  isCanonical2027OffPeakWindow,
+  isCanonical2027OffPeakStorageWindow,
+  isCanonical2027OffPeakWin,
+  isCanonical2027OffPeakStorageWin,
+  isCanonical2027PeakWin,
+  isCanonical2027PeakStorageWin,
+  hasProhibited2026PeakExtrapolation,
+  FBA_2027_METADATA,
+  PLACEMENT_BULKY_SMALL_MEDIUM_LB,
+  PLACEMENT_BULKY_LARGE_XL_LB,
+  BULKY_RETURNS_2027_RULE,
+  BULKY_2027_TIERS,
+  OVERSIZE_2027_TIERS,
+  OVERSIZE_HANDLING_2027_FEES,
+  OVERSIZE_RETURNS_2027_TIERS,
+  SMALL_STANDARD_APPAREL_2027_OZ,
+  LARGE_STANDARD_APPAREL_2027_LB,
+  LARGE_STANDARD_APPAREL_OVER_3LB,
+  APPAREL_SHOES_STANDARD_RETURNS_2027,
+  SMALL_STANDARD_DG_2027_OZ,
+  LARGE_STANDARD_DG_2027_LB,
+  LARGE_STANDARD_DG_OVER_3LB,
+  BULKY_DG_2027_TIERS,
+  OVERSIZE_DG_2027_TIERS,
+  DG_STORAGE_2027_RATES,
+  LOW_PRICE_INELIGIBLE_2027_CATEGORIES,
+  VERIFIED_2027_RETURN_THRESHOLDS,
+  lookupVerified2027ReturnThreshold,
+  isCategoryLowPriceEligible2027,
+  getHistoricalFba2027RateTableSnapshots,
+  getFba2027RateTableSnapshot,
+  buildOutOfTableLookupDirective,
+  validateAndComputeOutOfTableRule2027,
+  registerSupplementalOutOfTableRule2027,
+  listSupplementalOutOfTableRules2027,
+};
 
 const finite = value => typeof value === 'number' && Number.isFinite(value);
 const round = value => Math.round((value + Number.EPSILON) * 1e10) / 1e10;
-const isoDate = value => typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value) &&
-  Number.isFinite(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
-const validWindow = value => isoDate(value?.from) && isoDate(value?.through) && value.from <= value.through;
+const text = value => typeof value === 'string' && value.trim().length > 0;
+const date = validIsoDate;
+const isoDate = validIsoDate;
+const windowValid = validIsoWindow;
+const validWindow = validIsoWindow;
+const toRat = toBigRat;
 
 const CM_PER_INCH = 2.54;
 const KG_PER_LB = 0.45359237;
 const OZ_PER_LB = 16;
 
-function gcdBig(a, b) {
-  let x = a < 0n ? -a : a;
-  let y = b < 0n ? -b : b;
-  while (y !== 0n) { const t = x % y; x = y; y = t; }
-  return x;
-}
+/**
+ * Resolve ongoing Coupon / Prime exclusive discount into a single net effective USD price
+ * without double-deducting when price_usd is already supplied net.
+ * Returns { valid, has_ongoing_discount, list_price_usd, net_effective_price_usd, total_discount_usd, reason }.
+ */
+export function resolveEffectivePricing(input = {}) {
+  const {
+    price_usd,
+    list_price_usd,
+    net_effective_price_usd,
+    ongoing_coupon_usd = 0,
+    ongoing_coupon_pct = 0,
+    prime_exclusive_discount_usd = 0,
+    prime_exclusive_discount_pct = 0,
+    promo_basis_already_net = false,
+  } = input ?? {};
 
-function lcmBig(a, b) {
-  return (a / gcdBig(a, b)) * b;
-}
+  const hasList = list_price_usd !== undefined && list_price_usd !== null;
+  const hasNet = net_effective_price_usd !== undefined && net_effective_price_usd !== null;
+  const hasDiscountField =
+    (ongoing_coupon_usd !== undefined && ongoing_coupon_usd !== null && ongoing_coupon_usd !== 0) ||
+    (ongoing_coupon_pct !== undefined && ongoing_coupon_pct !== null && ongoing_coupon_pct !== 0) ||
+    (prime_exclusive_discount_usd !== undefined && prime_exclusive_discount_usd !== null && prime_exclusive_discount_usd !== 0) ||
+    (prime_exclusive_discount_pct !== undefined && prime_exclusive_discount_pct !== null && prime_exclusive_discount_pct !== 0);
 
-function ceilDivBig(a, b) {
-  return (a + b - 1n) / b;
-}
-
-function toRat(n) {
-  if (!finite(n)) throw new TypeError('Finite number required.');
-  const [mantissa, expPart = '0'] = n.toString().toLowerCase().split('e');
-  const sign = mantissa.startsWith('-') ? -1n : 1n;
-  const [intPart, fracPart = ''] = mantissa.replace(/^[+-]/, '').split('.');
-  const digits = BigInt(intPart + fracPart);
-  const exp = Number(expPart) - fracPart.length;
-  let num, den;
-  if (exp >= 0) { num = sign * digits * (10n ** BigInt(exp)); den = 1n; }
-  else { num = sign * digits; den = 10n ** BigInt(-exp); }
-  const g = gcdBig(num, den);
-  return { n: num / g, d: den / g };
-}
-
-function ratCmp(a, b) {
-  const lhs = a.n * b.d;
-  const rhs = b.n * a.d;
-  return lhs < rhs ? -1 : lhs > rhs ? 1 : 0;
-}
-
-function ratMax(a, b) {
-  return ratCmp(a, b) >= 0 ? a : b;
-}
-
-function monthsIn(window) {
-  const result = new Set();
-  let year = Number(window.from.slice(0, 4)), month = Number(window.from.slice(5, 7));
-  const lastYear = Number(window.through.slice(0, 4)), lastMonth = Number(window.through.slice(5, 7));
-  while (year < lastYear || (year === lastYear && month <= lastMonth)) {
-    result.add(month);
-    if (++month > 12) { month = 1; year++; }
-    if (result.size === 12) break;
+  if (!hasList && !hasNet && !hasDiscountField) {
+    if (!finite(price_usd) || price_usd <= 0) {
+      return { valid: false, has_ongoing_discount: false, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: 0, reason: 'Positive finite price_usd is required.' };
+    }
+    return {
+      valid: true,
+      has_ongoing_discount: false,
+      list_price_usd: price_usd,
+      net_effective_price_usd: price_usd,
+      total_discount_usd: 0,
+      reason: null,
+    };
   }
-  return [...result];
+
+  const cUsd = ongoing_coupon_usd ?? 0;
+  const cPct = ongoing_coupon_pct ?? 0;
+  const pUsd = prime_exclusive_discount_usd ?? 0;
+  const pPct = prime_exclusive_discount_pct ?? 0;
+  if (!finite(cUsd) || cUsd < 0 || !finite(pUsd) || pUsd < 0 ||
+    !finite(cPct) || cPct < 0 || cPct >= 1 || !finite(pPct) || pPct < 0 || pPct >= 1 ||
+    (cPct + pPct) >= 1) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'Ongoing coupon/Prime discounts must be finite nonnegative amounts or fractions < 1.' };
+  }
+  if (hasList && (!finite(list_price_usd) || list_price_usd <= 0)) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'list_price_usd must be a positive finite number.' };
+  }
+  if (hasNet && (!finite(net_effective_price_usd) || net_effective_price_usd <= 0)) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'net_effective_price_usd must be a positive finite number.' };
+  }
+  if (price_usd !== undefined && price_usd !== null && (!finite(price_usd) || price_usd <= 0)) {
+    return { valid: false, has_ongoing_discount: true, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'price_usd must be a positive finite number when supplied.' };
+  }
+  if (promo_basis_already_net === true && hasDiscountField && !hasList) {
+    return {
+      valid: false,
+      has_ongoing_discount: true,
+      list_price_usd: null,
+      net_effective_price_usd: null,
+      total_discount_usd: null,
+      reason: 'Double-deduction guard: cannot apply additional coupon/Prime discounts when promo_basis_already_net is true without an explicit gross list_price_usd.',
+    };
+  }
+
+  const baseList = hasList ? list_price_usd : (finite(price_usd) ? price_usd : (hasNet && !hasDiscountField ? net_effective_price_usd : null));
+  if (baseList === null) {
+    return { valid: false, has_ongoing_discount: hasDiscountField, list_price_usd: null, net_effective_price_usd: null, total_discount_usd: null, reason: 'list_price_usd or price_usd is required to derive net_effective_price_usd.' };
+  }
+
+  const listR = toBigRat(baseList);
+  const discUsdR = addBigRat(toBigRat(cUsd), toBigRat(pUsd));
+  const discPctR = addBigRat(toBigRat(cPct), toBigRat(pPct));
+  const pctAmtR = mulBigRat(listR, discPctR);
+  const totalDiscR = addBigRat(discUsdR, pctAmtR);
+  const computedNetR = addBigRat(listR, { n: -totalDiscR.n, d: totalDiscR.d });
+  if (computedNetR.n <= 0n) {
+    return { valid: false, has_ongoing_discount: hasDiscountField, list_price_usd: baseList, net_effective_price_usd: null, total_discount_usd: null, reason: 'Ongoing discounts cannot reduce net_effective_price_usd to <= 0.' };
+  }
+  const computedNetRaw = roundBigRat(computedNetR.n, computedNetR.d, 4);
+  // Amazon US retail prices settle in whole USD cents; round percentage-discounted net price to payable cents.
+  const computedNet = roundBigRat(computedNetR.n, computedNetR.d, 2);
+  const totalDisc = roundBigRat(addBigRat(listR, { n: -toBigRat(computedNet).n, d: toBigRat(computedNet).d }).n,
+    addBigRat(listR, { n: -toBigRat(computedNet).n, d: toBigRat(computedNet).d }).d, 4);
+
+  if (hasNet && Math.abs(net_effective_price_usd - computedNet) > 1e-6 && Math.abs(net_effective_price_usd - computedNetRaw) > 1e-4) {
+    return {
+      valid: false,
+      has_ongoing_discount: hasDiscountField,
+      list_price_usd: baseList,
+      net_effective_price_usd: null,
+      total_discount_usd: totalDisc,
+      reason: `Supplied net_effective_price_usd (${net_effective_price_usd}) disagrees with payable list price (${baseList}) minus ongoing discounts (${computedNet}).`,
+    };
+  }
+  // Always resolve to exact payable whole cents derived from gross minus discount (prevents half-cent drift across $10/$50 cliffs).
+  const resolvedNet = computedNet;
+
+  if (finite(price_usd)) {
+    const matchesNet = Math.abs(price_usd - resolvedNet) <= 1e-4 || Math.abs(price_usd - computedNetRaw) <= 1e-4;
+    const matchesList = Math.abs(price_usd - baseList) <= 1e-4;
+    if (promo_basis_already_net === true && !matchesNet) {
+      return {
+        valid: false,
+        has_ongoing_discount: hasDiscountField,
+        list_price_usd: baseList,
+        net_effective_price_usd: null,
+        total_discount_usd: totalDisc,
+        reason: `price_usd (${price_usd}) does not match net_effective_price_usd (${resolvedNet}) under promo_basis_already_net.`,
+      };
+    }
+    if (!matchesNet && !matchesList) {
+      return {
+        valid: false,
+        has_ongoing_discount: hasDiscountField,
+        list_price_usd: baseList,
+        net_effective_price_usd: null,
+        total_discount_usd: totalDisc,
+        reason: `Supplied price_usd (${price_usd}) matches neither list_price_usd (${baseList}) nor net_effective_price_usd (${resolvedNet}).`,
+      };
+    }
+  }
+
+  return {
+    valid: true,
+    has_ongoing_discount: hasDiscountField || (resolvedNet < baseList - 1e-6),
+    list_price_usd: baseList,
+    net_effective_price_usd: resolvedNet,
+    total_discount_usd: totalDisc,
+    ongoing_coupon_usd: cUsd,
+    ongoing_coupon_pct: cPct,
+    prime_exclusive_discount_usd: pUsd,
+    prime_exclusive_discount_pct: pPct,
+    reason: null,
+  };
 }
 
-export const FBA_2027_DEFAULT_OFF_PEAK_WINDOW = Object.freeze({ from: '2027-02-01', through: '2027-10-14' });
-export const FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW = Object.freeze({ from: '2027-02-01', through: '2027-09-30' });
-export const FBA_2027_COMPANION_PEAK_STORAGE_WINDOW = Object.freeze({ from: '2027-10-01', through: '2027-12-31' });
-export const FBA_2027_DEFAULT_INBOUND_WINDOW = Object.freeze({ from: '2027-01-15', through: '2027-02-01' });
-export const FBA_2027_UNPUBLISHED_PEAK_WINDOW = Object.freeze({ from: '2027-10-15', through: '2028-01-14' });
-export const UNPUBLISHED_2027_PEAK_MARGIN_NOTE = '待亚马逊公布 2027 旺季费率后补充';
+export function resolveConsistentText(values) {
+  const present = values.filter(v => v !== undefined && v !== null);
+  if (present.length === 0) return { present: false, valid: true, value: null };
+  if (present.some(v => !text(v))) return { present: true, valid: false, value: null };
+  const norm = s => s.trim().toLowerCase().replace(/&/g, ' and ').replace(/\s+/g, ' ');
+  for (let i = 1; i < present.length; i++) {
+    if (norm(present[i]) !== norm(present[0])) return { present: true, valid: false, value: null };
+  }
+  return { present: true, valid: true, value: present[0].trim() };
+}
 
-export function isCanonical2027OffPeakWindow(window) {
-  return Boolean(
-    validWindow(window) &&
-    window.from === FBA_2027_DEFAULT_OFF_PEAK_WINDOW.from &&
-    window.through === FBA_2027_DEFAULT_OFF_PEAK_WINDOW.through,
+export function resolveConsistentFeeCategory(values) {
+  const present = values.filter(v => v !== undefined && v !== null);
+  if (present.length === 0) return { present: false, valid: true, value: null };
+  if (present.some(v => !text(v))) return { present: true, valid: false, value: null };
+  const canon = s => {
+    const m = lookupVerified2027ReturnThreshold(s);
+    if (m) return m.canonical.toLowerCase();
+    return s.trim().toLowerCase().replace(/&/g, ' and ').replace(/\s+/g, ' ');
+  };
+  const firstCanon = canon(present[0]);
+  for (let i = 1; i < present.length; i++) {
+    if (canon(present[i]) !== firstCanon) return { present: true, valid: false, value: null };
+  }
+  const m0 = lookupVerified2027ReturnThreshold(present[0]);
+  return { present: true, valid: true, value: m0 ? m0.canonical : present[0].trim() };
+}
+
+
+export function resolveConsistentNumeric(values, predicate) {
+  const present = values.filter(v => v !== undefined && v !== null);
+  if (present.length === 0) return { present: false, valid: true, value: null };
+  if (present.some(v => !predicate(v))) return { present: true, valid: false, value: null };
+  for (let i = 1; i < present.length; i++) {
+    if (present[i] !== present[0]) return { present: true, valid: false, value: null };
+  }
+  return { present: true, valid: true, value: present[0] };
+}
+
+export function resolveConsistentBoolean(values) {
+  const present = values.filter(v => v !== undefined);
+  if (present.length === 0) return { present: false, valid: true, value: false };
+  if (present.some(v => typeof v !== 'boolean')) return { present: true, valid: false, value: null };
+  for (let i = 1; i < present.length; i++) {
+    if (present[i] !== present[0]) return { present: true, valid: false, value: null };
+  }
+  return { present: true, valid: true, value: present[0] };
+}
+
+export function resolveUniquePackageByRef(packages, pkgRef) {
+  if (packages === undefined) return { present: false, valid: true, pkg: null };
+  if (!Array.isArray(packages) || packages.length === 0) return { present: true, valid: false, pkg: null };
+  const seenExact = new Set();
+  const seenTrim = new Set();
+  let matched = null;
+  for (const p of packages) {
+    if (!p || typeof p !== 'object' || Array.isArray(p) || !text(p.id)) {
+      return { present: true, valid: false, pkg: null };
+    }
+    const trimId = p.id.trim();
+    if (seenExact.has(p.id) || seenTrim.has(trimId)) {
+      return { present: true, valid: false, pkg: null };
+    }
+    seenExact.add(p.id);
+    seenTrim.add(trimId);
+    if (text(pkgRef) && p.id === pkgRef) matched = p;
+  }
+  if (text(pkgRef) && !matched) return { present: true, valid: false, pkg: null };
+  return { present: true, valid: true, pkg: matched };
+}
+
+export function collectLedgerFlag(input, flagName, matchedPkg = null) {
+  const values = [input?.[flagName], matchedPkg?.[flagName]];
+  if (Array.isArray(input?.lines)) {
+    for (const l of input.lines) {
+      values.push(l?.[flagName], l?.fee_basis?.[flagName]);
+    }
+  }
+  return resolveConsistentBoolean(values);
+}
+
+const KG_PER_LB_RAT = toBigRat(0.45359237);
+const OZ_PER_LB_RAT = { n: 16n, d: 1n };
+const CM_PER_IN_RAT = toBigRat(2.54);
+
+export function resolveConsistentPkgWeightLb(pkg) {
+  if (!pkg || typeof pkg !== 'object') return { present: false, valid: true, weight_lb: null, weight_lb_rat: null };
+  const specs = [
+    ['weight_lb', v => toBigRat(v)],
+    ['unit_weight_lb', v => toBigRat(v)],
+    ['weight_oz', v => divBigRat(toBigRat(v), OZ_PER_LB_RAT)],
+    ['unit_weight_oz', v => divBigRat(toBigRat(v), OZ_PER_LB_RAT)],
+    ['weight_kg', v => divBigRat(toBigRat(v), KG_PER_LB_RAT)],
+    ['unit_weight_kg', v => divBigRat(toBigRat(v), KG_PER_LB_RAT)],
+  ];
+  const vals = [];
+  for (const [key, toLbRat] of specs) {
+    if (pkg[key] === undefined || pkg[key] === null) continue;
+    if (!finite(pkg[key]) || pkg[key] <= 0) return { present: true, valid: false, weight_lb: null, weight_lb_rat: null };
+    vals.push(toLbRat(pkg[key]));
+  }
+  if (vals.length === 0) return { present: false, valid: true, weight_lb: null, weight_lb_rat: null };
+  for (let i = 1; i < vals.length; i++) {
+    if (ratCmp(vals[i], vals[0]) !== 0) return { present: true, valid: false, weight_lb: null, weight_lb_rat: null };
+  }
+  return {
+    present: true,
+    valid: true,
+    weight_lb: Number(vals[0].n) / Number(vals[0].d),
+    weight_lb_rat: vals[0],
+  };
+}
+
+export function resolvePackageDimsRat(pkg) {
+  if (!pkg || typeof pkg !== 'object') return null;
+  const inKeys = ['length_in', 'width_in', 'height_in'];
+  const cmKeys = ['length_cm', 'width_cm', 'height_cm'];
+  const anyIn = inKeys.some(k => pkg[k] !== undefined && pkg[k] !== null);
+  const anyCm = cmKeys.some(k => pkg[k] !== undefined && pkg[k] !== null);
+  if (!anyIn && !anyCm) return null;
+  let lRat = null, wRat = null, hRat = null;
+  if (anyIn) {
+    if (!inKeys.every(k => finite(pkg[k]) && pkg[k] > 0)) return null;
+    lRat = toBigRat(pkg.length_in);
+    wRat = toBigRat(pkg.width_in);
+    hRat = toBigRat(pkg.height_in);
+  }
+  if (anyCm) {
+    if (!cmKeys.every(k => finite(pkg[k]) && pkg[k] > 0)) return null;
+    const cmL = divBigRat(toBigRat(pkg.length_cm), CM_PER_IN_RAT);
+    const cmW = divBigRat(toBigRat(pkg.width_cm), CM_PER_IN_RAT);
+    const cmH = divBigRat(toBigRat(pkg.height_cm), CM_PER_IN_RAT);
+    if (anyIn) {
+      if (ratCmp(cmL, lRat) !== 0 || ratCmp(cmW, wRat) !== 0 || ratCmp(cmH, hRat) !== 0) return null;
+    } else {
+      lRat = cmL; wRat = cmW; hRat = cmH;
+    }
+  }
+  const [s1Rat, s2Rat, s3Rat] = [lRat, wRat, hRat].sort((a, b) => ratCmp(b, a));
+  const cubicInRat = mulBigRat(mulBigRat(s1Rat, s2Rat), s3Rat);
+  const dimLbRat = divBigRat(cubicInRat, { n: 139n, d: 1n });
+  const cubicFtRat = divBigRat(cubicInRat, { n: 1728n, d: 1n });
+  const wtRes = resolveConsistentPkgWeightLb(pkg);
+  if (wtRes.present && !wtRes.valid) return null;
+  const wtLbRat = wtRes.present ? wtRes.weight_lb_rat : null;
+  const shipLbRat = wtLbRat ? ratMax(wtLbRat, dimLbRat) : null;
+  const isOversize = ratCmp(s1Rat, { n: 18n, d: 1n }) > 0 ||
+    ratCmp(s2Rat, { n: 14n, d: 1n }) > 0 ||
+    ratCmp(s3Rat, { n: 8n, d: 1n }) > 0 ||
+    (wtLbRat !== null && ratCmp(wtLbRat, { n: 20n, d: 1n }) > 0);
+  return {
+    s1Rat, s2Rat, s3Rat, cubicInRat, dimLbRat, cubicFtRat, wtLbRat, shipLbRat,
+    ozRat: wtLbRat ? mulBigRat(wtLbRat, OZ_PER_LB_RAT) : null,
+    isOversize,
+    cubic_feet: Number(cubicFtRat.n) / Number(cubicFtRat.d),
+    dim_weight_lb: Number(dimLbRat.n) / Number(dimLbRat.d),
+  };
+}
+
+export function isOfficial2027ScheduleWindowValid(lineId, basis, isApparel = false) {
+  const version = String(basis?.version ?? '').trim();
+  if (!version) return true;
+  if (lineId === 'fulfillment') {
+    const is2027NonPeak = /^US-FBA-2027-nonpeak/i.test(version) || (/2027/.test(version) && /non[-_ ]?peak/i.test(version));
+    if (is2027NonPeak) {
+      if (!date(basis.effective_from) || basis.effective_from < '2027-01-15') return false;
+      if (!date(basis.effective_through) || basis.effective_through > '2027-10-14') return false;
+    }
+  } else if (lineId === 'storage') {
+    if (/^US-FBA-2027/i.test(version) && date(basis.effective_from) && basis.effective_from < '2027-02-01') return false;
+  } else if (lineId === 'placement') {
+    if (/^US-FBA-2027/i.test(version) && date(basis.effective_from) && basis.effective_from < '2027-01-15') return false;
+  } else if (lineId === 'returns_processing') {
+    const minStart = isApparel ? '2027-01-15' : '2027-02-01';
+    if (/^US-FBA-2027/i.test(version) && date(basis.effective_from) && basis.effective_from < minStart) return false;
+  }
+  return true;
+}
+
+const SMALL_STD_RETURN_FEE_OZ = Object.freeze([
+  { max_oz: 2, fee: 1.78 }, { max_oz: 4, fee: 1.84 }, { max_oz: 6, fee: 1.90 }, { max_oz: 8, fee: 1.96 },
+  { max_oz: 10, fee: 2.02 }, { max_oz: 12, fee: 2.08 }, { max_oz: 14, fee: 2.14 }, { max_oz: 16, fee: 2.21 },
+]);
+
+const LARGE_STD_RETURN_FEE_LB = Object.freeze([
+  { max_lb: 0.25, fee: 2.36 }, { max_lb: 0.50, fee: 2.70 }, { max_lb: 0.75, fee: 3.05 }, { max_lb: 1.00, fee: 3.39 },
+  { max_lb: 1.25, fee: 3.70 }, { max_lb: 1.50, fee: 4.01 }, { max_lb: 1.75, fee: 4.32 }, { max_lb: 2.00, fee: 4.63 },
+  { max_lb: 2.25, fee: 4.66 }, { max_lb: 2.50, fee: 4.68 }, { max_lb: 2.75, fee: 4.71 }, { max_lb: 3.00, fee: 4.73 },
+]);
+
+const SMALL_STD_APPAREL_RETURN_FEE_OZ = Object.freeze([
+  { max_oz: 4, fee: 1.65 }, { max_oz: 8, fee: 1.75 }, { max_oz: 12, fee: 1.85 }, { max_oz: 16, fee: 1.95 },
+]);
+
+const LARGE_STD_APPAREL_RETURN_FEE_LB = Object.freeze([
+  { max_lb: 0.25, fee: 2.04 }, { max_lb: 0.50, fee: 2.12 }, { max_lb: 0.75, fee: 2.19 }, { max_lb: 1.00, fee: 2.27 },
+  { max_lb: 1.50, fee: 2.62 }, { max_lb: 2.00, fee: 2.98 }, { max_lb: 2.50, fee: 3.33 }, { max_lb: 3.00, fee: 3.69 },
+]);
+
+export function lookupVerified2027PerReturnFee(pkg, { isApparelOrShoes = false, allowAll2027Tiers = false } = {}) {
+  const dims = resolvePackageDimsRat(pkg);
+  if (!dims || !dims.wtLbRat || !dims.shipLbRat) return null;
+  const { s1Rat, s2Rat, s3Rat, wtLbRat, ozRat, shipLbRat } = dims;
+  const isSmall = ratCmp(wtLbRat, { n: 1n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 15n, d: 1n }) <= 0 &&
+    ratCmp(s2Rat, { n: 12n, d: 1n }) <= 0 &&
+    ratCmp(s3Rat, { n: 3n, d: 4n }) <= 0;
+  if (isSmall) {
+    if (isApparelOrShoes) {
+      return allowAll2027Tiers
+        ? (SMALL_STD_APPAREL_RETURN_FEE_OZ.find(r => ratCmp(ozRat, toBigRat(r.max_oz)) <= 0)?.fee ?? null)
+        : null;
+    }
+    return SMALL_STD_RETURN_FEE_OZ.find(r => ratCmp(ozRat, toBigRat(r.max_oz)) <= 0)?.fee ?? null;
+  }
+  const isLarge = ratCmp(wtLbRat, { n: 20n, d: 1n }) <= 0 &&
+    ratCmp(shipLbRat, { n: 20n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 18n, d: 1n }) <= 0 &&
+    ratCmp(s2Rat, { n: 14n, d: 1n }) <= 0 &&
+    ratCmp(s3Rat, { n: 8n, d: 1n }) <= 0;
+  if (isLarge) {
+    if (isApparelOrShoes) {
+      if (!allowAll2027Tiers) return null;
+      if (ratCmp(shipLbRat, { n: 3n, d: 1n }) <= 0) {
+        return LARGE_STD_APPAREL_RETURN_FEE_LB.find(r => ratCmp(shipLbRat, toBigRat(r.max_lb)) <= 0)?.fee ?? null;
+      }
+      const num2 = 2n * (shipLbRat.n - 3n * shipLbRat.d);
+      const halfSteps = num2 <= 0n ? 0 : Number((num2 + shipLbRat.d - 1n) / shipLbRat.d);
+      return Math.round((3.89 + halfSteps * 0.10 + Number.EPSILON) * 100) / 100;
+    }
+    if (ratCmp(shipLbRat, { n: 3n, d: 1n }) <= 0) {
+      return LARGE_STD_RETURN_FEE_LB.find(r => ratCmp(shipLbRat, toBigRat(r.max_lb)) <= 0)?.fee ?? null;
+    }
+    const num4 = 4n * (shipLbRat.n - 3n * shipLbRat.d);
+    const steps = num4 <= 0n ? 0 : Number((num4 + shipLbRat.d - 1n) / shipLbRat.d);
+    return Math.round((5.00 + steps * 0.05 + Number.EPSILON) * 100) / 100;
+  }
+  if (!allowAll2027Tiers) return null;
+
+  const bulkyS2Rat = ratCmp(s2Rat, { n: 2n, d: 1n }) >= 0 ? s2Rat : { n: 2n, d: 1n };
+  const bulkyS3Rat = ratCmp(s3Rat, { n: 2n, d: 1n }) >= 0 ? s3Rat : { n: 2n, d: 1n };
+  const bulkyCubicInRat = mulBigRat(mulBigRat(s1Rat, bulkyS2Rat), bulkyS3Rat);
+  const bulkyDimLbRat = divBigRat(bulkyCubicInRat, { n: 139n, d: 1n });
+  const bulkyShipLbRat = ratCmp(bulkyDimLbRat, wtLbRat) >= 0 ? bulkyDimLbRat : wtLbRat;
+  const girthPlusLenRat = addBigRat(s1Rat, mulBigRat({ n: 2n, d: 1n }, addBigRat(s2Rat, s3Rat)));
+  const ceilWholeExcess = (r, baseLb) => {
+    const excess = r.n - BigInt(baseLb) * r.d;
+    return excess > 0n ? Number((excess + r.d - 1n) / r.d) : 0;
+  };
+
+  // Official 2027 Bulky 4 tiers (<= 59 x 33 x 33 in, L+G <= 130 in, unit & shipping weight <= 50 lb): $6.74 + $0.32/lb over 1 lb
+  const fitsAnyBulky =
+    ratCmp(wtLbRat, { n: 50n, d: 1n }) <= 0 &&
+    ratCmp(bulkyShipLbRat, { n: 50n, d: 1n }) <= 0 &&
+    ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0 && (
+      (ratCmp(s1Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 24n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 20n, d: 1n }) <= 0) ||
+      (ratCmp(s1Rat, { n: 37n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 20n, d: 1n }) <= 0) ||
+      (ratCmp(s1Rat, { n: 52n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 28n, d: 1n }) <= 0) ||
+      (ratCmp(s1Rat, { n: 59n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 33n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 33n, d: 1n }) <= 0)
+    );
+  if (fitsAnyBulky) {
+    return Math.round((6.74 + ceilWholeExcess(bulkyShipLbRat, 1) * 0.32 + Number.EPSILON) * 100) / 100;
+  }
+
+  // Official 2027 Oversize 6 tiers returns processing (GZGEQLTM3RZXUV6T)
+  if (ratCmp(wtLbRat, { n: 50n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 50n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 72n, d: 1n }) <= 0 && ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0) {
+    return Math.round((26.33 + ceilWholeExcess(bulkyShipLbRat, 1) * 0.38 + Number.EPSILON) * 100) / 100;
+  }
+  if (ratCmp(wtLbRat, { n: 70n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 70n, d: 1n }) <= 0 &&
+    ratCmp(s1Rat, { n: 78n, d: 1n }) <= 0 && ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0) {
+    return Math.round((40.12 + ceilWholeExcess(bulkyShipLbRat, 51) * 0.75 + Number.EPSILON) * 100) / 100;
+  }
+  if (ratCmp(wtLbRat, { n: 150n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 150n, d: 1n }) <= 0) {
+    return Math.round((52.45 + ceilWholeExcess(bulkyShipLbRat, 71) * 0.75 + Number.EPSILON) * 100) / 100;
+  }
+  return Math.round((157.35 + ceilWholeExcess(wtLbRat, 151) * 0.19 + Number.EPSILON) * 100) / 100;
+}
+
+function canonicalValue(val) {
+  if (val === null || typeof val !== 'object') return val;
+  if (Array.isArray(val)) return val.map(canonicalValue);
+  const out = {};
+  for (const key of Object.keys(val).sort()) {
+    if (val[key] !== undefined) out[key] = canonicalValue(val[key]);
+  }
+  return out;
+}
+
+function canonicalSkuSignature(skuLines) {
+  if (!Array.isArray(skuLines)) return null;
+  const rows = [];
+  for (const row of skuLines) {
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return null;
+    const normalized = {
+      pack_multiple: 1,
+      moq_qty: 1,
+      ...row,
+    };
+    rows.push(JSON.stringify(canonicalValue(normalized)));
+  }
+  rows.sort();
+  return JSON.stringify(rows);
+}
+
+export function resolveConsistentSkuLines(input, procLine) {
+  const present = [input?.sku_lines, input?.source_inputs?.sku_lines, procLine?.sku_lines]
+    .filter(v => v !== undefined);
+  if (present.length === 0) return { present: false, conflict: false, skuLines: undefined };
+  if (present.length === 1) return { present: true, conflict: false, skuLines: present[0] };
+  const sig0 = canonicalSkuSignature(present[0]);
+  if (sig0 === null) return { present: true, conflict: true, skuLines: null };
+  for (let i = 1; i < present.length; i++) {
+    if (canonicalSkuSignature(present[i]) !== sig0) return { present: true, conflict: true, skuLines: null };
+  }
+  return { present: true, conflict: false, skuLines: present[0] };
+}
+
+export function validateSkuLinesR58(skuLines, allocatedSets, procAmountUsd, fxValues) {
+  if (!Array.isArray(skuLines) || skuLines.length === 0) return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+  if (!Number.isSafeInteger(allocatedSets) || allocatedSets < 100) return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+  const fxCheck = resolveConsistentNumeric(fxValues, v => finite(v) && v > 0);
+  if (!fxCheck.present || !fxCheck.valid) return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+  let minCompleteSets = Infinity;
+  let totalGoodsRat = { n: 0n, d: 1n };
+  for (const row of skuLines) {
+    if (!row || typeof row !== 'object') return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+    const q = row.qty_per_saleable_set;
+    const p = row.pack_multiple ?? 1;
+    const m = row.moq_qty ?? 1;
+    const ordered = row.ordered_qty;
+    if (!Number.isSafeInteger(q) || q < 1 || !Number.isSafeInteger(p) || p < 1 ||
+      !Number.isSafeInteger(m) || m < 1 || !Number.isSafeInteger(ordered) || ordered < 1) {
+      return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+    }
+    if (row.regular_goods_promo_false !== true) return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+    if (ordered < m || ordered % p !== 0 || ordered < allocatedSets * q) return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+    if (!finite(row.unit_price_cny) || row.unit_price_cny < 0) return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+    minCompleteSets = Math.min(minCompleteSets, Math.floor(ordered / q));
+    const priceRat = toBigRat(row.unit_price_cny);
+    totalGoodsRat = addBigRat(totalGoodsRat, { n: BigInt(ordered) * priceRat.n, d: priceRat.d });
+  }
+  if (!Number.isFinite(minCompleteSets) || minCompleteSets < allocatedSets) return { valid: false, expected_proc_usd: null, exact_usd_rational: null };
+  const fxRat = toBigRat(fxCheck.value);
+  // proc_usd = totalGoodsRat / (allocatedSets * fxRat) = (totalGoodsRat.n * fxRat.d) / (totalGoodsRat.d * allocatedSets * fxRat.n)
+  const rawN = totalGoodsRat.n * fxRat.d;
+  const rawD = totalGoodsRat.d * BigInt(allocatedSets) * fxRat.n;
+  const g = gcdBig(rawN, rawD);
+  const redN = rawN / g;
+  const redD = rawD / g;
+  const exactRat = { num: redN.toString(), den: redD.toString() };
+  const expectedProcUsd = roundBigRat(redN, redD, 10);
+  if (!finite(procAmountUsd) || Math.abs(procAmountUsd - expectedProcUsd) > 1e-6) {
+    return { valid: false, expected_proc_usd: expectedProcUsd, exact_usd_rational: exactRat };
+  }
+  return { valid: true, expected_proc_usd: expectedProcUsd, exact_usd_rational: exactRat };
+}
+
+export function storageMeets2027Floor(input, storageLine, storageMonths) {
+  if (!storageLine || storageLine.status === 'pending' || !finite(storageLine.amount_usd) || storageLine.amount_usd < 0) return true;
+  if (storageLine.amount_usd === 0 || storageLine.status === 'not_applicable') return false;
+  if (!Array.isArray(storageMonths) || storageMonths.length === 0) return true;
+  const pkgRef = input?.fee_context?.package_ref;
+  const pkgRes = resolveUniquePackageByRef(input?.packages, pkgRef);
+  if (pkgRes.present && !pkgRes.valid) return false;
+  const pkg = pkgRes.pkg;
+  let pkgCuft = null;
+  let pkgOversize = false;
+  if (pkg && typeof pkg === 'object') {
+    const wtRes = resolveConsistentPkgWeightLb(pkg);
+    if (wtRes.present && !wtRes.valid) return false;
+    const dims = resolvePackageDimsRat(pkg);
+    if (dims) {
+      pkgCuft = dims.cubic_feet;
+      pkgOversize = dims.isOversize;
+    } else if (pkg.length_in !== undefined || pkg.width_in !== undefined || pkg.height_in !== undefined ||
+      pkg.length_cm !== undefined || pkg.width_cm !== undefined || pkg.height_cm !== undefined) {
+      return false;
+    }
+  }
+  const lineCuft = finite(storageLine.cubic_feet_per_unit) && storageLine.cubic_feet_per_unit > 0
+    ? storageLine.cubic_feet_per_unit
+    : (finite(input?.source_inputs?.cubic_feet_per_unit) && input.source_inputs.cubic_feet_per_unit > 0
+      ? input.source_inputs.cubic_feet_per_unit
+      : null);
+  if (lineCuft !== null && pkgCuft !== null && Math.abs(lineCuft - pkgCuft) > 1e-4) return false;
+  const cuft = lineCuft ?? pkgCuft;
+  if (storageLine.average_inventory_days !== undefined && (!finite(storageLine.average_inventory_days) || storageLine.average_inventory_days < 45)) {
+    return false;
+  }
+  const days = storageLine.average_inventory_days ?? 45;
+  const overCheck = collectLedgerFlag(input, 'is_oversize', pkg);
+  const dgCheck = collectLedgerFlag(input, 'is_dangerous_goods', pkg);
+  if (!overCheck.valid || !dgCheck.valid) return false;
+  // Reject claiming is_oversize:true on physically Standard-size package or without proven oversize dimensions.
+  if (overCheck.value === true && !pkgOversize) return false;
+  const isDg = dgCheck.value === true;
+  // Dangerous goods storage in US FBA is strictly HIGHER than non-DG ($0.99/$3.63 standard, $0.78/$2.43 oversize); never bypass floor downward.
+  const offPeakFloor = isDg ? (pkgOversize ? 0.78 : 0.99) : (pkgOversize ? 0.56 : 0.78);
+  const peakFloor = isDg ? (pkgOversize ? 2.43 : 3.63) : (pkgOversize ? 1.40 : 2.40);
+  const rateCheck = resolveConsistentNumeric(
+    [storageLine.fee_basis?.rate_usd_per_cuft_month, storageLine.rate_usd_per_cuft_month],
+    v => finite(v) && v > 0,
   );
+  if (!rateCheck.valid) return false;
+  const storageWinCtx = input?.fee_context?.storage;
+  const effectiveStorageMonths = windowValid(storageWinCtx) ? monthsIn(storageWinCtx) : storageMonths;
+  const hasOffPeak = effectiveStorageMonths.some(m => m <= 9);
+  const hasPeak = effectiveStorageMonths.some(m => m >= 10);
+  if (rateCheck.present) {
+    if (hasOffPeak && hasPeak) return false;
+    if (hasPeak && rateCheck.value < peakFloor) return false;
+    if (hasOffPeak && rateCheck.value < offPeakFloor) return false;
+  }
+  if (cuft !== null) {
+    if (hasOffPeak && hasPeak) return false;
+    const minRate = effectiveStorageMonths.reduce((sum, m) => sum + (m >= 10 ? peakFloor : offPeakFloor), 0) / effectiveStorageMonths.length;
+    const minUsd = cuft * minRate * (days / 30);
+    if (storageLine.amount_usd < minUsd - 1e-6) return false;
+  }
+  return true;
 }
 
-export function isCanonical2027OffPeakStorageWindow(window) {
-  return Boolean(
-    validWindow(window) &&
-    window.from === FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW.from &&
-    window.through === FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW.through,
-  );
-}
+export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, requireRegularRepeatOrder = false, profileRevision = 0 } = {}) {
+  const strictR57 = Boolean(requireRegularRepeatOrder || profileRevision >= 57);
+  const isR58 = profileRevision >= 58;
+  const isR59 = profileRevision >= 59;
+  const context = input.fee_context;
+  const sources = new Set(evidenceIds);
+  const evidenced = refs => Array.isArray(refs) && refs.length > 0 && refs.every(id => text(id) && sources.has(id));
+  const issues = [];
+  const components = new Map();
+  const add = (line, code, reason) => issues.push({ line, code, reason });
+  const validContext = context?.marketplace === 'US' && context?.currency === 'USD' && text(context?.package_ref) &&
+    ['sales', 'storage', 'inbound'].every(key => windowValid(context[key]));
+  if (!validContext) add('context', 'missing_fee_context', 'US/USD, one package reference and explicit valid sales, storage and inbound date windows are required.');
+  else {
+    if (isR58 && context.inbound.from > context.sales.through) {
+      add('context', 'operating_period_mismatch', 'The inbound plan window cannot start after the declared sales window ends.');
+    }
+    if (operatingMonths) {
+      const salesMonths = monthsIn(context.sales);
+      const storageMonths = monthsIn(context.storage);
+      const canonicalR59OffPeak = isR59 && isCanonical2027OffPeakWin(context.sales) && isCanonical2027OffPeakStorageWin(context.storage);
+      const canonicalR59Peak = isR59 && isCanonical2027PeakWin(context.sales) && isCanonical2027PeakStorageWin(context.storage);
+      const yearMismatch = isR58 && !canonicalR59Peak && (
+        context.sales.from.slice(0, 4) !== context.sales.through.slice(0, 4) ||
+        context.storage.from.slice(0, 4) !== context.storage.through.slice(0, 4) ||
+        context.sales.from.slice(0, 4) !== context.storage.from.slice(0, 4)
+      );
+      const r59OffPeakMonthsOk = canonicalR59OffPeak && (
+        ([2, 3, 4, 5, 6, 7, 8, 9].every(m => operatingMonths.includes(m)) &&
+          operatingMonths.every(m => m >= 2 && m <= 10))
+      );
+      const r59PeakMonthsOk = canonicalR59Peak && (
+        ([10, 11, 12].every(m => operatingMonths.includes(m)) &&
+          operatingMonths.every(m => [10, 11, 12, 1].includes(m)))
+      );
+      if (yearMismatch || (!r59OffPeakMonthsOk && !r59PeakMonthsOk && (
+        salesMonths.some(month => !operatingMonths.includes(month)) ||
+        (strictR57 && (storageMonths.some(month => !operatingMonths.includes(month)) ||
+          operatingMonths.some(month => !salesMonths.includes(month)) ||
+          operatingMonths.some(month => !storageMonths.includes(month))))
+      ))) {
+        add('context', 'operating_period_mismatch', strictR57
+          ? 'The dated sales and storage windows must match one target year and cover every month declared in the operating period.'
+          : 'The dated sales window extends beyond the displayed operating-period months.');
+      }
+    }
+  }
+  const pkgResR58 = isR58 ? resolveUniquePackageByRef(input.packages, context?.package_ref) : { present: false, valid: true, pkg: null };
+  if (isR58 && pkgResR58.present && !pkgResR58.valid) {
+    add('context', 'invalid_fee_basis', 'packages[] must have unique nonempty ids matching fee_context.package_ref.');
+  }
+  const matchedPkgR58 = pkgResR58.pkg;
+  const ledgerApparelCheck = isR58 ? collectLedgerFlag(input, 'is_apparel_or_shoes', matchedPkgR58) : { present: false, valid: true, value: false };
+  const ledgerDgCheck = isR58 ? collectLedgerFlag(input, 'is_dangerous_goods', matchedPkgR58) : { present: false, valid: true, value: false };
+  const ledgerOverCheck = isR58 ? collectLedgerFlag(input, 'is_oversize', matchedPkgR58) : { present: false, valid: true, value: false };
 
-export const FBA_2027_METADATA = Object.freeze({
-  version: 'US-FBA-2027-nonpeak-standard-v1',
-  unified_version: 'US-FBA-2027-nonpeak-complete-v2',
-  marketplace: 'US',
-  currency: 'USD',
-  fuel_surcharge_fraction: 0.035,
-  non_peak_fulfillment_window: Object.freeze({ from: '2027-01-15', through: '2027-10-14' }),
-  default_off_peak_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
-  default_off_peak_storage_window: FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
-  companion_peak_storage_window: FBA_2027_COMPANION_PEAK_STORAGE_WINDOW,
-  default_inbound_window: FBA_2027_DEFAULT_INBOUND_WINDOW,
-  unpublished_holiday_peak_window: FBA_2027_UNPUBLISHED_PEAK_WINDOW,
-  unpublished_holiday_peak_note: UNPUBLISHED_2027_PEAK_MARGIN_NOTE,
-  unified_storage_effective_from: '2027-02-01',
-  placement_effective_from: '2027-01-15',
-  returns_non_apparel_effective_from: '2027-02-01',
-  official_sources: Object.freeze({
-    announcement: 'https://sellingpartners.aboutamazon.com/update-to-us-referral-and-fulfillment-by-amazon-fees-for-2027',
-    fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GABBX6GZPA8MSZGW',
-    apparel_fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GPDC3KPYAGDTVDJP',
-    dangerous_goods_fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GZPA23LMZ9G6699P',
-    bulky_packaging_service: 'https://sellercentral.amazon.com/help/hub/reference/external/GFGVB6C7ZF38285W',
-    size_tiers: 'https://sellercentral.amazon.com/gp/help/external/GG5KW835AHDJCH8W',
-    storage: 'https://sellercentral.amazon.com/help/hub/reference/external/GVZX6EAEL2KZ3SGA',
-    placement: 'https://sellercentral.amazon.com/help/hub/reference/external/GC3Q44PBK8BXQW3Z',
-    returns: 'https://sellercentral.amazon.com/help/hub/reference/external/GZGEQLTM3RZXUV6T',
-  }),
-});
+  const procLine = input.lines.find(line => line.id === 'procurement');
+  const domLine = input.lines.find(line => line.id === 'domestic_freight');
+  const validOrderUnits = value => isR58 ? (Number.isSafeInteger(value) && value >= 100) : value === 100;
+  const orderUnitsMismatch = isR58 && procLine && domLine && procLine.status !== 'pending' && domLine.status !== 'pending' &&
+    procLine.order_units !== domLine.order_units;
+  let invalidSourceUnits = false;
+  if (input.source_inputs && typeof input.source_inputs === 'object') {
+    const unitKeys = isR58 ? ['complete_saleable_sets', 'order_units'] : ['complete_saleable_sets'];
+    const presentSourceUnits = [];
+    for (const k of unitKeys) {
+      if (Object.hasOwn(input.source_inputs, k)) {
+        const v = input.source_inputs[k];
+        if (!validOrderUnits(v)) invalidSourceUnits = true;
+        else presentSourceUnits.push(v);
+      }
+    }
+    if (presentSourceUnits.length > 1 && presentSourceUnits.some(v => v !== presentSourceUnits[0])) {
+      invalidSourceUnits = true;
+    }
+    if (isR58 && presentSourceUnits.length > 0) {
+      const sv = presentSourceUnits[0];
+      if ((procLine && procLine.status !== 'pending' && sv !== procLine.order_units) ||
+        (domLine && domLine.status !== 'pending' && sv !== domLine.order_units)) {
+        invalidSourceUnits = true;
+      }
+    }
+  }
+  const invalidSourcePromo = input.source_inputs && Object.hasOwn(input.source_inputs, 'first_order_promotion') &&
+    input.source_inputs.first_order_promotion !== false;
+  const skuResolution = isR58 ? resolveConsistentSkuLines(input, procLine) : { present: false, conflict: false, skuLines: undefined };
+  const skuCheck = isR58 && skuResolution.present && !skuResolution.conflict
+    ? validateSkuLinesR58(skuResolution.skuLines, procLine?.order_units, procLine?.amount_usd, [
+      procLine?.fx_cny_per_usd, input.fx_cny_per_usd, input.source_inputs?.fx_cny_per_usd,
+    ])
+    : null;
+  const invalidSkuLines = Boolean(skuResolution.conflict || (skuCheck && !skuCheck.valid));
 
-// Verified 2027 US non-apparel Small Standard non-peak base rates (before 3.5% fuel surcharge).
-const SMALL_STANDARD_2027_OZ = Object.freeze([
-  { max_oz: 2, under_10: 2.64, '10_to_50': 3.75, over_50: 4.31, return_fee: 1.78 },
-  { max_oz: 4, under_10: 2.72, '10_to_50': 3.78, over_50: 4.34, return_fee: 1.84 },
-  { max_oz: 6, under_10: 2.80, '10_to_50': 3.92, over_50: 4.47, return_fee: 1.90 },
-  { max_oz: 8, under_10: 2.83, '10_to_50': 3.97, over_50: 4.53, return_fee: 1.96 },
-  { max_oz: 10, under_10: 2.87, '10_to_50': 4.06, over_50: 4.62, return_fee: 2.02 },
-  { max_oz: 12, under_10: 2.92, '10_to_50': 4.16, over_50: 4.73, return_fee: 2.08 },
-  { max_oz: 14, under_10: 2.96, '10_to_50': 4.30, over_50: 4.85, return_fee: 2.14 },
-  { max_oz: 16, under_10: 2.99, '10_to_50': 4.32, over_50: 4.88, return_fee: 2.21 },
-]);
+  // Revision 58 physical return rate (distinct from refund_fraction when explicitly supplied).
+  let rPhysical = input.refund_fraction;
+  let invalidPhysicalReturn = false;
+  if (isR58 && input.physical_return_fraction !== undefined && input.physical_return_fraction !== null) {
+    if (!finite(input.physical_return_fraction) || input.physical_return_fraction < 0 || input.physical_return_fraction >= 1) {
+      invalidPhysicalReturn = true;
+    } else {
+      rPhysical = input.physical_return_fraction;
+    }
+  }
 
-// Verified 2027 US non-apparel Large Standard non-peak base rates (before 3.5% fuel surcharge).
-const LARGE_STANDARD_2027_LB = Object.freeze([
-  { max_lb: 0.25, under_10: 2.91, '10_to_50': 3.79, over_50: 4.35, return_fee: 2.36 },
-  { max_lb: 0.50, under_10: 3.13, '10_to_50': 4.01, over_50: 4.57, return_fee: 2.70 },
-  { max_lb: 0.75, under_10: 3.38, '10_to_50': 4.26, over_50: 4.83, return_fee: 3.05 },
-  { max_lb: 1.00, under_10: 3.78, '10_to_50': 4.67, over_50: 5.23, return_fee: 3.39 },
-  { max_lb: 1.25, under_10: 4.22, '10_to_50': 5.19, over_50: 5.75, return_fee: 3.70 },
-  { max_lb: 1.50, under_10: 4.60, '10_to_50': 5.57, over_50: 6.14, return_fee: 4.01 },
-  { max_lb: 1.75, under_10: 4.75, '10_to_50': 5.72, over_50: 6.29, return_fee: 4.32 },
-  { max_lb: 2.00, under_10: 5.00, '10_to_50': 5.98, over_50: 6.54, return_fee: 4.63 },
-  { max_lb: 2.25, under_10: 5.10, '10_to_50': 6.08, over_50: 6.64, return_fee: 4.66 },
-  { max_lb: 2.50, under_10: 5.28, '10_to_50': 6.26, over_50: 6.83, return_fee: 4.68 },
-  { max_lb: 2.75, under_10: 5.44, '10_to_50': 6.42, over_50: 6.99, return_fee: 4.71 },
-  { max_lb: 3.00, under_10: 5.85, '10_to_50': 6.85, over_50: 7.41, return_fee: 4.73 },
-]);
-
-const LARGE_STANDARD_OVER_3LB = Object.freeze({
-  under_10: 6.15,
-  '10_to_50': 7.16,
-  over_50: 7.73,
-  step_usd: 0.08,
-  step_lb: 0.25,
-  return_base_usd: 5.00,
-  return_step_usd: 0.05,
-});
-
-const PLACEMENT_MINIMAL_SMALL_OZ = Object.freeze([
-  { max_oz: 8, range: Object.freeze([0.14, 0.32]) },
-  { max_oz: 16, range: Object.freeze([0.16, 0.32]) },
-]);
-
-const PLACEMENT_MINIMAL_LARGE_LB = Object.freeze([
-  { max_lb: 0.75, range: Object.freeze([0.20, 0.40]) },
-  { max_lb: 1.5, range: Object.freeze([0.24, 0.50]) },
-  { max_lb: 3.0, range: Object.freeze([0.34, 0.60]) },
-  { max_lb: 5.0, range: Object.freeze([0.38, 0.76]) },
-  { max_lb: 7.0, range: Object.freeze([0.40, 0.98]) },
-  { max_lb: 10.0, range: Object.freeze([0.42, 1.20]) },
-  { max_lb: 15.0, range: Object.freeze([0.44, 1.50]) },
-  { max_lb: 20.0, range: Object.freeze([0.55, 1.90]) },
-]);
-
-// VERIFIED_2027_RETURN_THRESHOLDS is owned by and re-exported from src/fee-basis.mjs to keep the module graph acyclic.
-
-const STORAGE_2027_RATES = { off_peak: 0.78, peak: 2.40 };
-const BULKY_STORAGE_2027_RATES = Object.freeze({ off_peak: 0.56, peak: 1.40 });
-
-// Official US FBA Bulky Inbound Placement Service Fee rate card (GC3Q44PBK8BXQW3Z; unchanged for 2027, mapped to Small/Medium vs Large/Extra-Large Bulky).
-export const PLACEMENT_BULKY_SMALL_MEDIUM_LB = Object.freeze([
-  Object.freeze({ max_lb: 5, minimal: Object.freeze([1.10, 1.60]), partial: Object.freeze([0.55, 1.10]) }),
-  Object.freeze({ max_lb: 12, minimal: Object.freeze([1.75, 2.40]), partial: Object.freeze([0.65, 1.75]) }),
-  Object.freeze({ max_lb: 28, minimal: Object.freeze([2.74, 3.50]), partial: Object.freeze([0.81, 2.19]) }),
-  Object.freeze({ max_lb: 42, minimal: Object.freeze([3.95, 4.95]), partial: Object.freeze([1.05, 2.83]) }),
-  Object.freeze({ max_lb: 50, minimal: Object.freeze([4.80, 5.95]), partial: Object.freeze([1.23, 3.32]) }),
-]);
-
-export const PLACEMENT_BULKY_LARGE_XL_LB = Object.freeze([
-  Object.freeze({ max_lb: 5, minimal: Object.freeze([1.30, 1.80]), partial: Object.freeze([0.55, 1.25]) }),
-  Object.freeze({ max_lb: 12, minimal: Object.freeze([2.10, 2.90]), partial: Object.freeze([0.65, 1.80]) }),
-  Object.freeze({ max_lb: 28, minimal: Object.freeze([3.40, 4.10]), partial: Object.freeze([0.81, 2.30]) }),
-  Object.freeze({ max_lb: 42, minimal: Object.freeze([4.70, 5.60]), partial: Object.freeze([1.05, 2.95]) }),
-  Object.freeze({ max_lb: 50, minimal: Object.freeze([5.50, 6.50]), partial: Object.freeze([1.23, 3.50]) }),
-]);
-
-// Official 2027 US FBA Bulky Returns Processing Fee (GZGEQLTM3RZXUV6T; Small, Medium, Large, and Extra-Large Bulky 0–50 lb: $6.74 + $0.32/lb above first lb).
-export const BULKY_RETURNS_2027_RULE = Object.freeze({
-  base_first_lb_usd: 6.74,
-  step_usd_per_lb_over_1: 0.32,
-});
-
-// Official 2027 US FBA Bulky 4-tier non-peak structure (effective 2027-01-15, before 3.5% fuel surcharge).
-export const BULKY_2027_TIERS = Object.freeze([
-  Object.freeze({
-    size_tier: 'small_bulky',
-    max_longest_in: 28,
-    max_median_in: 24,
-    max_shortest_in: 20,
-    max_length_plus_girth_in: 130,
-    max_weight_lb: 50,
-    under_10: 6.73,
-    '10_to_50': 7.51,
-    over_50: 7.51,
-    step_usd_per_lb_over_1: 0.39,
-  }),
-  Object.freeze({
-    size_tier: 'medium_bulky',
-    max_longest_in: 37,
-    max_median_in: 28,
-    max_shortest_in: 20,
-    max_length_plus_girth_in: 130,
-    max_weight_lb: 50,
-    under_10: 6.88,
-    '10_to_50': 7.66,
-    over_50: 7.66,
-    step_usd_per_lb_over_1: 0.39,
-  }),
-  Object.freeze({
-    size_tier: 'large_bulky',
-    max_longest_in: 52,
-    max_median_in: 28,
-    max_shortest_in: 28,
-    max_length_plus_girth_in: 130,
-    max_weight_lb: 50,
-    under_10: 9.09,
-    '10_to_50': 9.88,
-    over_50: 9.88,
-    step_usd_per_lb_over_1: 0.39,
-  }),
-  Object.freeze({
-    size_tier: 'extra_large_bulky',
-    max_longest_in: 59,
-    max_median_in: 33,
-    max_shortest_in: 33,
-    max_length_plus_girth_in: 130,
-    max_weight_lb: 50,
-    under_10: 9.31,
-    '10_to_50': 10.09,
-    over_50: 10.09,
-    step_usd_per_lb_over_1: 0.39,
-  }),
-]);
-
-// Official 2027 US FBA 6-tier Oversize non-peak structure (effective 2027-01-15, before 3.5% fuel surcharge; shared by Non-Apparel & Apparel).
-export const OVERSIZE_2027_TIERS = Object.freeze([
-  Object.freeze({
-    size_tier: 'small_oversize',
-    max_longest_in: 72,
-    max_length_plus_girth_in: 130,
-    max_weight_lb: 50,
-    base_threshold_lb: 1,
-    under_10: 13.44,
-    '10_to_50': 14.22,
-    over_50: 14.22,
-    step_usd_per_lb: 0.28,
-    unit_weight_only: false,
-  }),
-  Object.freeze({
-    size_tier: 'medium_oversize',
-    max_longest_in: 78,
-    max_length_plus_girth_in: 130,
-    max_weight_lb: 70,
-    base_threshold_lb: 51,
-    under_10: 27.36,
-    '10_to_50': 28.15,
-    over_50: 28.15,
-    step_usd_per_lb: 0.56,
-    unit_weight_only: false,
-  }),
-  Object.freeze({
-    size_tier: 'large_oversize',
-    max_longest_in: 96,
-    max_length_plus_girth_in: 130,
-    max_weight_lb: 150,
-    base_threshold_lb: 51,
-    under_10: 37.97,
-    '10_to_50': 38.75,
-    over_50: 38.75,
-    step_usd_per_lb: 0.68,
-    unit_weight_only: false,
-  }),
-  Object.freeze({
-    size_tier: 'long_oversize',
-    max_longest_in: 108,
-    max_length_plus_girth_in: 165,
-    max_weight_lb: 150,
-    base_threshold_lb: 1,
-    under_10: 62.97,
-    '10_to_50': 63.75,
-    over_50: 63.75,
-    step_usd_per_lb: 0.30,
-    unit_weight_only: false,
-  }),
-  Object.freeze({
-    size_tier: 'special_oversize_light',
-    max_longest_in: Infinity,
-    max_length_plus_girth_in: Infinity,
-    max_weight_lb: 150,
-    base_threshold_lb: 1,
-    under_10: 71.09,
-    '10_to_50': 71.87,
-    over_50: 71.87,
-    step_usd_per_lb: 0.30,
-    unit_weight_only: false,
-  }),
-  Object.freeze({
-    size_tier: 'special_oversize_heavy',
-    max_longest_in: Infinity,
-    max_length_plus_girth_in: Infinity,
-    max_weight_lb: Infinity,
-    base_threshold_lb: 151,
-    under_10: 190.50,
-    '10_to_50': 191.28,
-    over_50: 191.28,
-    step_usd_per_lb: 0.19,
-    unit_weight_only: true,
-  }),
-]);
-
-// Official 2027 US FBA Oversize Flat Product (shortest < 4 in AND median >= 25 in) & Overhang (median > 43 in) Handling Fees
-// (effective 2027-01-15, replacing Overmax; identical across Non-Apparel, Apparel, and Dangerous Goods; cumulative if both apply).
-export const OVERSIZE_HANDLING_2027_FEES = Object.freeze({
-  small_oversize: Object.freeze({ flat_product_usd: 8.40, overhang_usd: 0 }),
-  medium_oversize: Object.freeze({ flat_product_usd: 8.65, overhang_usd: 0 }),
-  large_oversize: Object.freeze({ flat_product_usd: 9.42, overhang_usd: 0 }),
-  long_oversize: Object.freeze({ flat_product_usd: 10.48, overhang_usd: 3.45 }),
-  special_oversize_light: Object.freeze({ flat_product_usd: 21.67, overhang_usd: 5.23 }),
-  special_oversize_heavy: Object.freeze({ flat_product_usd: 29.53, overhang_usd: 10.45 }),
-});
-
-// Official 2027 US FBA Oversize Returns Processing Fee Schedule (GZGEQLTM3RZXUV6T; Non-Apparel from 2027-02-01, Apparel & Shoes from 2027-01-15).
-export const OVERSIZE_RETURNS_2027_TIERS = Object.freeze({
-  small_oversize: Object.freeze({ base_usd: 26.33, base_threshold_lb: 1, step_usd_per_lb: 0.38, unit_weight_only: false }),
-  medium_oversize: Object.freeze({ base_usd: 40.12, base_threshold_lb: 51, step_usd_per_lb: 0.75, unit_weight_only: false }),
-  large_oversize: Object.freeze({ base_usd: 52.45, base_threshold_lb: 71, step_usd_per_lb: 0.75, unit_weight_only: false }),
-  long_oversize: Object.freeze({ base_usd: 52.45, base_threshold_lb: 71, step_usd_per_lb: 0.75, unit_weight_only: false }),
-  special_oversize_light: Object.freeze({ base_usd: 52.45, base_threshold_lb: 71, step_usd_per_lb: 0.75, unit_weight_only: false }),
-  special_oversize_heavy: Object.freeze({ base_usd: 157.35, base_threshold_lb: 151, step_usd_per_lb: 0.19, unit_weight_only: true }),
-});
-
-// Official 2027 US Apparel Standard-Size FBA Fulfillment Fees (GPDC3KPYAGDTVDJP, non-peak 2027-01-15..2027-10-14, before 3.5% fuel surcharge).
-// Note: Bulky & Oversize Apparel share BULKY_2027_TIERS / OVERSIZE_2027_TIERS; Shoes use Non-Apparel fulfillment + Apparel/Shoes returns processing.
-export const SMALL_STANDARD_APPAREL_2027_OZ = Object.freeze([
-  Object.freeze({ max_oz: 2, under_10: 2.83, '10_to_50': 3.92, over_50: 4.54 }),
-  Object.freeze({ max_oz: 4, under_10: 2.85, '10_to_50': 3.95, over_50: 4.57 }),
-  Object.freeze({ max_oz: 6, under_10: 2.90, '10_to_50': 4.01, over_50: 4.62 }),
-  Object.freeze({ max_oz: 8, under_10: 3.03, '10_to_50': 4.11, over_50: 4.72 }),
-  Object.freeze({ max_oz: 10, under_10: 3.17, '10_to_50': 4.25, over_50: 4.74 }),
-  Object.freeze({ max_oz: 12, under_10: 3.27, '10_to_50': 4.43, over_50: 4.92 }),
-  Object.freeze({ max_oz: 14, under_10: 3.38, '10_to_50': 4.55, over_50: 5.03 }),
-  Object.freeze({ max_oz: 16, under_10: 3.48, '10_to_50': 4.60, over_50: 5.08 }),
-]);
-
-export const LARGE_STANDARD_APPAREL_2027_LB = Object.freeze([
-  Object.freeze({ max_lb: 0.25, under_10: 3.53, '10_to_50': 4.36, over_50: 4.93 }),
-  Object.freeze({ max_lb: 0.50, under_10: 3.74, '10_to_50': 4.57, over_50: 5.13 }),
-  Object.freeze({ max_lb: 0.75, under_10: 3.96, '10_to_50': 4.79, over_50: 5.35 }),
-  Object.freeze({ max_lb: 1.00, under_10: 4.42, '10_to_50': 5.25, over_50: 5.81 }),
-  Object.freeze({ max_lb: 1.25, under_10: 5.13, '10_to_50': 5.96, over_50: 6.52 }),
-  Object.freeze({ max_lb: 1.50, under_10: 5.30, '10_to_50': 6.13, over_50: 6.69 }),
-  Object.freeze({ max_lb: 1.75, under_10: 5.40, '10_to_50': 6.23, over_50: 6.80 }),
-  Object.freeze({ max_lb: 2.00, under_10: 5.51, '10_to_50': 6.34, over_50: 6.91 }),
-  Object.freeze({ max_lb: 2.25, under_10: 5.87, '10_to_50': 6.70, over_50: 7.26 }),
-  Object.freeze({ max_lb: 2.50, under_10: 5.99, '10_to_50': 6.82, over_50: 7.38 }),
-  Object.freeze({ max_lb: 2.75, under_10: 6.04, '10_to_50': 6.87, over_50: 7.44 }),
-  Object.freeze({ max_lb: 3.00, under_10: 6.17, '10_to_50': 7.00, over_50: 7.57 }),
-]);
-
-export const LARGE_STANDARD_APPAREL_OVER_3LB = Object.freeze({
-  under_10: 6.24,
-  '10_to_50': 7.07,
-  over_50: 7.64,
-  step_usd_per_half_lb: 0.16,
-});
-
-// Official 2027 US Apparel & Shoes Standard-Size Returns Processing Fees (GZGEQLTM3RZXUV6T, effective 2027-01-15, charged per returned unit with zero threshold).
-export const APPAREL_SHOES_STANDARD_RETURNS_2027 = Object.freeze({
-  small_standard_oz: Object.freeze([
-    Object.freeze({ max_oz: 4, return_fee: 1.65 }),
-    Object.freeze({ max_oz: 8, return_fee: 1.75 }),
-    Object.freeze({ max_oz: 12, return_fee: 1.85 }),
-    Object.freeze({ max_oz: 16, return_fee: 1.95 }),
-  ]),
-  large_standard_lb: Object.freeze([
-    Object.freeze({ max_lb: 0.25, return_fee: 2.04 }),
-    Object.freeze({ max_lb: 0.50, return_fee: 2.12 }),
-    Object.freeze({ max_lb: 0.75, return_fee: 2.19 }),
-    Object.freeze({ max_lb: 1.00, return_fee: 2.27 }),
-    Object.freeze({ max_lb: 1.50, return_fee: 2.62 }),
-    Object.freeze({ max_lb: 2.00, return_fee: 2.98 }),
-    Object.freeze({ max_lb: 2.50, return_fee: 3.33 }),
-    Object.freeze({ max_lb: 3.00, return_fee: 3.69 }),
-  ]),
-  large_standard_over_3lb: Object.freeze({
-    return_base_usd: 3.89,
-    return_step_usd_per_half_lb: 0.10,
-  }),
-});
-
-// Official 2027 US Dangerous Goods (Hazmat) FBA Fulfillment Fees (GZPA23LMZ9G6699P, non-peak 2027-01-15..2027-10-14, before 3.5% fuel surcharge).
-export const SMALL_STANDARD_DG_2027_OZ = Object.freeze([
-  Object.freeze({ max_oz: 2, under_10: 3.57, '10_to_50': 4.59, over_50: 5.15 }),
-  Object.freeze({ max_oz: 4, under_10: 3.62, '10_to_50': 4.61, over_50: 5.17 }),
-  Object.freeze({ max_oz: 6, under_10: 3.69, '10_to_50': 4.75, over_50: 5.32 }),
-  Object.freeze({ max_oz: 8, under_10: 3.71, '10_to_50': 4.80, over_50: 5.37 }),
-  Object.freeze({ max_oz: 10, under_10: 3.74, '10_to_50': 4.88, over_50: 5.45 }),
-  Object.freeze({ max_oz: 12, under_10: 3.75, '10_to_50': 4.97, over_50: 5.54 }),
-  Object.freeze({ max_oz: 14, under_10: 3.79, '10_to_50': 5.01, over_50: 5.57 }),
-  Object.freeze({ max_oz: 16, under_10: 3.83, '10_to_50': 5.04, over_50: 5.60 }),
-]);
-
-export const LARGE_STANDARD_DG_2027_LB = Object.freeze([
-  Object.freeze({ max_lb: 0.25, under_10: 3.73, '10_to_50': 4.62, over_50: 5.18 }),
-  Object.freeze({ max_lb: 0.50, under_10: 3.94, '10_to_50': 4.83, over_50: 5.40 }),
-  Object.freeze({ max_lb: 0.75, under_10: 4.17, '10_to_50': 5.06, over_50: 5.63 }),
-  Object.freeze({ max_lb: 1.00, under_10: 4.37, '10_to_50': 5.27, over_50: 5.83 }),
-  Object.freeze({ max_lb: 1.25, under_10: 4.82, '10_to_50': 5.79, over_50: 6.36 }),
-  Object.freeze({ max_lb: 1.50, under_10: 5.20, '10_to_50': 6.18, over_50: 6.74 }),
-  Object.freeze({ max_lb: 1.75, under_10: 5.35, '10_to_50': 6.33, over_50: 6.90 }),
-  Object.freeze({ max_lb: 2.00, under_10: 5.49, '10_to_50': 6.47, over_50: 7.04 }),
-  Object.freeze({ max_lb: 2.25, under_10: 5.56, '10_to_50': 6.55, over_50: 7.11 }),
-  Object.freeze({ max_lb: 2.50, under_10: 5.74, '10_to_50': 6.73, over_50: 7.29 }),
-  Object.freeze({ max_lb: 2.75, under_10: 5.90, '10_to_50': 6.89, over_50: 7.45 }),
-  Object.freeze({ max_lb: 3.00, under_10: 6.31, '10_to_50': 7.32, over_50: 7.88 }),
-]);
-
-export const LARGE_STANDARD_DG_OVER_3LB = Object.freeze({
-  under_10: 6.61,
-  '10_to_50': 7.63,
-  over_50: 8.20,
-  step_usd: 0.08,
-});
-
-export const BULKY_DG_2027_TIERS = Object.freeze({
-  small_bulky: Object.freeze({ under_10: 7.46, '10_to_50': 8.24, over_50: 8.24, step_usd_per_lb_over_1: 0.39 }),
-  medium_bulky: Object.freeze({ under_10: 7.61, '10_to_50': 8.39, over_50: 8.39, step_usd_per_lb_over_1: 0.39 }),
-  large_bulky: Object.freeze({ under_10: 9.83, '10_to_50': 10.61, over_50: 10.61, step_usd_per_lb_over_1: 0.39 }),
-  extra_large_bulky: Object.freeze({ under_10: 10.04, '10_to_50': 10.82, over_50: 10.82, step_usd_per_lb_over_1: 0.39 }),
-});
-
-export const OVERSIZE_DG_2027_TIERS = Object.freeze({
-  small_oversize: Object.freeze({ under_10: 15.58, '10_to_50': 16.36, over_50: 16.36, base_threshold_lb: 1, step_usd_per_lb: 0.28, unit_weight_only: false }),
-  medium_oversize: Object.freeze({ under_10: 30.62, '10_to_50': 31.40, over_50: 31.40, base_threshold_lb: 51, step_usd_per_lb: 0.56, unit_weight_only: false }),
-  large_oversize: Object.freeze({ under_10: 45.21, '10_to_50': 45.99, over_50: 45.99, base_threshold_lb: 51, step_usd_per_lb: 0.68, unit_weight_only: false }),
-  long_oversize: Object.freeze({ under_10: 70.21, '10_to_50': 70.99, over_50: 70.99, base_threshold_lb: 1, step_usd_per_lb: 0.30, unit_weight_only: false }),
-  special_oversize_light: Object.freeze({ under_10: 78.33, '10_to_50': 79.11, over_50: 79.11, base_threshold_lb: 1, step_usd_per_lb: 0.30, unit_weight_only: false }),
-  special_oversize_heavy: Object.freeze({ under_10: 215.44, '10_to_50': 216.23, over_50: 216.23, base_threshold_lb: 151, step_usd_per_lb: 0.19, unit_weight_only: true }),
-});
-
-// Official 2027 US Dangerous Goods Unified Monthly Storage Rates (GVZX6EAEL2KZ3SGA, 0–180 days, effective 2027-02-01).
-export const DG_STORAGE_2027_RATES = Object.freeze({
-  standard: Object.freeze({ off_peak: 0.99, peak: 3.63 }),
-  bulky_and_oversize: Object.freeze({ off_peak: 0.78, peak: 2.43 }),
-});
-
-// Five fee categories losing <$10 Low-Price FBA eligibility from 2027-01-15 (billed at $10_to_50 when price_usd < $10).
-export const LOW_PRICE_INELIGIBLE_2027_CATEGORIES = Object.freeze([
-  'Automotive and Powersports',
-  'Compact Appliances',
-  'Computers',
-  'Musical Instruments and AV Production',
-  'Media - Books, DVD, Music, Software, Video',
-]);
-
-export function isCategoryLowPriceEligible2027(feeCategory) {
-  if (typeof feeCategory !== 'string' || !feeCategory.trim()) return true;
-  const canonical = lookupVerified2027ReturnThreshold(feeCategory)?.canonical ?? feeCategory.trim();
-  return !LOW_PRICE_INELIGIBLE_2027_CATEGORIES.some(c => c.toLowerCase() === canonical.toLowerCase());
+  for (const line of input.lines) {
+    if (!evidenced(line.evidence)) add(line.id, 'missing_cost_evidence', 'The cost needs registered source evidence, including any explicit zero or deferral.');
+    if (line.id === 'domestic_freight' && line.status === 'deferred') {
+      add(line.id, 'domestic_quote_required', 'The current >=100-purchased-unit scope requires a domestic-delivery quote; the historical deferral cannot be reused.');
+    } else if (strictR57 && (line.id === 'procurement' || line.id === 'domestic_freight') &&
+      line.status !== 'pending' && (line.first_order_promotion !== false || !validOrderUnits(line.order_units) ||
+        orderUnitsMismatch || invalidSourceUnits || invalidSourcePromo || invalidSkuLines)) {
+      add(line.id, 'domestic_quote_required', isR58
+        ? 'Revision 58 requires explicit integer order_units >= 100 (matching across procurement, domestic delivery, source_inputs, and any sku_lines[]) plus first_order_promotion: false.'
+        : 'Revision 57 requires explicit order_units: 100 and first_order_promotion: false on both regular repeat-order procurement and domestic delivery.');
+    }
+    if (isR59 && line.id === 'headhaul' && line.status !== 'pending') {
+      const rawHhSpec = line.cny_derivation
+        ?? (input.headhaul && typeof input.headhaul === 'object' ? input.headhaul : null)
+        ?? (input.source_inputs?.headhaul && typeof input.source_inputs.headhaul === 'object' ? input.source_inputs.headhaul : null);
+      if (rawHhSpec && typeof rawHhSpec === 'object' && rawHhSpec.rate_cny_per_kg !== undefined) {
+        const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
+        const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
+        const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
+        if (hhCalc.missing_surcharge_quote) {
+          add('headhaul', 'headhaul_surcharge_quote_required', `Freight A4 surcharge triggered (${hhCalc.a4_applied?.missing_surcharge_quote ?? 'small shipment / carton'}) without an explicit surcharge quote.`);
+        } else if (!hhCalc.exact_usd_rational) {
+          add('headhaul', 'invalid_headhaul_tariff', 'Supplied Freight A4 headhaul tariff inputs are incomplete or invalid.');
+        } else {
+          const expectedHhUsd = roundBigRat(hhCalc.exact_usd_rational.n, hhCalc.exact_usd_rational.d, 10);
+          if (finite(line.amount_usd) && Math.abs(line.amount_usd - expectedHhUsd) > 0.005) {
+            add('headhaul', 'headhaul_tariff_mismatch', `Supplied headhaul amount_usd (${line.amount_usd}) conflicts with recomputed Freight A4 tariff (${expectedHhUsd}).`);
+          }
+        }
+      }
+    }
+    if (isR58 && line.id === 'returns_processing' && line.status !== 'pending') {
+      if (invalidPhysicalReturn) {
+        add('returns_processing', 'invalid_return_rate', 'Supplied physical_return_fraction must be a finite fraction in [0, 1).');
+      } else {
+        const hasExemption = Boolean(line.exemption && typeof line.exemption === 'object' &&
+          text(line.exemption.reason) && evidenced(line.exemption.evidence));
+        const wtCheck = resolveConsistentPkgWeightLb(matchedPkgR58);
+        const isApparel = ledgerApparelCheck.value === true;
+        const isOfficial2027RetVersion = /^US-FBA-2027/i.test(String(line.fee_basis?.version ?? '').trim());
+        const backdatedOfficial2027Ret = !isOfficial2027ScheduleWindowValid('returns_processing', line.fee_basis, isApparel);
+        const minRetStart = isApparel && isR59 ? '2027-01-15' : '2027-02-01';
+        const maxRetEnd = isR59 ? '2028-01-14' : '2027-12-31';
+        const in2027RetSchedule = validContext && context.sales.from >= minRetStart && context.sales.through <= maxRetEnd;
+        const verifiedPerRet = (!isApparel || isR59) && (in2027RetSchedule || isOfficial2027RetVersion)
+          ? lookupVerified2027PerReturnFee(matchedPkgR58, { isApparelOrShoes: isApparel, allowAll2027Tiers: isR59 })
+          : null;
+        const catCheck = resolveConsistentFeeCategory([line.fee_basis?.fee_category, line.fee_category, input.fee_category]);
+        const verifiedCat = catCheck.valid && catCheck.present ? lookupVerified2027ReturnThreshold(catCheck.value) : null;
+        const threshCheck = resolveConsistentNumeric(
+          [line.fee_basis?.return_threshold, line.return_threshold, input.return_threshold],
+          v => finite(v) && v >= 0 && v < 1,
+        );
+        const perRetCheck = resolveConsistentNumeric(
+          [line.fee_basis?.per_return_fee_usd, line.per_return_fee_usd, input.per_return_fee_usd],
+          v => finite(v) && v > 0,
+        );
+        if ((pkgResR58.present && !pkgResR58.valid) || !ledgerApparelCheck.valid || !ledgerDgCheck.valid || !ledgerOverCheck.valid ||
+          (wtCheck.present && !wtCheck.valid)) {
+          add('returns_processing', 'returns_processing_required', 'Conflicting or invalid is_apparel_or_shoes, is_dangerous_goods, is_oversize, or package fields.');
+        } else if (backdatedOfficial2027Ret) {
+          add('returns_processing', 'invalid_fee_basis', 'Official 2027 US returns-processing schedule cannot be backdated before its effective start date.');
+        } else if (!catCheck.valid) {
+          add('returns_processing', 'returns_processing_required', 'Conflicting or invalid fee_category across line, fee_basis, and ledger.');
+        } else if (!threshCheck.valid) {
+          add('returns_processing', 'returns_processing_required', 'Conflicting or invalid return_threshold across line, fee_basis, and ledger.');
+        } else if (verifiedCat && threshCheck.present && threshCheck.value !== verifiedCat.threshold) {
+          add('returns_processing', 'returns_processing_required', `Supplied return_threshold (${threshCheck.value}) conflicts with verified 2027 threshold (${verifiedCat.threshold}) for ${verifiedCat.canonical}.`);
+        } else if (!perRetCheck.valid) {
+          add('returns_processing', 'returns_processing_required', 'Conflicting or invalid per_return_fee_usd across line, fee_basis, and ledger.');
+        } else if (verifiedPerRet !== null && perRetCheck.present && Math.abs(perRetCheck.value - verifiedPerRet) > 1e-9) {
+          add('returns_processing', 'returns_processing_required', `Supplied per_return_fee_usd (${perRetCheck.value}) conflicts with verified 2027 FBA return fee (${verifiedPerRet}).`);
+        } else if (isApparel) {
+          if (rPhysical > 0 && !hasExemption) {
+            if (line.amount_usd === 0 || line.status === 'not_applicable') {
+              add('returns_processing', 'returns_processing_required', 'Apparel and shoes incur per-return processing fees with no threshold exemption unless officially waived.');
+            } else if (!perRetCheck.present) {
+              add('returns_processing', 'returns_processing_required', 'Apparel and shoes returns processing requires explicit positive per_return_fee_usd for deterministic verification.');
+            } else {
+              const expected = Math.round((rPhysical * perRetCheck.value + Number.EPSILON) * 1e10) / 1e10;
+              if (!finite(line.amount_usd) || Math.abs(line.amount_usd - expected) > 1e-6) {
+                add('returns_processing', 'returns_processing_required', `Apparel returns_processing amount ${line.amount_usd} does not match expected r_physical * per_return_fee_usd (${expected}).`);
+              }
+            }
+          }
+        } else if (!hasExemption) {
+          if (!threshCheck.present && rPhysical > 0) {
+            add('returns_processing', 'returns_processing_required', 'Revision 58 requires a verified return_threshold or official exemption whenever r_physical > 0.');
+          } else if (threshCheck.present && rPhysical > threshCheck.value) {
+            if (line.amount_usd === 0 || line.status === 'not_applicable') {
+              add('returns_processing', 'returns_processing_required', `Physical return rate ${rPhysical} exceeds category threshold ${threshCheck.value} without an evidenced exemption; zero returns_processing is rejected.`);
+            } else if (!perRetCheck.present) {
+              add('returns_processing', 'returns_processing_required', 'Excess returns processing above threshold requires explicit positive per_return_fee_usd for deterministic verification.');
+            } else {
+              const expected = Math.round(((rPhysical - threshCheck.value) * perRetCheck.value + Number.EPSILON) * 1e10) / 1e10;
+              if (!finite(line.amount_usd) || Math.abs(line.amount_usd - expected) > 1e-6) {
+                add('returns_processing', 'returns_processing_required', `Returns processing amount ${line.amount_usd} does not match expected (r_physical - threshold) * per_return_fee_usd (${expected}).`);
+              }
+            }
+          }
+        }
+      }
+    }
+    if (line.amount_usd > 0 && !['pending', 'deferred'].includes(line.status)) {
+      if (!Array.isArray(line.components) || !line.components.length || line.components.some(value => !text(value))) {
+        add(line.id, 'missing_components', 'A positive cost must declare the charge components it already includes.');
+      } else {
+        for (const component of line.components) {
+          if (components.has(component)) {
+            const previous = components.get(component);
+            add(line.id, 'duplicate_component', `${component} is already included in ${previous}; do not charge it twice.`);
+            add(previous, 'duplicate_component', `${component} is repeated in ${line.id}.`);
+          } else components.set(component, line.id);
+        }
+      }
+    }
+    if (!Object.hasOwn(FEE_WINDOWS, line.id) || (line.id === 'other_applicable' && line.payee === 'external')) continue;
+    if (isR58 && line.id === 'fulfillment' && validContext && context.sales.through > '2027-10-14' &&
+      (line.status !== 'pending' || line.fee_basis?.status === 'published') &&
+      hasProhibited2026PeakExtrapolation(line, input)) {
+      add('fulfillment', 'prohibited_2026_peak_extrapolation', '2027 Q4 peak fulfillment fees cannot be estimated from 2026 peak uplifts; keep 2027 Q4 peak margin blank/pending until Amazon publishes official 2027 peak rates.');
+      continue;
+    }
+    const basis = line.fee_basis;
+    if (basis?.status !== 'published') {
+      add(line.id, 'unpublished_fee', 'A published applicable fee basis is missing; a hypothetical or unavailable rate cannot support this period.');
+      continue;
+    }
+    if (!text(basis.version) || !evidenced(basis.evidence) || !date(basis.effective_from) ||
+      !(basis.effective_through === null || date(basis.effective_through)) ||
+      (basis.effective_through !== null && basis.effective_through < basis.effective_from) ||
+      (line.id === 'fulfillment' && basis.effective_through === null)) {
+      add(line.id, 'invalid_fee_basis', 'A fee version, registered sources and valid effective dates are required; fulfillment needs a bounded published window.');
+      continue;
+    }
+    if (isR58 && !isOfficial2027ScheduleWindowValid(line.id, basis, ledgerApparelCheck.value === true)) {
+      add(line.id, 'invalid_fee_basis', `${line.id}: declared dates on official 2027 schedule (${basis.version}) exceed its published effective window.`);
+      continue;
+    }
+    if (!validContext) continue;
+    if (basis.marketplace !== context.marketplace || basis.currency !== context.currency || basis.package_ref !== context.package_ref) {
+      add(line.id, 'fee_scope_mismatch', 'Fee marketplace, currency or packaged-unit reference differs from the cost scenario.');
+    }
+    const target = context[FEE_WINDOWS[line.id]];
+    if (target.from < basis.effective_from || (basis.effective_through !== null && target.through > basis.effective_through)) {
+      add(line.id, 'fee_outside_dates', `${line.id}: target ${target.from}..${target.through} is outside ${basis.version} (${basis.effective_from}..${basis.effective_through ?? 'open'}).`);
+    }
+    if (basis.months !== undefined) {
+      const targetMonthsForSeason = monthsIn(target);
+      if (!Array.isArray(basis.months) || !basis.months.length ||
+        basis.months.some(month => !Number.isInteger(month) || month < 1 || month > 12)) {
+        add(line.id, isR58 ? 'invalid_fee_basis' : 'fee_season_mismatch', `${line.id}: declared fee_basis.months must be a nonempty array of integers 1..12.`);
+      } else if (targetMonthsForSeason.some(month => !basis.months.includes(month))) {
+        add(line.id, 'fee_season_mismatch', `${line.id}: the target months are not covered by the declared seasonal rate.`);
+      }
+    }
+    if (isR58 && line.id === 'fulfillment' && line.status !== 'pending') {
+      const pricingRes = resolveEffectivePricing(input);
+      if (pricingRes.valid) {
+        const bandOf = p => (p < 10 ? 'under_10' : p <= 50 ? '10_to_50' : 'over_50');
+        const listBand = bandOf(pricingRes.list_price_usd);
+        const netBand = bandOf(pricingRes.net_effective_price_usd);
+        const declaredBand = text(basis?.price_band) ? basis.price_band.trim() : null;
+        const hasCouponOnly = Boolean(
+          ((pricingRes.ongoing_coupon_usd ?? 0) > 0 || (pricingRes.ongoing_coupon_pct ?? 0) > 0) &&
+          !((input?.prime_exclusive_discount_usd ?? 0) > 0 || (input?.prime_exclusive_discount_pct ?? 0) > 0),
+        );
+        const r59CouponListTierVerified = isR59 && hasCouponOnly && (declaredBand === null || declaredBand === listBand);
+        const promoVerified = line.fulfillment_promo_tier_verified === true || input.fulfillment_promo_tier_verified === true || r59CouponListTierVerified;
+        if (isR59 && hasCouponOnly && listBand !== netBand && declaredBand && declaredBand !== listBand) {
+          add('fulfillment', 'fee_scope_mismatch', `Fulfillment fee_basis.price_band (${declaredBand}) under ongoing coupon must match list_price_usd band (${listBand}), not net band (${netBand}).`);
+        } else if (pricingRes.has_ongoing_discount && listBand !== netBand && !promoVerified) {
+          add('fulfillment', 'invalid_fee_basis', `Ongoing discount crosses FBA price tier (${listBand} -> ${netBand}) without fulfillment_promo_tier_verified: true; verify exact Amazon promo tier fee before scoring.`);
+        } else if (declaredBand && declaredBand !== netBand && !(pricingRes.has_ongoing_discount && promoVerified)) {
+          add('fulfillment', 'fee_scope_mismatch', `Fulfillment fee_basis.price_band (${declaredBand}) conflicts with payable net price band (${netBand}).`);
+        }
+      }
+    }
+    if (isR58 && line.id === 'storage' && !storageMeets2027Floor(input, line, monthsIn(target))) {
+      add('storage', 'fee_season_mismatch', 'storage: amount or rate violates the 2027 US unified monthly storage floor ($0.78 Jan–Sep / $2.40 Oct–Dec, >=45d average inventory).');
+    }
+  }
+  if (isR58) {
+    const headhaulLine = input.lines.find(l => l.id === 'headhaul');
+    if (headhaulLine && headhaulLine.amount_usd > 0 && !['pending', 'deferred'].includes(headhaulLine.status)) {
+      const hasBondExemption = Boolean(
+        headhaulLine.bond_exemption &&
+        typeof headhaulLine.bond_exemption === 'object' &&
+        text(headhaulLine.bond_exemption.reason) &&
+        evidenced(headhaulLine.bond_exemption.evidence),
+      );
+      const bondInHeadhaul = Array.isArray(headhaulLine.components) && headhaulLine.components.includes('carrier_bond');
+      const bondElsewherePositive = input.lines.some(
+        l => l &&
+          l.id !== 'headhaul' &&
+          l.id !== 'recovery_credit' &&
+          !['pending', 'deferred'].includes(l.status) &&
+          typeof l.amount_usd === 'number' &&
+          l.amount_usd > 0 &&
+          Array.isArray(l.components) &&
+          l.components.includes('carrier_bond'),
+      );
+      if (!bondInHeadhaul && !bondElsewherePositive && !hasBondExemption) {
+        add('headhaul', 'missing_carrier_bond', 'Revision 58 requires positive headhaul to include "carrier_bond" in components (or declare carrier_bond once in another positive cost line, never recovery_credit or negative credit, or supply an evidenced bond_exemption).');
+      }
+    }
+  }
+  return { status: issues.length ? 'needs_evidence' : 'validated', context: context ?? null, issues };
 }
 
 /**
- * Out-of-table fallback directive: whenever a candidate hits an unlisted new fee category,
- * tiered referral rule, or future fee schedule announcement, enforce the 3-step verified lookup-and-persist protocol.
+ * Official Amazon US Coupon Fee (June 2025 onward, carried into 2027):
+ * $5.00 upfront per coupon campaign + 2.5% of coupon-attributed sales.
+ * Allocates the $5.00 campaign flat fee across `coupon_campaign_units` (default 100 units)
+ * plus 2.5% of `net_effective_price_usd * coupon_redemption_share`.
  */
-export function buildOutOfTableLookupDirective({ reason = '', fee_category = null, asin = null } = {}) {
+export function computeAmazonCouponRedemptionFee2027({
+  net_effective_price_usd,
+  ongoing_coupon_usd = 0,
+  ongoing_coupon_pct = 0,
+  coupon_redemption_share = 1,
+  coupon_campaign_units = 100,
+  include_campaign_flat_usd = true,
+} = {}) {
+  const hasCoupon = (finite(ongoing_coupon_usd) && ongoing_coupon_usd > 0) ||
+    (finite(ongoing_coupon_pct) && ongoing_coupon_pct > 0);
+  if (!hasCoupon || !finite(net_effective_price_usd) || net_effective_price_usd <= 0) {
+    return {
+      applicable: false,
+      per_unit_usd: 0,
+      variable_2_5pct_usd: 0,
+      campaign_flat_per_unit_usd: 0,
+      exact_usd_rational: { n: 0n, d: 1n },
+    };
+  }
+  const share = finite(coupon_redemption_share) && coupon_redemption_share >= 0 && coupon_redemption_share <= 1
+    ? coupon_redemption_share
+    : 1;
+  const units = Number.isSafeInteger(coupon_campaign_units) && coupon_campaign_units > 0
+    ? coupon_campaign_units
+    : 100;
+  const netR = toBigRat(net_effective_price_usd);
+  const shareR = toBigRat(share);
+  // 2.5% = 25 / 1000 = 1 / 40
+  const varR = mulBigRat(mulBigRat(netR, { n: 1n, d: 40n }), shareR);
+  const flatR = include_campaign_flat_usd !== false
+    ? divBigRat({ n: 5n, d: 1n }, toBigRat(units))
+    : { n: 0n, d: 1n };
+  const totalR = addBigRat(varR, flatR);
   return {
-    protocol_id: 'spapi_then_official_seller_central_persist_v1',
-    fee_category: fee_category ?? null,
-    comparable_asin: asin ?? null,
-    reason,
-    required_steps: [
-      '1. Query read-only SP-API (catalogItems_getCatalogItem + productFees_getMyFeesEstimateForASIN + listingsRestrictions) on comparable ASIN(s) for official packaged dimensions, referral percentage, and live FBA baseline.',
-      '2. Search official Amazon Seller Central help pages / 2027+ fee announcements to verify the exact published rate card and effective dates, recording explicit source URLs.',
-      '3. Calculate using the verified official schedule with source attribution and persist the verified table/rule back into src/fba-rates-2027.mjs.',
-    ],
+    applicable: true,
+    per_unit_usd: roundBigRat(totalR.n, totalR.d, 10),
+    variable_2_5pct_usd: roundBigRat(varR.n, varR.d, 10),
+    campaign_flat_per_unit_usd: roundBigRat(flatR.n, flatR.d, 10),
+    coupon_campaign_units: units,
+    coupon_redemption_share: share,
+    exact_usd_rational: totalR,
   };
 }
 
-const SUPPLEMENTAL_OUT_OF_TABLE_RULES_2027 = new Map();
-const OFFICIAL_AMAZON_SOURCE_RE = /^https:\/\/(?:[a-z0-9-]+\.)?(?:sellercentral|sell|advertising|developer-docs)\.amazon\.[a-z.]+\/\S+/i;
+const A4_HEADHAUL_EXTRA_KEYS = [
+  'carton_cm',
+  'carton_count',
+  'actual_weight_kg_total',
+  'actual_weight_kg_per_unit',
+  'weight_per_carton_kg',
+  'volumetric_divisor',
+  'min_shipment_billable_kg',
+  'small_shipment_threshold_kg',
+  'small_shipment_surcharge_cny_per_kg',
+  'small_carton_threshold_kg',
+  'small_carton_surcharge_cny_per_carton',
+  'small_carton_surcharge_cny_per_kg',
+];
 
-export function validateAndComputeOutOfTableRule2027(ruleRecord, { test_price_usd = null } = {}) {
-  if (!ruleRecord || typeof ruleRecord !== 'object' || Array.isArray(ruleRecord)) {
-    throw new TypeError('Out-of-table rule record must be an object.');
+/**
+ * Shared exact BigInt rational headhaul calculator incorporating freight-forwarder A4 rules:
+ *  - Volumetric weight: carton_cm[0]*carton_cm[1]*carton_cm[2] / volumetric_divisor (default 6000) * carton_count
+ *  - Minimum shipment billable weight: <10 kg billed at 10 kg minimum (enabled in r59 or when A4 fields supplied)
+ *  - <50 kg small-shipment surcharge (`small_shipment_surcharge_cny_per_kg`)
+ *  - <8 kg outer-carton surcharge (`small_carton_surcharge_cny_per_carton` / `small_carton_surcharge_cny_per_kg`)
+ *  - Base rate + product surcharge + per-kg or per-shipment carrier bond
+ */
+export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = false, isR59 = false } = {}) {
+  if (!headhaul || typeof headhaul !== 'object') {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
   }
-  const feeCategory = typeof ruleRecord.fee_category === 'string' && ruleRecord.fee_category.trim()
-    ? ruleRecord.fee_category.trim()
+  const {
+    chargeable_kg_per_unit: kgPerUnit,
+    rate_cny_per_kg: rate,
+    surcharge_cny_per_kg: surcharge = 0,
+    bond_cny_per_kg: bondPerKg,
+    bond_cny_per_shipment: bondPerShipment,
+    carton_cm,
+    carton_count,
+    actual_weight_kg_total,
+    actual_weight_kg_per_unit,
+    weight_per_carton_kg,
+    volumetric_divisor,
+    min_shipment_billable_kg,
+    small_shipment_threshold_kg,
+    small_shipment_surcharge_cny_per_kg,
+    small_carton_threshold_kg,
+    small_carton_surcharge_cny_per_carton,
+    small_carton_surcharge_cny_per_kg,
+  } = headhaul;
+
+  const hasA4Extras = A4_HEADHAUL_EXTRA_KEYS.some(k => headhaul[k] !== undefined && headhaul[k] !== null);
+  const hasPerKgBond = finite(bondPerKg) && bondPerKg >= 0;
+  const hasShipmentBond = finite(bondPerShipment) && bondPerShipment >= 0;
+  const effectiveUnits = finite(orderUnits) && orderUnits > 0
+    ? orderUnits
+    : (finite(headhaul.order_units) && headhaul.order_units > 0 ? headhaul.order_units : null);
+  const needsUnits = !isR58 || hasShipmentBond || hasA4Extras || isR59;
+
+  const normalizedCartonCm = Array.isArray(carton_cm) && carton_cm.length === 3 && carton_cm.every(v => finite(v) && v > 0)
+    ? carton_cm
+    : (carton_cm && typeof carton_cm === 'object' &&
+      finite(carton_cm.length_cm ?? carton_cm.l_cm) && (carton_cm.length_cm ?? carton_cm.l_cm) > 0 &&
+      finite(carton_cm.width_cm ?? carton_cm.w_cm) && (carton_cm.width_cm ?? carton_cm.w_cm) > 0 &&
+      finite(carton_cm.height_cm ?? carton_cm.h_cm) && (carton_cm.height_cm ?? carton_cm.h_cm) > 0
+      ? [carton_cm.length_cm ?? carton_cm.l_cm, carton_cm.width_cm ?? carton_cm.w_cm, carton_cm.height_cm ?? carton_cm.h_cm]
+      : null);
+  const hasValidCartonCm = normalizedCartonCm !== null;
+  const canDeriveWeight = (finite(kgPerUnit) && kgPerUnit > 0) ||
+    (finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0) ||
+    (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) ||
+    hasValidCartonCm;
+
+  if (!canDeriveWeight || ![rate, surcharge].every(v => finite(v) && v >= 0) ||
+    (!hasPerKgBond && !hasShipmentBond) || (hasPerKgBond && hasShipmentBond) ||
+    !finite(fx) || fx <= 0 || (needsUnits && (!finite(effectiveUnits) || effectiveUnits <= 0))) {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
+  }
+
+  const unitsR = effectiveUnits !== null ? toBigRat(effectiveUnits) : { n: 100n, d: 1n };
+  const divisorVal = finite(volumetric_divisor) && volumetric_divisor > 0 ? volumetric_divisor : 6000;
+  const derivedCartonsFromPack = Number.isSafeInteger(headhaul.units_per_carton) && headhaul.units_per_carton > 0 &&
+    finite(effectiveUnits) && effectiveUnits > 0
+    ? Math.ceil(effectiveUnits / headhaul.units_per_carton)
     : null;
-  if (!feeCategory) throw new TypeError('Out-of-table rule requires a nonempty fee_category.');
-  const sourceUrl = typeof ruleRecord.official_source_url === 'string' ? ruleRecord.official_source_url.trim() : '';
-  if (!OFFICIAL_AMAZON_SOURCE_RE.test(sourceUrl)) {
-    throw new TypeError(
-      'Out-of-table rule requires an official Amazon Seller Central / Sell / Developer Docs HTTPS URL (official_source_url).',
+  const cartonCountInt = Number.isSafeInteger(carton_count) && carton_count > 0
+    ? carton_count
+    : derivedCartonsFromPack;
+
+  let actualTotalR = null;
+  if (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) {
+    actualTotalR = toBigRat(actual_weight_kg_total);
+  } else if (finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0) {
+    actualTotalR = mulBigRat(toBigRat(actual_weight_kg_per_unit), unitsR);
+  } else if (finite(kgPerUnit) && kgPerUnit > 0) {
+    actualTotalR = mulBigRat(toBigRat(kgPerUnit), unitsR);
+  }
+
+  let volTotalR = null;
+  if (hasValidCartonCm) {
+    if (cartonCountInt === null && headhaul.single_carton_verified !== true && !(effectiveUnits === 1)) {
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        missing_surcharge_quote: true,
+        a4_applied: {
+          volumetric_dimensions_present: true,
+          missing_surcharge_quote: 'carton_count_required_for_volumetric_weight',
+        },
+      };
+    }
+    const volOneR = divBigRat(
+      mulBigRat(mulBigRat(toBigRat(normalizedCartonCm[0]), toBigRat(normalizedCartonCm[1])), toBigRat(normalizedCartonCm[2])),
+      toBigRat(divisorVal),
     );
-  }
-  if (!isoDate(ruleRecord.effective_from)) {
-    throw new TypeError('Out-of-table rule requires a valid effective_from date (YYYY-MM-DD).');
-  }
-  if (ruleRecord.effective_through !== undefined && ruleRecord.effective_through !== null && !isoDate(ruleRecord.effective_through)) {
-    throw new TypeError('effective_through must be a valid YYYY-MM-DD date or null.');
-  }
-  if (isoDate(ruleRecord.effective_through) && ruleRecord.effective_through < ruleRecord.effective_from) {
-    throw new TypeError('effective_through cannot precede effective_from.');
-  }
-  const spApiVerified = ruleRecord.sp_api_verified === true;
-  const spApiPendingReason = typeof ruleRecord.sp_api_pending_reason === 'string' ? ruleRecord.sp_api_pending_reason.trim() : '';
-  if (!spApiVerified && !spApiPendingReason) {
-    throw new TypeError('Out-of-table rule requires sp_api_verified: true (with comparable_asin) or explicit sp_api_pending_reason.');
+    volTotalR = mulBigRat(volOneR, toBigRat(cartonCountInt ?? 1));
   }
 
-  let normalizedReferral = null;
-  if (ruleRecord.referral_schedule && typeof ruleRecord.referral_schedule === 'object') {
-    const sched = ruleRecord.referral_schedule;
-    const minRefUsd = finite(sched.minimum_fee_usd) && sched.minimum_fee_usd >= 0 ? sched.minimum_fee_usd : 0.30;
-    if (sched.type === 'flat') {
-      if (!finite(sched.rate) || sched.rate <= 0 || sched.rate >= 1) {
-        throw new TypeError('Flat referral_schedule requires 0 < rate < 1.');
-      }
-      normalizedReferral = { type: 'flat', rate: sched.rate, minimum_fee_usd: minRefUsd };
-    } else if (sched.type === 'tiered') {
-      if (!Array.isArray(sched.tiers) || sched.tiers.length < 2) {
-        throw new TypeError('Tiered referral_schedule requires at least 2 tiers.');
-      }
-      let prevCap = 0;
-      const tiers = sched.tiers.map((t, idx) => {
-        if (!finite(t?.rate) || t.rate <= 0 || t.rate >= 1) {
-          throw new TypeError(`Tier #${idx + 1} requires 0 < rate < 1.`);
-        }
-        const isLast = idx === sched.tiers.length - 1;
-        if (!isLast) {
-          if (!finite(t.up_to_usd) || t.up_to_usd <= prevCap) {
-            throw new TypeError(`Tier #${idx + 1} requires strictly increasing up_to_usd > ${prevCap}.`);
-          }
-          prevCap = t.up_to_usd;
-          return { up_to_usd: t.up_to_usd, rate: t.rate };
-        }
-        return { up_to_usd: null, rate: t.rate };
-      });
-      normalizedReferral = { type: 'tiered', tiers, minimum_fee_usd: minRefUsd };
-    } else {
-      throw new TypeError('referral_schedule.type must be "flat" or "tiered".');
-    }
+  let rawTotalKgR = actualTotalR ?? volTotalR;
+  let volumetricExceedsActual = false;
+  if (actualTotalR && volTotalR && ratCmp(volTotalR, actualTotalR) > 0) {
+    rawTotalKgR = volTotalR;
+    volumetricExceedsActual = true;
   }
 
-  const returnThreshold = ruleRecord.return_threshold_fraction !== undefined && ruleRecord.return_threshold_fraction !== null
-    ? Number(ruleRecord.return_threshold_fraction)
-    : null;
-  if (returnThreshold !== null && (!finite(returnThreshold) || returnThreshold < 0 || returnThreshold >= 1)) {
-    throw new TypeError('return_threshold_fraction must satisfy 0 <= value < 1.');
-  }
-  if (!normalizedReferral && returnThreshold === null) {
-    throw new TypeError('Out-of-table rule must supply referral_schedule and/or return_threshold_fraction.');
-  }
+  const applyA4Rules = Boolean(isR59 || hasA4Extras);
+  const minBillVal = finite(min_shipment_billable_kg) && min_shipment_billable_kg >= 0
+    ? min_shipment_billable_kg
+    : (applyA4Rules ? 10 : 0);
+  const minBillR = toBigRat(minBillVal);
+  const below10kgMinBill = minBillVal > 0 && ratCmp(rawTotalKgR, minBillR) < 0;
+  const billedTotalKgR = below10kgMinBill ? minBillR : rawTotalKgR;
 
-  let sampleReferralAtTestPrice = null;
-  if (normalizedReferral && finite(test_price_usd) && test_price_usd > 0) {
-    if (normalizedReferral.type === 'flat') {
-      const feeUsd = Math.max(normalizedReferral.minimum_fee_usd, Math.round(test_price_usd * normalizedReferral.rate * 100) / 100);
-      sampleReferralAtTestPrice = {
-        price_usd: test_price_usd,
-        referral_fee_usd: feeUsd,
-        effective_rate: Math.round((feeUsd / test_price_usd) * 1e6) / 1e6,
-      };
-    } else {
-      let remaining = test_price_usd;
-      let prev = 0;
-      let rawFee = 0;
-      for (const tier of normalizedReferral.tiers) {
-        if (remaining <= 0) break;
-        const slice = tier.up_to_usd === null ? remaining : Math.max(0, Math.min(test_price_usd, tier.up_to_usd) - prev);
-        rawFee += slice * tier.rate;
-        if (tier.up_to_usd !== null) prev = tier.up_to_usd;
-        remaining = Math.max(0, test_price_usd - prev);
-      }
-      const feeUsd = Math.max(normalizedReferral.minimum_fee_usd, Math.round(rawFee * 100) / 100);
-      sampleReferralAtTestPrice = {
-        price_usd: test_price_usd,
-        referral_fee_usd: feeUsd,
-        effective_rate: Math.round((feeUsd / test_price_usd) * 1e6) / 1e6,
-      };
-    }
+  const smallShipThreshR = toBigRat(finite(small_shipment_threshold_kg) && small_shipment_threshold_kg > 0 ? small_shipment_threshold_kg : 50);
+  const below50kg = applyA4Rules && ratCmp(rawTotalKgR, smallShipThreshR) < 0;
+  const hasExplicitA4ShipmentInputs = Boolean(
+    isR59 ||
+    actual_weight_kg_total !== undefined ||
+    actual_weight_kg_per_unit !== undefined ||
+    weight_per_carton_kg !== undefined ||
+    carton_count !== undefined ||
+    hasValidCartonCm ||
+    small_shipment_threshold_kg !== undefined ||
+    small_carton_threshold_kg !== undefined,
+  );
+  if (
+    below50kg &&
+    hasExplicitA4ShipmentInputs &&
+    headhaul.small_shipment_surcharge_exempt !== true &&
+    !(finite(small_shipment_surcharge_cny_per_kg) && small_shipment_surcharge_cny_per_kg >= 0)
+  ) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      missing_surcharge_quote: true,
+      a4_applied: {
+        below_50kg_small_shipment: true,
+        missing_surcharge_quote: 'small_shipment_surcharge_cny_per_kg',
+      },
+    };
   }
+  const smallShipRateR = below50kg && finite(small_shipment_surcharge_cny_per_kg) && small_shipment_surcharge_cny_per_kg > 0
+    ? toBigRat(small_shipment_surcharge_cny_per_kg)
+    : { n: 0n, d: 1n };
 
-  const normalized = {
-    fee_category: feeCategory,
-    canonical_key: feeCategory.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, ''),
-    official_source_url: sourceUrl,
-    official_help_page_id: typeof ruleRecord.official_help_page_id === 'string' ? ruleRecord.official_help_page_id.trim() : null,
-    effective_from: ruleRecord.effective_from,
-    effective_through: ruleRecord.effective_through ?? null,
-    sp_api_verified: spApiVerified,
-    comparable_asin: typeof ruleRecord.comparable_asin === 'string' ? ruleRecord.comparable_asin.trim().toUpperCase() : null,
-    ...(spApiPendingReason ? { sp_api_pending_reason: spApiPendingReason } : {}),
-    ...(normalizedReferral ? { referral_schedule: normalizedReferral } : {}),
-    ...(returnThreshold !== null ? { return_threshold_fraction: returnThreshold } : {}),
-    verified_at: typeof ruleRecord.verified_at === 'string' && isoDate(ruleRecord.verified_at)
-      ? ruleRecord.verified_at
-      : '2026-11-25',
+  let perCartonKgR = null;
+  if (finite(weight_per_carton_kg) && weight_per_carton_kg > 0) {
+    perCartonKgR = toBigRat(weight_per_carton_kg);
+  } else if (actualTotalR && cartonCountInt !== null) {
+    perCartonKgR = divBigRat(actualTotalR, toBigRat(cartonCountInt));
+  }
+  const smallCartonThreshR = toBigRat(finite(small_carton_threshold_kg) && small_carton_threshold_kg > 0 ? small_carton_threshold_kg : 8);
+  const below8kgCarton = applyA4Rules && perCartonKgR !== null && ratCmp(perCartonKgR, smallCartonThreshR) < 0;
+  const hasExplicitSmallCartonRate =
+    (finite(small_carton_surcharge_cny_per_carton) && small_carton_surcharge_cny_per_carton >= 0) ||
+    (finite(small_carton_surcharge_cny_per_kg) && small_carton_surcharge_cny_per_kg >= 0);
+  if (below8kgCarton && headhaul.small_carton_surcharge_exempt !== true && !hasExplicitSmallCartonRate) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      missing_surcharge_quote: true,
+      a4_applied: {
+        below_8kg_carton: true,
+        missing_surcharge_quote: 'small_carton_surcharge_cny_per_carton_or_per_kg',
+      },
+    };
+  }
+  if (
+    below8kgCarton &&
+    headhaul.small_carton_surcharge_exempt !== true &&
+    finite(small_carton_surcharge_cny_per_carton) &&
+    small_carton_surcharge_cny_per_carton > 0 &&
+    cartonCountInt === null
+  ) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      missing_surcharge_quote: true,
+      a4_applied: {
+        below_8kg_carton: true,
+        missing_surcharge_quote: 'carton_count_required_for_per_carton_surcharge',
+      },
+    };
+  }
+  const smallCartonPerCartonCnyR = below8kgCarton && cartonCountInt !== null &&
+    finite(small_carton_surcharge_cny_per_carton) && small_carton_surcharge_cny_per_carton > 0
+    ? mulBigRat(toBigRat(cartonCountInt), toBigRat(small_carton_surcharge_cny_per_carton))
+    : { n: 0n, d: 1n };
+  const smallCartonPerKgRateR = below8kgCarton && finite(small_carton_surcharge_cny_per_kg) && small_carton_surcharge_cny_per_kg > 0
+    ? toBigRat(small_carton_surcharge_cny_per_kg)
+    : { n: 0n, d: 1n };
+
+  const combinedPerKgRateR = addBigRat(
+    addBigRat(toBigRat(rate), toBigRat(surcharge)),
+    addBigRat(smallShipRateR, smallCartonPerKgRateR),
+  );
+  const totalBaseAndSurchargeCnyR = addBigRat(
+    mulBigRat(billedTotalKgR, combinedPerKgRateR),
+    smallCartonPerCartonCnyR,
+  );
+  const totalBondCnyR = hasPerKgBond
+    ? mulBigRat(billedTotalKgR, toBigRat(bondPerKg))
+    : toBigRat(bondPerShipment);
+  const totalShipmentCnyR = addBigRat(totalBaseAndSurchargeCnyR, totalBondCnyR);
+  const cnyPerUnitR = divBigRat(totalShipmentCnyR, unitsR);
+  if (cnyPerUnitR.n <= 0n) {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
+  }
+  const usdPerUnitR = divBigRat(cnyPerUnitR, toBigRat(fx));
+  const effKgPerUnit = roundBigRat(divBigRat(billedTotalKgR, unitsR).n, divBigRat(billedTotalKgR, unitsR).d, 10);
+
+  const cnyDerivation = {
+    fx,
+    chargeable_kg_per_unit: finite(kgPerUnit) && kgPerUnit > 0 ? kgPerUnit : effKgPerUnit,
+    rate_cny_per_kg: rate,
+    surcharge_cny_per_kg: surcharge,
+    ...(effectiveUnits !== null ? { order_units: effectiveUnits } : {}),
+    ...(hasPerKgBond ? { bond_cny_per_kg: bondPerKg } : { bond_cny_per_shipment: bondPerShipment, order_units: effectiveUnits }),
+    ...((applyA4Rules && (below10kgMinBill || below50kg || below8kgCarton || volumetricExceedsActual || hasA4Extras)) ? {
+      order_units: effectiveUnits,
+      ...(hasValidCartonCm ? { carton_cm } : {}),
+      ...(cartonCountInt !== null ? { carton_count: cartonCountInt } : {}),
+      ...(finite(actual_weight_kg_total) ? { actual_weight_kg_total } : {}),
+      ...(finite(actual_weight_kg_per_unit) ? { actual_weight_kg_per_unit } : {}),
+      ...(finite(weight_per_carton_kg) ? { weight_per_carton_kg } : {}),
+      ...(finite(volumetric_divisor) ? { volumetric_divisor } : {}),
+      ...(minBillVal > 0 ? { min_shipment_billable_kg: minBillVal } : {}),
+      ...(finite(small_shipment_threshold_kg) ? { small_shipment_threshold_kg } : {}),
+      ...(finite(small_shipment_surcharge_cny_per_kg) ? { small_shipment_surcharge_cny_per_kg } : {}),
+      ...(finite(small_carton_threshold_kg) ? { small_carton_threshold_kg } : {}),
+      ...(finite(small_carton_surcharge_cny_per_carton) ? { small_carton_surcharge_cny_per_carton } : {}),
+      ...(finite(small_carton_surcharge_cny_per_kg) ? { small_carton_surcharge_cny_per_kg } : {}),
+    } : {}),
   };
 
   return {
-    rule: normalized,
-    ...(sampleReferralAtTestPrice ? { sample_referral_calculation: sampleReferralAtTestPrice } : {}),
-    code_snippet: `// Verified ${normalized.verified_at} from ${normalized.official_source_url}\n${JSON.stringify({ [normalized.canonical_key]: normalized }, null, 2)}`,
+    amount_usd: roundBigRat(usdPerUnitR.n, usdPerUnitR.d, 10),
+    exact_usd_rational: usdPerUnitR,
+    cny_derivation: isR58 ? cnyDerivation : null,
+    a4_applied: {
+      below_10kg_min_bill: below10kgMinBill,
+      below_50kg_small_shipment: below50kg,
+      below_8kg_outer_carton: below8kgCarton,
+      volumetric_exceeds_actual: volumetricExceedsActual,
+      billed_total_kg: roundBigRat(billedTotalKgR.n, billedTotalKgR.d, 6),
+      effective_billed_kg_per_unit: effKgPerUnit,
+    },
   };
 }
 
-export function registerSupplementalOutOfTableRule2027(ruleRecord, options = {}) {
-  const validated = validateAndComputeOutOfTableRule2027(ruleRecord, options);
-  SUPPLEMENTAL_OUT_OF_TABLE_RULES_2027.set(validated.rule.canonical_key, validated.rule);
-  return validated;
-}
-
-export function listSupplementalOutOfTableRules2027() {
-  return [...SUPPLEMENTAL_OUT_OF_TABLE_RULES_2027.values()];
-}
 
 function computeOversizeOrSpecialHandlingFloor2027(pkgObj, band = '10_to_50') {
   const dims = parsePackage(pkgObj);
@@ -706,97 +1401,6 @@ function computeOversizeOrSpecialHandlingFloor2027(pkgObj, band = '10_to_50') {
   return null;
 }
 
-const FBA_2027_METADATA_R58_FROZEN = Object.freeze({
-  version: 'US-FBA-2027-nonpeak-standard-v1',
-  marketplace: 'US',
-  currency: 'USD',
-  fuel_surcharge_fraction: 0.035,
-  non_peak_fulfillment_window: Object.freeze({ from: '2027-01-15', through: '2027-10-14' }),
-  unified_storage_effective_from: '2027-02-01',
-  placement_effective_from: '2027-01-15',
-  returns_non_apparel_effective_from: '2027-02-01',
-  official_sources: Object.freeze({
-    announcement: 'https://sellingpartners.aboutamazon.com/update-to-us-referral-and-fulfillment-by-amazon-fees-for-2027',
-    fulfillment: 'https://sellercentral.amazon.com/help/hub/reference/external/GABBX6GZPA8MSZGW',
-    size_tiers: 'https://sellercentral.amazon.com/gp/help/external/GG5KW835AHDJCH8W',
-    storage: 'https://sellercentral.amazon.com/help/hub/reference/external/GVZX6EAEL2KZ3SGA',
-    placement: 'https://sellercentral.amazon.com/help/hub/reference/external/GC3Q44PBK8BXQW3Z',
-    returns: 'https://sellercentral.amazon.com/help/hub/reference/external/GZGEQLTM3RZXUV6T',
-  }),
-});
-
-const VERIFIED_2027_RETURN_THRESHOLDS_R57_NOV19 = Object.freeze({
-  'Business, Industrial, and Scientific Supplies': 0.06,
-  'Base Equipment Power Tools': 0.071,
-  'Tools and Home Improvement': 0.087,
-  'Everything Else': 0.048,
-});
-
-export function getHistoricalFba2027RateTableSnapshots() {
-  const r57Nov19 = {
-    metadata: FBA_2027_METADATA_R58_FROZEN,
-    small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
-    large_standard_2027_lb: LARGE_STANDARD_2027_LB,
-    large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
-    placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
-    placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
-    storage_usd_per_cuft_month: STORAGE_2027_RATES,
-    verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS_R57_NOV19,
-  };
-  const r58Frozen = {
-    metadata: FBA_2027_METADATA_R58_FROZEN,
-    small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
-    large_standard_2027_lb: LARGE_STANDARD_2027_LB,
-    large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
-    bulky_2027_tiers: BULKY_2027_TIERS,
-    placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
-    placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
-    storage_usd_per_cuft_month: STORAGE_2027_RATES,
-    bulky_storage_usd_per_cuft_month: BULKY_STORAGE_2027_RATES,
-    verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS,
-  };
-  return [r57Nov19, r58Frozen];
-}
-
-/**
- * Return the live 2027 US FBA rate tables & metadata for immutable evaluation fingerprinting.
- * Shares exact live rate objects with lookup functions so any rate-cell change alters evidence_bundle_sha256.
- * When `profileRevision <= 57` is requested, returns the Nov-19 r57 snapshot; when `profileRevision === 58`, returns the frozen r58 snapshot.
- */
-export function getFba2027RateTableSnapshot({ profileRevision = 59 } = {}) {
-  if (Number.isFinite(profileRevision) && profileRevision <= 57) {
-    return getHistoricalFba2027RateTableSnapshots()[0];
-  }
-  if (Number.isFinite(profileRevision) && profileRevision <= 58) {
-    return getHistoricalFba2027RateTableSnapshots()[1];
-  }
-  return {
-    metadata: FBA_2027_METADATA,
-    small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
-    large_standard_2027_lb: LARGE_STANDARD_2027_LB,
-    large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
-    bulky_2027_tiers: BULKY_2027_TIERS,
-    oversize_2027_tiers: OVERSIZE_2027_TIERS,
-    oversize_handling_2027_fees: OVERSIZE_HANDLING_2027_FEES,
-    oversize_returns_2027_tiers: OVERSIZE_RETURNS_2027_TIERS,
-    small_standard_apparel_2027_oz: SMALL_STANDARD_APPAREL_2027_OZ,
-    large_standard_apparel_2027_lb: LARGE_STANDARD_APPAREL_2027_LB,
-    large_standard_apparel_over_3lb: LARGE_STANDARD_APPAREL_OVER_3LB,
-    apparel_shoes_standard_returns_2027: APPAREL_SHOES_STANDARD_RETURNS_2027,
-    small_standard_dg_2027_oz: SMALL_STANDARD_DG_2027_OZ,
-    large_standard_dg_2027_lb: LARGE_STANDARD_DG_2027_LB,
-    large_standard_dg_over_3lb: LARGE_STANDARD_DG_OVER_3LB,
-    bulky_dg_2027_tiers: BULKY_DG_2027_TIERS,
-    oversize_dg_2027_tiers: OVERSIZE_DG_2027_TIERS,
-    placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
-    placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
-    storage_usd_per_cuft_month: STORAGE_2027_RATES,
-    bulky_storage_usd_per_cuft_month: BULKY_STORAGE_2027_RATES,
-    dg_storage_usd_per_cuft_month: DG_STORAGE_2027_RATES,
-    low_price_ineligible_2027_categories: LOW_PRICE_INELIGIBLE_2027_CATEGORIES,
-    verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS,
-  };
-}
 
 function parsePackage(pkg) {
   const dims = resolvePackageDimsRat(pkg);
@@ -2444,6 +3048,9 @@ function validateCalculatorVerifiedOverride(override, {
   is_apparel,
   is_dangerous_goods,
   is_sipp,
+  profile_revision = 59,
+  identical_cartons_count = null,
+  multi_destination_headhaul_verified = false,
 }) {
   if (!override || typeof override !== 'object' || Array.isArray(override)) {
     return { valid: false, reason: 'calculator_verified_override must be an object.' };
@@ -2716,6 +3323,17 @@ function validateCalculatorVerifiedOverride(override, {
     }
   }
   const sizeTier = nonEmpty(active.size_tier) ? active.size_tier.trim() : 'calculator_verified';
+  const classifiedForPlacement = (active.pkg ?? pkg) ? classifySizeTier2027(active.pkg ?? pkg) : null;
+  const isOversizeTier = classifiedForPlacement?.tier_family === 'oversize' || /oversize/i.test(sizeTier);
+  const unverifiedZeroPlacementOverride = Boolean(
+    !isOversizeTier &&
+    (profile_revision ?? 59) >= 59 &&
+    round(active.placement_usd) === 0 &&
+    !isAmazonOptimizedPlacementVerified2027({
+      identical_cartons_count: active.identical_cartons_count ?? identical_cartons_count,
+      multi_destination_headhaul_verified: active.multi_destination_headhaul_verified ?? multi_destination_headhaul_verified,
+    }),
+  );
   return {
     valid: true,
     receipt: {
@@ -2742,13 +3360,21 @@ function validateCalculatorVerifiedOverride(override, {
       per_unit_usd: round(active.storage_per_unit_usd),
       source: 'calculator_verified_override',
     },
-    placement: {
-      status: 'verified',
-      version: `calculator-override:${active.observed_at}`,
-      selected_usd: round(active.placement_usd),
-      range_usd: [round(active.placement_usd), round(active.placement_usd)],
-      split_option: 'calculator_verified_override',
-    },
+    placement: unverifiedZeroPlacementOverride
+      ? {
+        status: 'sensitivity_only',
+        selected_usd: 0,
+        range_usd: [0, 0],
+        split_option: 'amazon_optimized',
+        reason: 'Standard/Bulky $0 inbound placement in calculator_verified_override requires >= 5 identical cartons and verified multi-destination headhaul (sensitivity_only).',
+      }
+      : {
+        status: 'verified',
+        version: `calculator-override:${active.observed_at}`,
+        selected_usd: round(active.placement_usd),
+        range_usd: [round(active.placement_usd), round(active.placement_usd)],
+        split_option: 'calculator_verified_override',
+      },
     returns: {
       status: 'verified',
       version: `calculator-override:${active.observed_at}`,
@@ -2790,7 +3416,9 @@ function estimateGate1AWithLandedCost({
   fee_category = null,
   return_threshold = null,
   referral_terms,
+  headhaul = null,
   headhaul_usd,
+  order_units = 100,
   collection_rate,
   other_applicable_usd = 0,
   other_payee = 'external',
@@ -2854,10 +3482,44 @@ function estimateGate1AWithLandedCost({
   if (!pricing.valid) {
     return { status: 'needs_calculator_verification', reason: pricing.reason };
   }
+  let resolvedHeadhaulUsd = finite(headhaul_usd) ? headhaul_usd : null;
+  let resolvedHeadhaulExactRat = null;
+  let resolvedHeadhaulA4 = null;
+  if (resolvedHeadhaulUsd === null && headhaul !== null && headhaul !== undefined) {
+    if (finite(headhaul) && headhaul >= 0) {
+      resolvedHeadhaulUsd = headhaul;
+    } else if (typeof headhaul === 'object') {
+      if (finite(headhaul.amount_usd) && headhaul.amount_usd >= 0) {
+        resolvedHeadhaulUsd = headhaul.amount_usd;
+      } else if (finite(headhaul.usd_per_unit) && headhaul.usd_per_unit >= 0 && (headhaul.bond_included === true || finite(headhaul.bond_usd_per_unit))) {
+        resolvedHeadhaulUsd = headhaul.usd_per_unit + (headhaul.bond_included === true ? 0 : headhaul.bond_usd_per_unit);
+      } else if (finite(fx_cny_per_usd) && fx_cny_per_usd > 0) {
+        const effOrderUnits = finite(order_units) && order_units > 0
+          ? order_units
+          : (finite(headhaul.order_units) && headhaul.order_units > 0 ? headhaul.order_units : 100);
+        const a4Res = computeHeadhaulWithA4Rules(headhaul, fx_cny_per_usd, effOrderUnits, {
+          isR58: (profile_revision ?? 59) >= 58,
+          isR59: (profile_revision ?? 59) >= 59,
+        });
+        if (a4Res.missing_surcharge_quote) {
+          return {
+            status: 'needs_calculator_verification',
+            reason: `Headhaul Freight A4 requires ${a4Res.a4_applied?.missing_surcharge_quote ?? 'surcharge quote'}.`,
+            a4_applied: a4Res.a4_applied,
+          };
+        }
+        if (finite(a4Res.amount_usd)) {
+          resolvedHeadhaulUsd = a4Res.amount_usd;
+          resolvedHeadhaulExactRat = a4Res.exact_usd_rational ?? null;
+          resolvedHeadhaulA4 = a4Res.a4_applied ?? null;
+        }
+      }
+    }
+  }
   const effectivePriceUsd = pricing.net_effective_price_usd;
   if (!finite(effectivePriceUsd) || effectivePriceUsd <= 0 || !finite(fx_cny_per_usd) || fx_cny_per_usd <= 0 ||
     !finite(refund_fraction) || refund_fraction < 0 || refund_fraction >= 1 ||
-    !finite(headhaul_usd) || headhaul_usd < 0 ||
+    !finite(resolvedHeadhaulUsd) || resolvedHeadhaulUsd < 0 ||
     !finite(collection_rate) || collection_rate < 0 || collection_rate >= 1 ||
     !finite(other_applicable_usd) || other_applicable_usd < 0 ||
     !finite(margin_floor) || margin_floor < 0.3 || margin_floor >= 1) {
@@ -2904,6 +3566,9 @@ function estimateGate1AWithLandedCost({
       is_apparel: is_apparel ?? is_apparel_or_shoes,
       is_dangerous_goods,
       is_sipp,
+      profile_revision,
+      identical_cartons_count,
+      multi_destination_headhaul_verified,
     });
     if (!ov.valid) {
       return { status: 'needs_calculator_verification', reason: ov.reason };
@@ -2912,6 +3577,7 @@ function estimateGate1AWithLandedCost({
     fulfillment = ov.fulfillment;
     storage = ov.storage;
     placement = ov.placement;
+    if (placement.status !== 'verified') return placement;
     returns = ov.returns;
   } else {
     const effReqPkg = requires_amazon_packaging !== undefined ? requires_amazon_packaging : pkg?.requires_amazon_packaging;
@@ -3050,7 +3716,7 @@ function estimateGate1AWithLandedCost({
 
   // A = all non-landed-domestic USD costs (independent of 1688 goods & domestic freight).
   const nonDomesticCostA = round(
-    headhaul_usd +
+    resolvedHeadhaulUsd +
     referral.net_usd +
     fulfillment.total_usd +
     placement.selected_usd +
@@ -3076,7 +3742,6 @@ function estimateGate1AWithLandedCost({
     return { n: n / g, d: d / g };
   };
   const exactCostComponents = [
-    headhaul_usd,
     referral.net_usd,
     fulfillment.total_usd,
     placement.selected_usd,
@@ -3086,7 +3751,10 @@ function estimateGate1AWithLandedCost({
     payout.collection_usd,
     other_applicable_usd,
   ];
-  const aR = exactCostComponents.reduce((acc, v) => ratAdd(acc, toRat(v)), { n: 0n, d: 1n });
+  const aR = exactCostComponents.reduce(
+    (acc, v) => ratAdd(acc, toRat(v)),
+    resolvedHeadhaulExactRat ?? toRat(resolvedHeadhaulUsd),
+  );
   const pR = toRat(effectivePriceUsd), refR = toRat(refund_fraction), flR = toRat(margin_floor);
   const netRevRat = { n: pR.n * (refR.d - refR.n), d: pR.d * refR.d };
   const allowCostRat = { n: netRevRat.n * (flR.d - flR.n), d: netRevRat.d * flR.d };
@@ -3137,7 +3805,11 @@ function estimateGate1AWithLandedCost({
         },
       } : {}),
       collection: payout,
-      headhaul_usd: round(headhaul_usd),
+      headhaul: {
+        amount_usd: round(resolvedHeadhaulUsd),
+        ...(resolvedHeadhaulA4 ? { a4_applied: resolvedHeadhaulA4 } : {}),
+      },
+      headhaul_usd: round(resolvedHeadhaulUsd),
       other_applicable_usd: round(other_applicable_usd),
     },
   };
@@ -3680,7 +4352,7 @@ export function computeOrderPlan({
     return Number(bigVal);
   };
 
-  const effProfileRev = profile_revision ?? profileRevision ?? 58;
+  const effProfileRev = profile_revision ?? profileRevision ?? 59;
   const isR59AdvisoryLcm = effProfileRev >= 59 && !hasExplicitLcmCap;
   const highLcmAdvisory = K > BigInt(effectiveLcmCap);
   const useRemainderPath = Boolean(allow_remainder) || (!isR59AdvisoryLcm && highLcmAdvisory);
@@ -3751,7 +4423,7 @@ export function computeOrderPlan({
     all_promo_clear: linesWithRemainders.every(l => l.regular_goods_promo_false),
     total_goods_cny: totalGoodsCny,
     per_allocated_set_goods_cny: perAllocatedRat ? roundBigRat(perAllocatedRat.n, perAllocatedRat.d, 10) : null,
-    per_complete_set_goods_cny: perCompleteRat ? roundBigRat(perAllocatedRat.n, perCompleteRat.d, 10) : null,
+    per_complete_set_goods_cny: perCompleteRat ? roundBigRat(perCompleteRat.n, perCompleteRat.d, 10) : null,
     moq_capital_alert: allocatedSets >= 300 || actualCompleteSets >= 300,
     ...(isR59AdvisoryLcm && highLcmAdvisory ? {
       high_lcm_advisory: true,
@@ -4275,3 +4947,4 @@ export function computePackagingRedesignShortlist2027({
   );
   return validCandidates[0].payload;
 }
+

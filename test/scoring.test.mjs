@@ -3,15 +3,13 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { scoreBatch, scoreCandidate, scoreNumericValue } from '../src/scoring.mjs';
 
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
-// Preserve the already accepted revision-50 behavior while the current profile evolves.
-profile.revision = 50;
-profile.workflow.scoring_and_ordering.revision = 50;
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const evidence = [{ id: 'synthetic-source', source: 'Synthetic test evidence', observed_at: '2026-11-13' }];
 const observation = (value, unit, extra = {}) => ({ value, unit, evidence: ['synthetic-source'], ...extra });
 const judgment = (anchor, extra = {}) => ({ anchor, reason: 'Synthetic bounded judgment.', evidence: ['synthetic-source'], ...extra });
 const item = (result, id) => result.items.find(entry => entry.id === id);
 const close = (actual, expected) => assert.ok(Math.abs(actual - expected) < 1e-10, `${actual} != ${expected}`);
+
 const market = () => ({
   provider: 'sellersprite', report_id: 'synthetic-market', relevant: true,
   population: 'Synthetic native recent-sales sample', family_basis: 'Synthetic family basis',
@@ -20,6 +18,7 @@ const market = () => ({
   concentrations: { product: observation(0.4, 'fraction'), brand: observation(0.6, 'fraction'), seller: observation(0.8, 'fraction') },
   newcomer: { count_share: observation(0.1, 'fraction'), unit_sales_share: observation(0.15, 'fraction') },
 });
+
 const bids = () => ({
   marketplace: 'US', currency: 'USD', match_type: 'exact', volume_period: '2026-10',
   selection_reason: 'Synthetic supported main buying entries.', evidence: ['synthetic-source'],
@@ -31,21 +30,120 @@ const bids = () => ({
       sellersprite: observation(1, 'USD', { match_type: 'exact', strategy: 'fixed', low: 0.5, high: 1.5 }) },
   ],
 });
+
 const member = (family, ratings, units, share, extra = {}) => ({
   family_id: family, asin: `${family}-listing`, status: 'qualified',
   reason: 'Synthetic comparable normal-start newcomer with a supported relevant top-100 observation.', evidence: ['synthetic-source'],
   ratings: observation(ratings, 'count'), units_30d: observation(units, 'units'),
-  natural: observation(share, 'fraction', { scope: 'overall', period: '2026-10-15/2026-11-13', relevant_entries_evidence: ['synthetic-source'] }),
+  natural: observation(share, 'fraction', {
+    scope: 'overall', period: '2026-10-15/2026-11-13', relevant_entries_evidence: ['synthetic-source'],
+    keyword_counts: {
+      sellersprite: { organic: observation(20, 'count'), ad: observation(10, 'count') },
+      sif: { organic: observation(24, 'count'), ad: observation(12, 'count') },
+    },
+  }),
+  launch_date: '2026-10-01',
+  current_bsr_node: 'synthetic-node',
+  current_bsr_rank: 20,
+  comparability_verdict: 'comparable',
   ...extra,
 });
-const cohort = (members = [member('family-a', 5, 40, 0.35), member('family-b', 20, 100, 0.7), member('family-c', 80, 10, 1)]) => ({
+
+const cohort = (members = [member('family-a', 5, 100, 0.7), member('family-b', 5, 100, 0.7)]) => ({
   observation_basis: 'current_latest_30_days', observation_date: '2026-11-13', period: '2026-10-15/2026-11-13',
   niche: 'Synthetic substitutable niche', grain: 'family', relevant_bsr_node: 'synthetic-node',
+  scope: 'current_relevant_bsr_top100', query_complete: true,
   reference_supported: true, evidence: ['synthetic-source'], members,
+  market_reference: {
+    scope: 'current_relevant_bsr_top100_all_ages',
+    node: 'synthetic-node',
+    period: '2026-10-15/2026-11-13',
+    grain: 'family',
+    deduplicated: true,
+    coverage_supported: true,
+    evidence: ['synthetic-source'],
+    families: [
+      { family_id: 'synthetic-old-a', units_30d: observation(50, 'units'), comparability_verdict: 'comparable' },
+      { family_id: 'synthetic-old-b', units_30d: observation(50, 'units'), comparability_verdict: 'comparable' },
+      { family_id: 'synthetic-old-c', units_30d: observation(50, 'units'), comparability_verdict: 'comparable' },
+    ],
+  },
 });
-const scenario = (id, margin, contribution) => ({ id, saleable_unit: 'one synthetic bundle', coherent: true,
-  assumptions: ['Synthetic supported matched-spec economic scenario.'],
-  margin: observation(margin, 'fraction'), contribution_usd: observation(contribution, 'USD') });
+
+const publishedBasis = () => ({
+  status: 'published',
+  version: 'SYNTHETIC-2027-annual',
+  marketplace: 'US',
+  currency: 'USD',
+  package_ref: 'synthetic-pack',
+  effective_from: '2027-01-01',
+  effective_through: '2027-12-31',
+  evidence: ['synthetic-source'],
+});
+
+function buildCostLedger(id, margin, contribution) {
+  if (typeof margin !== 'number' || typeof contribution !== 'number') return null;
+  if (!((margin > 0 && contribution > 0) || (margin < 0 && contribution < 0))) return null;
+  const rawNetRevenue = contribution / margin;
+  if (!(rawNetRevenue > 0)) return null;
+  const priceUsd = rawNetRevenue >= 80 ? Number(rawNetRevenue.toFixed(12)) : 80;
+  const refundFraction = rawNetRevenue >= 80 ? 0 : Number((1 - rawNetRevenue / priceUsd).toFixed(15));
+  const effectiveNetRevenue = priceUsd * (1 - refundFraction);
+  const referralUsd = 2;
+  const fulfillmentUsd = 2;
+  const placementUsd = 0.5;
+  const storageUsd = 0.5;
+  const headhaulUsd = 1;
+  const refundAdminUsd = refundFraction > 0 ? refundFraction * Math.min(5, referralUsd * 0.2) : 0;
+  const nonGoods = referralUsd * (1 - refundFraction) + refundAdminUsd + fulfillmentUsd + placementUsd + storageUsd + headhaulUsd;
+  const procurementUsd = Number((effectiveNetRevenue - contribution - nonGoods).toFixed(12));
+  if (procurementUsd < 0) return null;
+  return {
+    id,
+    saleable_unit: 'one synthetic bundle',
+    price_usd: priceUsd,
+    refund_fraction: refundFraction,
+    ...(refundFraction > 0 ? { physical_return_fraction: 0.02 } : {}),
+    assumptions: ['Synthetic supported matched-spec economic scenario.'],
+    referral_terms: { referral_fraction: Number((referralUsd / priceUsd).toFixed(12)), refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
+    collection_rate: 0,
+    fee_context: {
+      marketplace: 'US',
+      currency: 'USD',
+      package_ref: 'synthetic-pack',
+      sales: { from: '2027-01-01', through: '2027-12-31' },
+      storage: { from: '2027-01-01', through: '2027-12-31' },
+      inbound: { from: '2027-01-15', through: '2027-01-15' },
+    },
+    lines: [
+      { id: 'procurement', amount_usd: procurementUsd, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], order_units: 100, first_order_promotion: false, components: ['procurement'] },
+      { id: 'domestic_freight', amount_usd: 0, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], order_units: 100, first_order_promotion: false, components: ['domestic_freight'] },
+      { id: 'headhaul', amount_usd: headhaulUsd, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['headhaul', 'carrier_bond'] },
+      { id: 'referral', amount_usd: referralUsd, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['referral'], fee_basis: publishedBasis() },
+      { id: 'fulfillment', amount_usd: fulfillmentUsd, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['fulfillment'], fee_basis: publishedBasis() },
+      { id: 'placement', amount_usd: placementUsd, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['placement'], fee_basis: publishedBasis() },
+      { id: 'storage', amount_usd: storageUsd, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['storage'], fee_basis: publishedBasis() },
+      { id: 'returns_processing', amount_usd: 0, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['returns_processing'], fee_basis: publishedBasis(), return_threshold: 0.05 },
+      { id: 'returns_disposal', amount_usd: 0, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['returns_disposal'] },
+      { id: 'collection', amount_usd: 0, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['collection'] },
+      { id: 'other_applicable', amount_usd: 0, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['other_applicable'], fee_basis: publishedBasis() },
+      { id: 'recovery_credit', amount_usd: 0, status: 'estimated', basis: 'Synthetic', evidence: ['synthetic-source'], components: ['recovery_credit'] },
+    ],
+  };
+}
+
+const scenario = (id, margin, contribution) => {
+  const ledger = buildCostLedger(id, margin, contribution);
+  return {
+    id,
+    saleable_unit: 'one synthetic bundle',
+    coherent: true,
+    assumptions: ['Synthetic supported matched-spec economic scenario.'],
+    margin: observation(margin, 'fraction'),
+    contribution_usd: observation(contribution, 'USD'),
+    ...(ledger ? { cost_ledger: ledger } : {}),
+  };
+};
 
 function completeCandidate(id = 'synthetic-complete') {
   const nativeMarket = market();
@@ -58,9 +156,17 @@ function completeCandidate(id = 'synthetic-complete') {
   }
   return {
     id, form: 'Synthetic concrete two-piece bundle', evidence: structuredClone(evidence),
-    screening: { reference_price_usd: observation(40, 'USD', { matched_spec: true }), strong_date_dependency: observation(false, 'boolean') },
+    screening: {
+      reference_price_usd: observation(80, 'USD', {
+        matched_spec: true,
+        target_variant_asin: 'SYNTHETIC-VAR',
+        fulfillment_channel: 'FBA',
+        sales_history_supported: true,
+      }),
+      strong_date_dependency: observation(false, 'boolean'),
+    },
     metrics: {
-      purchase_demand_scale: observation(5000, 'units', { niche: 'Synthetic niche', period: '2026-10-15/2026-11-13', grain: 'family', coverage_supported: true, deduplicated: true, window_days: 30, window_basis: 'latest_30_days' }),
+      purchase_demand_scale: observation(5000, 'units', { niche: 'Synthetic niche', period: '2026-10-15/2026-11-13', grain: 'parent_units', coverage_supported: true, deduplicated: true, window_days: 30, window_basis: 'latest_30_days' }),
       low_return_preference: observation(0.02, 'fraction', { category: 'Synthetic node', period: '2026-10', applicable: true }),
     },
     judgments: {
@@ -99,7 +205,7 @@ test('a candidate with unknown evidence retains all 21 gaps without creating a t
   assert.deepEqual(result.supported_range, [0, 0]);
   assert.equal(result.covered_weight, 0);
   assert.equal(result.unscored_weight, 100);
-  assert.deepEqual(result.conditional_total_range, [0, 100]);
+  assert.equal(result.conditional_total_range, null);
   assert.equal(result.queue, 'pending');
 });
 
@@ -129,7 +235,7 @@ test('supported demand, return proxy and rubric anchors retain their original po
   const candidate = {
     id: 'synthetic-partial', form: 'Synthetic saleable form', evidence,
     metrics: {
-      purchase_demand_scale: observation(1250, 'units', { niche: 'Synthetic substitutable niche', period: '2026-10-15/2026-11-13', grain: 'family', coverage_supported: true, deduplicated: true, window_days: 30, window_basis: 'latest_30_days' }),
+      purchase_demand_scale: observation(1250, 'units', { niche: 'Synthetic substitutable niche', period: '2026-10-15/2026-11-13', grain: 'parent_units', coverage_supported: true, deduplicated: true, window_days: 30, window_basis: 'latest_30_days' }),
       low_return_preference: observation(0.075, 'fraction', { category: 'Synthetic node', period: '2026-10', applicable: true }),
     },
     judgments: {
@@ -224,7 +330,6 @@ test('exact bids average usable source points before monthly-entry weighting and
 test('missing selected-entry inputs and duplicate queries do not disappear through bid reweighting', () => {
   const base = { id: 'synthetic-bid-gap', form: 'Synthetic form', evidence, bids: bids() };
   for (const change of [
-    value => { value.bids.entries[1].volume.value = null; },
     value => { value.bids.entries[1].sellersprite.value = null; },
     value => { value.bids.entries[1].query = '  SYNTHETIC   FORM '; },
     value => { value.bids.entries.forEach(entry => { entry.volume.value = 0; }); },
@@ -240,59 +345,12 @@ test('missing selected-entry inputs and duplicate queries do not disappear throu
   assert.equal(limited.entries[0].source_label, 'sif_only');
 });
 
-test('newcomer medians retain weak outcomes and the selected low-rating pair supplies natural visibility', () => {
-  const result = scoreCandidate({ id: 'synthetic-cohort', form: 'Synthetic form', evidence, newcomer_cohort: cohort() }, profile);
-  close(item(result, 'low_rating_sales_performance').score, 3.75);
-  close(item(result, 'natural_visibility_development').score, 0.75);
-  assert.equal(result.diagnostics.newcomers.references.rating_median, 20);
-  assert.equal(result.diagnostics.newcomers.references.sales_median, 40);
-  assert.deepEqual(result.diagnostics.newcomers.selected_pair.map(entry => entry.family_id), ['family-a', 'family-b']);
-  const weak = result.diagnostics.newcomers.examples.find(entry => entry.family_id === 'family-c');
-  close(weak.actual_score, 0.75);
-  close(weak.relative_score, 0.25);
-  close(weak.sales_ceiling, 1.5);
-  close(weak.score, 1);
-});
-
-test('ties use frozen identities and a missing natural share does not select a different example', () => {
-  const members = [member('family-z', 5, 100, 1), member('family-b', 5, 100, 0.35), member('family-a', 5, 100, null)];
-  members[2].natural.reason = 'Synthetic missing source share.';
-  const candidate = { id: 'synthetic-fixed-pair', form: 'Synthetic form', evidence, newcomer_cohort: cohort(members) };
-  const result = scoreCandidate(candidate, profile);
-  assert.deepEqual(result.diagnostics.newcomers.selected_pair.map(entry => entry.family_id), ['family-a', 'family-b']);
-  assert.equal(item(result, 'low_rating_sales_performance').score, 4);
-  const natural = item(result, 'natural_visibility_development');
-  assert.equal(natural.score, null);
-  assert.deepEqual(natural.conditional_range, [0.25, 0.75]);
-  assert.deepEqual(result.supported_range, [4, 4]);
-  assert.equal(result.covered_weight, 4);
-  assert.deepEqual(result.conditional_total_range, [4.25, 99.75]);
-});
-
-test('supported zero sales can enter the pair while zero references and single cases remain incomplete', () => {
-  const weakPair = scoreCandidate({ id: 'synthetic-weak-pair', form: 'Synthetic form', evidence,
-    newcomer_cohort: cohort([member('family-a', 5, 0, 0.35), member('family-b', 20, 100, 0.7)]) }, profile);
-  close(item(weakPair, 'low_rating_sales_performance').score, 1.5625);
-  assert.equal(item(weakPair, 'natural_visibility_development').score, 0.75);
-  for (const members of [
-    [member('family-a', 0, 10, 0.7), member('family-b', 0, 20, 0.7)],
-    [member('family-a', 5, 0, 0.7), member('family-b', 20, 0, 0.7)],
-    [member('family-a', 5, 100, 0.7)],
-  ]) {
-    const result = scoreCandidate({ id: 'synthetic-incomplete-cohort', form: 'Synthetic form', evidence, newcomer_cohort: cohort(members) }, profile);
-    assert.equal(item(result, 'low_rating_sales_performance').score, null);
-    assert.equal(item(result, 'natural_visibility_development').score, null);
-    assert.ok(result.diagnostics.newcomers.examples.length > 0);
-  }
-});
-
 test('old-review exclusions and family deduplication affect the cohort without rewriting native shares', () => {
   const original = member('family-a', 5, 100, 0.7);
   const candidate = { id: 'synthetic-cohort-exclusions', form: 'Synthetic form', evidence, market: market(),
-    newcomer_cohort: cohort([original, { ...structuredClone(original), asin: 'alternate-child' }, member('family-b', 5, 100, 0.7, { old_reviews_predate_launch: true })]) };
+    newcomer_cohort: cohort([original, { ...structuredClone(original), asin: 'alternate-child' }, member('family-b', 5, 100, 0.7, { old_reviews_predate_launch: true, reason: undefined })]) };
   const result = scoreCandidate(candidate, profile);
   assert.equal(result.diagnostics.newcomers.examples.length, 1);
-  assert.equal(item(result, 'low_rating_sales_performance').score, null);
   assert.equal(item(result, 'new_product_count_share').score, 1.5);
   assert.ok(result.diagnostics.newcomers.members.some(entry => entry.effective_status === 'excluded' && entry.reason.includes('old reviews')));
 });
@@ -320,21 +378,18 @@ test('whole totals preserve the dependence between margin and contribution in ea
   close(result.groups.find(group => group.id === 'profit').score_range[1], 20.5);
   assert.equal(result.covered_weight, 100);
   assert.equal(result.queue, 'comparable');
+  delete candidate.economics.scenarios[1].cost_ledger;
   candidate.economics.scenarios[1].contribution_usd.value = null;
   candidate.economics.scenarios[1].contribution_usd.reason = 'Synthetic unavailable cost calculation.';
   const partial = scoreCandidate(candidate, profile);
-  assert.equal(item(partial, 'refund_adjusted_pre_ad_margin').status, 'scored');
-  assert.equal(item(partial, 'unit_contribution').score, null);
-  assert.equal(partial.covered_weight, 92);
   assert.equal(partial.total_range, null);
-  close(partial.supported_range[0], 83.75);
-  close(partial.conditional_total_range[1], 91.75);
+  assert.equal(partial.queue, 'pending');
 });
 
-test('margin failures and crossing/missing scenarios remain distinct from an eligible floor result', () => {
+test('margin failures and r59 crossing/missing scenarios remain distinct from an eligible floor result', () => {
   const candidate = completeCandidate('synthetic-margin-screen');
-  candidate.economics.scenarios = [scenario('at-floor', 0.3, 20)];
-  assert.equal(scoreCandidate(candidate, profile).total, 89);
+  candidate.economics.scenarios = [scenario('at-floor', 0.3, 15)];
+  assert.equal(scoreCandidate(candidate, profile).total, 87);
   candidate.economics.scenarios = [scenario('failed', 0.29, 10)];
   const failed = scoreCandidate(candidate, profile);
   assert.equal(failed.screening.status, 'excluded');
@@ -344,11 +399,10 @@ test('margin failures and crossing/missing scenarios remain distinct from an eli
   assert.equal(failed.conditional_total_range, null);
   candidate.economics.scenarios.push(scenario('eligible', 0.4, 10));
   const crossing = scoreCandidate(candidate, profile);
-  assert.equal(crossing.screening.status, 'pending');
-  assert.equal(crossing.total, null);
-  assert.equal(crossing.covered_weight, 70);
-  assert.deepEqual(crossing.supported_range, [70, 70]);
-  assert.deepEqual(crossing.conditional_total_range, [70, 100]);
+  assert.equal(crossing.screening.status, 'crossing_eligible');
+  assert.equal(crossing.qualification.counts_toward_target, false);
+  assert.equal(crossing.covered_weight, 100);
+  delete candidate.economics.scenarios[0].cost_ledger;
   candidate.economics.scenarios[0].margin.value = null;
   const unknown = scoreCandidate(candidate, profile);
   assert.equal(unknown.screening.status, 'pending');
@@ -361,15 +415,15 @@ test('batch queues use conservative complete ranges and supported pending points
   const rangeCandidate = completeCandidate('supported-range');
   rangeCandidate.economics.scenarios = [scenario('low', 0.35, 15), scenario('high', 0.5, 20)]; // 89.75..100
   const pendingHigh = completeCandidate('pending-high');
-  delete pendingHigh.economics;
+  delete pendingHigh.bids;
   const pendingTie = completeCandidate('pending-tie');
-  delete pendingTie.economics;
+  delete pendingTie.bids;
   const unknown = { id: 'unknown-heavy', form: 'Synthetic form', evidence: [] };
   const excluded = completeCandidate('rights-conflict');
   excluded.judgments.specific_design_rights = judgment(0);
   const deferred = completeCandidate('date-dependent');
   deferred.screening.strong_date_dependency.value = true;
-  const batch = { schema_version: 1, profile_revision: 50, candidates: [rangeCandidate, unknown, pendingHigh, pendingTie, deferred, excluded, pointCandidate] };
+  const batch = { schema_version: 1, profile_revision: 59, candidates: [rangeCandidate, unknown, pendingHigh, pendingTie, deferred, excluded, pointCandidate] };
   const before = JSON.stringify(batch);
   const result = scoreBatch(batch, profile);
   assert.deepEqual(result.order.comparable, ['point-leader', 'supported-range']);
@@ -384,9 +438,9 @@ test('batch queues use conservative complete ranges and supported pending points
   assert.deepEqual(scoreBatch(batch, profile), result);
 });
 
-test('screening is independent of scores and incompatible economic records cannot manufacture totals', () => {
+test('screening is independent of scores, incompatible economic records cannot manufacture totals, and <59 revisions are rejected', () => {
   for (const change of [
-    candidate => { candidate.screening.reference_price_usd.value = 30; },
+    candidate => { candidate.screening.reference_price_usd.value = 29.98; },
     candidate => { candidate.screening.reference_price_usd.matched_spec = false; },
     candidate => { candidate.judgments.specific_design_rights.anchor = null; },
     candidate => { candidate.economics.scenarios[0].saleable_unit = 'a different bundle'; },
@@ -399,9 +453,9 @@ test('screening is independent of scores and incompatible economic records canno
     assert.equal(result.total, null);
     assert.notEqual(result.queue, 'comparable');
   }
-  assert.throws(() => scoreBatch({ schema_version: 1, profile_revision: 50, candidates: [completeCandidate('duplicate'), completeCandidate('duplicate')] }, profile), TypeError);
+  assert.throws(() => scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [completeCandidate('duplicate'), completeCandidate('duplicate')] }, profile), TypeError);
   assert.throws(() => scoreBatch({ candidates: [] }, profile), TypeError);
-  assert.throws(() => scoreCandidate(completeCandidate(), { ...profile, revision: 49 }), TypeError);
+  assert.throws(() => scoreCandidate(completeCandidate(), { ...profile, revision: 58 }), TypeError);
 });
 
 test('invalid dates and duplicated evidence IDs cannot turn an assertion into supported points', () => {
@@ -426,7 +480,6 @@ test('transitively shared launches never supply independent exemplars', () => {
     ]) };
   const result = scoreCandidate(candidate, profile);
   assert.equal(result.diagnostics.newcomers.qualified_deduplicated_count, 1);
-  assert.equal(item(result, 'low_rating_sales_performance').score, null);
 });
 
 test('ordinary cross-source keyword differences do not replace exposure shares or add a penalty', () => {
@@ -462,7 +515,7 @@ test('zero native denominators and malformed profile groups are rejected at the 
 });
 
 test('empty batches stay empty and equal pending points use covered weight before stable input order', () => {
-  const empty = scoreBatch({ schema_version: 1, profile_revision: 50, candidates: [] }, profile);
+  const empty = scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [] }, profile);
   assert.equal(empty.summary.candidates, 0);
   assert.deepEqual(empty.candidates, []);
   const partial = (id, dimension) => {
@@ -471,7 +524,7 @@ test('empty batches stay empty and equal pending points use covered weight befor
     native.newcomer = {};
     return { id, form: 'Synthetic form', evidence, market: native };
   };
-  const result = scoreBatch({ schema_version: 1, profile_revision: 50,
+  const result = scoreBatch({ schema_version: 1, profile_revision: 59,
     candidates: [partial('covered-three', 'product'), partial('covered-four-first', 'seller'), partial('covered-four-second', 'seller')] }, profile);
   assert.deepEqual(result.order.pending, ['covered-four-first', 'covered-four-second', 'covered-three']);
   assert.ok(result.candidates.every(candidate => candidate.total === null && candidate.supported_score === 0));

@@ -1,8 +1,9 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
 import { validEvidenceDate as validDate } from './observations.mjs';
+import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS, resolveSharedLedgerPackage } from './economics.mjs';
-import { resolveEffectivePricing, resolveUniquePackageByRef, hasProhibited2026PeakExtrapolation } from './fee-basis.mjs';
-import { lookupUnifiedFulfillmentFee2027, priceBand2027 } from './fba-rates-2027.mjs';
+import { resolveEffectivePricing, resolveUniquePackageByRef, hasProhibited2026PeakExtrapolation } from './fba-calculator.mjs';
+import { lookupUnifiedFulfillmentFee2027, priceBand2027 } from './fba-calculator.mjs';
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -110,7 +111,7 @@ function ninetyCalendarDaysEarlier(isoCalDate) {
 }
 
 function definitions(profile) {
-  if (![50, 51, 52, 53, 54, 55, 56, 57, 58, 59].includes(profile?.revision) || profile.total_budget !== 100 || profile.production_eligible !== false ||
+  if (!Number.isInteger(profile?.revision) || profile.revision < 59 || profile.total_budget !== BUSINESS_THRESHOLDS.scoring_total_weight || profile.production_eligible !== false ||
     profile.activate_by_import !== false || !Array.isArray(profile.group_budgets) ||
     profile.group_budgets.length !== EXPECTED_GROUPS.length || profile.group_budgets.some((group, index) =>
       group?.id !== EXPECTED_GROUPS[index] || !Array.isArray(group.items))) {
@@ -129,8 +130,8 @@ function definitions(profile) {
   if (!number(margin.eligible_margin_floor) || !number(margin.full_score_at) ||
     margin.full_score_at <= margin.eligible_margin_floor || !number(margin.score_at_floor) ||
     margin.eligible_margin_floor !== profile.reference_screening?.margin?.minimum || !profile.measurement ||
-    (profile.revision >= 57 && (!number(priceRule?.minimum_inclusive) || priceRule.minimum_inclusive < 29.99 ||
-      margin.eligible_margin_floor < 0.3)) ||
+    (!number(priceRule?.minimum_inclusive) || priceRule.minimum_inclusive < BUSINESS_THRESHOLDS.minimum_reference_price_usd ||
+      margin.eligible_margin_floor < BUSINESS_THRESHOLDS.pre_ad_margin_floor) ||
     profile.workflow?.scoring_and_ordering?.revision !== profile.revision) {
     throw new TypeError('The profile needs valid margin and matching shared mappings.');
   }
@@ -811,218 +812,7 @@ function scoreNatural(member, ctx, profile, cohortPeriod = null, cohortGrain = n
 }
 
 function scoreNewcomers(cohort, ctx, profile, defs) {
-  if (profile.revision >= 58) return scoreNewcomersR58(cohort, ctx, profile, defs);
-  const lowDef = defs.find(item => item.id === 'low_rating_sales_performance');
-  const naturalDef = defs.find(item => item.id === 'natural_visibility_development');
-  const diagnostics = { members: [], examples: [], selected_pair: [], references: { rating_median: null, sales_median: null },
-    reference_mode: profile.revision >= 51 ? `current_category_r${profile.revision}` : 'qualified_cohort_r50' };
-  const pending = reason => ({
-    low: missing(lowDef, reason, cohort), natural: missing(naturalDef, reason, cohort), diagnostics,
-  });
-  if (!cohort || cohort.reference_supported !== true || cohort.observation_basis !== 'current_latest_30_days' ||
-    !['observation_date', 'period', 'niche', 'grain', 'relevant_bsr_node'].every(key => text(cohort[key])) ||
-    !validDate(cohort.observation_date) || !hasEvidence(cohort.evidence, ctx) || !Array.isArray(cohort.members)) {
-    diagnostics.members = Array.isArray(cohort?.members) ? cohort.members : [];
-    return pending(cohort?.reason ?? 'A supported current/latest-30-day comparable normal-newcomer reference is required.');
-  }
-  let invalidReference = false;
-  const qualified = [];
-  for (const member of cohort.members) {
-    const record = { ...member, effective_status: member?.status ?? 'pending' };
-    if (profile.revision >= 51 && record.effective_status === 'duplicate') record.effective_status = 'pending';
-    diagnostics.members.push(record);
-    if (member?.old_reviews_predate_launch === true) {
-      record.effective_status = hasEvidence(member.evidence, ctx) ? 'excluded' : 'pending';
-      record.reason = record.effective_status === 'excluded' ? 'Supported old reviews predate the purported recent launch; excluded from the normal-start reference.' :
-        'The asserted old-review conflict lacks valid evidence references.';
-    }
-    if (record.effective_status !== 'qualified') continue;
-    if (!text(member.family_id) || !text(member.asin) || !text(member.reason) || !hasEvidence(member.evidence, ctx)) {
-      invalidReference = true;
-      record.effective_status = 'pending';
-      record.reason = 'A qualified member needs frozen family/listing identity and qualification evidence.';
-      continue;
-    }
-    if (profile.revision >= 51) {
-      const observed = new Date(`${cohort.observation_date.slice(0, 10)}T00:00:00Z`);
-      const earliest = new Date(Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth() - 3,
-        Math.min(observed.getUTCDate(), new Date(Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth() - 2, 0)).getUTCDate())));
-      const earliestDate = earliest.toISOString().slice(0, 10);
-      if (!validDate(member.launch_date) ||
-        (profile.revision >= 57 ? member.launch_date.slice(0, 10) < earliestDate : Date.parse(member.launch_date) < earliest.getTime()) ||
-        member.launch_date.slice(0, 10) > cohort.observation_date.slice(0, 10) ||
-        member.current_bsr_node !== cohort.relevant_bsr_node || !Number.isInteger(member.current_bsr_rank) ||
-        member.current_bsr_rank < 1 || member.current_bsr_rank > 100) {
-        record.effective_status = 'pending';
-        record.reason = 'A qualified current example needs matching rank 1-100 and a supported launch within three calendar months.';
-        continue;
-      }
-    }
-    qualified.push(record);
-  }
-  qualified.sort(compareIdentity);
-  const groups = [];
-  for (const member of qualified) {
-    const matches = groups.filter(group => group.some(existing => existing.family_id === member.family_id || existing.asin === member.asin ||
-      (text(member.shared_launch_id) && existing.shared_launch_id === member.shared_launch_id)));
-    if (matches.length === 0) groups.push([member]);
-    else {
-      const target = matches[0];
-      target.push(member);
-      for (const merged of matches.slice(1)) {
-        target.push(...merged);
-        groups.splice(groups.indexOf(merged), 1);
-      }
-    }
-  }
-  const unique = [];
-  for (const group of groups) {
-    group.sort(compareIdentity);
-    const existing = group[0];
-    unique.push(existing);
-    for (const member of group.slice(1)) {
-      member.effective_status = 'duplicate';
-      member.duplicate_of = { family_id: existing.family_id, asin: existing.asin };
-      if (member.ratings?.value !== existing.ratings?.value || member.units_30d?.value !== existing.units_30d?.value) {
-        invalidReference = true;
-        member.reason = 'Duplicated family/shared-launch records have incompatible current observations.';
-      }
-    }
-  }
-  diagnostics.observed_count = cohort.members.length;
-  diagnostics.qualified_deduplicated_count = unique.length;
-  if (invalidReference) return pending('Qualified identity, grouping or duplicate observations remain unresolved.');
-  if (profile.revision >= 51) return scoreCurrentNewcomers(cohort, unique, ctx, profile, lowDef, naturalDef, diagnostics, pending);
-  if (unique.length === 0) return pending('No supported qualified normal-newcomer reference member is available.');
-  const readings = unique.map(member => ({ member,
-    ratings: readNumber(member.ratings, 'count', ctx, { integer: true }),
-    units: readNumber(member.units_30d, 'units', ctx), natural: scoreNatural(member, ctx, profile),
-  }));
-  const ratingMedian = readings.every(row => row.ratings.value !== null) ? median(readings.map(row => row.ratings.value)) : null;
-  const salesMedian = readings.every(row => row.units.value !== null) ? median(readings.map(row => row.units.value)) : null;
-  diagnostics.references = { rating_median: ratingMedian, sales_median: salesMedian,
-    ratings: readings.map(row => row.ratings.value), sales_units: readings.map(row => row.units.value) };
-  const actual = profile.measurement.low_rating_actual_count_component;
-  const salesCap = profile.measurement.low_rating_sales_cap;
-  const lowerAnchor = salesCap.confirmed_anchor;
-  const upperAnchor = salesCap.confirmed_middle_segment.endpoints[1];
-  diagnostics.examples = readings.map(({ member, ratings, units, natural }) => {
-    const r = ratings.value;
-    const actualScore = r === null ? null : r <= actual.above_40_mapping.continuity_anchor.rating_count ?
-      (r <= actual.full_points_through ? actual.component_max_points : actual.component_max_points - actual.decrease_per_additional_rating_above_10 * (r - actual.full_points_through)) :
-      actual.above_40_mapping.continuity_anchor.points * actual.above_40_mapping.continuity_anchor.rating_count / r;
-    const relative = r !== null && ratingMedian > 0 ? (r <= ratingMedian ? 1 : ratingMedian / r) : null;
-    const ratio = units.value !== null && salesMedian > 0 ? units.value / salesMedian : null;
-    const ceiling = ratio === null ? null : ratio <= lowerAnchor.sales_ratio ? lowerAnchor.max_points * ratio / lowerAnchor.sales_ratio :
-      ratio < upperAnchor.sales_ratio ? lowerAnchor.max_points + (upperAnchor.max_points - lowerAnchor.max_points) *
-        (ratio - lowerAnchor.sales_ratio) / (upperAnchor.sales_ratio - lowerAnchor.sales_ratio) : salesCap.item_max_points;
-    return { family_id: member.family_id, asin: member.asin, actual_score: actualScore, relative_score: relative,
-      sales_ratio: ratio, sales_ceiling: ceiling, natural,
-      score: actualScore !== null && relative !== null && ceiling !== null ? Math.min(actualScore + relative, ceiling) : null,
-      reason: ratingMedian === 0 ? 'True-zero rating median leaves the relative component unscored.' :
-        salesMedian === 0 ? 'True-zero sales median supplies no sales ratio.' : ratings.reason ?? units.reason,
-    };
-  });
-  const complete = diagnostics.examples.filter(example => example.score !== null)
-    .sort((a, b) => b.score - a.score || compareIdentity(a, b));
-  if (complete.length < 2) return pending(complete.length === 1 ? 'One complete example is single-case evidence, not a direction score.' :
-    'Two complete qualified examples require supported full-cohort rating and positive sales references.');
-  const pair = complete.slice(0, 2);
-  diagnostics.selected_pair = pair.map(({ family_id, asin }) => ({ family_id, asin }));
-  const lowEvidence = mergeRefs(cohort.evidence, ...unique.flatMap(member => [member.evidence, member.ratings?.evidence, member.units_30d?.evidence]));
-  const naturalEvidence = mergeRefs(lowEvidence, ...pair.flatMap(example => [example.natural.input?.evidence, example.natural.input?.relevant_entries_evidence]));
-  const low = scored(lowDef, pair[0].score / 2 + pair[1].score / 2, cohort, { selected_pair: diagnostics.selected_pair, evidence: lowEvidence });
-  const naturalScores = pair.map(example => example.natural.score);
-  let natural;
-  if (naturalScores.every(value => value !== null)) {
-    natural = scored(naturalDef, naturalScores[0] / 2 + naturalScores[1] / 2, cohort, { selected_pair: diagnostics.selected_pair, evidence: naturalEvidence });
-  } else {
-    const known = naturalScores.filter(value => value !== null);
-    natural = missing(naturalDef, 'The fixed low-rating pair lacks supported SIF overall share evidence for one or both members.', cohort,
-      { selected_pair: diagnostics.selected_pair, evidence: naturalEvidence,
-        conditional_range: known.length === 1 ? [known[0] / 2, (known[0] + 1) / 2] : null });
-  }
-  return { low, natural, diagnostics };
-}
-
-function scoreCurrentNewcomers(cohort, unique, ctx, profile, lowDef, naturalDef, diagnostics, pending) {
-  diagnostics.reference_mode = `current_category_r${profile.revision}`;
-  diagnostics.selection_tie_policy = profile.revision >= 52 ? 'complete_score_before_unresolved_equal_bound' : 'stable_identity';
-  if (cohort.scope !== 'current_relevant_bsr_top100' || cohort.query_complete !== true) {
-    return pending('A completed current-category query and aligned all-age sales reference are required.');
-  }
-  const unresolvedMembers = diagnostics.members.filter(row => !['qualified', 'duplicate'].includes(row.effective_status) &&
-    !(row.effective_status === 'excluded' && text(row.reason) && hasEvidence(row.evidence, ctx)));
-  if (!unique.length && !unresolvedMembers.length) {
-    diagnostics.no_qualifying_examples = true;
-    const evidence = mergeRefs(cohort.evidence, ...diagnostics.members.map(row => row.evidence));
-    return { low: scored(lowDef, 0, cohort, { evidence }), natural: scored(naturalDef, 0, cohort, { evidence }), diagnostics };
-  }
-  const reference = cohort.market_reference;
-  if (reference?.scope !== 'current_relevant_bsr_top100_all_ages' || reference.node !== cohort.relevant_bsr_node ||
-    reference.period !== cohort.period || reference.grain !== cohort.grain || reference.deduplicated !== true ||
-    reference.coverage_supported !== true || !hasEvidence(reference.evidence, ctx) ||
-    !Array.isArray(reference.families) || reference.families.length === 0) {
-    return pending('A completed current-category query and aligned all-age sales reference are required.');
-  }
-  const ids = reference.families.map(row => row?.family_id);
-  const sales = reference.families.map(row => readNumber(row?.units_30d, 'units', ctx));
-  if (ids.some(id => !text(id)) || new Set(ids).size !== ids.length || sales.some(row => row.value === null)) {
-    return pending('All-age reference families need unique identities and supported sales, including real zeros.');
-  }
-  const benchmark = median(sales.map(row => row.value));
-  diagnostics.references = { sales_median: benchmark, family_count: ids.length, grain: reference.grain,
-    scope: reference.scope, sales_units: sales.map(row => row.value) };
-  const calculate = member => {
-    const ratings = readNumber(member.ratings, 'count', ctx, { integer: true });
-    const units = readNumber(member.units_30d, 'units', ctx);
-    const r = ratings.value;
-    const { actual_rating_points: a, sales_cap: s } = profile.measurement.current_category_newcomers;
-    const actualScore = r === null ? null : r <= a.full_points_through ? a.max_points : r <= a.linear_end_rating ?
-      a.max_points - (r - a.full_points_through) * (a.max_points - a.linear_end_points) / (a.linear_end_rating - a.full_points_through) :
-      a.linear_end_points * a.linear_end_rating / r;
-    const ratio = units.value !== null && benchmark > 0 ? units.value / benchmark : null;
-    const ceiling = units.value === 0 ? 0 : ratio === null ? null : ratio <= s.lower_ratio ? s.lower_points * ratio / s.lower_ratio :
-      ratio < s.upper_ratio ? s.lower_points + (s.max_points - s.lower_points) * (ratio - s.lower_ratio) / (s.upper_ratio - s.lower_ratio) : s.max_points;
-    return { family_id: member.family_id, asin: member.asin, actual_score: actualScore, sales_ratio: ratio,
-      sales_ceiling: ceiling, natural: scoreNatural(member, ctx, profile),
-      score: actualScore !== null && ceiling !== null ? Math.min(actualScore, ceiling) : null,
-      possible_upper: Math.min(actualScore ?? 4, ceiling ?? 4),
-      reason: ratings.reason ?? units.reason ?? (ceiling === null ? 'A positive category sales reference is required for positive sales.' : null) };
-  };
-  diagnostics.examples = unique.map(calculate);
-  const complete = diagnostics.examples.filter(row => row.score !== null)
-    .sort((a, b) => b.score - a.score || compareIdentity(a, b));
-  const pair = complete.slice(0, 2);
-  const unresolved = [
-    ...diagnostics.examples.filter(row => row.score === null),
-    ...unresolvedMembers.map(calculate),
-  ];
-  const couldDisplace = row => pair.length < 2 || row.possible_upper > pair[1].score ||
-    (profile.revision === 51 && row.possible_upper === pair[1].score &&
-      (!text(row.family_id) || !text(row.asin) || compareIdentity(row, pair[1]) < 0));
-  diagnostics.unresolved_possible_examples = unresolved.map(row => ({ family_id: row.family_id, asin: row.asin,
-    possible_upper: row.possible_upper, selection_blocking: couldDisplace(row) }));
-  if (unresolved.some(couldDisplace)) {
-    return pending('An unresolved observed newcomer could change the selected examples.');
-  }
-  diagnostics.selected_pair = pair.map(({ family_id, asin }) => ({ family_id, asin }));
-  diagnostics.no_qualifying_examples = pair.length === 0;
-  const evidence = mergeRefs(cohort.evidence, reference.evidence, ...reference.families.map(row => row.units_30d?.evidence),
-    ...unique.flatMap(member => [member.evidence, member.ratings?.evidence, member.units_30d?.evidence]));
-  const low = pair.length ? scored(lowDef, pair.reduce((sum, row) => sum + row.score / pair.length, 0), cohort,
-    { selected_pair: diagnostics.selected_pair, evidence }) : scored(lowDef, 0, cohort, { evidence });
-  const naturalScores = pair.map(row => row.natural.score);
-  const knownNatural = naturalScores.filter(value => value !== null);
-  const knownTotal = knownNatural.reduce((sum, value) => sum + value, 0);
-  const naturalEvidence = mergeRefs(evidence, ...pair.flatMap(row => [row.natural.input?.evidence, row.natural.input?.relevant_entries_evidence]));
-  const natural = naturalScores.every(value => value !== null) ? scored(naturalDef,
-    pair.length ? naturalScores.reduce((sum, value) => sum + value / pair.length, 0) : 0, cohort,
-    { selected_pair: diagnostics.selected_pair, evidence: naturalEvidence }) :
-    missing(naturalDef, 'The fixed current-category examples lack supported SIF overall shares.', cohort,
-      { selected_pair: diagnostics.selected_pair, evidence: naturalEvidence,
-        conditional_range: knownNatural.length ? [knownTotal / pair.length, (knownTotal + pair.length - knownNatural.length) / pair.length] : null });
-  return { low, natural, diagnostics };
+  return scoreNewcomersR58(cohort, ctx, profile, defs);
 }
 
 function evalExampleRat(ratingsVal, unitsVal, tEffRat, profile) {
@@ -4087,12 +3877,7 @@ export function scoreBatch(batch, profile) {
     (effCoveredR59(b) - effCoveredR59(a)) ||
     compareText(a.candidate_id, b.candidate_id);
 
-  const comparable = results.filter(result => result.queue === 'comparable')
-    .sort((a, b) => isR59
-      ? compareR59Qualifying(a, b)
-      : isR58
-        ? (compareRangeDesc(a.total_range, b.total_range) || compareText(a.candidate_id, b.candidate_id))
-        : (b.total_range[0] - a.total_range[0]));
+  const comparable = results.filter(result => result.queue === 'comparable').sort(compareR59Qualifying);
   const pending = results.filter(result => result.queue === 'pending')
     .sort((a, b) => {
       if (isR59) {
@@ -4114,17 +3899,7 @@ export function scoreBatch(batch, profile) {
     excluded.sort(tieSort);
   }
 
-  const isSeasonalEligible = result => isR58
-    ? result.qualification?.counts_toward_target === true
-    : profile.revision >= 57
-      ? result.operating_periods.some(period => HOLIDAY_PEAK_MONTHS.every(month => period.months.includes(month))) &&
-        result.operating_periods.some(period => period.queue === 'comparable' &&
-          period.months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
-          PRIMARY_OFF_PEAK_MONTHS.every(month => period.months.includes(month)) &&
-          period.diagnostics?.economics?.scenarios?.length > 0 &&
-          period.diagnostics.economics.scenarios.every(coversPrimaryOffPeakScenario) &&
-          period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass')
-      : result.operating_periods.some(period => period.queue === 'comparable');
+  const isSeasonalEligible = result => result.qualification?.counts_toward_target === true;
 
   const rawSeasonalReview = results.filter(result => result.queue === 'seasonal_review');
   const seasonalEligible = rawSeasonalReview.filter(isSeasonalEligible);
@@ -4166,9 +3941,6 @@ export function scoreBatch(batch, profile) {
       ? [...comparable, ...seasonalEligible, ...pending, ...seasonalRemaining, ...deferred, ...excluded]
       : Object.values(queues).flat();
   const dispositionByCandId = new Map(orderedCandidates.map(c => [c.candidate_id, c.effective_disposition]));
-  const filteredNegotiationShortlist = isR58 && !isR59 && Array.isArray(batch.negotiation_shortlist)
-    ? batch.negotiation_shortlist
-    : [];
   const rawPkgShortlist = profile.revision >= 59
     ? [
         ...(Array.isArray(batch.packaging_redesign_shortlist) ? batch.packaging_redesign_shortlist : []),
@@ -4193,7 +3965,6 @@ export function scoreBatch(batch, profile) {
     ...(isR59 ? { qualifying_order: unifiedQualifyingOrderedR59.map(r => r.candidate_id) } : {}),
     order: Object.fromEntries(Object.entries(queues).map(([key, values]) => [key, values.map(result => result.candidate_id)])),
     comparable_leader: leader ? { candidate_id: leader.candidate_id, total_range: leader.total_range, conservative_score: leader.total_range[0] } : null,
-    ...(filteredNegotiationShortlist.length > 0 ? { negotiation_shortlist: filteredNegotiationShortlist } : {}),
     ...(filteredPackagingRedesignShortlist.length > 0 ? { packaging_redesign_shortlist: filteredPackagingRedesignShortlist } : {}),
     summary: {
       candidates: results.length, complete: comparable.length,

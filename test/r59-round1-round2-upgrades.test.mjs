@@ -25,7 +25,7 @@ import {
   computePackagingRedesignShortlist2027,
   estimateGate1A2027,
   getFba2027RateTableSnapshot,
-} from '../src/fba-rates-2027.mjs';
+} from '../src/fba-calculator.mjs';
 import { canonicalizeConnectorToolName, validateProviderCall } from '../src/provider-guards.mjs';
 import { extractNewcomerReviewOriginBreakdown } from '../src/observations.mjs';
 import {
@@ -54,9 +54,9 @@ import {
   detectKeepaVeteranClearanceOrWar,
   evaluateGate0CategoryBoundary,
 } from '../src/price-band.mjs';
-import { evaluateEarlyScreen } from '../src/early-screen.mjs';
+import { evaluateEarlyScreen } from '../src/economics.mjs';
 import { calculateEconomics } from '../src/economics.mjs';
-import { resolveEffectivePricing } from '../src/fee-basis.mjs';
+import { resolveEffectivePricing } from '../src/fba-calculator.mjs';
 import * as openaiIndex from '../src/openai/index.mjs';
 import * as openaiClientMod from '../src/openai/client.mjs';
 import * as openaiPricingMod from '../src/openai/pricing.mjs';
@@ -82,7 +82,7 @@ import {
 } from '../src/openai/codex-runner.mjs';
 
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
-const r58Profile = JSON.parse(readFileSync(join(REPO_ROOT, 'docs', 'design', 'reference-profile.draft.json'), 'utf8'));
+const r58Profile = JSON.parse(readFileSync(join(REPO_ROOT, 'docs', 'archive', 'design', 'reference-profile.r58.archived.json'), 'utf8'));
 const r59Profile = JSON.parse(readFileSync(join(REPO_ROOT, 'docs', 'design', 'reference-profile.r59.draft.json'), 'utf8'));
 const synthBatch = JSON.parse(readFileSync(join(REPO_ROOT, 'fixtures', 'synthetic-batch.json'), 'utf8'));
 
@@ -557,8 +557,7 @@ test('Round 1 (6) & Fixes: SellerSprite monthly archive market (15 pts), r59 NEA
   };
 
   // r58 rejects NEAR_30_DAYS (preserving 100% historical r50-r58 strictness), while r59 scores it cleanly!
-  const r58Scored = scoreCandidate(cand, r58Profile);
-  assert.equal(r58Scored.items.find(i => i.id === 'low_rating_sales_performance').status, 'needs_evidence');
+  assert.throws(() => scoreCandidate(cand, r58Profile), TypeError);
 
   const r59Scored = scoreCandidate(cand, r59Profile);
   for (const mId of ['new_product_count_share', 'new_product_sales_share', 'product_dispersion', 'brand_dispersion', 'seller_dispersion']) {
@@ -678,9 +677,7 @@ test('Round 2 (1 & 2): sample_pending_qualifying gate (85-pt core + deferred sam
   proc0.amount_usd = Number((baseCalc.net_revenue_usd * (1 - 0.34) - (baseCalc.net_cost_usd - proc0.amount_usd)).toFixed(4));
 
   // Under r58: stays pending (counts_toward_target: false)
-  const r58Res = scoreCandidate(candSamplePending, r58Profile);
-  assert.equal(r58Res.qualification.counts_toward_target, false);
-  assert.equal(r58Res.queue, 'pending');
+  assert.throws(() => scoreCandidate(candSamplePending, r58Profile), TypeError);
 
   // Under r59: qualifies as sample_pending_qualifying (counts_toward_target: true, 91/100 covered, ranked high-to-low)!
   const r59Res = scoreCandidate(candSamplePending, r59Profile);
@@ -1966,10 +1963,11 @@ test('Astra Full-Capability Audit Round-1 Remediations (B1, H1-H16, M1-M9, L1)',
       ],
     }), 'utf8');
     const pbCliR58 = await runCliMem(['price-band', '--input', pbCliIn, '--profile-revision', '58']);
-    assert.equal(pbCliR58.code, 0, pbCliR58.stderr);
-    const pbCliR58Json = JSON.parse(pbCliR58.stdout);
-    assert.equal(pbCliR58Json.analysis.mainstream_count, 1, 'H15: --profile-revision 58 isolates 100d (<120d) 16% (>=15%) coupon peer');
-    assert.equal(pbCliR58Json.analysis.band.p50_usd, 59.99);
+    assert.notEqual(pbCliR58.code, 0, 'H15 closed: --profile-revision 58 rejected after r50-r58 retirement');
+    const pbCliR59 = await runCliMem(['price-band', '--input', pbCliIn, '--profile-revision', '59']);
+    assert.equal(pbCliR59.code, 0, pbCliR59.stderr);
+    const pbCliR59Json = JSON.parse(pbCliR59.stdout);
+    assert.equal(pbCliR59Json.analysis.mainstream_count, 2, 'r59 includes 100d (>90d) <20% routine coupon peer alongside 400d veteran');
 
     // 6) H7 + H8: sample_pending_qualifying blocks prescreen_completed:false, hard_ban excludes, and #4 rejects median while accepting family_units
     const unprescreenedCand = structuredClone(synthBatch.candidates[0]);
@@ -2533,11 +2531,7 @@ test('Astra Full-Capability Audit Round-2 Remediations (R2-1..R2-4, H1-H16, M2/M
     assert.equal(evaluateGate0CategoryBoundary({ title: 'Diaper Bag Backpack for Parents with Pocket for Toddler Clothes' }).hard_exclusion, false, 'H12a');
     assert.equal(evaluateGate0CategoryBoundary({ title: 'Floating Wood Nursery Shelf for Bedding Storage' }).hard_exclusion, false, 'H12b');
 
-    const pbR58Clearance = analyzeMainstreamPriceBand([
-      { asin: 'B0SYNR58C1', title: 'Clearance 225d', price_usd: 59.99, monthly_units: 100, fulfillment: 'FBA', age_days: 225, keepa_clearance: true },
-      { asin: 'B0SYNR58C2', title: 'Steady 400d', price_usd: 72.00, monthly_units: 100, fulfillment: 'FBA', age_days: 400 },
-    ], { profile_revision: 58 });
-    assert.equal(pbR58Clearance.band.p50_usd, 65.995, 'H15: Explicit r58 preserves HEAD $65.995 median on 225d clearance peer');
+    assert.throws(() => analyzeMainstreamPriceBand([], { profile_revision: 58 }), /retired/i, 'H15 closed: r58 price-band branch retired');
 
     // 5) H7 + H8 + H11 + H14 + M8: Registry access failure not marked completed, trademark conflict excluded, point target_child_units rejected, A4 missing carton_count & <50kg unit-weight held pending, #17 reviews_inspected:false rejected
     const regFailResolved = resolveStage1QualitativeJudgments({
@@ -2799,11 +2793,12 @@ test('12. Astra Final Round-3 Sign-Off Remediations: stderr secret scrub, season
         collection_rate: 0.006,
       }],
     });
-    // Persist 2 uncompetitive SKU quotes from the SAME 1688 offer_id ('offer-same-factory-1')
+    // Persist 2 uncompetitive SKU quotes from the SAME verified 1688 factory ('fac-1', 'offer-same-factory-1')
     for (const idx of [1, 2]) {
       r3Store.recordSourcingQuote1688({
         quote_id: `q-samefac-${idx}`,
         form_id: 'form-r3-same-fac',
+        factory_id: 'fac-1',
         spec_variant_key: `sku-var-${idx}`,
         observed_at: '2026-11-24',
         redacted_destination: '广东深圳',
@@ -2826,6 +2821,7 @@ test('12. Astra Final Round-3 Sign-Off Remediations: stderr secret scrub, season
         status: 'quoted',
         quote: {
           quote_id: 'q-fac2-fail',
+          factory_id: 'fac-2',
           spec_variant_key: 'sku-var-fac2',
           observed_at: '2026-11-24',
           redacted_destination: '广东深圳',
@@ -2868,7 +2864,7 @@ test('12. Astra Final Round-3 Sign-Off Remediations: stderr secret scrub, season
     const upgradedLiveForm = r3Store.getCandidateForm(cand0Id);
     replayBatchIntoStore(r3Store, {
       batch: synthBatch,
-      profile: r58Profile,
+      profile: r59Profile,
     });
     const repEv = r3Store.getEvaluationsForForm(cand0Id)[0];
     assert.ok(repEv, 'M4: Replayed evaluation persisted');
@@ -2995,7 +2991,7 @@ test('12. Astra Final Round-3 Sign-Off Remediations: stderr secret scrub, season
     assert.equal(volMissingCntEv.ledger.margin, null, 'H11: Volumetric carton_cm without carton_count holds headhaul pending instead of silently assuming 100 cartons');
 
     assert.equal(builtPeriods.operating_periods[0].months.includes(10), false, 'H14: Paired off_peak months remain [2..9] without falsely claiming full-October storage coverage');
-    assert.equal(evaluateGate0CategoryBoundary({ title: 'Diaper Bag Backpack for Mom with Toddler Pocket' }, { profile_revision: 58 }).hard_exclusion, true, 'H15: Explicit r58 preserves pre-r59 Gate-0 boundary');
+    assert.throws(() => evaluateGate0CategoryBoundary({ title: 'Diaper Bag Backpack for Mom with Toddler Pocket' }, { profile_revision: 58 }), /retired/i, 'H15 closed: r58 Gate-0 branch retired');
     assert.equal(evaluateGate0CategoryBoundary({ title: 'Nursery Shelving Unit for Closet Organization' }, { profile_revision: 59 }).hard_exclusion, false, 'H12: Nursery shelving exempted in r59');
 
     // 7) H16: Shareable HTML scrubs comma-inverted recipient ('Roe, Jane'), dot-separated US phone ('415.555.0199'), and uppercase abbreviated street ('1234 MAPLE ST')

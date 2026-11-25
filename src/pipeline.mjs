@@ -1,3 +1,4 @@
+import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 /**
  * Phase 2 single-controller resumable selection pipeline:
  *  Stage 0: Multi-source lead ingestion & form registration (raw_leads + lead_form_links + candidate_forms)
@@ -8,7 +9,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { evaluateEarlyScreen } from './early-screen.mjs';
+import { evaluateEarlyScreen } from './economics.mjs';
 import {
   FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
   FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
@@ -20,19 +21,20 @@ import {
   computeNegotiationShortlist,
   computePackagingRedesignShortlist2027,
   computeMatchedPeerMedianPackage,
+  computeHeadhaulWithA4Rules,
   bindSourcingQuotePricingInputs,
   solveMinPriceForMargin2027,
   classifySizeTier2027,
   lookupFulfillmentFee2027,
   lookupBulkyFulfillmentFee2027,
   lookupUnifiedFulfillmentFee2027,
-} from './fba-rates-2027.mjs';
+} from './fba-calculator.mjs';
 import {
   toBigRat,
   divBigRat,
   roundBigRat,
   resolveEffectivePricing,
-} from './fee-basis.mjs';
+} from './fba-calculator.mjs';
 import {
   assertNoRawPii,
   containsSecretToken,
@@ -67,8 +69,8 @@ import {
   validateEvidenceReviewOutput,
   runCodexEvidenceReview,
   stageAndHashReviewAttachments,
-  verifySavedCodexReceipt,
 } from './openai/index.mjs';
+import { verifySavedCodexReceipt } from './receipt-verifier.mjs';
 
 const finite = v => typeof v === 'number' && Number.isFinite(v);
 const nonemptyStr = v => typeof v === 'string' && v.trim().length > 0;
@@ -80,6 +82,8 @@ const PRICE_WATCH_REASONS = [
   'launch_spiral_low_price',
   'heavy_coupon_outlier',
   'young_heavy_coupon_outlier',
+  'newcomer_le_90d_launch_ref',
+  'newcomer_launch_reference',
   'young_newcomer_launch_band_only',
   'unknown_age_excluded_from_mature_band',
   'seed_merged_unverified_regular_price',
@@ -185,13 +189,46 @@ function hasTerminalRejectionOrDeferralOnCurrentSpec(form) {
   return { blocked: false, status: null, preserve_rights_conflict: false, reason: null };
 }
 
+function resolveQuoteVerifiedFactoryKey(q) {
+  for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name']) {
+    if (nonemptyStr(q?.[k])) return `fac:${q[k].trim()}`;
+  }
+  let lines = Array.isArray(q?.sku_lines) ? q.sku_lines : null;
+  if (!lines && nonemptyStr(q?.sku_lines_json)) {
+    try {
+      const parsed = JSON.parse(q.sku_lines_json);
+      if (Array.isArray(parsed)) lines = parsed;
+    } catch { /* ignore */ }
+  }
+  const lineFactories = Array.isArray(lines)
+    ? [...new Set(lines.map(l => {
+      const fk = l?.factory_id ?? l?.supplier_id ?? l?.seller_member_id ?? l?.company_name ?? null;
+      return nonemptyStr(fk) ? fk.trim() : null;
+    }).filter(Boolean))].sort()
+    : [];
+  if (lineFactories.length > 0) return `fac:${lineFactories.join('+')}`;
+  return null;
+}
+
 function resolveScreenHeadhaulUsd(sc) {
   if (!sc || typeof sc !== 'object') return null;
   let objVal = null;
   if (finite(sc.headhaul)) objVal = sc.headhaul;
   else if (sc.headhaul && typeof sc.headhaul === 'object') {
     if (finite(sc.headhaul.amount_usd)) objVal = sc.headhaul.amount_usd;
-    else if (finite(sc.headhaul.usd_per_unit)) objVal = sc.headhaul.usd_per_unit;
+    else if (finite(sc.headhaul.usd_per_unit)) {
+      objVal = sc.headhaul.usd_per_unit + (sc.headhaul.bond_included === true ? 0 : (finite(sc.headhaul.bond_usd_per_unit) ? sc.headhaul.bond_usd_per_unit : 0));
+    } else if (finite(sc.fx_cny_per_usd) && sc.fx_cny_per_usd > 0) {
+      const a4 = computeHeadhaulWithA4Rules(
+        sc.headhaul,
+        sc.fx_cny_per_usd,
+        finite(sc.order_units) && sc.order_units > 0 ? sc.order_units : 100,
+        { isR58: true, isR59: (sc.profile_revision ?? 59) >= 59 },
+      );
+      if (!a4.missing_surcharge_quote && finite(a4.amount_usd)) {
+        objVal = a4.amount_usd;
+      }
+    }
   }
   const flatVal = finite(sc.headhaul_usd) ? sc.headhaul_usd : null;
   if (objVal !== null && flatVal !== null && Math.abs(objVal - flatVal) > PARITY_TOLERANCE_USD) {
@@ -295,7 +332,7 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
     sanitizedRaw.source_inputs = si;
   }
 
-  const resolvedRev = Math.max(58, Number.isInteger(effectiveProfileRevision) ? effectiveProfileRevision : 59);
+  const resolvedRev = Math.max(59, Number.isInteger(effectiveProfileRevision) ? effectiveProfileRevision : 59);
 
   if (skuLines.length > 0) {
     return {
@@ -1106,7 +1143,10 @@ export function runGate1AForForm(store, {
     title: [form.label, form.core_form, form.buyer_task].filter(Boolean).join(' '),
     ...(category_check && typeof category_check === 'object' ? category_check : {}),
   };
-  const isR59Gate1ADefault = (profile_revision ?? 59) >= 59;
+  if (profile_revision !== undefined && profile_revision !== null && (!Number.isInteger(profile_revision) || profile_revision < 59)) {
+    throw new TypeError(`runGate1AForForm: profile_revision ${profile_revision} (< 59) is retired; use archive/r50-r58-frozen-replay-20261125 for historical replay.`);
+  }
+  const isR59Gate1ADefault = true;
   const gate0 = evaluateGate0CategoryBoundary(gate0Input, {
     ...(gate0_options ?? {}),
     profile_revision: profile_revision ?? 59,
@@ -1136,7 +1176,8 @@ export function runGate1AForForm(store, {
 
   // Stage-1 price-band guardrail check when peer listings or analysis are provided.
   const defaultStrictMature = isR59Gate1ADefault;
-  if (defaultStrictMature && (price_band_analysis?.options?.strict_mature_only === false || price_band_analysis?.strict_mature_only === false)) {
+  if (defaultStrictMature && (price_band_analysis?.options?.strict_mature_only === false ||
+    (!Array.isArray(price_band_analysis?.mainstream_pool) && price_band_analysis?.strict_mature_only === false))) {
     throw new TypeError('Cannot disable strict_mature_only under Revision 59.');
   }
   const requestedSpiralMaxAge = price_band_analysis?.options?.spiral_max_age_days ?? price_band_analysis?.spiral_max_age_days;
@@ -1360,7 +1401,10 @@ export function runGate1AForForm(store, {
     );
     const peerWatchReason = Array.isArray(promoPeer?.watch_reasons) && finite(price) && finite(promoPeer.net_price_usd) &&
       Math.abs(price - promoPeer.net_price_usd) <= PARITY_TOLERANCE_USD
-      ? promoPeer.watch_reasons.find(reason => PRICE_WATCH_REASONS.includes(reason) && !(isR59Gate1A && isAllUnder90dBlueOcean && reason === 'newcomer_le_90d_launch_ref'))
+      ? PRICE_WATCH_REASONS.find(reason =>
+        promoPeer.watch_reasons.includes(reason) &&
+        !(isR59Gate1A && isAllUnder90dBlueOcean && reason === 'newcomer_le_90d_launch_ref'),
+      ) ?? null
       : null;
     const isConfirmedMainstreamPeer = Boolean(
       scAsinUpper &&
@@ -1656,7 +1700,10 @@ export async function runGate1BForForm(store, {
 } = {}) {
   const form = store.getCandidateForm(form_id);
   if (!form) throw new TypeError(`Unknown form_id for Gate 1B: ${form_id}`);
-  const isR59 = (profile_revision ?? 59) >= 59;
+  if (profile_revision !== undefined && profile_revision !== null && (!Number.isInteger(profile_revision) || profile_revision < 59)) {
+    throw new TypeError(`runGate1BForForm: profile_revision ${profile_revision} (< 59) is retired; use archive/r50-r58-frozen-replay-20261125 for historical replay.`);
+  }
+  const isR59 = true;
   if (isR59 && require_ui_readback === false) {
     throw new TypeError('Cannot disable require_ui_readback under Revision 59.');
   }
@@ -1855,39 +1902,55 @@ export async function runGate1BForForm(store, {
     }
 
     // Re-check spec_version, proven rights conflicts, and concurrent Gate 1A rejection/deferral after async sourcing!
-    const latestAfterSource = store.getCandidateForm(form_id);
-    if (!latestAfterSource || latestAfterSource.spec_version !== expectedSpecVersion) {
-      return {
-        form_id,
-        status: 'stale_spec_version_conflict',
-        reason: `Form spec changed from v${expectedSpecVersion} to v${latestAfterSource?.spec_version} during Gate 1B sourcing.`,
-        proceed_to_gate2_3: false,
-      };
-    }
-    const terminalAfterSource = hasTerminalRejectionOrDeferralOnCurrentSpec(latestAfterSource);
-    if (terminalAfterSource.blocked && !(canRetrySecondFactoryR59 && terminalAfterSource.status === 'gate1b_rejected' && !terminalAfterSource.preserve_rights_conflict)) {
-      if (terminalAfterSource.preserve_rights_conflict) {
-        const g1bRes = {
-          status: 'gate1b_rejected',
-          spec_sha256: latestAfterSource.spec_sha256,
-          specific_rights_conflict_proven: true,
-          reason: 'Proven specific design rights conflict recorded during or prior to Gate 1B sourcing.',
-        };
-        store.updateFormLifecycle(form_id, 'gate1b_rejected', { gate1b_result: g1bRes, negotiation_shortlist: null });
+    const checkConcurrentSourcingAbort = () => {
+      const liveForm = store.getCandidateForm(form_id);
+      if (!liveForm || liveForm.spec_version !== expectedSpecVersion) {
         return {
-          form_id,
-          status: 'gate1b_rejected',
-          negotiation_shortlist: null,
-          proceed_to_gate2_3: false,
+          aborted: {
+            form_id,
+            status: 'stale_spec_version_conflict',
+            reason: `Form spec changed from v${expectedSpecVersion} to v${liveForm?.spec_version} during Gate 1B sourcing.`,
+            proceed_to_gate2_3: false,
+          },
+          liveForm,
         };
       }
-      return {
-        form_id,
-        status: terminalAfterSource.status,
-        reason: terminalAfterSource.reason,
-        proceed_to_gate2_3: false,
-      };
-    }
+      const term = hasTerminalRejectionOrDeferralOnCurrentSpec(liveForm);
+      if (term.blocked && !(canRetrySecondFactoryR59 && term.status === 'gate1b_rejected' && !term.preserve_rights_conflict)) {
+        if (term.preserve_rights_conflict) {
+          const g1bRes = {
+            status: 'gate1b_rejected',
+            spec_sha256: liveForm.spec_sha256,
+            specific_rights_conflict_proven: true,
+            reason: 'Proven specific design rights conflict recorded during or prior to Gate 1B sourcing.',
+          };
+          store.updateFormLifecycle(form_id, 'gate1b_rejected', { gate1b_result: g1bRes, negotiation_shortlist: null });
+          return {
+            aborted: {
+              form_id,
+              status: 'gate1b_rejected',
+              negotiation_shortlist: null,
+              proceed_to_gate2_3: false,
+            },
+            liveForm,
+          };
+        }
+        return {
+          aborted: {
+            form_id,
+            status: term.status,
+            reason: term.reason,
+            proceed_to_gate2_3: false,
+          },
+          liveForm,
+        };
+      }
+      return { aborted: null, liveForm };
+    };
+
+    const firstSourceCheck = checkConcurrentSourcingAbort();
+    if (firstSourceCheck.aborted) return firstSourceCheck.aborted;
+    let latestAfterSource = firstSourceCheck.liveForm;
 
     if (sourcingOutcome.status !== 'quoted') {
       const staleAfterSourcing = staleGate1AScenarios(latestAfterSource);
@@ -1931,24 +1994,186 @@ export async function runGate1BForForm(store, {
       return { form_id, ...g1bRes, quote: pendingQuote, proceed_to_gate2_3: false };
     }
 
-    const incomingQuotes = Array.isArray(sourcingOutcome.quotes) && sourcingOutcome.quotes.length > 0
-      ? sourcingOutcome.quotes
-      : [sourcingOutcome.quote];
-    const recordedBatch = store.recordSourcingQuotesBatch1688(
-      incomingQuotes.map(qObj => {
-        if (isR59 && qObj?.require_ui_readback === false) {
+    const maxFactoriesToCheck = BUSINESS_THRESHOLDS.max_1688_factories_to_check;
+    const doesQuoteClearEntireInterval = (candQuote) => {
+      if (!isR59 || typeof early_screen_builder !== 'function' || gate1aRecord.forward_price_discovery_only === true) {
+        return false;
+      }
+      if (!candQuote || candQuote.ui_readback_verified !== true) return false;
+      try {
+        const plan = deriveOrderPlanFromPersistedQuote(candQuote);
+        const built = early_screen_builder({
+          form: { ...form },
+          quote: structuredClone(candQuote),
+          order_plan: structuredClone(plan),
+        });
+        const qScens = Array.isArray(built) ? built : [built];
+        if (qScens.length === 0) return false;
+        const bind = bindGate1BScenariosToGate1A(qScens, gate1aRecord);
+        if (!bind.valid || bind.missingDeclared.length > 0) return false;
+        const qBinds = qScens.map(raw => bindSourcingQuotePricingInputs(candQuote, raw));
+        if (qBinds.some(b => Boolean(b.issue))) return false;
+        const evalRev = Math.max(59, Number.isInteger(profile_revision) ? profile_revision : 59);
+        const evs = qScens.map((raw, idx) => {
+          const authIn = applyAuthoritativeQuoteToScreenInput(raw, candQuote, plan, qBinds[idx], evalRev);
+          return evaluateEarlyScreen(authIn, { profileRevision: evalRev });
+        });
+        if (!evs.every(e => e.gate_status === 'pass' || e.gate_status === 'economic_pass_rights_unsearched')) {
+          return false;
+        }
+        // Also ensure no interior $10/$50 cliff drops below 30% between min and max evaluated price.
+        const prices = qScens.map(resolveScenarioEffectivePrice).filter(finite);
+        const minP = prices.length > 0 ? Math.min(...prices) : null;
+        const maxP = prices.length > 0 ? Math.max(...prices) : null;
+        if (minP !== null && maxP !== null && maxP > minP + 1e-9) {
+          for (const cliffP of [9.99, 10.00, 49.99, 50.00, 50.01]) {
+            if (cliffP <= minP + 1e-9 || cliffP >= maxP - 1e-9) continue;
+            const baseRaw = qScens[0];
+            const qBind0 = qBinds[0];
+            const ful = lookupBulkyFulfillmentFee2027({
+              pkg: candQuote.pkg ?? baseRaw.pkg,
+              price_usd: cliffP,
+              sales_window: baseRaw.fee_context?.sales ?? baseRaw.sales_window,
+              is_apparel: baseRaw.is_apparel_or_shoes,
+              is_dangerous_goods: baseRaw.is_dangerous_goods,
+              is_sipp: baseRaw.is_sipp ?? candQuote.pkg?.is_sipp,
+            });
+            if (ful.status !== 'verified') continue;
+            const cliffIn = applyAuthoritativeQuoteToScreenInput(
+              { ...structuredClone(baseRaw), price_usd: cliffP, fulfillment_usd: ful.total_usd },
+              candQuote,
+              plan,
+              qBind0,
+              evalRev,
+            );
+            const cliffEv = evaluateEarlyScreen(cliffIn, { profileRevision: evalRev });
+            if (cliffEv.gate_status === 'fail') return false;
+          }
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const existingSpecRows = store.getQuotesForForm(form_id).filter(
+      q => q.spec_version === expectedSpecVersion &&
+        q.goods_first_order_promotion === 0 &&
+        q.freight_first_order_promotion === 0 &&
+        (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
+    );
+    const seenVerifiedFactories = new Set(existingSpecRows.map(resolveQuoteVerifiedFactoryKey).filter(Boolean));
+    let submittedQuoteBatches = 0;
+
+    const validateAndRecordBatch = (quotesArr) => {
+      const cleanArr = quotesArr.filter(qObj => qObj && typeof qObj === 'object');
+      if (isR59 && cleanArr.length > maxFactoriesToCheck) {
+        return {
+          rejectedOverCap: true,
+          reason: `Revision 59 1688 stop rule caps checked factories at ${maxFactoriesToCheck} per form (received ${cleanArr.length} quotes at once); submit per-factory quotes sequentially.`,
+        };
+      }
+      const prospectiveFactories = new Set(seenVerifiedFactories);
+      for (const qObj of cleanArr) {
+        if (isR59 && qObj.require_ui_readback === false) {
           throw new TypeError('Revision 59 prohibits disabling require_ui_readback on verified 1688 quotes.');
         }
+        const fk = resolveQuoteVerifiedFactoryKey(qObj);
+        if (fk) prospectiveFactories.add(fk);
+      }
+      if (isR59 && prospectiveFactories.size > maxFactoriesToCheck) {
         return {
+          rejectedOverCap: true,
+          reason: `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesToCheck} per form (would reach ${prospectiveFactories.size}).`,
+        };
+      }
+      const batchOut = store.recordSourcingQuotesBatch1688(
+        cleanArr.map(qObj => ({
           ...qObj,
           ...(isR59 ? { require_ui_readback: true } : {}),
           form_id,
           spec_version: expectedSpecVersion,
-        };
-      }),
-    );
-    // H2: Reload each recorded quote from SQLite AFTER the batch completes so any same-spec quote
-    // archived as `superseded_uncompetitive` by a cheaper later quote in the same batch is NOT evaluated!
+        })),
+      );
+      for (const fk of prospectiveFactories) seenVerifiedFactories.add(fk);
+      submittedQuoteBatches += 1;
+      const clearedInterval = cleanArr.length === 1 && batchOut.some(rec => {
+        const freshCheck = store.getQuoteById(rec.quote.quote_id) ?? rec.quote;
+        return isR59 && isQuoteUsableForForm(freshCheck, latestAfterSource, as_of_date) && doesQuoteClearEntireInterval(freshCheck);
+      });
+      return { rejectedOverCap: false, recordedIds: batchOut, clearedInterval };
+    };
+
+    const incomingQuotes = Array.isArray(sourcingOutcome.quotes) && sourcingOutcome.quotes.length > 0
+      ? sourcingOutcome.quotes
+      : [sourcingOutcome.quote];
+    let seqRes = validateAndRecordBatch(incomingQuotes);
+    if (seqRes.rejectedOverCap) {
+      const g1bRes = {
+        status: 'gate1b_pending',
+        reason: seqRes.reason,
+      };
+      store.updateFormLifecycle(form_id, 'gate1b_pending', { gate1b_result: g1bRes });
+      return { form_id, ...g1bRes, proceed_to_gate2_3: false };
+    }
+    const recordedBatch = [...seqRes.recordedIds];
+
+    // Support iterative per-factory sourcing_executor when `has_more_factories === true` and prior factory did not clear >= 30%
+    while (
+      isR59 &&
+      !seqRes.clearedInterval &&
+      sourcingOutcome.has_more_factories === true &&
+      seenVerifiedFactories.size < maxFactoriesToCheck &&
+      submittedQuoteBatches < maxFactoriesToCheck
+    ) {
+      const preIterCheck = checkConcurrentSourcingAbort();
+      if (preIterCheck.aborted) return preIterCheck.aborted;
+      latestAfterSource = preIterCheck.liveForm;
+
+      const nextLease = store.acquireQueueLease('gate1b_1688_queue', lease_owner);
+      if (!nextLease.acquired) break;
+      let nextOutcome;
+      try {
+        nextOutcome = await sourcing_executor({
+          form: store.getCandidateForm(form_id),
+          landed_domestic_cap_cny: latestAfterSource.landed_domestic_cap_cny,
+          landed_domestic_cap_advisory_only: true,
+          factory_attempt_index: submittedQuoteBatches + 1,
+          checked_factory_quotes_count: seenVerifiedFactories.size,
+        });
+      } finally {
+        store.releaseQueueLease('gate1b_1688_queue', nextLease.lease_token);
+      }
+      const postIterCheck = checkConcurrentSourcingAbort();
+      if (postIterCheck.aborted) return postIterCheck.aborted;
+      latestAfterSource = postIterCheck.liveForm;
+
+      if (!nextOutcome || nextOutcome.status !== 'quoted') {
+        if (nextOutcome?.status === 'captcha_triggered' || nextOutcome?.status === 'login_expired') {
+          const pauseReason = nextOutcome.reason || `1688 queue paused due to ${nextOutcome.status}`;
+          store.pauseQueue('gate1b_1688_queue', pauseReason, { paused_form_id: form_id });
+          return {
+            form_id,
+            status: 'captcha_paused',
+            queue_status: 'CAPTCHA_PAUSED',
+            pause_reason: pauseReason,
+            paused_form_id: form_id,
+            proceed_to_gate2_3: false,
+          };
+        }
+        break;
+      }
+      sourcingOutcome = nextOutcome;
+      const nextQuotes = Array.isArray(nextOutcome.quotes) && nextOutcome.quotes.length > 0
+        ? nextOutcome.quotes
+        : [nextOutcome.quote];
+      seqRes = validateAndRecordBatch(nextQuotes);
+      if (seqRes.rejectedOverCap) break;
+      recordedBatch.push(...seqRes.recordedIds);
+    }
+
+    // H2: Reload each recorded quote from SQLite AFTER sequential recording completes so any same-spec quote
+    // archived as `superseded_uncompetitive` by a cheaper later quote is NOT evaluated!
     for (const rec of recordedBatch) {
       const freshQuote = store.getQuoteById(rec.quote.quote_id) ?? rec.quote;
       if (isQuoteUsableForForm(freshQuote, latestAfterSource, as_of_date)) {
@@ -2038,7 +2263,7 @@ export async function runGate1BForForm(store, {
   const missingDeclaredIdsSet = new Set();
   const passingQuoteIds = [];
   const failingQuoteIds = [];
-  const effectiveRevForEval = Math.max(58, Number.isInteger(profile_revision) ? profile_revision : 59);
+  const effectiveRevForEval = Math.max(59, Number.isInteger(profile_revision) ? profile_revision : 59);
 
   for (const activeQuote of quotesToEvaluate) {
     const activePlan = deriveOrderPlanFromPersistedQuote(activeQuote);
@@ -2271,7 +2496,7 @@ export async function runGate1BForForm(store, {
               requires_amazon_packaging: effRequiresPackaging,
             });
           if (cliffFul.status !== 'verified') continue;
-          const cliffEvalRev = Math.max(58, Number.isInteger(profile_revision) ? profile_revision : 59);
+          const cliffEvalRev = Math.max(59, Number.isInteger(profile_revision) ? profile_revision : 59);
           const hasBaseCouponUsd = finite(baseRaw.ongoing_coupon_usd) && baseRaw.ongoing_coupon_usd > 0;
           const hasBaseCouponPct = finite(baseRaw.ongoing_coupon_pct) && baseRaw.ongoing_coupon_pct > 0 && baseRaw.ongoing_coupon_pct < 1;
           const cliffListPrice = hasBaseCouponUsd
@@ -2426,29 +2651,6 @@ export async function runGate1BForForm(store, {
         }
       }
     }
-    const resolveQuoteDistinctFactoryKey = q => {
-      if (nonemptyStr(q?.factory_id)) return `fac:${q.factory_id.trim()}`;
-      if (nonemptyStr(q?.supplier_id)) return `fac:${q.supplier_id.trim()}`;
-      let lines = Array.isArray(q?.sku_lines) ? q.sku_lines : null;
-      if (!lines && nonemptyStr(q?.sku_lines_json)) {
-        try {
-          const parsed = JSON.parse(q.sku_lines_json);
-          if (Array.isArray(parsed)) lines = parsed;
-        } catch { /* ignore */ }
-      }
-      const lineFactories = Array.isArray(lines)
-        ? [...new Set(lines.map(l => {
-          const fk = l?.factory_id ?? l?.supplier_id ?? null;
-          return nonemptyStr(fk) ? fk.trim() : null;
-        }).filter(Boolean))].sort()
-        : [];
-      if (lineFactories.length > 0) return `fac:${lineFactories.join('+')}`;
-      const offerIds = Array.isArray(lines)
-        ? [...new Set(lines.map(l => (nonemptyStr(l?.offer_id) ? l.offer_id.trim() : null)).filter(Boolean))].sort()
-        : [];
-      if (offerIds.length > 0) return `off:${offerIds.join('+')}`;
-      return `qid:${q?.quote_id ?? 'unknown'}`;
-    };
     const countDistinctCheckedFactories = () => {
       const rows = store.getQuotesForForm(form_id).filter(
         q => q.spec_version === expectedSpecVersion &&
@@ -2456,7 +2658,7 @@ export async function runGate1BForForm(store, {
           q.freight_first_order_promotion === 0 &&
           (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
       );
-      return new Set(rows.map(resolveQuoteDistinctFactoryKey)).size;
+      return new Set(rows.map(resolveQuoteVerifiedFactoryKey).filter(Boolean)).size;
     };
     const checkedFactoryQuotesCount = effectiveRevForEval >= 59
       ? countDistinctCheckedFactories()
@@ -2472,7 +2674,7 @@ export async function runGate1BForForm(store, {
       evaluated_scenarios: evaluatedScenarioSummary,
       ...(effectiveRevForEval >= 59 ? { checked_factory_quotes_count: checkedFactoryQuotesCount } : {}),
       ...(effectiveRevForEval >= 59 && maxTargetGoodsCnyFor30Pct !== null ? { target_goods_cny_for_30pct: maxTargetGoodsCnyFor30Pct } : {}),
-      ...(effectiveRevForEval >= 59 && !anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < 3 } : {}),
+      ...(effectiveRevForEval >= 59 && !anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < BUSINESS_THRESHOLDS.max_1688_factories_to_check } : {}),
       ...(bestPackagingRedesign ? { packaging_redesign_shortlist: bestPackagingRedesign } : {}),
       reasons: evaluations.flatMap(e => e.reasons || []).map(sanitizeDiagnosticText),
     };
@@ -2487,7 +2689,7 @@ export async function runGate1BForForm(store, {
       margin_interval_verdict: g1bRes.margin_interval_verdict,
       ...(effectiveRevForEval >= 59 ? { checked_factory_quotes_count: checkedFactoryQuotesCount } : {}),
       ...(effectiveRevForEval >= 59 && maxTargetGoodsCnyFor30Pct !== null ? { target_goods_cny_for_30pct: maxTargetGoodsCnyFor30Pct } : {}),
-      ...(effectiveRevForEval >= 59 && !anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < 3 } : {}),
+      ...(effectiveRevForEval >= 59 && !anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < BUSINESS_THRESHOLDS.max_1688_factories_to_check } : {}),
       ...(sampleWarningTag ? { sample_warning_tag: sampleWarningTag } : {}),
       ...quotePricing,
       quote: persistedQuote,
@@ -2521,39 +2723,7 @@ export async function runGate1BForForm(store, {
   }
 
   if (allSuppliedPass && interiorFailPrices.length === 0 && missingDeclared.length === 0) {
-    const latest = store.getCandidateForm(form_id);
-    if (!latest || latest.spec_version !== expectedSpecVersion) {
-      return {
-        form_id,
-        status: 'stale_spec_version_conflict',
-        proceed_to_gate2_3: false,
-      };
-    }
-    const terminalNow = hasTerminalRejectionOrDeferralOnCurrentSpec(latest);
-    if (terminalNow.blocked && !(canRetrySecondFactoryR59 && terminalNow.status === 'gate1b_rejected' && !terminalNow.preserve_rights_conflict)) {
-      if (terminalNow.preserve_rights_conflict) {
-        const g1bRes = {
-          status: 'gate1b_rejected',
-          spec_sha256: latest.spec_sha256,
-          specific_rights_conflict_proven: true,
-          quote_id: persistedQuote.quote_id,
-          reason: 'Proven specific design rights conflict recorded on current specification.',
-        };
-        store.updateFormLifecycle(form_id, 'gate1b_rejected', { gate1b_result: g1bRes, negotiation_shortlist: null });
-        return {
-          form_id,
-          status: 'gate1b_rejected',
-          negotiation_shortlist: null,
-          proceed_to_gate2_3: false,
-        };
-      }
-      return {
-        form_id,
-        status: terminalNow.status,
-        reason: terminalNow.reason,
-        proceed_to_gate2_3: false,
-      };
-    }
+    const latest = store.getCandidateForm(form_id) ?? form;
     const secondFactoryQuoteNeeded = false;
     const nextStatus = latest.lifecycle_status === 'evaluated' ? 'evaluated' : 'gate1b_passed';
     const g1bRes = {
@@ -2603,23 +2773,7 @@ export async function runGate1BForForm(store, {
       }
     }
     const marginRange = margins.length > 0 ? [Math.min(...margins), Math.max(...margins)] : null;
-    const latest = store.getCandidateForm(form_id);
-    if (!latest || latest.spec_version !== expectedSpecVersion) {
-      return {
-        form_id,
-        status: 'stale_spec_version_conflict',
-        proceed_to_gate2_3: false,
-      };
-    }
-    const terminalNow = hasTerminalRejectionOrDeferralOnCurrentSpec(latest);
-    if (terminalNow.blocked && !(canRetrySecondFactoryR59 && terminalNow.status === 'gate1b_rejected' && !terminalNow.preserve_rights_conflict)) {
-      return {
-        form_id,
-        status: terminalNow.status,
-        reason: terminalNow.reason,
-        proceed_to_gate2_3: false,
-      };
-    }
+    const latest = store.getCandidateForm(form_id) ?? form;
     const canProceed = (allow_crossing_to_gate2_3 === true || isR59) && missingDeclared.length === 0 && (anyPass || interiorPassPrices.length > 0);
     const checkedFactoryQuotesCountCross = effectiveRevForEval >= 59
       ? (() => {
@@ -2652,7 +2806,7 @@ export async function runGate1BForForm(store, {
       spec_sha256: form.spec_sha256,
       ...(effectiveRevForEval >= 59 ? {
         checked_factory_quotes_count: checkedFactoryQuotesCountCross,
-        second_factory_quote_needed: checkedFactoryQuotesCountCross < 3,
+        second_factory_quote_needed: checkedFactoryQuotesCountCross < BUSINESS_THRESHOLDS.max_1688_factories_to_check,
       } : {}),
       owner_review_required: !isR59 || hasInteriorCliffCrossing,
       owner_crossing_override: canProceed,
@@ -2689,7 +2843,7 @@ export async function runGate1BForForm(store, {
       margin_interval_verdict: 'crosses_30pct',
       ...(effectiveRevForEval >= 59 ? {
         checked_factory_quotes_count: checkedFactoryQuotesCountCross,
-        second_factory_quote_needed: checkedFactoryQuotesCountCross < 3,
+        second_factory_quote_needed: checkedFactoryQuotesCountCross < BUSINESS_THRESHOLDS.max_1688_factories_to_check,
       } : {}),
       owner_review_required: g1bRes.owner_review_required,
       owner_crossing_override: canProceed,
@@ -3453,8 +3607,8 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
   candidateId = undefined,
   formSpecSha256 = undefined,
   model = null,
-  reasoningEffort = null,
-  serviceTier = null,
+  reasoningEffort = BUSINESS_THRESHOLDS.codex_default_reasoning_effort,
+  serviceTier = BUSINESS_THRESHOLDS.codex_default_service_tier,
   imagePaths = [],
   timeoutMs = null,
   cwd = null,
@@ -4156,8 +4310,17 @@ export async function runPhase2Batch(store, {
   for (const item of items) {
     const formId = item.form.form_id;
     const currentForm = store.getCandidateForm(formId);
+    if (currentForm?.lifecycle_status === 'deferred' && resume_skip_completed !== false && item.force_reopen_deferred !== true) {
+      report.gate1a.push({
+        form_id: formId,
+        status: 'deferred',
+        reason: 'Preserved existing deferred status in SQLite.',
+        proceed_to_gate1b: false,
+      });
+      continue;
+    }
     let priorCachedLuna = null;
-    if ((profile.revision ?? 58) >= 59 && currentForm?.gate1a_result_json && item.force_refresh_luna !== true) {
+    if ((profile.revision ?? 59) >= 59 && currentForm?.gate1a_result_json && item.force_refresh_luna !== true) {
       try {
         const prevG1a = JSON.parse(currentForm.gate1a_result_json);
         if (prevG1a?.spec_sha256 === currentForm.spec_sha256 && prevG1a?.luna_triage?.status === 'ready') {
@@ -4175,7 +4338,7 @@ export async function runPhase2Batch(store, {
       gate0_options: item.gate0_options ?? {},
       price_band_analysis: item.price_band_analysis ?? null,
       cluster_bands: item.cluster_bands ?? null,
-      profile_revision: profile.revision ?? 58,
+      profile_revision: profile.revision ?? 59,
       disallow_pre1688_cost_guess_kill: item.disallow_pre1688_cost_guess_kill ?? true,
       allow_forward_price_discovery: item.allow_forward_price_discovery ?? false,
     });
@@ -4236,7 +4399,7 @@ export async function runPhase2Batch(store, {
     if (g1a.proceed_to_gate1b) {
       const usableQuotes = store.getQuotesForForm(formId).filter(q => isQuoteUsableForForm(q, currentForm, as_of_date));
       let prevNeedMore = false;
-      if ((profile.revision ?? 58) >= 59 && currentForm?.gate1b_result_json) {
+      if ((profile.revision ?? 59) >= 59 && currentForm?.gate1b_result_json) {
         try {
           const prevG1b = JSON.parse(currentForm.gate1b_result_json);
           if ((!prevG1b?.spec_sha256 || prevG1b.spec_sha256 === currentForm.spec_sha256) && prevG1b?.second_factory_quote_needed === true) {
@@ -4259,13 +4422,14 @@ export async function runPhase2Batch(store, {
   }
 
   // Stage 2: Gate 1B serial 1688 queue (isolated sanitized per-form errors + CAPTCHA_PAUSED isolation).
-  if ((profile.revision ?? 58) >= 59) {
+  if ((profile.revision ?? 59) >= 59) {
     const initialQueue = store.getQueueState('gate1b_1688_queue');
     if (initialQueue && initialQueue.status === 'CAPTCHA_PAUSED') {
       report.batch_paused = true;
       report.pause_status = 'CAPTCHA_PAUSED';
       report.pause_reason = initialQueue.pause_reason ?? '1688 queue is persistently paused (CAPTCHA_PAUSED); clear slider and resume before continuing batch.';
       report.paused_form_id = initialQueue.paused_form_id ?? null;
+      report.queue_state = initialQueue;
       report.resumable = true;
       return report;
     }
@@ -4351,7 +4515,7 @@ export async function runPhase2Batch(store, {
       g1b = { ...g1b, vision_1688_precheck: vision1688Out };
     }
     report.gate1b.push(g1b);
-    if ((profile.revision ?? 58) >= 59 && (g1b.status === 'captcha_paused' || g1b.queue_status === 'CAPTCHA_PAUSED')) {
+    if ((profile.revision ?? 59) >= 59 && (g1b.status === 'captcha_paused' || g1b.queue_status === 'CAPTCHA_PAUSED')) {
       report.batch_paused = true;
       report.pause_status = 'CAPTCHA_PAUSED';
       report.pause_reason = g1b.pause_reason ?? '1688 session requires owner verification (CAPTCHA_PAUSED).';
@@ -4360,6 +4524,7 @@ export async function runPhase2Batch(store, {
       report.pending_form_ids = afterGate1A
         .map(e => e.form_id)
         .filter(fid => !readyForGate23.some(r => r.form_id === fid));
+      report.queue_state = store.getQueueState('gate1b_1688_queue');
       report.resumable = true;
       return report;
     }
@@ -4758,7 +4923,7 @@ export async function runPhase2Batch(store, {
         }
       }
 
-      if ((profile.revision ?? 58) >= 59 && latestForm.spec_sha256) {
+      if ((profile.revision ?? 59) >= 59 && latestForm.spec_sha256) {
         inputCand.spec_sha256 = latestForm.spec_sha256;
       }
       const resultBytes = Buffer.from(`${JSON.stringify(scoredResult, null, 2)}\n`, 'utf8');
@@ -4784,19 +4949,14 @@ export async function runPhase2Batch(store, {
 
       let persistedHtmlSha = htmlSha;
       let persistedEvidenceReview = attachedEvidenceReview;
+      let txAborted = null;
       store.runInTransaction(() => {
-        const recheck = store.getCandidateForm(formId);
-        if (!recheck || recheck.spec_version !== expectedSpecVersion) {
-          throw new Error(`Spec version changed concurrently for ${formId}; aborting stale evaluation write.`);
+        const txCheck = checkLiveFormAllowsDispatch();
+        if (!txCheck.allowed) {
+          txAborted = txCheck;
+          return;
         }
-        const recheckTerm = hasTerminalRejectionOrDeferralOnCurrentSpec(recheck);
-        if (recheckTerm.blocked) {
-          throw new Error(`${recheckTerm.reason}; aborting evaluation write.`);
-        }
-        const currentLeads = store.getLeadsForForm(formId);
-        if (!currentLeads.some(l => isPrimaryLeadAdmissibleForForm(l, recheck))) {
-          throw new Error(`No admissible primary_discovery lead remains for ${formId}; aborting evaluation write.`);
-        }
+        const recheck = txCheck.form;
         for (const p of periods) {
           const evRec = store.recordEvaluation({
             form_id: formId,
@@ -4837,6 +4997,15 @@ export async function runPhase2Batch(store, {
         }
         store.updateFormLifecycle(formId, 'evaluated');
       });
+      if (txAborted) {
+        report.gate2_3.push({
+          form_id: formId,
+          status: txAborted.status,
+          ...(txAborted.reason ? { reason: txAborted.reason } : {}),
+          attempt_ids: attemptIds,
+        });
+        continue;
+      }
 
       const currentSpecReviewVerified = Boolean(
         persistedEvidenceReview?.validated_envelope === true &&
@@ -4847,7 +5016,7 @@ export async function runPhase2Batch(store, {
         form_id: formId,
         status: 'evaluated',
         qualification,
-        ...((profile.revision ?? 58) >= 59 && qualification?.counts_toward_target === true ? {
+        ...((profile.revision ?? 59) >= 59 && qualification?.counts_toward_target === true ? {
           current_spec_sha256: latestForm.spec_sha256,
           current_spec_review_verified: currentSpecReviewVerified,
           review_visible_state: currentSpecReviewVerified ? '已复核' : '业务入围、当前规格待复核',
@@ -4910,14 +5079,72 @@ export function runFastProfitHealthcheck2027(spec = {}) {
     ? pricing.net_effective_price_usd
     : (finite(spec.price_usd) ? spec.price_usd : null);
   const fx = finite(spec.fx_cny_per_usd) && spec.fx_cny_per_usd > 0 ? spec.fx_cny_per_usd : null;
-  const orderUnits = Number.isInteger(spec.order_units) && spec.order_units >= 1 ? spec.order_units : 100;
+  let derivedCompleteSets = null;
+  if (
+    !Number.isInteger(spec.order_units) &&
+    !Number.isInteger(spec.actual_complete_sets) &&
+    Array.isArray(spec.sku_lines) &&
+    spec.sku_lines.length > 0
+  ) {
+    if (spec.sku_lines.every(sl => Number.isInteger(sl?.ordered_qty) && sl.ordered_qty >= 1)) {
+      derivedCompleteSets = Math.min(
+        ...spec.sku_lines.map(sl => {
+          const qPerSet = Number.isInteger(sl?.qty_per_saleable_set) && sl.qty_per_saleable_set >= 1 ? sl.qty_per_saleable_set : 1;
+          return Math.floor(sl.ordered_qty / qPerSet);
+        }),
+      );
+    } else {
+      try {
+        const comp = Array.isArray(spec.saleable_set_composition) && spec.saleable_set_composition.length > 0
+          ? spec.saleable_set_composition
+          : spec.sku_lines.map(sl => ({
+              component_id: sl.component_id ?? 'unit',
+              qty_per_saleable_set: Number.isInteger(sl.qty_per_saleable_set) && sl.qty_per_saleable_set >= 1 ? sl.qty_per_saleable_set : 1,
+            }));
+        const plan = computeOrderPlan({
+          saleable_set_composition: comp,
+          sku_lines: spec.sku_lines,
+          allow_remainder: spec.allow_remainder ?? false,
+          target_sets: spec.target_sets ?? null,
+          profile_revision: 59,
+        });
+        if (Number.isInteger(plan?.actual_complete_sets) && plan.actual_complete_sets >= 1) {
+          derivedCompleteSets = plan.actual_complete_sets;
+        }
+      } catch { /* leave null for explicit fallback */ }
+    }
+  }
+  const orderUnits = Number.isInteger(spec.actual_complete_sets) && spec.actual_complete_sets >= 1
+    ? spec.actual_complete_sets
+    : (Number.isInteger(spec.order_units) && spec.order_units >= 1
+      ? spec.order_units
+      : (derivedCompleteSets ?? 100));
   const hasGoodsCny = finite(spec.goods_cny_per_unit) || finite(spec.goods_cny_total);
   const goodsCnyTotal = finite(spec.goods_cny_total)
     ? spec.goods_cny_total
     : (finite(spec.goods_cny_per_unit) ? spec.goods_cny_per_unit * orderUnits : null);
+  const hasDomFreightCny = finite(spec.domestic_freight_cny_total) || finite(spec.domestic_freight_cny_per_unit);
   const domFreightCnyTotal = finite(spec.domestic_freight_cny_total)
     ? spec.domestic_freight_cny_total
-    : (finite(spec.domestic_freight_cny_per_unit) ? spec.domestic_freight_cny_per_unit * orderUnits : 0);
+    : (finite(spec.domestic_freight_cny_per_unit) ? spec.domestic_freight_cny_per_unit * orderUnits : null);
+
+  const missingTopLevelBond = spec.bond_included === false && !finite(spec.bond_usd_per_unit);
+  let resolvedHeadhaulUsd = !missingTopLevelBond && finite(spec.headhaul_usd)
+    ? spec.headhaul_usd + (spec.bond_included === false ? spec.bond_usd_per_unit : 0)
+    : undefined;
+  if (resolvedHeadhaulUsd === undefined && spec.headhaul && typeof spec.headhaul === 'object') {
+    if (finite(spec.headhaul.usd_per_unit) && (spec.headhaul.bond_included === true || finite(spec.headhaul.bond_usd_per_unit))) {
+      resolvedHeadhaulUsd = spec.headhaul.usd_per_unit + (spec.headhaul.bond_included === true ? 0 : spec.headhaul.bond_usd_per_unit);
+    } else if (!finite(spec.headhaul.usd_per_unit) && fx !== null) {
+      const a4 = computeHeadhaulWithA4Rules(spec.headhaul, fx, orderUnits, {
+        isR58: true,
+        isR59: true,
+      });
+      if (!a4?.missing_surcharge_quote && finite(a4?.amount_usd)) {
+        resolvedHeadhaulUsd = a4.amount_usd;
+      }
+    }
+  }
 
   const rawTierInfo = classifySizeTier2027(pkg, {
     is_apparel: spec.is_apparel === true,
@@ -4931,6 +5158,8 @@ export function runFastProfitHealthcheck2027(spec = {}) {
   const baseInput = {
     ...spec,
     pkg,
+    order_units: orderUnits,
+    headhaul: finite(resolvedHeadhaulUsd) ? undefined : spec.headhaul,
     sales_window: spec.sales_window ?? FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
     storage_window: spec.storage_window ?? FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
     inbound_window: spec.inbound_window ?? FBA_2027_DEFAULT_INBOUND_WINDOW,
@@ -4947,7 +5176,7 @@ export function runFastProfitHealthcheck2027(spec = {}) {
       ? spec.physical_return_fraction
       : (finite(spec.refund_fraction) ? spec.refund_fraction : 0.04),
     collection_rate: finite(spec.collection_rate) ? spec.collection_rate : 0.006,
-    headhaul_usd: finite(spec.headhaul_usd) ? spec.headhaul_usd : undefined,
+    headhaul_usd: resolvedHeadhaulUsd,
     fx_cny_per_usd: fx ?? undefined,
     profile_revision: 59,
   };
@@ -4967,43 +5196,71 @@ export function runFastProfitHealthcheck2027(spec = {}) {
   let packagingRescue = null;
 
   if (hasGoodsCny && fx !== null) {
-    const goodsUsdPerUnit = (goodsCnyTotal / orderUnits) / fx;
-    const domFreightUsdPerUnit = (domFreightCnyTotal / orderUnits) / fx;
-    const landedCnyPerUnit = (goodsCnyTotal + domFreightCnyTotal) / orderUnits;
+    if (!hasDomFreightCny) {
+      const pendingReason = 'Missing domestic_freight_cny_total / domestic_freight_cny_per_unit to 广东深圳; domestic freight is never assumed ¥0.';
+      forwardBreakeven = {
+        status: 'pending_domestic_freight',
+        reason: pendingReason,
+        feasible_min_price_usd: null,
+      };
+      realizedScreen = {
+        status: 'pending_domestic_freight',
+        reason: pendingReason,
+        margin: null,
+        contribution_usd: null,
+      };
+    } else {
+      const landedCnyPerUnit = (goodsCnyTotal + domFreightCnyTotal) / orderUnits;
 
-    forwardBreakeven = solveMinPriceForMargin2027({
-      ...baseInput,
-      landed_domestic_cny: landedCnyPerUnit,
-      margin_floor: 0.30,
-      min_retail_price_usd: 29.99,
-    });
+      forwardBreakeven = finite(baseInput.headhaul_usd)
+        ? solveMinPriceForMargin2027({
+            ...baseInput,
+            landed_domestic_cny: landedCnyPerUnit,
+            margin_floor: 0.30,
+            min_retail_price_usd: 29.99,
+          })
+        : {
+            status: 'needs_calculator_verification',
+            reason: 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
+            feasible_min_price_usd: null,
+          };
 
-    if (priceUsd !== null && finite(baseInput.headhaul_usd)) {
-      const landedUsdPerUnit = landedCnyPerUnit / fx;
-      const g1aAtPrice = estimateGate1A2027({
-        ...baseInput,
-        price_usd: spec.price_usd ?? priceUsd,
-        margin_floor: 0.30,
-        min_landed_domestic_usd: landedUsdPerUnit,
-        domestic_freight_usd: 0,
-      });
-      if (g1aAtPrice?.status === 'verified' && finite(g1aAtPrice.net_revenue_usd) && g1aAtPrice.net_revenue_usd > 0) {
-        const contrib = Math.round((g1aAtPrice.net_revenue_usd - g1aAtPrice.non_domestic_cost_a_usd - landedUsdPerUnit) * 1e10) / 1e10;
-        const marg = Math.round((contrib / g1aAtPrice.net_revenue_usd) * 1e10) / 1e10;
-        realizedScreen = { status: 'verified', margin: marg, contribution_usd: contrib };
-      } else {
-        realizedScreen = { status: g1aAtPrice?.status ?? 'needs_calculator_verification', margin: null, contribution_usd: null };
-      }
-      const realizedMargin = realizedScreen?.margin ?? null;
-      if (finite(realizedMargin) && realizedMargin < 0.30) {
-        packagingRescue = computePackagingRedesignShortlist2027({
-          ...baseInput,
-          price_usd: spec.price_usd ?? priceUsd,
-          landed_domestic_cny_per_set: landedCnyPerUnit,
-          fx_cny_per_usd: fx,
-          headhaul_usd: baseInput.headhaul_usd,
-          collection_rate: baseInput.collection_rate,
-        });
+      if (priceUsd !== null) {
+        if (!finite(baseInput.headhaul_usd)) {
+          realizedScreen = {
+            status: 'needs_calculator_verification',
+            reason: 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
+            margin: null,
+            contribution_usd: null,
+          };
+        } else {
+          const landedUsdPerUnit = landedCnyPerUnit / fx;
+          const g1aAtPrice = estimateGate1A2027({
+            ...baseInput,
+            price_usd: spec.price_usd ?? priceUsd,
+            margin_floor: 0.30,
+            min_landed_domestic_usd: landedUsdPerUnit,
+            domestic_freight_usd: 0,
+          });
+          if (g1aAtPrice?.status === 'verified' && finite(g1aAtPrice.net_revenue_usd) && g1aAtPrice.net_revenue_usd > 0) {
+            const contrib = Math.round((g1aAtPrice.net_revenue_usd - g1aAtPrice.non_domestic_cost_a_usd - landedUsdPerUnit) * 1e10) / 1e10;
+            const marg = Math.round((contrib / g1aAtPrice.net_revenue_usd) * 1e10) / 1e10;
+            realizedScreen = { status: 'verified', margin: marg, contribution_usd: contrib };
+          } else {
+            realizedScreen = { status: g1aAtPrice?.status ?? 'needs_calculator_verification', margin: null, contribution_usd: null };
+          }
+          const realizedMargin = realizedScreen?.margin ?? null;
+          if (finite(realizedMargin) && realizedMargin < 0.30) {
+            packagingRescue = computePackagingRedesignShortlist2027({
+              ...baseInput,
+              price_usd: spec.price_usd ?? priceUsd,
+              landed_domestic_cny_per_set: landedCnyPerUnit,
+              fx_cny_per_usd: fx,
+              headhaul_usd: baseInput.headhaul_usd,
+              collection_rate: baseInput.collection_rate,
+            });
+          }
+        }
       }
     }
   }
@@ -5067,6 +5324,11 @@ export function buildAutoEarlyScreenScenariosFromGate1A(gate1aScenarios = [], {
       profile_revision,
     });
     const refTerms = rawSc.referral_terms ?? {};
+    const resolvedHeadhaulUsd = finite(rawSc.headhaul_usd)
+      ? rawSc.headhaul_usd
+      : (finite(est.components?.headhaul?.amount_usd)
+        ? est.components.headhaul.amount_usd
+        : (finite(est.components?.headhaul_usd) ? est.components.headhaul_usd : null));
     return {
       ...rawSc,
       profile_revision,
@@ -5075,10 +5337,12 @@ export function buildAutoEarlyScreenScenariosFromGate1A(gate1aScenarios = [], {
       order_units: 100,
       first_order_promotion: false,
       goods_first_order_promotion: false,
-      headhaul: rawSc.headhaul ?? {
-        usd_per_unit: rawSc.headhaul_usd ?? est.components?.headhaul_usd ?? 2.0,
-        bond_included: true,
-      },
+      headhaul: rawSc.headhaul ?? (resolvedHeadhaulUsd !== null
+        ? {
+          usd_per_unit: resolvedHeadhaulUsd,
+          bond_included: true,
+        }
+        : null),
       refund_fraction: rawSc.refund_fraction ?? 0.04,
       physical_return_fraction: rawSc.physical_return_fraction ?? rawSc.refund_fraction ?? 0.04,
       return_threshold: est.components?.returns_processing?.return_threshold ?? 0.081,

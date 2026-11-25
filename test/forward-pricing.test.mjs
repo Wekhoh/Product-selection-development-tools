@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { estimateGate1A2027, solveMinPriceForMargin2027 } from '../src/fba-rates-2027.mjs';
+import { estimateGate1A2027, solveMinPriceForMargin2027 } from '../src/fba-calculator.mjs';
 import { runGate1AForForm, runGate1BForForm, runOptionalRightsPreScreen } from '../src/pipeline.mjs';
 import { analyzeMainstreamPriceBand, tightenClusterBands } from '../src/price-band.mjs';
 import { openSelectionStore } from '../src/store.mjs';
 
 function scenario(overrides = {}) {
   return {
-    profile_revision: 58,
+    profile_revision: 59,
     id: 'offpeak',
     price_usd: 39.99,
     pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
@@ -22,7 +22,7 @@ function scenario(overrides = {}) {
     },
     headhaul_usd: 2.20,
     collection_rate: 0.006,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
+    sales_window: { from: '2027-02-01', through: '2027-10-14' },
     storage_window: { from: '2027-02-01', through: '2027-09-30' },
     inbound_window: { from: '2027-01-20', through: '2027-02-01' },
     ...overrides,
@@ -63,34 +63,40 @@ function quoteFor(store, formId, overrides = {}) {
     goods_cny_total: 13200,
     domestic_freight_cny_total: 120,
     raw_readback_ref: 'fixture:carton-quote',
+    ui_readback: {
+      logged_in: true,
+      viewport_width_px: 1440,
+      selected_sku_row_visible: true,
+      settlement_bar_visible: true,
+      applied_quantity_confirmed: true,
+    },
     ...overrides,
   }).quote;
 }
 
-test('mature event discounts at the 15% boundary stay outside regular and cluster price bands', () => {
-  const base = { fulfillment: 'FBA', age_days: 150, monthly_units: 40 };
+test('heavy single-coupon discounts at the >=20% r59 boundary and <=90d newcomers stay outside regular and cluster price bands', () => {
+  const base = { fulfillment: 'FBA', age_days: 400, keepa_price_steady: true, monthly_units: 40 };
   const listings = [
-    { ...base, asin: 'EVENT-A', net_price_usd: 25.50, keepa_90d_median_usd: 30, monthly_units: 800 },
-    { ...base, asin: 'EVENT-B', price_usd: 24.90, historical_regular_price_usd: 32, monthly_units: 500 },
+    { ...base, asin: 'COUPON-A', list_price_usd: 30, net_price_usd: 24.00, monthly_units: 800 },
+    { ...base, asin: 'COUPON-B', list_price_usd: 32, net_price_usd: 24.90, monthly_units: 500 },
     { ...base, asin: 'REGULAR-A', price_usd: 29.99, keepa_90d_median_usd: 35.27 },
     { ...base, asin: 'REGULAR-B', price_usd: 31.99 },
     { ...base, asin: 'YOUNG-A', age_days: 40, price_usd: 30.99, keepa_90d_median_usd: 40 },
   ];
-  const analysis = analyzeMainstreamPriceBand(listings, { profile_revision: 58 });
-  assert.deepEqual(analysis, analyzeMainstreamPriceBand([...listings].reverse(), { profile_revision: 58 }));
+  const analysis = analyzeMainstreamPriceBand(listings, { profile_revision: 59 });
+  assert.deepEqual(analysis, analyzeMainstreamPriceBand([...listings].reverse(), { profile_revision: 59 }));
   assert.deepEqual(analysis.spiral_watch.map(r => [r.asin, r.watch_reasons]), [
-    ['EVENT-A', ['holiday_or_event_promo_outlier']],
-    ['EVENT-B', ['holiday_or_event_promo_outlier']],
+    ['COUPON-A', ['heavy_coupon_outlier']],
+    ['COUPON-B', ['heavy_coupon_outlier']],
+    ['YOUNG-A', ['newcomer_le_90d_launch_ref']],
   ]);
-  assert.equal(analysis.spiral_watch[1].regular_price_reference.source, 'historical_regular_price_usd');
-  assert.equal(analysis.regular_band_reference.basis, 'observed_historical_regular_prices');
-  assert.equal(analysis.regular_band_reference.min_usd, 30);
-  assert.equal(analysis.regular_band_reference.max_usd, 35.27);
-  assert.deepEqual(analysis.regular_band_reference.sources, { keepa_90d_median_usd: 2, historical_regular_price_usd: 1 });
-  assert.equal(analysis.regular_band_reference.peer_count, 3);
+  assert.equal(analysis.regular_band_reference.basis, 'veteran_ge_365d_keepa_steady');
+  assert.equal(analysis.regular_band_reference.min_usd, 29.99);
+  assert.equal(analysis.regular_band_reference.max_usd, 31.99);
+  assert.equal(analysis.regular_band_reference.peer_count, 2);
   const tightened = tightenClusterBands(analysis, [{ asins: listings.map(row => row.asin) }]);
   assert.equal(tightened.clusters[0].band.min_usd, 29.99);
-  assert.deepEqual(tightened.clusters[0].spiral_watch_asins, ['EVENT-A', 'EVENT-B']);
+  assert.deepEqual(tightened.clusters[0].spiral_watch_asins, ['COUPON-A', 'COUPON-B', 'YOUNG-A']);
 });
 
 test('Gate 1A ignores pre-quote guesses and requires regular price or non-domestic cost proof to reject', t => {
@@ -98,7 +104,7 @@ test('Gate 1A ignores pre-quote guesses and requires regular price or non-domest
   t.after(() => store.close());
   register(store, 'gate-proof');
   const guess = scenario({ min_landed_domestic_usd: 100, domestic_freight_usd: 99, margin_floor: 0.90 });
-  const admitted = runGate1AForForm(store, { form_id: 'gate-proof', profile_revision: 58, scenarios: [guess] });
+  const admitted = runGate1AForForm(store, { form_id: 'gate-proof', profile_revision: 59, scenarios: [guess] });
   assert.equal(admitted.proceed_to_gate1b, true);
   assert.equal(admitted.landed_domestic_cap_advisory_only, true);
   assert.ok(admitted.best_landed_domestic_cap_cny > 0);
@@ -107,20 +113,20 @@ test('Gate 1A ignores pre-quote guesses and requires regular price or non-domest
 
   const gross = runGate1AForForm(store, {
     form_id: 'gate-proof',
-    profile_revision: 58,
+    profile_revision: 59,
     scenarios: [scenario({ headhaul_usd: 100 })],
   });
   assert.equal(gross.gate_status, 'gate1a_rejected');
   assert.equal(gross.reason_code, 'non_domestic_cost_exceeds_70pct_at_zero_goods');
 
-  const promo = scenario({ price_usd: 25.50, age_days: 150, keepa_90d_median_usd: 30 });
-  const isolated = runGate1AForForm(store, { form_id: 'gate-proof', profile_revision: 58, scenarios: [promo] });
+  const promo = scenario({ price_usd: 24.00, age_days: 150, keepa_90d_median_usd: 30 });
+  const isolated = runGate1AForForm(store, { form_id: 'gate-proof', profile_revision: 59, scenarios: [promo] });
   assert.equal(isolated.gate_status, 'gate1a_needs_verification');
   assert.equal(isolated.scenarios[0].holiday_or_event_promo_outlier, true);
 
   const priceFloor = runGate1AForForm(store, {
     form_id: 'gate-proof',
-    profile_revision: 58,
+    profile_revision: 59,
     scenarios: [scenario({ price_usd: 29.98 })],
   });
   assert.equal(priceFloor.reason_code, 'all_regular_scenario_prices_below_floor');
@@ -131,7 +137,7 @@ test('Gate 1A isolates the observed watch prices while retaining a different reg
   t.after(() => store.close());
   const formId = 'watched-prices';
   register(store, formId);
-  const base = { fulfillment: 'FBA', age_days: 150, monthly_units: 40 };
+  const base = { fulfillment: 'FBA', age_days: 400, keepa_price_steady: true, monthly_units: 40 };
   const listings = [
     { ...base, asin: 'LAUNCH', age_days: 45, price_usd: 21 },
     { ...base, asin: 'COUPON', list_price_usd: 40, net_price_usd: 22 },
@@ -142,21 +148,22 @@ test('Gate 1A isolates the observed watch prices while retaining a different reg
   const watched = listings.slice(0, 3).map(peer => scenario({
     id: peer.asin, asin: peer.asin.toLowerCase(), price_usd: peer.net_price_usd ?? peer.price_usd,
   }));
-  const held = runGate1AForForm(store, { form_id: formId, profile_revision: 58, scenarios: watched, price_band_analysis: listings });
+  const held = runGate1AForForm(store, { form_id: formId, profile_revision: 59, scenarios: watched, price_band_analysis: listings });
   assert.equal(held.gate_status, 'gate1a_needs_verification');
   assert.deepEqual(held.scenarios.map(s => s.price_basis), [
-    'launch_spiral_low_price', 'heavy_coupon_outlier', 'young_heavy_coupon_outlier',
+    'newcomer_le_90d_launch_ref', 'heavy_coupon_outlier', 'young_heavy_coupon_outlier',
   ]);
+  const listingsWithSteadyPeer = [...listings, { ...base, asin: 'REG-STEADY', price_usd: 40 }];
   const admitted = runGate1AForForm(store, {
     form_id: formId,
-    profile_revision: 58,
-    scenarios: [...watched, scenario({ id: 'regular-readback', asin: 'COUPON', price_usd: 40 })],
-    price_band_analysis: listings,
+    profile_revision: 59,
+    scenarios: [...watched, scenario({ id: 'regular-readback', asin: 'REG-STEADY', price_usd: 40 })],
+    price_band_analysis: listingsWithSteadyPeer,
   });
   assert.equal(admitted.proceed_to_gate1b, true);
   assert.deepEqual(admitted.declared_scenarios.map(s => s.id), ['regular-readback']);
   const explicit = runGate1AForForm(store, {
-    form_id: formId, profile_revision: 58, scenarios: [scenario({ price_usd: 21, price_basis: 'launch_spiral_low_price' })],
+    form_id: formId, profile_revision: 59, scenarios: [scenario({ price_usd: 21, price_basis: 'launch_spiral_low_price' })],
   });
   assert.equal(explicit.gate_status, 'gate1a_needs_verification');
 });
@@ -171,7 +178,7 @@ test('cold-start Gate 1B prices a persisted carton quote over declared non-peak 
   const peak = scenario({ id: 'peak', price_usd: null, sales_window: { from: '2027-10-15', through: '2027-12-31' } });
   const g1a = runGate1AForForm(store, {
     form_id: formId,
-    profile_revision: 58,
+    profile_revision: 59,
     scenarios: [low, high, peak],
     allow_forward_price_discovery: true,
   });
@@ -186,7 +193,7 @@ test('cold-start Gate 1B prices a persisted carton quote over declared non-peak 
   assert.equal(Object.hasOwn(quote, 'fx_cny_per_usd'), false);
   const outcome = await runGate1BForForm(store, {
     form_id: formId,
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: { ...quote, goods_cny_total: 120 },
     as_of_date: '2026-11-22',
     early_screen_builder: () => { assert.fail('Cold start cannot run the actual-price margin builder.'); },
@@ -223,7 +230,7 @@ test('Gate 1B uses a persisted saleable package and FX for a cold-start scenario
   const formId = 'quote-only-fee-basis';
   register(store, formId);
   const fees = scenario({ price_usd: null, pkg: undefined, fx_cny_per_usd: undefined });
-  runGate1AForForm(store, { form_id: formId, profile_revision: 58, scenarios: [fees], allow_forward_price_discovery: true });
+  runGate1AForForm(store, { form_id: formId, profile_revision: 59, scenarios: [fees], allow_forward_price_discovery: true });
   const pkg = { length_in: 10, width_in: 6, height_in: 2, weight_lb: 5 };
   const quote = quoteFor(store, formId, { pkg: { ...pkg, unsupported_note: 'discarded fixture' }, fx_cny_per_usd: 6 });
   assert.deepEqual(quote.pkg, pkg);
@@ -231,7 +238,7 @@ test('Gate 1B uses a persisted saleable package and FX for a cold-start scenario
   assert.equal(quote.fx_cny_per_usd, 6);
   const outcome = await runGate1BForForm(store, {
     form_id: formId,
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: { ...quote, pkg: scenario().pkg, fx_cny_per_usd: 7 },
     as_of_date: '2026-11-22',
   });
@@ -260,12 +267,12 @@ test('Gate 1B blocks package or FX conflicts in any declared scenario before the
     register(store, formId);
     const base = scenario({ id: 'basis-matches', pkg: { ...scenario().pkg, weight_lb: 1.75 }, fx_cny_per_usd: 6.9 });
     const conflicting = { ...base, id: 'basis-conflicts', ...override };
-    const admitted = runGate1AForForm(store, { form_id: formId, profile_revision: 58, scenarios: [base, conflicting] });
+    const admitted = runGate1AForForm(store, { form_id: formId, profile_revision: 59, scenarios: [base, conflicting] });
     assert.deepEqual(admitted.declared_scenarios.map(s => s.id), [base.id, conflicting.id]);
     const quote = quoteFor(store, formId, { pkg: equivalentQuotePkg, fx_cny_per_usd: 6.9 });
     const outcome = await runGate1BForForm(store, {
       form_id: formId,
-      profile_revision: 58,
+      profile_revision: 59,
       existing_quote: quote,
       as_of_date: '2026-11-22',
       allow_crossing_to_gate2_3: true,
@@ -303,12 +310,12 @@ test('an explicit forward discovery request can source without any retail scenar
   const store = openSelectionStore();
   t.after(() => store.close());
   register(store, 'no-price');
-  const gate = runGate1AForForm(store, { form_id: 'no-price', profile_revision: 58, allow_forward_price_discovery: true });
+  const gate = runGate1AForForm(store, { form_id: 'no-price', profile_revision: 59, allow_forward_price_discovery: true });
   assert.equal(gate.proceed_to_gate1b, true);
   assert.equal(gate.forward_price_discovery_only, true);
   assert.deepEqual(gate.scenarios, []);
   const quote = quoteFor(store, 'no-price');
-  const result = await runGate1BForForm(store, { form_id: 'no-price', profile_revision: 58, existing_quote: quote, as_of_date: '2026-11-22' });
+  const result = await runGate1BForForm(store, { form_id: 'no-price', profile_revision: 59, existing_quote: quote, as_of_date: '2026-11-22' });
   assert.equal(result.status, 'gate1b_pending');
   assert.equal(result.forward_pricing.status, 'needs_calculator_verification');
   assert.equal(result.forward_pricing.min_retail_price_for_30pct_usd, null);
@@ -319,16 +326,16 @@ test('a Gate 1A rerun during the Gate 1B screen builder leaves the new scenarios
   t.after(() => store.close());
   const formId = 'scenario-rerun';
   register(store, formId);
-  runGate1AForForm(store, { form_id: formId, profile_revision: 58, scenarios: [scenario()] });
+  runGate1AForForm(store, { form_id: formId, profile_revision: 59, scenarios: [scenario()] });
   const quote = quoteFor(store, formId);
   const result = await runGate1BForForm(store, {
     form_id: formId,
-    profile_revision: 58,
+    profile_revision: 59,
     existing_quote: quote,
     as_of_date: '2026-11-22',
     early_screen_builder: ({ quote: builderQuote }) => {
       builderQuote.goods_cny_total = 1;
-      runGate1AForForm(store, { form_id: formId, profile_revision: 58, scenarios: [scenario({ id: 'replacement', price_usd: 43 })] });
+      runGate1AForForm(store, { form_id: formId, profile_revision: 59, scenarios: [scenario({ id: 'replacement', price_usd: 43 })] });
       return [];
     },
   });

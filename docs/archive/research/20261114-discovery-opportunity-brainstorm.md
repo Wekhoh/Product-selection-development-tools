@@ -1,6 +1,6 @@
 # Discovery opportunity brainstorming — 2026-11-14
 
-Status: research and recommendations for discussion. This does not adopt new scoring dimensions, bonuses, weights, thresholds or an execution schedule. The owner paused scoring changes and further candidate trials to reconsider discovery. The five existing discovery routes and the growth/stable-demand/supply-gap hypotheses remain the baseline. [STATE](../STATE.md) owns execution and recovery; [the earlier reuse review](20261114-discovery-methods-reuse.md) retains the upstream inspection already completed.
+Status: research and recommendations for discussion. This does not adopt new scoring dimensions, bonuses, weights, thresholds or an execution schedule. The owner paused scoring changes and further candidate trials to reconsider discovery. The five existing discovery routes and the growth/stable-demand/supply-gap hypotheses remain the baseline. [STATE](../../STATE.md) owns execution and recovery; [the earlier reuse review](20261114-discovery-methods-reuse.md) retains the upstream inspection already completed.
 
 ## Question and working recommendation
 

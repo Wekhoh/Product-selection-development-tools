@@ -18,10 +18,12 @@ import { parseArgs } from 'node:util';
 import { canonicalJson, computeEvidenceBundleHash, openSelectionStore, sha256Hex } from './store.mjs';
 import {
   buildOutOfTableLookupDirective,
+  computeHeadhaulWithA4Rules,
+  computeOrderPlan,
   getFba2027RateTableSnapshot,
   registerSupplementalOutOfTableRule2027,
   solveMinPriceForMargin2027,
-} from './fba-rates-2027.mjs';
+} from './fba-calculator.mjs';
 import { buildFunnelLedger, checkFormDuplicates } from './funnel-ledger.mjs';
 import {
   importRecoveryLockFile,
@@ -52,7 +54,7 @@ import {
 import { attachDiscovery, attachStoreDiscoveryProvenance, prepareDiscovery } from './discovery.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
-import { extractSpApiFinalistCalibration, ingestTrialSpecification } from './raw-ingest.mjs';
+import { extractSpApiFinalistCalibration, ingestTrialSpecification, mergeKeepaPayloadsIntoPeerListings } from './raw-ingest.mjs';
 import { assertNoRawPii, containsSecretToken, sanitizeDiagnosticText } from './contracts.mjs';
 import {
   WORKFLOW_RESPONSES_TASKS,
@@ -67,8 +69,8 @@ import {
   openOpenAiBudgetLedger,
   resolveCodexCommand,
   runCodexEvidenceReview,
-  verifySavedCodexReceipt,
 } from './openai/index.mjs';
+import { verifySavedCodexReceipt } from './receipt-verifier.mjs';
 
 const THIS_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_CANONICAL_BUDGET_DB = resolve(THIS_DIR, '..', '.local', 'state', 'selection.sqlite');
@@ -108,7 +110,7 @@ const USAGE = [
   '  serve-report       --dir <report-dir> [--port <port>] [--check | --once]  (无状态，在 127.0.0.1 启动本地 HTML 报告渲染预览服务)',
   '  redteam-review     --packet <packet.json> --output <review.json> [--effort <xhigh|max>] [--image <file>...] [--dry-run | --offline]  (未传 --dry-run/--offline 时调用本地订阅 codex exec)',
   '  daily-batch        --db <sqlite> --input <daily-batch.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (日常 80% 站内 + 20% 站外 + 1688 源头厂小批入口，支持滑块暂停续跑)',
-  '  single-dive        --db <sqlite> --input <asin-or-post.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (扔单 ASIN 或站外帖子单品深挖)',
+  '  single-product     --db <sqlite> --input <asin-or-post.json> [--profile <profile.json>] [--report-dir <dir>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (单品种子登记、Gate1A/1B/21项评分与 V4 报告导出；兼容别名 single-dive)',
   '  reverse-1688       --db <sqlite> --input <1688-spec.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (1688 源头厂反向测美亚 30% 保底零售价与深挖)',
   '  profit-check       --input <profit-spec.json> [--output <out.json>]  (无状态，快速 2027 淡季利润体检 + 非 SIPP 合并费 + <=10mm 改盒可救检测)',
   '  openai-recover     --db <sqlite> --credential-file <json> --attempt <id> [--output <out.json>]  (零重复 POST 读取 GET /v1/responses/{id} 断点恢复并补记新用量)',
@@ -561,6 +563,24 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
     for (const cand of boundBatch.candidates) {
       if (!cand?.id) continue;
       const form = store.getCandidateForm(cand.id);
+      if (form?.lifecycle_status === 'deferred' && !expectedHtmlSha256 && effectiveRevForSnap >= 59) {
+        if (!Array.isArray(cand.evidence) || cand.evidence.length === 0) {
+          cand.evidence = [{
+            id: 'sqlite-lifecycle-deferred',
+            source: 'SQLite candidate_forms lifecycle',
+            observed_at: (form.updated_at ?? '2026-11-25').slice(0, 10),
+          }];
+        }
+        cand.screening = {
+          ...(cand.screening && typeof cand.screening === 'object' ? cand.screening : {}),
+          strong_date_dependency: {
+            value: true,
+            unit: 'boolean',
+            evidence: [cand.evidence[0].id],
+            reason: 'Synchronized from SQLite lifecycle_status: deferred.',
+          },
+        };
+      }
       if (form?.gate1a_result_json) {
         try {
           attachGate1APriceCliffStress(cand, JSON.parse(form.gate1a_result_json));
@@ -1164,6 +1184,7 @@ export async function runPhase2Cli(
           'submit-jsonl': { type: 'string' },
           'download-output': { type: 'boolean' },
           'persist-file': { type: 'string' },
+          'report-dir': { type: 'string' },
           list: { type: 'boolean' },
         },
       });
@@ -1347,12 +1368,21 @@ export async function runPhase2Cli(
       if (command === 'price-band') {
         const inputPath = resolve(requireOption(values.input, 'input'));
         const payload = await readJsonFileSafe(inputPath, '价位带输入文件');
-        const listings = Array.isArray(payload) ? payload : payload.listings;
+        const rawListings = Array.isArray(payload) ? payload : payload.listings;
+        let extraKeepaPayloads = Array.isArray(payload?.keepa_receipts) ? [...payload.keepa_receipts] : [];
+        if (Array.isArray(payload?.raw_receipt_files)) {
+          for (const relFp of payload.raw_receipt_files) {
+            extraKeepaPayloads.push(await readJsonFileSafe(resolve(dirname(inputPath), String(relFp)), 'Keepa 原始回执'));
+          }
+        }
+        const listings = extraKeepaPayloads.length > 0
+          ? mergeKeepaPayloadsIntoPeerListings(rawListings, extraKeepaPayloads, { as_of_date: payload?.options?.as_of_date ?? null })
+          : rawListings;
         const pbRev = values['profile-revision'] !== undefined
           ? Number(values['profile-revision'])
           : (payload?.profile_revision ?? payload?.options?.profile_revision);
-        if (pbRev !== undefined && (!Number.isInteger(pbRev) || pbRev < 50)) {
-          throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+        if (pbRev !== undefined && (!Number.isInteger(pbRev) || pbRev < 59)) {
+          throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
         }
         const gate0Opts = {
           ...(payload?.gate0_options ?? payload?.options?.gate0_config ?? {}),
@@ -1604,7 +1634,7 @@ export async function runPhase2Cli(
       if (command === 'redteam-review') {
         const packetPath = resolve(requireOption(values.packet, 'packet'));
         const outputPath = resolve(requireOption(values.output, 'output'));
-        const effort = values.effort ? values.effort.trim() : null;
+        const effort = values.effort ? values.effort.trim() : 'max';
         if (effort !== null && !['xhigh', 'max'].includes(effort)) {
           throw new Phase2CliError('--effort 必须为 xhigh 或 max。');
         }
@@ -1901,8 +1931,7 @@ export async function runPhase2Cli(
           confirmAutoRechargeOff !== undefined ||
           confirmHardLimit !== undefined ||
           monthlyLimitCents !== undefined ||
-          sameMonthPendingBufferCents !== undefined ||
-          allowStage4Media !== undefined,
+          sameMonthPendingBufferCents !== undefined,
         );
         if (!hasPolicyAction && !attemptId) {
           throw new Phase2CliError(
@@ -1931,7 +1960,6 @@ export async function runPhase2Cli(
               hardMonthlyLimitConfirmed: confirmHardLimit,
               monthlyLimitCents,
               sameMonthPendingBufferCents,
-              allowStage4Media,
               note: !attemptId ? (noteText ?? null) : null,
             });
           } else {
@@ -1959,8 +1987,7 @@ export async function runPhase2Cli(
                   hardMonthlyLimitConfirmed: confirmHardLimit,
                   monthlyLimitCents,
                   sameMonthPendingBufferCents,
-                  allowStage4Media,
-                  note: !attemptId ? (noteText ?? null) : null,
+                      note: !attemptId ? (noteText ?? null) : null,
                 });
               } else if (hasPolicyAction) {
                 ledger.configurePolicy({
@@ -1970,8 +1997,7 @@ export async function runPhase2Cli(
                   hardMonthlyLimitConfirmed: confirmHardLimit,
                   monthlyLimitCents,
                   sameMonthPendingBufferCents,
-                  allowStage4Media,
-                  note: !attemptId ? noteText : undefined,
+                      note: !attemptId ? noteText : undefined,
                 });
               }
 
@@ -2027,6 +2053,28 @@ export async function runPhase2Cli(
 
     const rawDb = requireOption(values.db, 'db');
     const dbPath = rawDb === ':memory:' ? ':memory:' : resolve(rawDb);
+    if (values['profile-revision'] !== undefined) {
+      const preRev = Number(values['profile-revision']);
+      if (!Number.isInteger(preRev) || preRev < 59) {
+        throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
+      }
+    }
+    if (values.profile && ['replay', 'export-report', 'daily-batch', 'single-product', 'single-dive', 'reverse-1688'].includes(command)) {
+      const preProf = await readJsonFileSafe(resolve(values.profile), '评分配置文件');
+      const effPreRev = values['profile-revision'] !== undefined ? Number(values['profile-revision']) : (preProf?.revision ?? 59);
+      if (!Number.isInteger(effPreRev) || effPreRev < 59) {
+        throw new Phase2CliError('当前主线仅运行 Revision 59+（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
+      }
+    }
+    if (values.input && ['gate1a', 'gate1b', 'daily-batch', 'single-product', 'single-dive', 'reverse-1688'].includes(command)) {
+      const preSpec = await readJsonFileSafe(resolve(values.input), `${command} 输入文件`);
+      if (preSpec && typeof preSpec === 'object' && !Array.isArray(preSpec) && preSpec.profile_revision !== undefined && values['profile-revision'] === undefined) {
+        const specRev = Number(preSpec.profile_revision);
+        if (!Number.isInteger(specRev) || specRev < 59) {
+          throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
+        }
+      }
+    }
     const isReadOnlyCmd = READ_ONLY_DB_COMMANDS.has(command) ||
       (command === 'calibration-track' && values.list === true && !values.input);
     const openReadOnly = (isReadOnlyCmd || (command === 'export-report' && existsSync(dbPath))) && dbPath !== ':memory:';
@@ -2107,9 +2155,12 @@ export async function runPhase2Cli(
         const profile = await readJsonFileSafe(profilePath, '评分配置文件');
         if (values['profile-revision']) {
           const rev = Number(values['profile-revision']);
-          if (!Number.isInteger(rev) || rev < 50) throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+          if (!Number.isInteger(rev) || rev < 59) throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
           profile.revision = rev;
           if (profile.workflow?.scoring_and_ordering) profile.workflow.scoring_and_ordering.revision = rev;
+        }
+        if ((profile.revision ?? 59) < 59) {
+          throw new Phase2CliError('当前主线仅运行 Revision 59+（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
         }
         const discovery = discoveryPath ? await readJsonFileSafe(discoveryPath, '发现记录文件') : null;
         const out = replayBatchIntoStore(store, {
@@ -2152,9 +2203,12 @@ export async function runPhase2Cli(
         const profile = await readJsonFileSafe(profilePath, '评分配置文件');
         if (values['profile-revision']) {
           const rev = Number(values['profile-revision']);
-          if (!Number.isInteger(rev) || rev < 50) throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+          if (!Number.isInteger(rev) || rev < 59) throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
           profile.revision = rev;
           if (profile.workflow?.scoring_and_ordering) profile.workflow.scoring_and_ordering.revision = rev;
+        }
+        if ((profile.revision ?? 59) < 59) {
+          throw new Phase2CliError('当前主线仅运行 Revision 59+（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
         }
         const discoveryBundle = discoveryPath ? await readJsonFileSafe(discoveryPath, '发现记录文件') : null;
         const manifest = discoveryBundle ? prepareDiscovery(discoveryBundle.pool, discoveryBundle.decisions) : null;
@@ -2219,7 +2273,7 @@ export async function runPhase2Cli(
             if (notes && notes.length > 0) sc.review_notes = notes;
           }
         }
-        if ((profile.revision ?? 58) < 59 && storedShortlist.length > 0) {
+        if ((profile.revision ?? 59) < 59 && storedShortlist.length > 0) {
           const existingList = Array.isArray(scoredResult.negotiation_shortlist) ? scoredResult.negotiation_shortlist : [];
           const seenIds = new Set(existingList.map(x => x?.form_id || x?.id).filter(Boolean));
           const mergedShortlist = [...existingList];
@@ -2231,7 +2285,7 @@ export async function runPhase2Cli(
           }
           scoredResult.negotiation_shortlist = mergedShortlist;
         }
-        if ((profile.revision ?? 58) >= 59 && Array.isArray(storedPackagingShortlist) && storedPackagingShortlist.length > 0) {
+        if ((profile.revision ?? 59) >= 59 && Array.isArray(storedPackagingShortlist) && storedPackagingShortlist.length > 0) {
           const existingPkgList = Array.isArray(scoredResult.packaging_redesign_shortlist) ? scoredResult.packaging_redesign_shortlist : [];
           const seenPkgIds = new Set(existingPkgList.map(x => x?.form_id || x?.candidate_id || x?.id).filter(Boolean));
           const mergedPkgShortlist = [...existingPkgList];
@@ -2275,6 +2329,15 @@ export async function runPhase2Cli(
       if (command === 'gate1a') {
         const specPath = resolve(requireOption(values.input, 'input'));
         const spec = await readJsonFileSafe(specPath, 'Gate 1A 输入文件');
+        const g1aProfileRev = values['profile-revision'] !== undefined
+          ? Number(values['profile-revision'])
+          : (spec.profile_revision ?? 59);
+        if (!Number.isInteger(g1aProfileRev) || g1aProfileRev < 59) {
+          throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
+        }
+        if (g1aProfileRev >= 59 && spec.disallow_pre1688_cost_guess_kill === false) {
+          throw new Phase2CliError('Revision 59 严禁启用 Gate 1A 倒推价前置砍品（disallow_pre1688_cost_guess_kill 不可为 false）。');
+        }
         let formId = spec.form_id;
         if (spec.form && typeof spec.form === 'object') {
           const { form } = store.upsertCandidateForm(spec.form);
@@ -2298,11 +2361,21 @@ export async function runPhase2Cli(
             });
           }
         }
-        const g1aProfileRev = values['profile-revision'] !== undefined
-          ? Number(values['profile-revision'])
-          : (spec.profile_revision ?? 59);
-        if (!Number.isInteger(g1aProfileRev) || g1aProfileRev < 50) {
-          throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+        let g1aPriceBandAnalysis = spec.price_band_analysis ?? null;
+        if (!g1aPriceBandAnalysis && Array.isArray(spec.peer_listings) && spec.peer_listings.length > 0) {
+          const g1aKeepaPayloads = Array.isArray(spec.keepa_receipts) ? [...spec.keepa_receipts] : [];
+          if (Array.isArray(spec.raw_receipt_files)) {
+            for (const relFp of spec.raw_receipt_files) {
+              g1aKeepaPayloads.push(await readJsonFileSafe(resolve(dirname(specPath), String(relFp)), 'Gate 1A Keepa 原始回执'));
+            }
+          }
+          const mergedPeers = g1aKeepaPayloads.length > 0
+            ? mergeKeepaPayloadsIntoPeerListings(spec.peer_listings, g1aKeepaPayloads, { as_of_date: spec.as_of_date ?? null })
+            : spec.peer_listings;
+          g1aPriceBandAnalysis = analyzeMainstreamPriceBand(mergedPeers, {
+            ...(spec.as_of_date ? { as_of_date: spec.as_of_date } : {}),
+            ...(spec.price_band_options ?? {}),
+          });
         }
         const result = runGate1AForForm(store, {
           form_id: formId,
@@ -2312,7 +2385,7 @@ export async function runPhase2Cli(
           strong_date_dependency: spec.strong_date_dependency ?? 'unknown',
           category_check: spec.category_check ?? null,
           gate0_options: spec.gate0_options ?? {},
-          price_band_analysis: spec.price_band_analysis ?? null,
+          price_band_analysis: g1aPriceBandAnalysis,
           cluster_bands: spec.cluster_bands ?? null,
           profile_revision: g1aProfileRev,
           allow_forward_price_discovery: spec.allow_forward_price_discovery,
@@ -2332,8 +2405,8 @@ export async function runPhase2Cli(
         const g1bProfileRev = values['profile-revision'] !== undefined
           ? Number(values['profile-revision'])
           : (spec.profile_revision ?? 59);
-        if (!Number.isInteger(g1bProfileRev) || g1bProfileRev < 50) {
-          throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+        if (!Number.isInteger(g1bProfileRev) || g1bProfileRev < 59) {
+          throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
         }
         if (g1bProfileRev >= 59 && spec.require_ui_readback === false) {
           throw new Phase2CliError('Revision 59 严禁关闭 1688 ui_readback 核验门禁。');
@@ -2494,7 +2567,7 @@ export async function runPhase2Cli(
         return 0;
       }
 
-      if (command === 'daily-batch' || command === 'single-dive' || command === 'reverse-1688') {
+      if (command === 'daily-batch' || command === 'single-product' || command === 'single-dive' || command === 'reverse-1688') {
         const inputPath = resolve(requireOption(values.input, 'input'));
         const spec = await readJsonFileSafe(inputPath, `${command} 输入文件`);
         checkOperatorPayload(spec);
@@ -2503,11 +2576,84 @@ export async function runPhase2Cli(
         const profile = await readJsonFileSafe(profilePath, '评分配置文件');
         if (values['profile-revision']) {
           const rev = Number(values['profile-revision']);
-          if (!Number.isInteger(rev) || rev < 50) throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+          if (!Number.isInteger(rev) || rev < 59) throw new Phase2CliError('--profile-revision 必须为 >= 59 的整数（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
           profile.revision = rev;
           if (profile.workflow?.scoring_and_ordering) profile.workflow.scoring_and_ordering.revision = rev;
         }
+        if ((profile.revision ?? 59) < 59) {
+          throw new Phase2CliError('当前主线仅运行 Revision 59+（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
+        }
         const asOfDate = values['as-of'] ? values['as-of'].trim() : (spec.as_of_date ?? new Date().toISOString().slice(0, 10));
+        const requestedReportDir = values['report-dir']
+          ? resolve(values['report-dir'])
+          : (typeof spec.report_dir === 'string' && spec.report_dir.trim() ? resolve(dirname(inputPath), spec.report_dir.trim()) : null);
+
+        // Support raw-receipt trial specs directly in `single-product` (`ingest-trial -> replayBatchIntoStore -> V4 HTML report`)!
+        if ((command === 'single-product' || command === 'single-dive') && Array.isArray(spec.raw_receipt_files) && Array.isArray(spec.candidates)) {
+          if (spec.candidates.length !== 1) {
+            throw new Phase2CliError(`${command} 原始回执模式每次仅支持 1 个候选（当前 ${spec.candidates.length} 个）。`);
+          }
+          const ingestedOut = ingestTrialSpecification(spec, profile, {
+            baseDir: dirname(inputPath),
+            ledgerDbPath: dbPath !== ':memory:' ? dbPath : null,
+            allowSyntheticIds: values['allow-synthetic'] === true,
+          });
+          const ingestedBatch = ingestedOut.batch;
+          const replayOut = replayBatchIntoStore(store, { batch: ingestedBatch, profile });
+          let exported = null;
+          if (requestedReportDir) {
+            exported = await writeReportArtifacts(requestedReportDir, {
+              resultBytes: replayOut.result_bytes,
+              htmlBytes: replayOut.html_bytes,
+              resultSha: replayOut.result_sha256,
+              htmlSha: replayOut.html_sha256,
+              summary: replayOut.summary,
+              profileRevision: profile.revision,
+              protectedInputPaths: [inputPath, profilePath, dbPath],
+            });
+          }
+          const outIngest = {
+            ok: true,
+            command,
+            mode: 'ingested_and_scored',
+            candidate_id: ingestedBatch.candidates[0]?.id ?? null,
+            result_sha256: replayOut.result_sha256,
+            html_sha256: replayOut.html_sha256,
+            evaluations_recorded: replayOut.evaluations_recorded,
+            summary: replayOut.summary,
+            ...(exported ? { exported } : {}),
+          };
+          checkOperatorPayload(outIngest);
+          const jsonIngest = `${stringifyCliJson(outIngest)}\n`;
+          if (values.output) {
+            await writeSingleFileSafe(resolve(values.output), Buffer.from(jsonIngest, 'utf8'), [...sqlitePaths(dbPath), inputPath, profilePath]);
+          }
+          streams.stdout.write(jsonIngest);
+          return 0;
+        }
+
+        const deriveFallbackFormId = rawItem => {
+          if (typeof rawItem?.asin === 'string' && rawItem.asin.trim()) {
+            return `form-${rawItem.asin.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '')}`;
+          }
+          if (typeof rawItem?.keyword === 'string' && rawItem.keyword.trim()) {
+            const slug = rawItem.keyword.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40);
+            return `form-kw-${slug || sha256Hex(rawItem.keyword).slice(0, 10)}`;
+          }
+          if (typeof rawItem?.post_url === 'string' && rawItem.post_url.trim()) {
+            return `form-post-${sha256Hex(rawItem.post_url.trim()).slice(0, 10)}`;
+          }
+          if (typeof rawItem?.offer_id === 'string' && rawItem.offer_id.trim()) {
+            return `form-1688-${rawItem.offer_id.trim().replace(/[^a-zA-Z0-9_-]/g, '')}`;
+          }
+          if (rawItem?.quote && typeof rawItem.quote === 'object') {
+            const oId = rawItem.quote.sku_lines?.[0]?.offer_id ?? rawItem.quote.quote_id ?? null;
+            if (typeof oId === 'string' && oId.trim()) {
+              return `form-1688-${oId.trim().replace(/[^a-zA-Z0-9_-]/g, '')}`;
+            }
+          }
+          return null;
+        };
 
         const hydrateWorkflowItem = rawItem => {
           if (!rawItem || typeof rawItem !== 'object') {
@@ -2516,9 +2662,10 @@ export async function runPhase2Cli(
           if ((profile.revision ?? 59) >= 59 && rawItem.disallow_pre1688_cost_guess_kill === false) {
             throw new Phase2CliError('Revision 59 严禁启用 Gate 1A 倒推价前置砍品（disallow_pre1688_cost_guess_kill 不可为 false）。');
           }
+          const autoFormId = command !== 'daily-batch' ? deriveFallbackFormId(rawItem) : null;
           const targetFormId = rawItem.form && typeof rawItem.form === 'object'
-            ? requireOption(rawItem.form.form_id, 'form_id')
-            : requireOption(rawItem.form_id, 'form_id');
+            ? requireOption(rawItem.form.form_id ?? autoFormId, 'form_id')
+            : requireOption(rawItem.form_id ?? autoFormId, 'form_id');
           const existingDbForm = store.getCandidateForm(targetFormId);
           let existingDbComp = existingDbForm?.saleable_set_composition ?? null;
           if (!existingDbComp && typeof existingDbForm?.saleable_set_composition_json === 'string') {
@@ -2530,19 +2677,23 @@ export async function runPhase2Cli(
             rawItem.buyer_task ||
             rawItem.grade_or_material !== undefined,
           );
+          const normAsinUpper = typeof rawItem.asin === 'string' && /^B0[A-Z0-9]{8}$/i.test(rawItem.asin.trim())
+            ? rawItem.asin.trim().toUpperCase()
+            : null;
           const formObj = rawItem.form && typeof rawItem.form === 'object'
             ? {
                 ...rawItem.form,
+                form_id: targetFormId,
                 saleable_set_composition: rawItem.form.saleable_set_composition ?? existingDbComp ?? [{ component_id: 'unit', qty_per_saleable_set: 1 }],
               }
             : {
                 form_id: targetFormId,
                 product_family_key: rawItem.product_family_key ?? existingDbForm?.product_family_key ?? targetFormId,
-                label: rawItem.label ?? existingDbForm?.label ?? targetFormId,
-                buyer_task: rawItem.buyer_task ?? existingDbForm?.buyer_task ?? rawItem.label ?? targetFormId,
+                label: rawItem.label ?? existingDbForm?.label ?? (normAsinUpper ? `Single-ASIN candidate ${normAsinUpper}` : targetFormId),
+                buyer_task: rawItem.buyer_task ?? existingDbForm?.buyer_task ?? rawItem.label ?? rawItem.keyword ?? targetFormId,
                 saleable_set_composition: rawItem.saleable_set_composition ?? existingDbComp ?? [{ component_id: 'unit', qty_per_saleable_set: 1 }],
                 grade_or_material: rawItem.grade_or_material ?? existingDbForm?.grade_or_material ?? null,
-                target_child_asin: rawItem.target_child_asin ?? existingDbForm?.target_child_asin ?? null,
+                target_child_asin: rawItem.target_child_asin ?? normAsinUpper ?? existingDbForm?.target_child_asin ?? null,
                 leaf_node_path: rawItem.leaf_node_path ?? existingDbForm?.leaf_node_path ?? null,
               };
           let leads = Array.isArray(rawItem.leads) ? [...rawItem.leads] : [];
@@ -2556,7 +2707,7 @@ export async function runPhase2Cli(
                 observed_at: asOfDate,
                 disposition: 'product',
               }];
-            } else if (rawItem.asin || rawItem.post_url || rawItem.social_bridge) {
+            } else if (rawItem.asin || rawItem.keyword || rawItem.post_url || rawItem.social_bridge) {
               leads = [rawItem.social_bridge
                 ? {
                     lead_id: rawItem.lead_id ?? `ld-dive-${formObj.form_id}`,
@@ -2568,8 +2719,8 @@ export async function runPhase2Cli(
                 : {
                     lead_id: rawItem.lead_id ?? `ld-dive-${formObj.form_id}`,
                     source_channel: rawItem.post_url ? (rawItem.source_channel ?? 'reddit') : (rawItem.source_channel ?? 'sellersprite_supply_gap'),
-                    source_ref: rawItem.post_url ?? rawItem.source_ref ?? `https://www.amazon.com/dp/${String(rawItem.asin || '').trim().toUpperCase()}`,
-                    phrase_or_title: rawItem.phrase_or_title ?? formObj.label ?? String(rawItem.asin || formObj.form_id),
+                    source_ref: rawItem.post_url ?? rawItem.source_ref ?? (normAsinUpper ? `https://www.amazon.com/dp/${normAsinUpper}` : `search://keyword/${formObj.form_id}`),
+                    phrase_or_title: rawItem.phrase_or_title ?? rawItem.keyword ?? formObj.label ?? String(rawItem.asin || formObj.form_id),
                     observed_at: asOfDate,
                     disposition: 'product',
                   }];
@@ -2605,12 +2756,15 @@ export async function runPhase2Cli(
             })));
           }
 
+          const resolvedG1aScenarios = Array.isArray(rawItem.gate1a_scenarios) && rawItem.gate1a_scenarios.length > 0
+            ? rawItem.gate1a_scenarios
+            : (Array.isArray(rawItem.scenarios) && rawItem.scenarios.length > 0 ? rawItem.scenarios : null);
           const earlyScens = Array.isArray(rawItem.early_screen_scenarios)
             ? rawItem.early_screen_scenarios
             : (rawItem.early_screen_scenario
                 ? [rawItem.early_screen_scenario]
-                : (Array.isArray(rawItem.gate1a_scenarios) && rawItem.gate1a_scenarios.length > 0
-                    ? buildAutoEarlyScreenScenariosFromGate1A(rawItem.gate1a_scenarios, {
+                : (resolvedG1aScenarios
+                    ? buildAutoEarlyScreenScenariosFromGate1A(resolvedG1aScenarios, {
                         saleable_unit: rawItem.saleable_unit ?? formObj.label ?? '1 complete saleable set',
                         profile_revision: profile.revision ?? 59,
                         specific_rights_conflict: rawItem.specific_rights_conflict ?? 'unknown',
@@ -2624,6 +2778,7 @@ export async function runPhase2Cli(
             ...rawItem,
             form: formObj,
             leads,
+            ...(resolvedG1aScenarios && !rawItem.gate1a_scenarios ? { gate1a_scenarios: resolvedG1aScenarios } : {}),
             disallow_pre1688_cost_guess_kill: true,
             ...(earlyScens && !rawItem.early_screen_builder ? { early_screen_builder: () => earlyScens } : {}),
             ...(simCaptcha && !rawItem.sourcing_executor
@@ -2646,33 +2801,113 @@ export async function runPhase2Cli(
           if (!pkgObj || !Number.isFinite(fxVal) || fxVal <= 0) {
             throw new Phase2CliError('reverse-1688 需要提供外箱尺寸重量 pkg 与正数汇率 fx_cny_per_usd。');
           }
+          let derivedCompleteSets = null;
+          if (
+            !Number.isInteger(qObj.actual_complete_sets) &&
+            Array.isArray(qObj.sku_lines) &&
+            qObj.sku_lines.length > 0
+          ) {
+            if (qObj.sku_lines.every(sl => Number.isInteger(sl?.ordered_qty) && sl.ordered_qty >= 1)) {
+              derivedCompleteSets = Math.min(
+                ...qObj.sku_lines.map(sl => {
+                  const qPerSet = Number.isInteger(sl?.qty_per_saleable_set) && sl.qty_per_saleable_set >= 1 ? sl.qty_per_saleable_set : 1;
+                  return Math.floor(sl.ordered_qty / qPerSet);
+                }),
+              );
+            } else {
+              const comp = Array.isArray(spec.saleable_set_composition) && spec.saleable_set_composition.length > 0
+                ? spec.saleable_set_composition
+                : (Array.isArray(spec.form?.saleable_set_composition) && spec.form.saleable_set_composition.length > 0
+                  ? spec.form.saleable_set_composition
+                  : qObj.sku_lines.map(sl => ({
+                      component_id: sl.component_id ?? 'unit',
+                      qty_per_saleable_set: Number.isInteger(sl.qty_per_saleable_set) && sl.qty_per_saleable_set >= 1 ? sl.qty_per_saleable_set : 1,
+                    })));
+              const plan = computeOrderPlan({
+                saleable_set_composition: comp,
+                sku_lines: qObj.sku_lines,
+                allow_remainder: qObj.allow_remainder ?? spec.allow_remainder ?? false,
+                target_sets: qObj.target_sets ?? spec.target_sets ?? null,
+                profile_revision: 59,
+              });
+              if (Number.isInteger(plan?.actual_complete_sets) && plan.actual_complete_sets > 0) {
+                derivedCompleteSets = plan.actual_complete_sets;
+              }
+            }
+          }
           const orderUnits = Number.isInteger(qObj.actual_complete_sets) && qObj.actual_complete_sets > 0
             ? qObj.actual_complete_sets
-            : 100;
-          const landedCnyPerUnit = (Number(qObj.goods_cny_total) + Number(qObj.domestic_freight_cny_total ?? 0)) / orderUnits;
-          const solved = solveMinPriceForMargin2027({
-            pkg: pkgObj,
-            landed_domestic_cny: landedCnyPerUnit,
-            headhaul_usd: spec.headhaul_usd ?? 2.20,
-            fee_category: spec.fee_category ?? 'Home and Kitchen',
-            referral_terms: spec.referral_terms ?? { referral_fraction: 0.15, minimum_referral_usd: 0.30, minimum_referral_fee_usd: 0.30, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.00 },
-            refund_fraction: spec.refund_fraction ?? 0.04,
-            physical_return_fraction: spec.physical_return_fraction ?? spec.refund_fraction ?? 0.04,
-            collection_rate: spec.collection_rate ?? 0.006,
-            fx_cny_per_usd: fxVal,
-            margin_floor: 0.30,
-            min_retail_price_usd: Math.max(29.99, spec.minimum_price_usd ?? 29.99),
-          });
-          const band = spec.mature_price_band?.mature_regular_band ?? spec.mature_price_band?.regular_band_reference ?? spec.mature_price_band?.band ?? spec.mature_price_band ?? null;
-          const minPrice = solved.feasible_min_price_usd ?? null;
-          const bandVerdict = Number.isFinite(minPrice) && Number.isFinite(band?.p25_usd) && Number.isFinite(band?.p75_usd)
-            ? (minPrice < band.p25_usd ? 'below_band_strong_headroom' : (minPrice <= band.p75_usd ? 'within_mature_band_viable' : 'above_mature_band_p75_uncompetitive'))
-            : 'forward_price_only_awaiting_us_band';
-          reverseSolution = {
-            min_retail_price_for_30pct_usd: minPrice,
-            mature_band_comparison: bandVerdict,
-            solution: solved,
-          };
+            : (derivedCompleteSets ?? (Number.isInteger(qObj.order_units) && qObj.order_units > 0 ? qObj.order_units : 100));
+          const hasGoodsTotal = Number.isFinite(qObj.goods_cny_total) && qObj.goods_cny_total >= 0;
+          const hasDomFreight = Number.isFinite(qObj.domestic_freight_cny_total) && qObj.domestic_freight_cny_total >= 0;
+          const missingTopRevBond = (spec.bond_included === false || qObj.bond_included === false) &&
+            !Number.isFinite(spec.bond_usd_per_unit ?? qObj.bond_usd_per_unit);
+          let resolvedRevHeadhaulUsd = !missingTopRevBond && Number.isFinite(spec.headhaul_usd) && spec.headhaul_usd >= 0
+            ? spec.headhaul_usd + (spec.bond_included === false ? Number(spec.bond_usd_per_unit ?? qObj.bond_usd_per_unit) : 0)
+            : (!missingTopRevBond && Number.isFinite(qObj.headhaul_usd) && qObj.headhaul_usd >= 0
+              ? qObj.headhaul_usd + (qObj.bond_included === false ? Number(qObj.bond_usd_per_unit ?? spec.bond_usd_per_unit) : 0)
+              : undefined);
+          const rawRevHeadhaulObj = spec.headhaul ?? qObj.headhaul ?? null;
+          if (resolvedRevHeadhaulUsd === undefined && rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object') {
+            if (
+              Number.isFinite(rawRevHeadhaulObj.usd_per_unit) &&
+              rawRevHeadhaulObj.usd_per_unit >= 0 &&
+              (rawRevHeadhaulObj.bond_included === true || Number.isFinite(rawRevHeadhaulObj.bond_usd_per_unit))
+            ) {
+              resolvedRevHeadhaulUsd = rawRevHeadhaulObj.usd_per_unit + (rawRevHeadhaulObj.bond_included === true ? 0 : rawRevHeadhaulObj.bond_usd_per_unit);
+            } else if (!Number.isFinite(rawRevHeadhaulObj.usd_per_unit)) {
+              const a4Rev = computeHeadhaulWithA4Rules(rawRevHeadhaulObj, fxVal, orderUnits, {
+                isR58: true,
+                isR59: true,
+              });
+              if (!a4Rev?.missing_surcharge_quote && Number.isFinite(a4Rev?.amount_usd)) {
+                resolvedRevHeadhaulUsd = a4Rev.amount_usd;
+              }
+            }
+          }
+          if (!hasGoodsTotal || !hasDomFreight || !Number.isFinite(resolvedRevHeadhaulUsd)) {
+            const pendingReason = !hasGoodsTotal
+              ? 'Missing goods_cny_total on 1688 quote.'
+              : (!hasDomFreight
+                ? 'Missing domestic_freight_cny_total to 广东深圳; domestic freight is never assumed ¥0.'
+                : 'Missing verified headhaul_usd or complete structured A4 headhaul inputs; headhaul is never assumed $2.20.');
+            reverseSolution = {
+              actual_complete_sets_used: orderUnits,
+              min_retail_price_for_30pct_usd: null,
+              mature_band_comparison: 'pending_freight_or_headhaul_verification',
+              solution: {
+                status: !hasDomFreight ? 'pending_domestic_freight' : 'needs_calculator_verification',
+                reason: pendingReason,
+                feasible_min_price_usd: null,
+              },
+            };
+          } else {
+            const landedCnyPerUnit = (Number(qObj.goods_cny_total) + Number(qObj.domestic_freight_cny_total)) / orderUnits;
+            const solved = solveMinPriceForMargin2027({
+              pkg: pkgObj,
+              landed_domestic_cny: landedCnyPerUnit,
+              headhaul_usd: resolvedRevHeadhaulUsd,
+              fee_category: spec.fee_category ?? 'Home and Kitchen',
+              referral_terms: spec.referral_terms ?? { referral_fraction: 0.15, minimum_referral_usd: 0.30, minimum_referral_fee_usd: 0.30, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.00 },
+              refund_fraction: spec.refund_fraction ?? 0.04,
+              physical_return_fraction: spec.physical_return_fraction ?? spec.refund_fraction ?? 0.04,
+              collection_rate: spec.collection_rate ?? 0.006,
+              fx_cny_per_usd: fxVal,
+              margin_floor: 0.30,
+              min_retail_price_usd: Math.max(29.99, spec.minimum_price_usd ?? 29.99),
+            });
+            const band = spec.mature_price_band?.mature_regular_band ?? spec.mature_price_band?.regular_band_reference ?? spec.mature_price_band?.band ?? spec.mature_price_band ?? null;
+            const minPrice = solved.feasible_min_price_usd ?? null;
+            const bandVerdict = Number.isFinite(minPrice) && Number.isFinite(band?.p25_usd) && Number.isFinite(band?.p75_usd)
+              ? (minPrice < band.p25_usd ? 'below_band_strong_headroom' : (minPrice <= band.p75_usd ? 'within_mature_band_viable' : 'above_mature_band_p75_uncompetitive'))
+              : 'forward_price_only_awaiting_us_band';
+            reverseSolution = {
+              actual_complete_sets_used: orderUnits,
+              min_retail_price_for_30pct_usd: minPrice,
+              mature_band_comparison: bandVerdict,
+              solution: solved,
+            };
+          }
           if (!Array.isArray(spec.gate1a_scenarios) || spec.gate1a_scenarios.length === 0) {
             const outOnly = { ok: true, command, reverse_1688: reverseSolution };
             checkOperatorPayload(outOnly);
@@ -2692,6 +2927,54 @@ export async function runPhase2Cli(
           throw new Phase2CliError(`${command} 每次仅执行单个候选深挖。`);
         }
         const hydratedItems = rawItems.map(hydrateWorkflowItem);
+
+        // Bare seed registration mode on `single-product` (e.g. `{"asin":"B0SYNV400D"}` before SP-API/SellerSprite Gate 1A scenarios are attached):
+        if (
+          (command === 'single-product' || command === 'single-dive') &&
+          !Array.isArray(hydratedItems[0].gate1a_scenarios) &&
+          !hydratedItems[0].deep_research_executor &&
+          !store.getCandidateForm(hydratedItems[0].form.form_id)?.gate1a_result_json
+        ) {
+          const seedItem = hydratedItems[0];
+          const registeredLeads = [];
+          for (const leadSpec of seedItem.leads ?? []) {
+            if (leadSpec?.social_bridge) {
+              const res = store.ingestSocialBridgeLead(leadSpec.social_bridge, {
+                ...leadSpec,
+                form_id: seedItem.form.form_id,
+                link_role: leadSpec.link_role ?? 'primary_discovery',
+                link_note: leadSpec.link_note ?? null,
+              });
+              registeredLeads.push(res.lead.lead_id);
+            } else {
+              const { lead } = store.upsertRawLead(leadSpec);
+              store.linkLeadToForm({
+                lead_id: lead.lead_id,
+                form_id: seedItem.form.form_id,
+                link_role: leadSpec.link_role ?? 'primary_discovery',
+                note: leadSpec.link_note ?? null,
+              });
+              registeredLeads.push(lead.lead_id);
+            }
+          }
+          const outSeed = {
+            ok: true,
+            command,
+            mode: 'seed_registered_awaiting_gate1a',
+            form_id: seedItem.form.form_id,
+            leads_registered: registeredLeads,
+            lifecycle_status: store.getCandidateForm(seedItem.form.form_id)?.lifecycle_status ?? 'discovered',
+            next_step: 'Attach verified SP-API/SellerSprite Gate 1A scenarios (or raw_receipt_files + candidate spec) to advance through Gate 1A -> Gate 1B -> 21-item V4 HTML report.',
+          };
+          checkOperatorPayload(outSeed);
+          const jsonSeed = `${stringifyCliJson(outSeed)}\n`;
+          if (values.output) {
+            await writeSingleFileSafe(resolve(values.output), Buffer.from(jsonSeed, 'utf8'), [...sqlitePaths(dbPath), inputPath, profilePath]);
+          }
+          streams.stdout.write(jsonSeed);
+          return 0;
+        }
+
         const discoveryPlan = command === 'daily-batch'
           ? planDiscoveryBatch(store, {
               max_channels: Math.max(5, hydratedItems.length),
@@ -2708,6 +2991,38 @@ export async function runPhase2Cli(
           openai_hooks: testHooks?.openaiHooks ?? null,
           resume_skip_completed: spec.resume_skip_completed !== false,
         });
+        let singleExportedReport = null;
+        if ((command === 'single-product' || command === 'single-dive') && requestedReportDir) {
+          const singleBatchSrc = hydratedItems[0]?.scored_batch ?? hydratedItems[0]?.research_out?.batch ?? null;
+          if (singleBatchSrc && Array.isArray(singleBatchSrc.candidates) && singleBatchSrc.candidates.length > 0) {
+            const boundSingleBatch = attachStoreDiscoveryProvenance(structuredClone(singleBatchSrc), store);
+            const { notesByFormId, storedPackagingShortlist } = enrichBatchAndResultFromStore(boundSingleBatch, store, {
+              profileRevision: profile.revision,
+              profile,
+            });
+            const scoredSingle = scoreBatch(boundSingleBatch, profile);
+            if (notesByFormId.size > 0 && Array.isArray(scoredSingle.candidates)) {
+              for (const sc of scoredSingle.candidates) {
+                const notes = notesByFormId.get(sc.candidate_id || sc.id);
+                if (notes && notes.length > 0) sc.review_notes = notes;
+              }
+            }
+            if (Array.isArray(storedPackagingShortlist) && storedPackagingShortlist.length > 0) {
+              scoredSingle.packaging_redesign_shortlist = storedPackagingShortlist;
+            }
+            const resBytes = Buffer.from(`${JSON.stringify(scoredSingle, null, 2)}\n`, 'utf8');
+            const htmBytes = Buffer.from(renderReport(scoredSingle, boundSingleBatch), 'utf8');
+            singleExportedReport = await writeReportArtifacts(requestedReportDir, {
+              resultBytes: resBytes,
+              htmlBytes: htmBytes,
+              resultSha: sha256Hex(resBytes),
+              htmlSha: sha256Hex(htmBytes),
+              summary: scoredSingle.summary,
+              profileRevision: profile.revision,
+              protectedInputPaths: [inputPath, profilePath, dbPath],
+            });
+          }
+        }
         const coverageAudit = command === 'daily-batch'
           ? auditDiscoveryCoverage(store, { profile_revision: profile.revision })
           : null;
@@ -2717,6 +3032,7 @@ export async function runPhase2Cli(
           ...(discoveryPlan ? { discovery_plan_80_20: discoveryPlan } : {}),
           ...(coverageAudit ? { coverage_audit: coverageAudit } : {}),
           ...(reverseSolution ? { reverse_1688: reverseSolution } : {}),
+          ...(singleExportedReport ? { exported: singleExportedReport } : {}),
           batch_report: batchReport,
         };
         checkOperatorPayload(out);

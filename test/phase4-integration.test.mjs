@@ -37,7 +37,7 @@ import { openSelectionStore, sha256Hex } from '../src/store.mjs';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 const SYNTHETIC_BATCH_PATH = join(REPO_ROOT, 'fixtures', 'synthetic-batch.json');
-const PROFILE_PATH = join(REPO_ROOT, 'docs', 'design', 'reference-profile.draft.json');
+const PROFILE_PATH = join(REPO_ROOT, 'docs', 'design', 'reference-profile.r59.draft.json');
 
 const ONE_PIXEL_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
@@ -1055,11 +1055,11 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
     const fx = 7.0;
     const unitGoodsCny = Math.round(procAmtUsd * fx * 10000) / 10000;
     const totalDomCny = Math.round(domAmtUsd * fx * 100 * 100) / 100;
-    const salesWin = { from: '2027-02-01', through: '2027-09-30' };
+    const salesWin = { from: '2027-02-01', through: '2027-10-14' };
     const storageWin = { from: '2027-02-01', through: '2027-09-30' };
     const inboundWin = { from: '2027-01-20', through: '2027-02-01' };
 
-    const { estimateGate1A2027 } = await import('../src/fba-rates-2027.mjs');
+    const { estimateGate1A2027 } = await import('../src/fba-calculator.mjs');
     const gate1aSpec = {
       id: primaryScen.id,
       pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
@@ -1086,13 +1086,14 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       storage_usd: rawEst.components.storage.per_unit_usd,
     };
 
+    const matchedPacket = buildSyntheticPacket({ candidate: { ...packet.candidate, saleable_spec: { components: [{ component_id: 'shelf-main', qty_per_saleable_set: 1 }], material: 'Powder-coated carbon steel', set_count: 1 } } });
     const buildBatchItem = (withPacket) => ({
       form: {
         form_id: formId,
         label: synthCand.label,
         buyer_task: 'Desktop dual-shelf cable and stationery organizer',
         saleable_set_composition: {
-          components: [{ component_id: 'shelf-main', qty_per_saleable_set: 1 }],
+          components: [{ component_id: 'shelf-main', qty_per_saleable_set: 1 }], material: 'Powder-coated carbon steel', set_count: 2,
         },
       },
       leads: [
@@ -1114,6 +1115,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
           expires_at: '2026-12-31',
           redacted_destination: '广东深圳',
           raw_readback_ref: 'synthetic-readback-01',
+          ui_readback: { logged_in: true, viewport_width_px: 1440, selected_sku_row_visible: true, settlement_bar_visible: true, applied_quantity_confirmed: true },
           goods_first_order_promotion: false,
           freight_first_order_promotion: false,
           sku_lines: [
@@ -1134,7 +1136,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
         },
       }),
       early_screen_builder: () => ([{
-        profile_revision: 58,
+        profile_revision: 59,
         id: primaryScen.id,
         saleable_unit: '1 complete set',
         price_usd: priceUsd,
@@ -1159,7 +1161,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
           average_inventory_days: 45,
         },
         operating_period: 'off_peak',
-        operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
+        operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
         fee_context: {
           marketplace: 'US',
           currency: 'USD',
@@ -1191,11 +1193,11 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
         return {
           batch: {
             schema_version: 1,
-            profile_revision: 58,
+            profile_revision: 59,
             presentation: rawBatch.presentation,
             candidates: [alignedCand],
           },
-          ...(withPacket ? { evidence_review_packet: packet } : {}),
+          ...(withPacket ? { evidence_review_packet: matchedPacket } : {}),
         };
       },
     });
@@ -1209,7 +1211,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
         profile,
         as_of_date: '2026-11-21',
       });
-      assert.equal(outNoAi.gate2_3[0].status, 'evaluated');
+      assert.equal(outNoAi.gate2_3[0]?.status, 'evaluated', JSON.stringify(outNoAi.gate1b));
 
       // P1-17: Persist reviewed evaluation into file-backed SQLite, close, reopen via CLI `export-report`,
       // and verify exported `index.html` SHA-256 reproduces `outWithAi.gate2_3[0].html_sha256` byte-for-byte!
@@ -1222,7 +1224,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
         allowTestDoubleReceipts: true,
       };
       const storeWithAi = openSelectionStore(roundtripDbPath);
-      const frozenBundle1Pkt = freezeEvidenceReviewPacket(packet);
+      const frozenBundle1Pkt = freezeEvidenceReviewPacket(matchedPacket);
       const outWithAi = await runPhase2Batch(storeWithAi, {
         items: [buildBatchItem(true)],
         profile,
@@ -1242,7 +1244,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
         },
       });
       assert.equal(outWithAi.gate2_3[0].status, 'evaluated');
-      assert.equal(outWithAi.gate2_3[0].evidence_review.status, 'ready');
+      assert.equal(outWithAi.gate2_3[0].evidence_review.status, 'ready', JSON.stringify(outWithAi.gate2_3[0].evidence_review));
       assert.equal(outWithAi.gate2_3[0].evidence_review.execution_provenance, 'synthetic_test_double');
       assert.equal(outWithAi.gate2_3[0].result_sha256, outNoAi.gate2_3[0].result_sha256);
       assert.equal(outWithAi.gate2_3[0].batch_result_sha256, outNoAi.gate2_3[0].batch_result_sha256);
@@ -1280,9 +1282,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       // must each reproduce their OWN exact `html_sha256` on `export-report`!
       const secondBundleItem = buildBatchItem(true);
       const origSecondExec = secondBundleItem.deep_research_executor;
-      const secondPacket = buildSyntheticPacket({
-        review_id: 'rev-phase4-synth-02',
-      });
+      const secondPacket = buildSyntheticPacket({ review_id: 'rev-phase4-synth-02', candidate: matchedPacket.candidate });
       const frozenBundle2Pkt = freezeEvidenceReviewPacket(secondPacket);
       secondBundleItem.deep_research_executor = async () => {
         const base = await origSecondExec();
@@ -1587,7 +1587,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
 
       storeNoAi.close();
     } finally {
-      rmSync(tempExportDir, { recursive: true, force: true });
+      try { rmSync(tempExportDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 }); } catch { /* Windows temp cleanup best-effort */ }
     }
   });
 

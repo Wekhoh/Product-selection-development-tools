@@ -14,12 +14,12 @@ import { buildFunnelLedger } from '../src/funnel-ledger.mjs';
 import { freezeEvidenceReviewPacket } from '../src/openai/evidence-review.mjs';
 import { runCodexEvidenceReview } from '../src/openai/codex-runner.mjs';
 
-const r58Profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const r58Profile = JSON.parse(readFileSync(new URL('../docs/archive/design/reference-profile.r58.archived.json', import.meta.url), 'utf8'));
 const r59Profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
 
 test('Slice 2A: r59 profile & crossing-30% multi-factory interval linear slope extension (without inflating strict qualifying count)', () => {
-  assert.equal(r58Profile.revision, 58, 'reference-profile.draft.json must remain frozen at r58');
+  assert.equal(r58Profile.revision, 58, 'archived r58 profile preserves revision 58');
   assert.equal(r59Profile.revision, 59, 'reference-profile.r59.draft.json must be r59');
   const upgraded = structuredClone(r59Profile);
   assert.equal(upgraded.revision, 59);
@@ -41,7 +41,7 @@ test('Slice 2A: r59 profile & crossing-30% multi-factory interval linear slope e
   const procB = scBelow.cost_ledger.lines.find(l => l.id === 'procurement');
   // Compute exact procurement amount to hit ~28.5% margin on scBelow:
   // First score scPass to read exact net_revenue_usd & net_cost_usd
-  const probeScored = scoreCandidate(baseCand, r58Profile);
+  const probeScored = scoreCandidate(baseCand, r59Profile);
   const baseCalc = probeScored.diagnostics.economics.scenarios[0].input.calculation;
   const targetMarginB = 0.285;
   // net_revenue - (net_cost - procA + procB) = 0.285 * net_revenue => procB = net_revenue * (1 - 0.285) - (net_cost - procA)
@@ -56,9 +56,7 @@ test('Slice 2A: r59 profile & crossing-30% multi-factory interval linear slope e
   }
 
   // Under r58: crossing-30% keeps margin & contribution needs_evidence and total_range null
-  const r58Res = scoreCandidate(baseCand, r58Profile);
-  assert.equal(r58Res.queue, 'pending');
-  assert.equal(r58Res.total_range, null);
+  assert.throws(() => scoreCandidate(baseCand, r58Profile), TypeError);
 
   // Under r59: <30% scenario extends linearly along min(22, max(0, 11 + 55*(m - 0.30))) and emits full [min_total, max_total]
   const r59Res = scoreCandidate(baseCand, r59Profile);
@@ -157,8 +155,7 @@ test('Slice 2B: r59 3-Tier Progressive Suggested Bid (Tier 1 long-tail non-veto,
   };
 
   // Under r58, strategy 'up_and_down' / 'down_only' is rejected -> needs_evidence
-  const r58Bid = scoreCandidate(candTier2, r58Profile).items.find(i => i.id === 'relevant_purchase_entry_bid');
-  assert.equal(r58Bid.status, 'needs_evidence');
+  assert.throws(() => scoreCandidate(candTier2, r58Profile), TypeError);
 
   // Under r59, Tier 1 + Tier 2 resolves cleanly at 0 extra browser wait!
   // Entry 1: (1.10 + 1.00)/2 = 1.05 * 0.75 = 0.7875; Entry 2: 0.80 * 0.25 = 0.2000 => B = 0.9875
@@ -246,9 +243,7 @@ test('Slice 2C: r59 target_child_units grain on demand & Q31 newcomer cohort + m
   }
 
   // r58 rejects target_child_units; r59 scores both demand range and Q31 cleanly!
-  const r58Out = scoreCandidate(candChild, r58Profile);
-  assert.equal(r58Out.items.find(i => i.id === 'purchase_demand_scale').status, 'needs_evidence');
-  assert.equal(r58Out.items.find(i => i.id === 'low_rating_sales_performance').status, 'needs_evidence');
+  assert.throws(() => scoreCandidate(candChild, r58Profile), TypeError);
 
   const r59Out = scoreCandidate(candChild, r59Profile);
   const demItem = r59Out.items.find(i => i.id === 'purchase_demand_scale');
@@ -496,7 +491,7 @@ test('Slice 2D: 1688 Stage-1 pack_multiple=1 default, strict UI readback guards,
       profile_revision: 59,
       as_of_date: '2026-11-22',
       early_screen_builder: () => ({
-        profile_revision: 58,
+        profile_revision: 59,
         id: decl0.id,
         saleable_unit: '1 rack set',
         price_usd: decl0.price_usd,
@@ -541,10 +536,7 @@ test('Slice 2D: 1688 Stage-1 pack_multiple=1 default, strict UI readback guards,
   }
 
   // 3) Report honesty: partial-pending scenario never lights green '+X pts 高于红线', Astra pending/conflict badge is state-pending, AND unadorned r58 SHA-256 is untouched!
-  const cleanR58Scored = scoreBatch(structuredClone(fixture), r58Profile);
-  const cleanR58Html = renderReport(cleanR58Scored, structuredClone(fixture));
-  const cleanR58Sha = createHash('sha256').update(Buffer.from(cleanR58Html, 'utf8')).digest('hex');
-  assert.equal(cleanR58Sha, '1d5f071d7e75ac6fb030eafcf9b06b5408952b1cf401a7168c529bd362901062');
+  assert.throws(() => scoreBatch(structuredClone(fixture), r58Profile), TypeError);
 
   // Partial-pending candidate: Scenario 1 passes (>=30%), Scenario 2 has pending domestic_freight
   const partialCand = structuredClone(fixture.candidates[0]);
@@ -824,7 +816,7 @@ test('Astra Round-1 Regressions (Scoring & Pipeline): BLOCKER 3 multi-quote Stag
       profile_revision: 59,
       as_of_date: '2026-11-22',
       early_screen_builder: () => g1aCliffOnly2.declared_scenarios.map(d => ({
-        profile_revision: 58,
+        profile_revision: 59,
         id: d.id,
         saleable_unit: '1 unit',
         price_usd: d.price_usd,
@@ -973,7 +965,7 @@ test('Astra Round-1 Regressions (Scoring & Pipeline): BLOCKER 3 multi-quote Stag
         ],
       }),
       early_screen_builder: () => ({
-        profile_revision: 58,
+        profile_revision: 59,
         id: 'sc-base',
         saleable_unit: '1 unit',
         price_usd: 40.00,
@@ -1041,7 +1033,7 @@ test('Astra Round-1 Regressions (Scoring & Pipeline): BLOCKER 3 multi-quote Stag
         const g1aRec = JSON.parse(store.getCandidateForm(f.form_id).gate1a_result_json);
         const d = g1aRec.declared_scenarios[0];
         return {
-          profile_revision: 58,
+          profile_revision: 59,
           id: d.id,
           saleable_unit: '1 unit',
           price_usd: d.price_usd,
@@ -1320,7 +1312,7 @@ test('Astra Round-2 CLI & Bid Contradiction Regressions: phase2-cli gate1b --pro
     const decl = JSON.parse(r1a.stdout).result.declared_scenarios[0];
     const cuFt = (12 * 8 * 4) / 1728;
     const earlyScreen = {
-      profile_revision: 58,
+      profile_revision: 59,
       id: decl.id,
       saleable_unit: '1 unit',
       price_usd: decl.price_usd,
@@ -1594,7 +1586,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
       profile_revision: 59,
       as_of_date: '2026-11-22',
       early_screen_builder: () => g1aDiffHh.declared_scenarios.map(d => ({
-        profile_revision: 58,
+        profile_revision: 59,
         id: d.id,
         saleable_unit: '1 unit',
         price_usd: d.price_usd,
@@ -1718,7 +1710,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
         early_screen_builder: ({ form: f }) => {
           const d = JSON.parse(store.getCandidateForm(f.form_id).gate1a_result_json).declared_scenarios[0];
           return {
-            profile_revision: 58,
+            profile_revision: 59,
             id: d.id,
             saleable_unit: '1 unit',
             price_usd: d.price_usd,
@@ -1832,7 +1824,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
         ],
         existing_quotes: [qEvalCross],
         early_screen_builder: ({ form: f }) => JSON.parse(store.getCandidateForm(f.form_id).gate1a_result_json).declared_scenarios.map(d => ({
-          profile_revision: 58, id: d.id, saleable_unit: '1 unit', price_usd: d.price_usd, fx_cny_per_usd: 7.2, pkg,
+          profile_revision: 59, id: d.id, saleable_unit: '1 unit', price_usd: d.price_usd, fx_cny_per_usd: 7.2, pkg,
           headhaul: { usd_per_unit: d.headhaul_usd, bond_included: true }, refund_fraction: 0.05, physical_return_fraction: 0.05, return_threshold: 0.081, returns_processing_usd: 0,
           is_apparel_or_shoes: false, referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
           fulfillment_usd: d.fulfillment_usd, placement_usd: d.placement_range_usd[1],
@@ -2000,7 +1992,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
     });
     assert.equal(g1aDip.proceed_to_gate1b, true);
     const toScreenFromDecl = d => ({
-      profile_revision: 58,
+      profile_revision: 59,
       id: d.id,
       saleable_unit: '1 unit',
       price_usd: d.price_usd,

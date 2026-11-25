@@ -1,3 +1,4 @@
+import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 /**
  * Multi-channel anti-convergence discovery registry, Track A/B/C promotion classifier,
  * discovery batch planner, and coverage auditor (docs/PRODUCT.md & 04 section 2.6 / 6.1).
@@ -540,16 +541,6 @@ export function auditDiscoveryCoverage(store, {
         code: 'single_route_concentration',
         message: `All ${totalLeads} leads come from only 1 route (${activeRoutes.join(', ')}); add cross-platform social, supply-gap, or trend discovery.`,
       });
-    }
-    if (profile_revision < 59 && categorizedLeadsOrForms >= 3) {
-      const sortedLeaves = Object.entries(byLeafCategory).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
-      const [topLeaf, topLeafCount] = sortedLeaves[0];
-      if ((topLeafCount / categorizedLeadsOrForms) > 0.70) {
-        alerts.push({
-          code: 'single_leaf_concentration',
-          message: `${topLeafCount}/${categorizedLeadsOrForms} (${((topLeafCount / categorizedLeadsOrForms) * 100).toFixed(1)}%) categorized leads/forms concentrate in leaf "${topLeaf}" even across multiple channels; expand into adjacent categories.`,
-        });
-      }
     }
     if ((byEntryGroup.social ?? 0) === 0) {
       alerts.push({

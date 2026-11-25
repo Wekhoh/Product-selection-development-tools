@@ -10,7 +10,7 @@ import { attachCandidateEvidenceReview } from '../src/pipeline.mjs';
 import { scoreBatch } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
 
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
 
 const VALID_PNG_URI = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFz8AAAAASUVORK5CYII=';
@@ -361,50 +361,13 @@ test('r58 escapes XSS payloads, redacts local user paths, and rejects non-data o
   assert.doesNotMatch(allInvalidHtml, /data-section="concept-plinth"/);
 });
 
-test('unadorned r58 HTML matches 96023bc golden digest and legacy r57/r56/r55 outputs remain 100% byte-identical', () => {
-  const cleanR58Batch = structuredClone(fixture);
-  const cleanR58Scored = scoreBatch(cleanR58Batch, profile);
-  const cleanR58Html = renderReport(cleanR58Scored, cleanR58Batch);
-  const cleanR58Sha = createHash('sha256').update(Buffer.from(cleanR58Html, 'utf8')).digest('hex');
-  assert.equal(
-    cleanR58Sha,
-    '1d5f071d7e75ac6fb030eafcf9b06b5408952b1cf401a7168c529bd362901062',
-    'unadorned r58 HTML must match pre-Phase-4 96023bc golden SHA-256 byte-for-byte',
-  );
-
-  for (const rev of [57, 56, 55]) {
-    const revProfile = structuredClone(profile);
-    revProfile.revision = rev;
-    revProfile.workflow.scoring_and_ordering.revision = rev;
-
-    const cleanBatch = structuredClone(fixture);
-    cleanBatch.profile_revision = rev;
-    const cleanScored = scoreBatch(cleanBatch, revProfile);
-    const baselineHtml = renderReport(cleanScored, cleanBatch);
-
-    const enrichedBatch = structuredClone(cleanBatch);
-    enrichedBatch.candidates[0].evidence_review = {
-      status: 'ready',
-      schema_version: 'evidence-review-draft-v1',
-      review_id: 'rev-pre58-ignore',
-      packet_sha256: 'd'.repeat(64),
-      reviewer: 'GPT-6.2 Astra · max',
-      conclusion: 'Should not appear in frozen pre-r58 templates.',
-      subjects: [{ subject_id: 's1', disposition: 'included', evidence_ids: ['e1'], reason: 'ok' }],
-      contradictions: [],
-      gaps: [],
-    };
-    enrichedBatch.candidates[0].concept_images = [
-      { data_uri: VALID_PNG_URI, title: 'Should not render in r57', caption: 'Ignored' },
-    ];
-    const enrichedScored = scoreBatch(enrichedBatch, revProfile);
-    enrichedScored.candidates[0].evidence_review = enrichedBatch.candidates[0].evidence_review;
-    enrichedScored.candidates[0].concept_images = enrichedBatch.candidates[0].concept_images;
-
-    const afterHtml = renderReport(enrichedScored, enrichedBatch);
-    assert.equal(afterHtml, baselineHtml, `revision ${rev} HTML must remain 100% byte-identical`);
-    assert.doesNotMatch(afterHtml, /Red-Team Audit|Concept Plinth/);
-  }
+test('unadorned r59 HTML omits optional AI sections cleanly while preserving V4 Curatorial Studio CSP & structure', () => {
+  const cleanBatch = structuredClone(fixture);
+  const cleanScored = scoreBatch(cleanBatch, profile);
+  const cleanHtml = renderReport(cleanScored, cleanBatch);
+  assert.match(cleanHtml, /script-src 'none'/);
+  assert.doesNotMatch(cleanHtml, /data-section="redteam-audit"/);
+  assert.doesNotMatch(cleanHtml, /data-section="concept-plinth"/);
 });
 
 test('r58 refuses to render 已复核 or fabricate GPT-6.2 Astra for unvalidated, reviewerless, or mismatched envelopes', () => {

@@ -9,7 +9,7 @@ import { spawnSync } from 'node:child_process';
 import { scoreBatch } from '../src/scoring.mjs';
 import { renderReport, safeHttpUrl } from '../src/report.mjs';
 
-const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.draft.json', import.meta.url), 'utf8'));
+const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
 
 test('Chinese cards distinguish complete point/range totals from supported partial points and all 21 rows', () => {
@@ -28,14 +28,6 @@ test('Chinese cards distinguish complete point/range totals from supported parti
   assert.match(html, /独立类目参照/);
   assert.doesNotMatch(html, /相对数量分|包含弱表现与仍合格的退出样本/);
   assert.match(html, /原始精确竞价/);
-  // Also preserve explicit legacy r57 tie-policy wording coverage on an in-memory r57 clone (works in clean clones too).
-  const r57Profile = structuredClone(profile);
-  r57Profile.revision = 57;
-  r57Profile.workflow.scoring_and_ordering.revision = 57;
-  const r57Fixture = structuredClone(fixture);
-  r57Fixture.profile_revision = 57;
-  const r57Html = renderReport(scoreBatch(r57Fixture, r57Profile), r57Fixture);
-  assert.match(r57Html, /最多只能同分的缺数样本不再阻断选例/);
 });
 
 test('cards display a supported demand interval and its basis rather than an unknown or midpoint input', () => {
@@ -176,7 +168,7 @@ function temporaryDirectory(run) {
 }
 
 const cli = fileURLToPath(new URL('../src/cli.mjs', import.meta.url));
-const profilePath = fileURLToPath(new URL('../docs/design/reference-profile.draft.json', import.meta.url));
+const profilePath = fileURLToPath(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url));
 const fixturePath = fileURLToPath(new URL('../fixtures/synthetic-batch.json', import.meta.url));
 const hash = bytes => createHash('sha256').update(bytes).digest('hex');
 

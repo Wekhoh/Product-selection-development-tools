@@ -1,26 +1,19 @@
 /**
- * Deterministic, zero-glue raw-receipt -> pipeline ingestion & seasonal companion builder (Revision 59+).
- *
- * Guarantees:
- *  1. 100% raw-receipt ASIN provenance (blocks phantom un-sourced ASINs before SpecMatcher/scoring).
- *  2. SellerSprite leaf-first `returnRatio` extraction with explicit fallback to department `avgReturnRatio` ONLY when the leaf is missing/`NO_DATA` (never 0.05 or sibling-leaf `returnRatio`).
- *  3. Parent-family `monthlySales` deduplication across child rows.
- *  4. 3-Tier Progressive Suggested Bid auto-extraction (mid-core vs 5+-word opportunistic long-tail, SIF `cpc_raise_exact` fallback).
- *  5. Stage-1 vs Stage-2 qualitative scoring unlock (#16/#17/#20/#21) + SP-API competitor-brand vs category gating classification.
- *  6. Paired `off_peak` + `peak` seasonal operating period builder with period-scoped `expected_primary_scenarios` and unique `stress_scenarios[]` IDs.
+ * Deterministic zero-glue raw trial ingestion & candidate provenance verifier.
+ * External provider adapters live in `src/adapters/{mcp-envelope,sellersprite,sif,sp-api,keepa}.mjs`.
  */
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
-  resolveCategoryReturnWithFallback,
   deduplicateParentSalesRows,
   extractNewcomerReviewOriginBreakdown,
+  resolveCategoryReturnWithFallback,
 } from './observations.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { calculateEconomics, netReferral } from './economics.mjs';
 import { assertNoRawPii, containsSecretToken } from './contracts.mjs';
 import { analyzeMainstreamPriceBand, parseSingleUnitUsdCoupon } from './price-band.mjs';
-import { resolveEffectivePricing, computeHeadhaulWithA4Rules } from './fee-basis.mjs';
+import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import {
   FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
   FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
@@ -29,1064 +22,67 @@ import {
   FBA_2027_UNPUBLISHED_PEAK_WINDOW,
   UNPUBLISHED_2027_PEAK_MARGIN_NOTE,
   classifySizeTier2027,
+  priceBand2027,
   lookupUnifiedFulfillmentFee2027,
   lookupUnifiedStorageFee2027,
   lookupUnifiedPlacementFee2027,
   lookupUnifiedReturnsProcessing2027,
   computeMatchedPeerMedianPackage,
-} from './fba-rates-2027.mjs';
+  resolveEffectivePricing,
+  computeHeadhaulWithA4Rules,
+} from './fba-calculator.mjs';
 import { canonicalJson, openSelectionStore, sha256Hex } from './store.mjs';
+import {
+  ASIN_EXACT_RE,
+  ASIN_TOKEN_RE,
+  hasUpstreamErrorMarkers,
+  isPayloadUpstreamFailure,
+  hasEnvelopeFailureMarkers,
+  isFailedOrEmptyRawReceipt,
+  unwrapMcpEnvelope,
+  isFailedUnwrappedBody,
+  extractItemCategoryRoot,
+  extractStructuredPricesFromObject,
+  reconcileAsinPriceProvenance,
+  extractVerifiedAsinCatalogFromRawPayloads,
+  extractVerifiedAsinSetFromRawPayloads,
+  extractAllCandidateAsins,
+  assertRawAsinProvenance,
+  ingestRawCategoryAndDemandMetrics,
+  extractSifThreeTierBidPlan,
+  classifySpApiRestrictionReasons,
+  extractSpApiFinalistCalibration,
+  extractSpApiPeerPackagesFromRawPayloads,
+  ingestSellerSpriteMonthlyArchiveMarket,
+  extractNicheAverageStarReference,
+  extractQ31DualSourceKeywordCounts,
+  parseSellerSpriteKeepaPayload,
+  buildKeepaPeerFactsForMarketJudge,
+} from './adapters/index.mjs';
 
-const ASIN_EXACT_RE = /^B0[A-Z0-9]{8}$/;
-const ASIN_TOKEN_RE = /\bB0[A-Z0-9]{8}\b/g;
-const STRUCTURED_ASIN_KEY_RE = /^(?:asin|parent|parent_asin|parentAsin|child_asin|target_asin|variation_asin|IdValue)$/i;
-const STRUCTURED_ASIN_ARRAY_KEY_RE = /^(?:asins|asinList|top_asins|topAsins|variationAsins|childAsins)$/i;
-const DIRECT_PRICE_KEYS = [
-  'price',
-  'price_usd',
-  'list_price_usd',
-  'net_price_usd',
-  'keepa_90d_median_usd',
-  'historical_regular_price_usd',
-  'buyboxPrice',
-  'salePrice',
-];
+export {
+  isFailedOrEmptyRawReceipt,
+  unwrapMcpEnvelope,
+  extractVerifiedAsinCatalogFromRawPayloads,
+  extractVerifiedAsinSetFromRawPayloads,
+  extractAllCandidateAsins,
+  assertRawAsinProvenance,
+  ingestRawCategoryAndDemandMetrics,
+  extractSifThreeTierBidPlan,
+  classifySpApiRestrictionReasons,
+  extractSpApiFinalistCalibration,
+  extractSpApiPeerPackagesFromRawPayloads,
+  ingestSellerSpriteMonthlyArchiveMarket,
+  extractNicheAverageStarReference,
+  extractQ31DualSourceKeywordCounts,
+  parseSellerSpriteKeepaPayload,
+  buildKeepaPeerFactsForMarketJudge,
+};
+
 const finite = v => typeof v === 'number' && Number.isFinite(v);
 const nonemptyStr = v => typeof v === 'string' && v.trim().length > 0;
 const round2 = v => Number(v.toFixed(2));
 
-function hasUpstreamErrorMarkers(obj) {
-  if (!obj || typeof obj !== 'object') return false;
-  if (obj.isError === true) return true;
-  if (obj.error !== undefined && obj.error !== null && obj.error !== false && obj.error !== '') return true;
-  if (Array.isArray(obj.errors) && obj.errors.length > 0) return true;
-  if (obj.status === 'failed' || obj.status === 'error') return true;
-  if (obj.code !== undefined && obj.code !== null && !['OK', '0', 0, 200].includes(obj.code)) {
-    return true;
-  }
-  return false;
-}
-
-function isPayloadUpstreamFailure(rawPayload, depth = 0, seen = new Set()) {
-  if (!rawPayload || typeof rawPayload !== 'object' || depth > 5 || seen.has(rawPayload)) return false;
-  seen.add(rawPayload);
-  if (hasUpstreamErrorMarkers(rawPayload)) return true;
-  for (const key of ['structuredContent', 'data', 'result', 'response', 'payload']) {
-    const child = rawPayload[key];
-    if (child && typeof child === 'object' && isPayloadUpstreamFailure(child, depth + 1, seen)) {
-      return true;
-    }
-  }
-  if (Array.isArray(rawPayload.content)) {
-    for (const block of rawPayload.content) {
-      if (block?.isError === true) return true;
-      if (typeof block?.text === 'string') {
-        const s = block.text.trim();
-        if (s.startsWith('{') && s.endsWith('}')) {
-          try {
-            const parsed = JSON.parse(s);
-            if (isPayloadUpstreamFailure(parsed, depth + 1, seen)) return true;
-          } catch { /* ignore */ }
-        }
-      }
-    }
-  }
-  return false;
-}
-
-function hasEnvelopeFailureMarkers(obj) {
-  if (!obj || typeof obj !== 'object') return false;
-  if (hasUpstreamErrorMarkers(obj)) return true;
-  if (obj.dataStatus === 'NO_DATA') return true;
-  return false;
-}
-
-export function isFailedOrEmptyRawReceipt(rawPayload) {
-  if (!rawPayload || typeof rawPayload !== 'object') return true;
-  if (isPayloadUpstreamFailure(rawPayload)) return true;
-  if (hasEnvelopeFailureMarkers(rawPayload)) return true;
-  if (hasEnvelopeFailureMarkers(rawPayload.structuredContent)) return true;
-  if (hasEnvelopeFailureMarkers(rawPayload.structuredContent?.data)) return true;
-  if (hasEnvelopeFailureMarkers(rawPayload.data)) return true;
-  return false;
-}
-
-export function unwrapMcpEnvelope(rawPayload) {
-  if (!rawPayload || typeof rawPayload !== 'object') return rawPayload;
-  if (isFailedOrEmptyRawReceipt(rawPayload)) return null;
-  if (rawPayload.structuredContent?.data !== undefined) return rawPayload.structuredContent.data;
-  if (rawPayload.data !== undefined && typeof rawPayload.data === 'object') return rawPayload.data;
-  if (Array.isArray(rawPayload.content)) {
-    for (const block of rawPayload.content) {
-      if (typeof block?.text === 'string') {
-        const s = block.text.trim();
-        if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
-          try {
-            const parsed = JSON.parse(s);
-            if (hasEnvelopeFailureMarkers(parsed)) return null;
-            if (parsed?.data !== undefined && typeof parsed.data === 'object') {
-              return hasEnvelopeFailureMarkers(parsed.data) ? null : parsed.data;
-            }
-            return parsed;
-          } catch { /* ignore */ }
-        }
-      }
-    }
-  }
-  return rawPayload;
-}
-
-function isFailedUnwrappedBody(unwrapped) {
-  if (!unwrapped || typeof unwrapped !== 'object') return true;
-  if (Array.isArray(unwrapped)) return unwrapped.length === 0;
-  if (hasEnvelopeFailureMarkers(unwrapped)) return true;
-  return false;
-}
-
-function extractItemCategoryRoot(obj) {
-  if (!obj || typeof obj !== 'object') return null;
-  if (nonemptyStr(obj.categoryId)) return obj.categoryId.trim().toLowerCase();
-  if (Array.isArray(obj.categoryPath) && nonemptyStr(obj.categoryPath[0])) {
-    return obj.categoryPath[0].trim().toLowerCase();
-  }
-  if (nonemptyStr(obj.rootCategory)) return obj.rootCategory.trim().toLowerCase();
-  return null;
-}
-
-function extractStructuredPricesFromObject(obj) {
-  // Never treat SP-API productFees request/estimate echo structures as observed market selling prices.
-  if (obj && typeof obj === 'object' && (
-    obj.PriceToEstimateFees !== undefined ||
-    obj.FeesEstimateIdentifier !== undefined ||
-    obj.FeesEstimate !== undefined ||
-    obj.FeesEstimateResult !== undefined
-  )) {
-    return { observed_prices_usd: [], has_keepa_series: false };
-  }
-  const prices = new Set();
-  const addPrice = p => {
-    if (finite(p) && p > 0) prices.add(round2(p));
-  };
-  for (const key of DIRECT_PRICE_KEYS) {
-    addPrice(obj?.[key]);
-  }
-  const baseListPrice = finite(obj?.list_price_usd) ? obj.list_price_usd : (finite(obj?.price) ? obj.price : null);
-  if (baseListPrice !== null && obj?.coupon !== undefined && obj?.coupon !== null) {
-    const parsedCoupon = parseSingleUnitUsdCoupon(obj.coupon);
-    if (parsedCoupon.type === 'pct') {
-      addPrice(baseListPrice * (1 - parsedCoupon.pct));
-    } else if (parsedCoupon.type === 'usd' && parsedCoupon.usd < baseListPrice) {
-      addPrice(baseListPrice - parsedCoupon.usd);
-    }
-  }
-  // SP-API competitive pricing summary structures (do NOT treat PriceToEstimateFees input query price as observed market price)
-  for (const lp of obj?.Summary?.LowestPrices ?? []) {
-    addPrice(lp?.LandedPrice?.Amount);
-    addPrice(lp?.ListingPrice?.Amount);
-  }
-  for (const bp of obj?.Summary?.BuyBoxPrices ?? []) {
-    addPrice(bp?.LandedPrice?.Amount);
-    addPrice(bp?.ListingPrice?.Amount);
-  }
-  // Keepa / SellerSprite historical price arrays
-  let hasKeepaSeries = false;
-  for (const arr of [obj?.series?.price, obj?.priceList, obj?.keepa?.price]) {
-    if (Array.isArray(arr)) {
-      for (const p of arr) {
-        if (finite(p) && p > 0) {
-          addPrice(p);
-          hasKeepaSeries = true;
-        }
-      }
-    }
-  }
-  return {
-    observed_prices_usd: [...prices],
-    has_keepa_series: hasKeepaSeries,
-  };
-}
-
-/**
- * Build a structured ASIN provenance & price catalog strictly from successful structured receipt objects.
- * Never regex-scans free-text error/summary strings, and rejects failed/error/NO_DATA envelopes.
- */
-export function extractVerifiedAsinCatalogFromRawPayloads(rawPayloads = []) {
-  const catalog = new Map();
-  const recordAsin = (asin, meta) => {
-    if (!ASIN_EXACT_RE.test(asin)) return;
-    let bucket = catalog.get(asin);
-    if (!bucket) {
-      bucket = [];
-      catalog.set(asin, bucket);
-    }
-    bucket.push(meta);
-  };
-
-  for (const entry of rawPayloads) {
-    const raw = entry?.payload ?? entry;
-    const sourceId = nonemptyStr(entry?.source_id) ? entry.source_id : null;
-    const sourceSha256 = nonemptyStr(entry?.source_sha256) ? entry.source_sha256 : null;
-    if (isFailedOrEmptyRawReceipt(raw)) continue;
-    const unwrapped = unwrapMcpEnvelope(raw);
-    if (isFailedUnwrappedBody(unwrapped)) continue;
-
-    const seen = new Set();
-    const visit = (val, depth = 0) => {
-      if (!val || typeof val !== 'object' || depth > 12 || seen.has(val)) return;
-      seen.add(val);
-      if (Array.isArray(val)) {
-        for (const item of val) visit(item, depth + 1);
-        return;
-      }
-      // Skip failed individual sub-rows (e.g. SP-API batch error item, per-row error envelope, or failed sub-call)
-      if (hasEnvelopeFailureMarkers(val) || val.resultStatus === 'error') {
-        return;
-      }
-
-      const priceInfo = extractStructuredPricesFromObject(val);
-      const itemCatRoot = extractItemCategoryRoot(val);
-      for (const [k, v] of Object.entries(val)) {
-        if (STRUCTURED_ASIN_KEY_RE.test(k) && typeof v === 'string') {
-          const norm = v.trim().toUpperCase();
-          if (ASIN_EXACT_RE.test(norm)) {
-            const isPrimaryRowAsin = /^(?:asin|child_asin|target_asin|IdValue)$/i.test(k);
-            recordAsin(norm, {
-              asin: norm,
-              key: k,
-              source_id: sourceId,
-              source_sha256: sourceSha256,
-              category_root: isPrimaryRowAsin ? itemCatRoot : null,
-              observed_prices_usd: isPrimaryRowAsin ? priceInfo.observed_prices_usd : [],
-              has_keepa_series: isPrimaryRowAsin ? priceInfo.has_keepa_series : false,
-            });
-          }
-        } else if (STRUCTURED_ASIN_ARRAY_KEY_RE.test(k) && Array.isArray(v)) {
-          for (const elem of v) {
-            if (typeof elem === 'string') {
-              const norm = elem.trim().toUpperCase();
-              if (ASIN_EXACT_RE.test(norm)) {
-                recordAsin(norm, {
-                  asin: norm,
-                  key: k,
-                  source_id: sourceId,
-                  source_sha256: sourceSha256,
-                  observed_prices_usd: [],
-                  has_keepa_series: false,
-                });
-              }
-            }
-          }
-        }
-        if (v && typeof v === 'object') visit(v, depth + 1);
-      }
-    };
-    visit(unwrapped, 0);
-  }
-  return catalog;
-}
-
-/**
- * Scan raw provider receipt objects/JSON trees and return the exact uppercase set of observed structured ASINs.
- */
-export function extractVerifiedAsinSetFromRawPayloads(rawPayloads = []) {
-  return new Set(extractVerifiedAsinCatalogFromRawPayloads(rawPayloads).keys());
-}
-
-/**
- * Extract every B0xxxxxxxx ASIN token referenced anywhere inside a candidate object tree,
- * skipping embedded raster data URIs (`data:image/...;base64,...`) and requiring uppercase `B0[A-Z0-9]{8}`
- * in prose while normalizing structured ASIN fields.
- */
-export function extractAllCandidateAsins(value) {
-  const found = new Set();
-  const seen = new Set();
-  const walk = (v, keyHint = '', depth = 0) => {
-    if (v === null || v === undefined || depth > 14) return;
-    if (typeof v === 'string') {
-      if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(v)) return;
-      if (STRUCTURED_ASIN_KEY_RE.test(keyHint)) {
-        const norm = v.trim().toUpperCase();
-        if (ASIN_EXACT_RE.test(norm)) found.add(norm);
-        return;
-      }
-      for (const m of v.matchAll(ASIN_TOKEN_RE)) found.add(m[0]);
-      return;
-    }
-    if (typeof v !== 'object' || seen.has(v)) return;
-    seen.add(v);
-    if (Array.isArray(v)) {
-      for (const item of v) walk(item, keyHint, depth + 1);
-      return;
-    }
-    for (const [k, child] of Object.entries(v)) walk(child, k, depth + 1);
-  };
-  walk(value, '', 0);
-  return found;
-}
-
-/**
- * Hard-reject any ASIN in a candidate/SpecMatcher/cohort payload that does not exist in raw receipts.
- */
-export function assertRawAsinProvenance(asins, rawPayloads = []) {
-  const verifiedSet = rawPayloads instanceof Set
-    ? rawPayloads
-    : (rawPayloads instanceof Map
-      ? new Set(rawPayloads.keys())
-      : extractVerifiedAsinSetFromRawPayloads(rawPayloads));
-  const missing = [];
-  for (const rawAsin of asins ?? []) {
-    if (!nonemptyStr(rawAsin)) continue;
-    const norm = rawAsin.trim().toUpperCase();
-    if (ASIN_EXACT_RE.test(norm) && !verifiedSet.has(norm)) {
-      missing.push(norm);
-    }
-  }
-  if (missing.length > 0) {
-    throw new TypeError(
-      `Raw ASIN provenance violation: un-sourced phantom ASIN(s) [${[...new Set(missing)].join(', ')}] never appeared in verified structured raw receipts.`,
-    );
-  }
-  return { valid: true, verified_count: verifiedSet.size };
-}
-
-/**
- * Extract category return rate under Revision 59 leaf-first priority (`returnRatio` first, falling back strictly to
- * department `avgReturnRatio` ONLY when leaf `returnRatio` is missing/`NO_DATA`) and deduplicated parent sales from raw receipts.
- */
-export function ingestRawCategoryAndDemandMetrics({
-  demand365Raw = null,
-  parentDemand365Raw = null,
-  parentCategoryLabel = null,
-  preferLeafReturnRatio = true,
-  asinRows = [],
-} = {}) {
-  if (demand365Raw !== null && demand365Raw !== undefined && isPayloadUpstreamFailure(demand365Raw)) {
-    throw new TypeError(
-      'Upstream leaf category_demand_report failed with an error payload; cannot treat API/transport failure as NO_DATA fallback.',
-    );
-  }
-  if (parentDemand365Raw !== null && parentDemand365Raw !== undefined && isPayloadUpstreamFailure(parentDemand365Raw)) {
-    throw new TypeError(
-      'Upstream parent category_demand_report failed with an error payload; cannot adopt failed fallback metrics.',
-    );
-  }
-  const leafData = unwrapMcpEnvelope(demand365Raw);
-  const parentData = unwrapMcpEnvelope(parentDemand365Raw);
-  const leafRatioObj = leafData?.ratioComparison ?? leafData?.stat ?? leafData ?? null;
-  const parentRatioObj = parentData
-    ? {
-      ...(parentData?.ratioComparison ?? parentData?.stat ?? parentData),
-      ...(parentCategoryLabel ? { category_label: parentCategoryLabel } : {}),
-    }
-    : null;
-  const categoryReturn = resolveCategoryReturnWithFallback(leafRatioObj, parentRatioObj, { preferLeafReturnRatio });
-  const deduplicatedSales = deduplicateParentSalesRows(asinRows);
-  return {
-    category_return: categoryReturn,
-    deduplicated_sales: deduplicatedSales,
-  };
-}
-
-/**
- * Build a Revision 59 3-Tier Progressive Bid payload from raw SIF & SellerSprite rows:
- *  - Tier 1: keeps 1–3 searched mid-core purchase terms in `entries`; moves unbid 5+-word ultra-long-tail terms to `long_tail_opportunistic_terms[]`.
- *  - Tier 2: prefers SIF `cpc_fixed_exact`, automatically falling back to SIF `cpc_raise_exact` (`up_and_down`) when fixed exact is absent.
- *  - Tier 3: supports `entry_scope: 'parent_functional_proxy'` or `unbid_after_all_tiers: true`.
- */
-export function extractSifThreeTierBidPlan({
-  queries = [],
-  evidence = [],
-  marketplace = 'US',
-  currency = 'USD',
-  volume_period = null,
-  selection_reason = '3-Tier Progressive Suggested Bid auto-extracted from raw receipts.',
-  entry_scope = null,
-  proxy_reason = null,
-  unbid_after_all_tiers = null,
-  unbid_reason = null,
-} = {}) {
-  const entries = [];
-  const opportunistic = [];
-  const mainQueriesMeta = [];
-  const validQueries = Array.isArray(queries) ? queries.filter(q => q && nonemptyStr(q.query)) : [];
-  const queryHasAnyBid = q => {
-    const ssExact = finite(q.ss_row?.exactPpc) ? q.ss_row.exactPpc
-      : finite(q.ss_row?.ppc?.exact?.value) ? q.ss_row.ppc.exact.value
-        : finite(q.ss_exact_usd) ? q.ss_exact_usd : null;
-    const sig = q.sif_row?.supporting_signals ?? q.sif_row ?? {};
-    const hasSif = finite(sig.cpc_fixed_exact) || finite(sig.cpc_raise_exact);
-    const effSs = (q.ss_channel === 'ss_web' && hasSif) ? null : ssExact;
-    return effSs !== null || hasSif;
-  };
-  const nonOpportunisticMainCount = validQueries.filter(q => {
-    const wc = q.query.trim().split(/\s+/).length;
-    return queryHasAnyBid(q) || (wc < 5 && q.is_long_tail_opportunistic !== true);
-  }).length;
-
-  for (const q of validQueries) {
-    const queryText = q.query.trim();
-    const wordCount = queryText.split(/\s+/).length;
-    const ssExact = finite(q.ss_row?.exactPpc) ? q.ss_row.exactPpc
-      : finite(q.ss_row?.ppc?.exact?.value) ? q.ss_row.ppc.exact.value
-        : finite(q.ss_exact_usd) ? q.ss_exact_usd : null;
-    const ssLow = finite(q.ss_row?.minExactPpc) ? q.ss_row.minExactPpc : null;
-    const ssHigh = finite(q.ss_row?.maxExactPpc) ? q.ss_row.maxExactPpc : null;
-    const ssStrategy = q.ss_strategy ?? 'unspecified';
-
-    const sig = q.sif_row?.supporting_signals ?? q.sif_row ?? {};
-    const sifFixed = finite(sig.cpc_fixed_exact) ? sig.cpc_fixed_exact : null;
-    const sifFixedLow = finite(sig.cpc_fixed_exact_low) ? sig.cpc_fixed_exact_low : null;
-    const sifFixedHigh = finite(sig.cpc_fixed_exact_high) ? sig.cpc_fixed_exact_high : null;
-    const sifRaise = finite(sig.cpc_raise_exact) ? sig.cpc_raise_exact : null;
-    const sifRaiseLow = finite(sig.cpc_raise_exact_low) ? sig.cpc_raise_exact_low : null;
-    const sifRaiseHigh = finite(sig.cpc_raise_exact_high) ? sig.cpc_raise_exact_high : null;
-
-    const hasSifTier1Or2 = sifFixed !== null || sifRaise !== null;
-    // Tier 3a (`ss_web`) is strictly a fallback when Tier 1/2 lack exact bids; ignore ss_web when SIF Tier 1/2 already returned an exact point!
-    const effectiveSsExact = (q.ss_channel === 'ss_web' && hasSifTier1Or2) ? null : ssExact;
-    const hasAnyExactBid = effectiveSsExact !== null || hasSifTier1Or2;
-
-    // Tier 1: unbid 5+-word ultra-long-tail queries move to opportunistic list ONLY when >=1 other main entry remains
-    // (if the sole 5-word main query is unbid across all tiers, keep it in entries so scoring resolves 0/15 honestly).
-    if (!hasAnyExactBid && (wordCount >= 5 || q.is_long_tail_opportunistic === true) && nonOpportunisticMainCount >= 1) {
-      opportunistic.push({
-        query: queryText,
-        volume: finite(q.monthly_searches) ? q.monthly_searches : null,
-        note: '超长尾蓝海捡漏词（同行未单独建精准词组，不锁死主词竞价 15 分）',
-      });
-      continue;
-    }
-
-    const entry = {
-      query: queryText,
-      ...(finite(q.monthly_searches) && volume_period ? {
-        volume: {
-          value: q.monthly_searches,
-          unit: 'searches_per_month',
-          period: volume_period,
-          evidence,
-        },
-      } : {}),
-      sellersprite: effectiveSsExact !== null ? {
-        value: effectiveSsExact,
-        ...(ssLow !== null && ssHigh !== null ? { low: ssLow, high: ssHigh } : {}),
-        unit: 'USD',
-        match_type: 'exact',
-        strategy: ssStrategy,
-        ...(q.ss_channel ? { channel: q.ss_channel } : {}),
-        evidence,
-      } : null,
-      sif: sifFixed !== null ? {
-        value: sifFixed,
-        ...(sifFixedLow !== null && sifFixedHigh !== null ? { low: sifFixedLow, high: sifFixedHigh } : {}),
-        unit: 'USD',
-        match_type: 'exact',
-        strategy: 'fixed',
-        evidence,
-      } : sifRaise !== null ? {
-        value: null,
-        cpc_raise_exact: sifRaise,
-        ...(sifRaiseLow !== null && sifRaiseHigh !== null ? {
-          cpc_raise_exact_low: sifRaiseLow,
-          cpc_raise_exact_high: sifRaiseHigh,
-        } : {}),
-        unit: 'USD',
-        match_type: 'exact',
-        strategy: 'up_and_down',
-        evidence,
-      } : null,
-      ...(q.unbid_after_all_tiers === true || q.all_tiers_exhausted === true ? { all_tiers_exhausted: true } : {}),
-    };
-    entries.push(entry);
-    mainQueriesMeta.push({
-      hasAnyExactBid,
-      exhausted: q.unbid_after_all_tiers === true || q.all_tiers_exhausted === true,
-    });
-  }
-
-  const allMainQueriesExhausted = mainQueriesMeta.length > 0 &&
-    mainQueriesMeta.every(m => !m.hasAnyExactBid && m.exhausted);
-  const anyContradictoryExhausted = mainQueriesMeta.some(m => m.hasAnyExactBid && m.exhausted);
-  const resolvedUnbidAfterAllTiers = unbid_after_all_tiers === true || allMainQueriesExhausted || anyContradictoryExhausted;
-
-  return {
-    marketplace,
-    currency,
-    match_type: 'exact',
-    ...(volume_period ? { volume_period } : {}),
-    selection_reason,
-    evidence,
-    ...(entry_scope ? { entry_scope } : {}),
-    ...(proxy_reason ? { proxy_reason } : {}),
-    ...(resolvedUnbidAfterAllTiers ? { unbid_after_all_tiers: true } : {}),
-    ...(unbid_reason ? { unbid_reason } : {}),
-    entries,
-    ...(opportunistic.length > 0 ? { long_tail_opportunistic_terms: opportunistic } : {}),
-  };
-}
-
-/**
- * Classify SP-API getListingsRestrictions reasons so competitor brand-gating on a peer ASIN
- * is never mistaken for a category ban on a new own-brand white-label listing.
- */
-export function classifySpApiRestrictionReasons(reasons = [], { target_is_own_white_label = true } = {}) {
-  const msgs = (Array.isArray(reasons) ? reasons : []).map(r => String(r?.message || '')).filter(Boolean);
-  const hasBrandGate = msgs.some(m => /approval to list in this brand|brand owner contribution/i.test(m));
-  const hasCategoryOrProductApproval = msgs.some(m =>
-    /approval to list this product|other listing limitations|toys|topical|dietary|medical|hazmat/i.test(m) &&
-    !/in this brand/i.test(m),
-  );
-  const hardBan = msgs.some(m => /prohibited|recalled|banned|not permitted for sale/i.test(m));
-  return {
-    hard_category_ban: hardBan,
-    has_competitor_brand_gate: hasBrandGate,
-    has_category_or_product_approval_note: hasCategoryOrProductApproval,
-    white_label_note: target_is_own_white_label && hasBrandGate
-      ? 'SP-API 竞品 ASIN 限制含「竞品品牌锁（approval to list in this brand）」，对自有白牌新建链接不构成品牌封锁；类目准入按自有 productType 预检核实。'
-      : '已按 SP-API 准入原因分类核对。',
-  };
-}
-
-function spApiMeasureToInches(measure) {
-  if (!measure || typeof measure !== 'object' || !finite(measure.value) || measure.value <= 0) return null;
-  const u = String(measure.unit ?? '').trim().toLowerCase();
-  if (u === 'inches' || u === 'inch' || u === 'in') return Number(measure.value.toFixed(6));
-  if (u === 'centimeters' || u === 'centimeter' || u === 'cm') return Number((measure.value / 2.54).toFixed(6));
-  if (u === 'millimeters' || u === 'millimeter' || u === 'mm') return Number((measure.value / 25.4).toFixed(6));
-  if (u === 'feet' || u === 'foot' || u === 'ft') return Number((measure.value * 12).toFixed(6));
-  return null;
-}
-
-function spApiWeightToPounds(measure) {
-  if (!measure || typeof measure !== 'object' || !finite(measure.value) || measure.value <= 0) return null;
-  const u = String(measure.unit ?? '').trim().toLowerCase();
-  if (u === 'pounds' || u === 'pound' || u === 'lbs' || u === 'lb') return Number(measure.value.toFixed(6));
-  if (u === 'ounces' || u === 'ounce' || u === 'oz') return Number((measure.value / 16).toFixed(6));
-  if (u === 'kilograms' || u === 'kilogram' || u === 'kg') return Number((measure.value / 0.45359237).toFixed(6));
-  if (u === 'grams' || u === 'gram' || u === 'g') return Number((measure.value / 453.59237).toFixed(6));
-  return null;
-}
-
-/**
- * Extract official Amazon packaged dimensions/weight, exact category referral rate, real-time FBA fee calibration,
- * and listing restriction status from read-only SP-API finalist receipts (`catalogItems_getCatalogItem`,
- * `productFees_getMyFeesEstimateForASIN/Estimates`, `listingsRestrictions_getListingsRestrictions`).
- * Automatically detects and overrides stale SellerSprite cached dimensions/weights.
- */
-export function extractSpApiFinalistCalibration({
-  asin: requestedAsin = null,
-  marketplace_id = 'ATVPDKIKX0DER',
-  currency = 'USD',
-  catalogItemRaw = null,
-  feesEstimateRaw = null,
-  restrictionsRaw = null,
-  sellerSpriteCachedRow = null,
-  price_usd = null,
-  target_is_own_white_label = true,
-  is_apparel = undefined,
-  is_shoes = undefined,
-  is_apparel_or_shoes = undefined,
-  is_dangerous_goods = undefined,
-  is_sipp = undefined,
-  fee_category = null,
-} = {}) {
-  if (catalogItemRaw && isPayloadUpstreamFailure(catalogItemRaw)) {
-    throw new TypeError('SP-API catalogItems_getCatalogItem receipt contains an upstream error.');
-  }
-  if (feesEstimateRaw && isPayloadUpstreamFailure(feesEstimateRaw)) {
-    throw new TypeError('SP-API productFees receipt contains an upstream error.');
-  }
-  if (restrictionsRaw && isPayloadUpstreamFailure(restrictionsRaw)) {
-    throw new TypeError('SP-API listingsRestrictions receipt contains an upstream error.');
-  }
-
-  const reqAsin = nonemptyStr(requestedAsin) ? requestedAsin.trim().toUpperCase() : null;
-  const targetMkt = nonemptyStr(marketplace_id) ? marketplace_id.trim() : 'ATVPDKIKX0DER';
-  const targetCur = nonemptyStr(currency) ? currency.trim().toUpperCase() : 'USD';
-
-  const catBody = catalogItemRaw ? unwrapMcpEnvelope(catalogItemRaw) : null;
-  const feesBody = feesEstimateRaw ? unwrapMcpEnvelope(feesEstimateRaw) : null;
-  const restBody = restrictionsRaw ? unwrapMcpEnvelope(restrictionsRaw) : null;
-
-  let asin = reqAsin;
-  let officialPkg = null;
-  if (catBody && typeof catBody === 'object') {
-    const catAsin = nonemptyStr(catBody.asin) ? catBody.asin.trim().toUpperCase() : null;
-    if (reqAsin && catAsin && catAsin !== reqAsin) {
-      throw new TypeError(`SP-API catalogItems ASIN ("${catAsin}") conflicts with requested ASIN ("${reqAsin}").`);
-    }
-    if (catAsin) asin = catAsin;
-    const dimArr = Array.isArray(catBody.dimensions) ? catBody.dimensions : [];
-    const matchedDimRow = dimArr.find(d => !d?.marketplaceId || d.marketplaceId === targetMkt)
-      ?? (dimArr.length === 1 && !dimArr[0]?.marketplaceId ? dimArr[0] : null);
-    const dimEntry = matchedDimRow?.package ?? null;
-    const attrPkgDimArr = Array.isArray(catBody.attributes?.item_package_dimensions)
-      ? catBody.attributes.item_package_dimensions
-      : [];
-    const attrPkgDim = attrPkgDimArr.find(d => !d?.marketplace_id || d.marketplace_id === targetMkt) ?? null;
-    const attrPkgWtArr = Array.isArray(catBody.attributes?.item_package_weight)
-      ? catBody.attributes.item_package_weight
-      : [];
-    const attrPkgWt = attrPkgWtArr.find(w => !w?.marketplace_id || w.marketplace_id === targetMkt) ?? null;
-    const lengthIn = spApiMeasureToInches(dimEntry?.length ?? attrPkgDim?.length);
-    const widthIn = spApiMeasureToInches(dimEntry?.width ?? attrPkgDim?.width);
-    const heightIn = spApiMeasureToInches(dimEntry?.height ?? attrPkgDim?.height);
-    const weightLb = spApiWeightToPounds(dimEntry?.weight ?? attrPkgWt);
-    if (lengthIn !== null && widthIn !== null && heightIn !== null && weightLb !== null) {
-      officialPkg = {
-        ...(asin ? { asin } : {}),
-        length_in: lengthIn,
-        width_in: widthIn,
-        height_in: heightIn,
-        unit_weight_lb: weightLb,
-        is_sp_api_official: true,
-        source: 'sp_api_catalog_items',
-      };
-    }
-  }
-
-  let feeCalibration = null;
-  let feeCalibrationStatus = null;
-  if (feesBody && typeof feesBody === 'object') {
-    const rawList = Array.isArray(feesBody)
-      ? feesBody
-      : (Array.isArray(feesBody.FeesEstimateResultList)
-        ? feesBody.FeesEstimateResultList
-        : (Array.isArray(feesBody.payload?.FeesEstimateResultList)
-          ? feesBody.payload.FeesEstimateResultList
-          : (Array.isArray(feesBody.payload)
-            ? feesBody.payload
-            : [feesBody.FeesEstimateResult ?? feesBody.payload?.FeesEstimateResult ?? feesBody])));
-    const candidateNodes = rawList
-      .map(n => (n && typeof n === 'object' ? (n.FeesEstimateResult ?? n) : null))
-      .filter(Boolean);
-
-    const hasRealErrorObj = errObj => Boolean(
-      errObj && typeof errObj === 'object' && (
-        nonemptyStr(errObj.Code) || nonemptyStr(errObj.Message) ||
-        nonemptyStr(errObj.code) || nonemptyStr(errObj.message)
-      ),
-    );
-    const asinScopedNodes = candidateNodes.filter(node => {
-      const ident = node?.FeesEstimateIdentifier ?? node?.feesEstimateIdentifier ?? null;
-      const idType = nonemptyStr(ident?.IdType) ? ident.IdType.trim().toUpperCase() : null;
-      const idVal = nonemptyStr(ident?.IdValue) ? ident.IdValue.trim().toUpperCase() : null;
-      const mktId = nonemptyStr(ident?.MarketplaceId) ? ident.MarketplaceId.trim() : null;
-      const curCode = nonemptyStr(ident?.PriceToEstimateFees?.ListingPrice?.CurrencyCode)
-        ? ident.PriceToEstimateFees.ListingPrice.CurrencyCode.trim().toUpperCase()
-        : null;
-      const isFba = ident?.IsAmazonFulfilled;
-      const lp = ident?.PriceToEstimateFees?.ListingPrice?.Amount;
-      const shipAmt = finite(ident?.PriceToEstimateFees?.Shipping?.Amount)
-        ? ident.PriceToEstimateFees.Shipping.Amount
-        : 0;
-      const totalInputPrice = finite(lp) ? lp + shipAmt : null;
-      if ((asin || finite(price_usd)) && !ident) return false;
-      if (asin && idType && idType !== 'ASIN') return false;
-      if (asin && idVal && idVal !== asin) return false;
-      if (asin && !idVal && candidateNodes.length > 1) return false;
-      if (!asin && candidateNodes.length > 1) return false;
-      if (mktId && mktId !== targetMkt) return false;
-      if (curCode && curCode !== targetCur) return false;
-      if (isFba === false) return false;
-      if (finite(price_usd) && price_usd > 0 && finite(totalInputPrice) && Math.round(totalInputPrice * 100) !== Math.round(price_usd * 100)) return false;
-      const est = node?.FeesEstimate ?? node?.feesEstimate ?? null;
-      if (est && typeof est === 'object') {
-        const totalCur = nonemptyStr(est.TotalFeesEstimate?.CurrencyCode) ? est.TotalFeesEstimate.CurrencyCode.trim().toUpperCase() : null;
-        if (totalCur && totalCur !== targetCur) return false;
-        const details = Array.isArray(est.FeeDetailList) ? est.FeeDetailList : [];
-        for (const d of details) {
-          const fc = nonemptyStr(d?.FinalFee?.CurrencyCode) ? d.FinalFee.CurrencyCode.trim().toUpperCase()
-            : (nonemptyStr(d?.FeeAmount?.CurrencyCode) ? d.FeeAmount.CurrencyCode.trim().toUpperCase() : null);
-          if (fc && fc !== targetCur) return false;
-        }
-      }
-      return true;
-    });
-
-    for (const node of asinScopedNodes) {
-      const st = nonemptyStr(node?.Status) ? node.Status.trim().toLowerCase() : null;
-      if ((st && st !== 'success') || hasRealErrorObj(node?.Error ?? node?.error)) {
-        throw new TypeError(`SP-API productFees FeesEstimateResult failed (${node?.Error?.Code ?? node?.Status ?? 'error'}).`);
-      }
-    }
-
-    const rawMatchedNodes = asinScopedNodes.filter(node => {
-      const est = node?.FeesEstimate ?? node?.feesEstimate ?? null;
-      return Boolean(est && typeof est === 'object');
-    });
-    const dedupedBySignature = new Map();
-    for (const node of rawMatchedNodes) {
-      const est = node?.FeesEstimate ?? node?.feesEstimate ?? null;
-      const ident = node?.FeesEstimateIdentifier ?? node?.feesEstimateIdentifier ?? null;
-      const idVal = nonemptyStr(ident?.IdValue) ? ident.IdValue.trim().toUpperCase() : '';
-      const lpCents = finite(ident?.PriceToEstimateFees?.ListingPrice?.Amount)
-        ? Math.round(ident.PriceToEstimateFees.ListingPrice.Amount * 100)
-        : '';
-      const details = Array.isArray(est?.FeeDetailList) ? est.FeeDetailList : [];
-      const refRow = details.find(d => String(d?.FeeType || '').toLowerCase() === 'referralfee');
-      const fbaRow = details.find(d => String(d?.FeeType || '').toLowerCase() === 'fbafees');
-      const refAmt = refRow?.FinalFee?.Amount ?? refRow?.FeeAmount?.Amount ?? '';
-      const fbaAmt = fbaRow?.FinalFee?.Amount ?? fbaRow?.FeeAmount?.Amount ?? '';
-      const sig = `${idVal}::${lpCents}::${refAmt}::${fbaAmt}`;
-      if (!dedupedBySignature.has(sig)) dedupedBySignature.set(sig, node);
-    }
-    const matchedNodes = [...dedupedBySignature.values()];
-
-    if (matchedNodes.length === 1) {
-      const resNode = matchedNodes[0];
-      const est = resNode?.FeesEstimate ?? resNode?.feesEstimate ?? null;
-      const ident = resNode?.FeesEstimateIdentifier ?? resNode?.feesEstimateIdentifier ?? null;
-      if (!asin && nonemptyStr(ident?.IdValue)) asin = ident.IdValue.trim().toUpperCase();
-      const listingPriceAmt = ident?.PriceToEstimateFees?.ListingPrice?.Amount ?? price_usd ?? null;
-      const details = Array.isArray(est.FeeDetailList) ? est.FeeDetailList : [];
-      const findFee = type => details.find(d => String(d?.FeeType || '').toLowerCase() === type.toLowerCase());
-      const refRow = findFee('ReferralFee');
-      const fbaRow = findFee('FBAFees');
-      const vcfRow = findFee('VariableClosingFee');
-      const referralUsd = finite(refRow?.FinalFee?.Amount) ? refRow.FinalFee.Amount : (finite(refRow?.FeeAmount?.Amount) ? refRow.FeeAmount.Amount : null);
-      const fbaLiveUsd = finite(fbaRow?.FinalFee?.Amount) ? fbaRow.FinalFee.Amount : (finite(fbaRow?.FeeAmount?.Amount) ? fbaRow.FeeAmount.Amount : null);
-      const vcfUsd = finite(vcfRow?.FinalFee?.Amount) ? vcfRow.FinalFee.Amount : 0;
-      const totalFeesUsd = finite(est.TotalFeesEstimate?.Amount) ? est.TotalFeesEstimate.Amount : null;
-      const referralFraction = (referralUsd !== null && finite(listingPriceAmt) && listingPriceAmt > 0)
-        ? Number((referralUsd / listingPriceAmt).toFixed(6))
-        : null;
-      feeCalibration = {
-        listing_price_usd: listingPriceAmt,
-        referral_fee_usd: referralUsd,
-        referral_fraction: referralFraction,
-        live_fba_fulfillment_usd: fbaLiveUsd,
-        variable_closing_fee_usd: vcfUsd,
-        total_fees_estimate_usd: totalFeesUsd,
-        source: 'sp_api_product_fees',
-      };
-      feeCalibrationStatus = 'verified';
-    } else {
-      feeCalibrationStatus = matchedNodes.length === 0 ? 'unmatched' : 'ambiguous_multiple_estimates';
-    }
-  }
-
-  let restrictions = null;
-  if (restBody !== null) {
-    if (!restBody || typeof restBody !== 'object' || (!Array.isArray(restBody.restrictions) && !Array.isArray(restBody))) {
-      throw new TypeError('SP-API listingsRestrictions payload is missing a valid restrictions[] array.');
-    }
-    if (asin && nonemptyStr(restBody.asin) && restBody.asin.trim().toUpperCase() !== asin) {
-      throw new TypeError(`SP-API listingsRestrictions ASIN ("${restBody.asin.trim().toUpperCase()}") conflicts with target ASIN ("${asin}").`);
-    }
-    const restArr = Array.isArray(restBody.restrictions) ? restBody.restrictions : restBody;
-    const asinFilteredRest = restArr.filter(r => {
-      if (asin && nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() !== asin) return false;
-      if (nonemptyStr(r?.marketplaceId) && r.marketplaceId.trim() !== targetMkt) return false;
-      if (nonemptyStr(r?.conditionType) && r.conditionType.trim().toLowerCase() !== 'new_new') return false;
-      return true;
-    });
-    const allReasons = asinFilteredRest.flatMap(r => Array.isArray(r?.reasons) ? r.reasons : []);
-    restrictions = {
-      restriction_count: asinFilteredRest.length,
-      ...classifySpApiRestrictionReasons(allReasons, { target_is_own_white_label }),
-    };
-  }
-
-  const evalPrice = finite(price_usd) && price_usd > 0
-    ? price_usd
-    : (finite(feeCalibration?.listing_price_usd) && feeCalibration.listing_price_usd > 0 ? feeCalibration.listing_price_usd : 39.99);
-  const local2027 = officialPkg
-    ? lookupUnifiedFulfillmentFee2027({
-      pkg: officialPkg,
-      price_usd: evalPrice,
-      sales_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
-      is_apparel,
-      is_shoes,
-      is_apparel_or_shoes,
-      is_dangerous_goods,
-      is_sipp,
-      fee_category,
-    })
-    : null;
-
-  let staleCacheAudit = null;
-  if (officialPkg && sellerSpriteCachedRow && typeof sellerSpriteCachedRow === 'object') {
-    const ssPkg = {
-      length_in: sellerSpriteCachedRow.length_in ?? sellerSpriteCachedRow.pkgLength,
-      width_in: sellerSpriteCachedRow.width_in ?? sellerSpriteCachedRow.pkgWidth,
-      height_in: sellerSpriteCachedRow.height_in ?? sellerSpriteCachedRow.pkgHeight,
-      unit_weight_lb: sellerSpriteCachedRow.unit_weight_lb ?? sellerSpriteCachedRow.weight_lb ?? sellerSpriteCachedRow.pkgWeight,
-      length_cm: sellerSpriteCachedRow.length_cm,
-      width_cm: sellerSpriteCachedRow.width_cm,
-      height_cm: sellerSpriteCachedRow.height_cm,
-      unit_weight_kg: sellerSpriteCachedRow.unit_weight_kg ?? sellerSpriteCachedRow.weight_kg,
-    };
-    const ssTier = classifySizeTier2027(ssPkg);
-    if (ssTier.status === 'verified') {
-      const ssFul2027 = lookupUnifiedFulfillmentFee2027({
-        pkg: ssPkg,
-        price_usd: evalPrice,
-        sales_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
-        is_apparel,
-        is_shoes,
-        is_apparel_or_shoes,
-        is_dangerous_goods,
-        is_sipp,
-        fee_category,
-      });
-      const weightDeltaLb = Number((officialPkg.unit_weight_lb - ssTier.unit_weight_lb).toFixed(4));
-      const fbaDeltaUsd = (local2027?.status === 'verified' && ssFul2027.status === 'verified')
-        ? Number((local2027.total_usd - ssFul2027.total_usd).toFixed(4))
-        : null;
-      staleCacheAudit = {
-        stale_sellersprite_cache_corrected:
-          Math.abs(weightDeltaLb) >= 0.05 ||
-          ssTier.size_tier !== local2027?.size_tier ||
-          (fbaDeltaUsd !== null && Math.abs(fbaDeltaUsd) >= 0.05),
-        sellersprite_cached_size_tier: ssTier.size_tier,
-        sp_api_official_size_tier: local2027?.size_tier ?? null,
-        sellersprite_cached_weight_lb: ssTier.unit_weight_lb,
-        sp_api_official_weight_lb: officialPkg.unit_weight_lb,
-        weight_delta_lb: weightDeltaLb,
-        sellersprite_cached_fba_2027_usd: ssFul2027.status === 'verified' ? ssFul2027.total_usd : null,
-        sp_api_official_fba_2027_usd: local2027?.status === 'verified' ? local2027.total_usd : null,
-        fba_2027_delta_usd: fbaDeltaUsd,
-      };
-    }
-  }
-
-  return {
-    asin,
-    official_pkg: officialPkg,
-    local_2027_off_peak_fulfillment: local2027?.status === 'verified' ? local2027 : null,
-    fee_calibration: feeCalibration,
-    ...(feeCalibrationStatus ? { fee_calibration_status: feeCalibrationStatus } : {}),
-    restrictions,
-    stale_sellersprite_audit: staleCacheAudit,
-    calibration_source: 'sp_api_readonly_finalist',
-  };
-}
-
-/**
- * Scan raw payloads for SP-API `catalogItems_getCatalogItem` receipts and return official peer package specs.
- */
-export function extractSpApiPeerPackagesFromRawPayloads(rawPayloads = []) {
-  const peers = [];
-  for (const entry of rawPayloads) {
-    const raw = entry?.payload ?? entry;
-    if (isFailedOrEmptyRawReceipt(raw)) continue;
-    try {
-      const cal = extractSpApiFinalistCalibration({ catalogItemRaw: raw });
-      if (cal.official_pkg) peers.push(cal.official_pkg);
-    } catch { /* ignore non-catalog payloads */ }
-  }
-  return peers;
-}
-
-/**
- * Normalize SellerSprite latest monthly archive macro metrics (`category_report_detail` / `category_stats_list`)
- * directly into `candidate.market` under Revision 59+ (accepting monthly archive directly for macro structure).
- */
-export function ingestSellerSpriteMonthlyArchiveMarket(archiveRaw, {
-  evidence = [],
-  report_id = 'sellersprite-monthly-archive',
-  population = '卖家精灵最新月度归档类目宏观样本',
-  family_basis = '卖家精灵月度归档父体/Listing 口径',
-} = {}) {
-  if (!archiveRaw || isPayloadUpstreamFailure(archiveRaw)) {
-    throw new TypeError('Valid SellerSprite monthly archive receipt is required.');
-  }
-  const body = unwrapMcpEnvelope(archiveRaw);
-  if (Array.isArray(body?.items) && body.items.length === 0 && !body?.stat && !body?.detail) {
-    throw new TypeError('SellerSprite monthly archive items[] is empty; required category record is missing.');
-  }
-  const row = Array.isArray(body?.items) ? body.items[0] : (body?.stat ?? body?.detail ?? body);
-  if (!row || typeof row !== 'object' || Array.isArray(row)) {
-    throw new TypeError('SellerSprite monthly archive payload contains no structured category record.');
-  }
-  const normFrac = v => {
-    if (!finite(v) || v < 0) return null;
-    return v > 1 ? Number((v / 100).toFixed(6)) : Number(v.toFixed(6));
-  };
-  const rawMonth = String(row.dataMonth ?? row.month ?? body?.dataMonth ?? '').trim();
-  const archiveMonth = /^\d{6}$/.test(rawMonth)
-    ? `${rawMonth.slice(0, 4)}-${rawMonth.slice(4, 6)}`
-    : (nonemptyStr(rawMonth) ? rawMonth : null);
-
-  const countShare = normFrac(row.newProductRatio ?? row.newProductsRatio ?? row.newcomer_count_share);
-  const salesShare = normFrac(row.newProductSalesRatio ?? row.newProductsSalesRatio ?? row.newcomer_sales_share);
-  const prodConc = normFrac(row.commodityConcentration ?? row.top10ProductSalesRatio ?? row.product_concentration_top10);
-  const brandConc = normFrac(row.brandConcentration ?? row.top10BrandSalesRatio ?? row.brand_concentration_top10);
-  const sellerConc = normFrac(row.sellerConcentration ?? row.top10SellerSalesRatio ?? row.seller_concentration_top10);
-  const amzSalesShare = normFrac(row.amzSalesRatio ?? row.amzUnitRatio ?? row.amz_sales_share ?? body?.stat?.amzSalesRatio);
-  const rawSellerCount = row.sellers ?? row.sellerCount ?? row.seller_count ?? body?.stat?.sellers;
-  const sellerCount = finite(rawSellerCount) && rawSellerCount >= 0 ? Math.round(rawSellerCount) : null;
-
-  let top10MedianReviews = finite(row.top10_median_reviews ?? row.top10MedianReviews ?? row.medianReviews)
-    ? Number(row.top10_median_reviews ?? row.top10MedianReviews ?? row.medianReviews)
-    : null;
-  const categoryAvgReviews = finite(row.avgReviews ?? row.average_reviews ?? row.category_avg_reviews)
-    ? Number(row.avgReviews ?? row.average_reviews ?? row.category_avg_reviews)
-    : null;
-  const rawSampleCount = row.top10_review_sample_count ?? row.top10ReviewSampleCount ?? body?.stat?.top10_review_sample_count ?? body?.top10_review_sample_count;
-  let top10ReviewSampleCount = finite(rawSampleCount)
-    ? Math.round(Number(rawSampleCount))
-    : null;
-  if (top10MedianReviews === null && Array.isArray(body?.items) && body.items.length > 0) {
-    const revNums = body.items
-      .slice(0, 10)
-      .map(it => it?.ratings ?? it?.reviews ?? it?.reviewCount)
-      .filter(v => finite(v) && v >= 0)
-      .sort((a, b) => a - b);
-    if (top10ReviewSampleCount === null) top10ReviewSampleCount = revNums.length;
-    if (revNums.length >= 2) {
-      const mid = Math.floor(revNums.length / 2);
-      top10MedianReviews = revNums.length % 2 === 1 ? revNums[mid] : (revNums[mid - 1] + revNums[mid]) / 2;
-    }
-  } else if (top10ReviewSampleCount === null && Array.isArray(body?.items) && body.items.length > 1) {
-    const revNums = body.items
-      .slice(0, 10)
-      .map(it => it?.ratings ?? it?.reviews ?? it?.reviewCount)
-      .filter(v => finite(v) && v >= 0);
-    if (revNums.length > 0) top10ReviewSampleCount = revNums.length;
-  }
-  const avgStarRef = Array.isArray(body?.items) && body.items.length > 0
-    ? extractNicheAverageStarReference(body.items)
-    : (finite(row.avgRating ?? row.average_star_rating) && Number(row.avgRating ?? row.average_star_rating) > 0 && Number(row.avgRating ?? row.average_star_rating) <= 5
-      ? Number(Number(row.avgRating ?? row.average_star_rating).toFixed(2))
-      : null);
-
-  const mkMetric = val => (val !== null ? { value: val, unit: 'fraction', evidence } : null);
-  const concentrations = {};
-  if (mkMetric(prodConc)) concentrations.product = mkMetric(prodConc);
-  if (mkMetric(brandConc)) concentrations.brand = mkMetric(brandConc);
-  if (mkMetric(sellerConc)) concentrations.seller = mkMetric(sellerConc);
-  const newcomer = {};
-  if (mkMetric(countShare)) newcomer.count_share = mkMetric(countShare);
-  if (mkMetric(salesShare)) {
-    newcomer.unit_sales_share = {
-      ...mkMetric(salesShare),
-      window: 'latest_monthly_archive',
-    };
-  }
-  return {
-    provider: 'sellersprite',
-    report_id,
-    relevant: true,
-    archive_basis: 'sellersprite_latest_monthly_archive',
-    ...(archiveMonth ? { period: archiveMonth, archive_month: archiveMonth } : {}),
-    population,
-    family_basis,
-    head_group: 'top10',
-    newcomer_age_months: 3,
-    newcomer_sales_window: 'latest_monthly_archive',
-    evidence,
-    ...(Object.keys(concentrations).length > 0 ? { concentrations } : {}),
-    ...(Object.keys(newcomer).length > 0 ? { newcomer } : {}),
-    ...(mkMetric(countShare) ? { newcomer_count_share: mkMetric(countShare) } : {}),
-    ...(mkMetric(salesShare) ? {
-      newcomer_sales_share: {
-        ...mkMetric(salesShare),
-        window: 'latest_monthly_archive',
-      },
-    } : {}),
-    ...(mkMetric(prodConc) ? { product_concentration_top10: mkMetric(prodConc) } : {}),
-    ...(mkMetric(brandConc) ? { brand_concentration_top10: mkMetric(brandConc) } : {}),
-    ...(mkMetric(sellerConc) ? { seller_concentration_top10: mkMetric(sellerConc) } : {}),
-    ...(top10MedianReviews !== null ? { top10_median_reviews: top10MedianReviews } : {}),
-    ...(top10ReviewSampleCount !== null ? { top10_review_sample_count: top10ReviewSampleCount } : {}),
-    ...(categoryAvgReviews !== null ? { avg_reviews: categoryAvgReviews, category_avg_reviews: categoryAvgReviews } : {}),
-    ...(amzSalesShare !== null ? { amz_sales_share: amzSalesShare } : {}),
-    ...(sellerCount !== null ? { seller_count: sellerCount } : {}),
-    ...(avgStarRef !== null ? { average_star_rating: typeof avgStarRef === 'object' ? avgStarRef.value : avgStarRef, niche_average_star_reference: avgStarRef } : {}),
-  };
-}
-
-/**
- * Compute equal-weight niche average star reference (`r20`) across parent-deduplicated comparable listings (`(0, 5]`).
- */
-export function extractNicheAverageStarReference(rows = [], {
-  scope = '去重同款父体等权均星',
-  period = null,
-} = {}) {
-  if (!Array.isArray(rows) || rows.length === 0) return null;
-  const flatRows = rows.flatMap(entry => {
-    if (!entry || typeof entry !== 'object') return [];
-    const unwrapped = unwrapMcpEnvelope(entry);
-    if (Array.isArray(unwrapped?.items)) return unwrapped.items;
-    if (Array.isArray(unwrapped?.list)) return unwrapped.list;
-    return [unwrapped];
-  });
-  if (flatRows.length === 0) return null;
-  const rowByAsin = new Map();
-  for (const r of flatRows) {
-    const a = typeof r?.asin === 'string' && r.asin.trim() ? r.asin.trim().toUpperCase() : null;
-    if (a && !rowByAsin.has(a)) rowByAsin.set(a, r);
-  }
-  const dedupRes = deduplicateParentSalesRows(flatRows);
-  const repRows = dedupRes.families.length > 0
-    ? dedupRes.families.map(f => rowByAsin.get(f.representative_asin) ?? f)
-    : flatRows;
-  const stars = repRows
-    .map(r => r?.rating ?? r?.stars ?? r?.star_rating ?? r?.avgRating ?? r?.representative?.rating)
-    .map(v => Number(v))
-    .filter(v => Number.isFinite(v) && v > 0 && v <= 5);
-  if (stars.length === 0) return null;
-  const mean = Number((stars.reduce((a, b) => a + b, 0) / stars.length).toFixed(2));
-  return {
-    value: mean,
-    family_count: stars.length,
-    scope: `${scope}（${stars.length} 款）`,
-    ...(period ? { period } : {}),
-    note: '仅作细分市场口碑与差评预期参考，不纳入 100 分评分。',
-  };
-}
-
-/**
- * Extract Q31 dual-source organic/ad keyword counts (`r48/r50`: SellerSprite + SIF).
- */
-export function extractQ31DualSourceKeywordCounts({
-  sellerspriteRaw = null,
-  sifRaw = null,
-} = {}) {
-  const readCounts = (raw, isSif = false) => {
-    if (!raw || typeof raw !== 'object') return null;
-    const body = unwrapMcpEnvelope(raw);
-    if (!body || typeof body !== 'object') return null;
-    if (finite(body.organic) && finite(body.ad)) {
-      return { organic: Math.max(0, Math.round(body.organic)), ad: Math.max(0, Math.round(body.ad)) };
-    }
-    const orgDirect = body.organic_keywords ?? body.organicKeywords ?? body.naturalKeywordCount ?? body.organicCount ?? body.natural_count;
-    const adDirect = body.ad_keywords ?? body.adKeywords ?? body.sponsoredKeywordCount ?? body.adCount ?? body.sponsored_count;
-    if (finite(orgDirect) && finite(adDirect)) {
-      return { organic: Math.max(0, Math.round(orgDirect)), ad: Math.max(0, Math.round(adDirect)) };
-    }
-    const items = Array.isArray(body.items) ? body.items : (Array.isArray(body.list) ? body.list : null);
-    if (items) {
-      let org = 0;
-      let ad = 0;
-      for (const it of items) {
-        if (!it || typeof it !== 'object') continue;
-        const hasOrg = isSif
-          ? Boolean(finite(it.naturalRank ?? it.organic_rank) && Number(it.naturalRank ?? it.organic_rank) > 0)
-          : Boolean(finite(it.naturalRank ?? it.rankPosition ?? it.organic_rank) && Number(it.naturalRank ?? it.rankPosition ?? it.organic_rank) > 0);
-        const hasAd = Boolean(finite(it.adRank ?? it.sponsoredRank ?? it.ad_rank) && Number(it.adRank ?? it.sponsoredRank ?? it.ad_rank) > 0);
-        if (hasOrg) org += 1;
-        if (hasAd) ad += 1;
-      }
-      return { organic: org, ad };
-    }
-    return null;
-  };
-  const ss = readCounts(sellerspriteRaw, false);
-  const sif = readCounts(sifRaw, true);
-  if (!ss && !sif) return null;
-  return {
-    ...(ss ? { sellersprite: ss } : {}),
-    ...(sif ? { sif } : {}),
-  };
-}
-
-/**
- * Resolve Stage-1 qualitative rubric judgments (#16/#17/#20/#21) from public/listing evidence,
- * reserving physical tolerance/compliance lab checks for Stage-2 sample tags rather than blocking Stage-1 scoring.
- */
 export function resolveStage1QualitativeJudgments({
   evidence = [],
   spec_verification = null,
@@ -1721,6 +717,93 @@ export function buildEvergreen2027OffPeakEconomics({
   };
 }
 
+export function extractKeepaFactsByAsinFromPayloads(rawPayloads = [], { asOfDate = null } = {}) {
+  const byAsin = new Map();
+  const considerNode = (node) => {
+    if (!node || typeof node !== 'object' || hasEnvelopeFailureMarkers(node)) return;
+    const looksKeepa = Boolean(
+      node.keepa_trend ||
+      node.keepa ||
+      node.series ||
+      node.pkgDimensionsSize !== undefined ||
+      node.pkgWeightGram !== undefined,
+    );
+    if (!looksKeepa) return;
+    const parsed = parseSellerSpriteKeepaPayload(node, { as_of_date: asOfDate });
+    if (!parsed?.ok || !nonemptyStr(parsed.asin)) return;
+    const prev = byAsin.get(parsed.asin);
+    // Prefer full timestamped curves over undated curves, and curves over package-only snapshots.
+    const rank = p => (p.status === 'parsed' ? (p.has_timestamps ? 3 : 2) : 1);
+    if (!prev || rank(parsed) >= rank(prev)) {
+      byAsin.set(parsed.asin, parsed);
+    }
+  };
+  for (const entry of rawPayloads) {
+    const raw = entry?.payload ?? entry;
+    if (isFailedOrEmptyRawReceipt(raw)) continue;
+    const unwrapped = unwrapMcpEnvelope(raw);
+    if (!unwrapped || typeof unwrapped !== 'object' || isFailedUnwrappedBody(unwrapped)) continue;
+    considerNode(unwrapped);
+    if (unwrapped.data && typeof unwrapped.data === 'object') considerNode(unwrapped.data);
+    const items = Array.isArray(unwrapped.items)
+      ? unwrapped.items
+      : (Array.isArray(unwrapped.data?.items) ? unwrapped.data.items : null);
+    if (items) {
+      for (const it of items) considerNode(it);
+    }
+  }
+  return byAsin;
+}
+
+export function mergeKeepaReceiptIntoListingRow(row, parsedKeepa) {
+  if (!row || typeof row !== 'object' || !parsedKeepa?.ok) return row;
+  const merged = { ...row };
+  if (parsedKeepa.status === 'package_snapshot_only') {
+    merged.keepa_package_only = true;
+    merged.keepa_peer_facts = buildKeepaPeerFactsForMarketJudge(parsedKeepa);
+  } else if (parsedKeepa.status === 'parsed') {
+    if (merged.keepa_90d_steady === undefined) {
+      merged.keepa_90d_steady = parsedKeepa.keepa_90d_steady;
+    }
+    if (merged.keepa_price_steady === undefined) {
+      merged.keepa_price_steady = parsedKeepa.keepa_90d_steady;
+    }
+    if (merged.sustained_drop_or_clearance_watch === undefined && parsedKeepa.sustained_drop_or_clearance_watch === true) {
+      merged.sustained_drop_or_clearance_watch = true;
+    }
+    if (parsedKeepa.has_timestamps && finite(parsedKeepa.keepa_90d_median_usd) && merged.keepa_90d_median_usd === undefined) {
+      merged.keepa_90d_median_usd = parsedKeepa.keepa_90d_median_usd;
+    }
+    const hasExplicitRowCoupon =
+      merged.ongoing_coupon_pct !== undefined ||
+      merged.coupon_pct !== undefined ||
+      merged.ongoing_coupon_usd !== undefined ||
+      merged.coupon_usd !== undefined ||
+      merged.coupon !== undefined ||
+      merged.net_effective_price_usd !== undefined ||
+      merged.net_price_usd !== undefined;
+    if (!hasExplicitRowCoupon && finite(parsedKeepa.latest_coupon_fraction) && parsedKeepa.latest_coupon_fraction > 0 && parsedKeepa.latest_coupon_fraction < 1) {
+      merged.ongoing_coupon_pct = parsedKeepa.latest_coupon_fraction;
+    }
+    merged.keepa_peer_facts = buildKeepaPeerFactsForMarketJudge(parsedKeepa);
+  }
+  if (!merged.pkg && parsedKeepa.package_snapshot?.length_in && parsedKeepa.package_snapshot?.width_in && parsedKeepa.package_snapshot?.height_in) {
+    merged.pkg = { ...parsedKeepa.package_snapshot };
+  }
+  return merged;
+}
+
+export function mergeKeepaPayloadsIntoPeerListings(listings = [], rawPayloads = [], { as_of_date = null } = {}) {
+  if (!Array.isArray(listings) || listings.length === 0) return [];
+  const keepaByAsin = extractKeepaFactsByAsinFromPayloads(rawPayloads, { asOfDate: as_of_date });
+  if (keepaByAsin.size === 0) return listings.map(r => ({ ...r }));
+  return listings.map(row => {
+    const asin = typeof row?.asin === 'string' && row.asin.trim() ? row.asin.trim().toUpperCase() : null;
+    const k = asin ? keepaByAsin.get(asin) : null;
+    return k ? mergeKeepaReceiptIntoListingRow(row, k) : { ...row };
+  });
+}
+
 function extractQuantileSupportedPricesFromPayloads(candPayloads = [], {
   asOfDate = null,
   excludedAsins = new Set(),
@@ -1730,6 +813,7 @@ function extractQuantileSupportedPricesFromPayloads(candPayloads = [], {
   const quantilePrices = new Set();
   const mainstreamMedians = [];
   const rowFloorPrices = [];
+  const keepaByAsin = extractKeepaFactsByAsinFromPayloads(candPayloads, { asOfDate });
   for (const entry of candPayloads) {
     const raw = entry?.payload ?? entry;
     if (isFailedOrEmptyRawReceipt(raw)) continue;
@@ -1738,11 +822,17 @@ function extractQuantileSupportedPricesFromPayloads(candPayloads = [], {
     const rawItems = Array.isArray(unwrapped?.items) ? unwrapped.items : null;
     if (!rawItems || rawItems.length < 2) continue;
 
-    let items = rawItems.filter(it => {
-      if (!it || typeof it !== 'object' || hasEnvelopeFailureMarkers(it)) return false;
-      const a = typeof it.asin === 'string' ? it.asin.trim().toUpperCase() : '';
-      return !(a && excludedAsins.has(a));
-    });
+    let items = rawItems
+      .filter(it => {
+        if (!it || typeof it !== 'object' || hasEnvelopeFailureMarkers(it)) return false;
+        const a = typeof it.asin === 'string' ? it.asin.trim().toUpperCase() : '';
+        return !(a && excludedAsins.has(a));
+      })
+      .map(it => {
+        const a = typeof it.asin === 'string' ? it.asin.trim().toUpperCase() : '';
+        const k = a ? keepaByAsin.get(a) : null;
+        return k ? mergeKeepaReceiptIntoListingRow(it, k) : it;
+      });
     if (items.length < 2) continue;
 
     // Record low-end page price even on 2-row pages so 2-row ($39.99 + $289.99) bundle hijacking cannot evade median checks.
@@ -1936,12 +1026,29 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
         `Raw ASIN provenance violation on candidate "${cand.id}": target_variant_asin "${targetAsin}" is absent from candidate's verified structured receipts.`,
       );
     }
-    const observedPrices = [...new Set(obsRecords.flatMap(r => r.observed_prices_usd ?? []))];
-    if (refPriceScalar !== null && (refPrice.matched_spec === true || (observedPrices.length > 0 && refPrice.allow_unobserved_derived_price !== true))) {
-      const matched = observedPrices.some(p => Math.abs(p - refPriceScalar) <= 0.05);
+    const candObsDateForRef = resolveCandidateReferenceAsOfDate(cand, fallbackAsOfDate);
+    const reconciledRef = reconcileAsinPriceProvenance(obsRecords, {
+      asOfDate: candObsDateForRef,
+      newcomerMaxAgeDays: BUSINESS_THRESHOLDS.newcomer_max_age_days,
+    });
+    const observedPrices = reconciledRef.observed_prices_usd;
+    const listOnlyPrices = reconciledRef.list_prices_usd;
+    const hasAnyPriceProvenance = observedPrices.length > 0 || listOnlyPrices.length > 0;
+    const pricesMatchWithHardBoundaries = (observedUsd, declaredUsd, tol = 0.05) => {
+      if (!finite(observedUsd) || !finite(declaredUsd) || Math.abs(observedUsd - declaredUsd) > tol) return false;
+      const minFloor = BUSINESS_THRESHOLDS.minimum_reference_price_usd;
+      if ((observedUsd < minFloor) !== (declaredUsd < minFloor)) return false;
+      if (priceBand2027(observedUsd) !== priceBand2027(declaredUsd)) return false;
+      return true;
+    };
+    if (refPriceScalar !== null && (refPrice.matched_spec === true || (hasAnyPriceProvenance && refPrice.allow_unobserved_derived_price !== true))) {
+      const matched = observedPrices.some(p => pricesMatchWithHardBoundaries(p, refPriceScalar));
       if (!matched) {
+        const matchedListOnly = listOnlyPrices.some(p => Math.abs(p - refPriceScalar) <= 0.05);
         throw new TypeError(
-          `Raw ASIN price-binding violation on candidate "${cand.id}": target_variant_asin "${targetAsin}" observed structured receipt price(s) [${observedPrices.map(p => `$${p.toFixed(2)}`).join(', ') || 'none'}] do not match screening.reference_price_usd.value ($${refPriceScalar}).`,
+          matchedListOnly
+            ? `Raw ASIN price-binding violation on candidate "${cand.id}": target_variant_asin "${targetAsin}" only shows $${refPriceScalar} as an un-realized pre-coupon list price without independent regular-price evidence; realized/verified price(s) are [${observedPrices.map(p => `$${p.toFixed(2)}`).join(', ') || 'none'}].`
+            : `Raw ASIN price-binding violation on candidate "${cand.id}": target_variant_asin "${targetAsin}" observed structured receipt price(s) [${observedPrices.map(p => `$${p.toFixed(2)}`).join(', ') || 'none'}] do not match screening.reference_price_usd.value ($${refPriceScalar}).`,
         );
       }
     }
@@ -1951,6 +1058,13 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
   // Blocks un-evidenced prices ($89.99), value_range / mega-bundle hijacking ($289.99), cross-category detail batch quantiles ($64.69),
   // free-text prose wall-mount notes ($49.99), AND excluded_different_task ASIN hijacking.
   if (!allowSyntheticIds) {
+    const pricesMatchWithHardBoundaries = (observedUsd, declaredUsd, tol = 0.05) => {
+      if (!finite(observedUsd) || !finite(declaredUsd) || Math.abs(observedUsd - declaredUsd) > tol) return false;
+      const minFloor = BUSINESS_THRESHOLDS.minimum_reference_price_usd;
+      if ((observedUsd < minFloor) !== (declaredUsd < minFloor)) return false;
+      if (priceBand2027(observedUsd) !== priceBand2027(declaredUsd)) return false;
+      return true;
+    };
     const targetAsinNorm = nonemptyStr(refPrice?.target_variant_asin)
       ? refPrice.target_variant_asin.trim().toUpperCase()
       : null;
@@ -1978,8 +1092,10 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
     const referencedPeerPrices = [
       ...new Set(
         [...referencedComparableAsins]
-          .flatMap(a => candCatalog.get(a) ?? [])
-          .flatMap(r => r.observed_prices_usd ?? []),
+          .flatMap(a => reconcileAsinPriceProvenance(candCatalog.get(a) ?? [], {
+            asOfDate: candObsDate,
+            newcomerMaxAgeDays: BUSINESS_THRESHOLDS.newcomer_max_age_days,
+          }).observed_prices_usd),
       ),
     ];
     const allowedScenarioPrices = [...new Set([...referencedPeerPrices, ...quantilePrices])];
@@ -2074,10 +1190,17 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
       }
 
       // Orthogonally enforce supported_price_range EVEN when scenario target_variant_asin is set!
-      if (supportedRange && (effectiveScPrice < supportedRange[0] - 0.05 || effectiveScPrice > supportedRange[1] + 0.05)) {
-        throw new TypeError(
-          `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) lies outside supported_price_range [$${supportedRange[0]}, $${supportedRange[1]}].`,
-        );
+      // Never allow 5-cent boundary tolerance to cross $10.00, $29.99, or $50.00 FBA / hard-floor cliffs!
+      if (supportedRange) {
+        const belowMin = effectiveScPrice < supportedRange[0] && !pricesMatchWithHardBoundaries(supportedRange[0], effectiveScPrice);
+        const aboveMax = effectiveScPrice > supportedRange[1] && !pricesMatchWithHardBoundaries(supportedRange[1], effectiveScPrice);
+        const minFloorForRange = BUSINESS_THRESHOLDS.minimum_reference_price_usd;
+        const crossedMinFloorOnRange = supportedRange[1] < minFloorForRange && effectiveScPrice >= minFloorForRange;
+        if (belowMin || aboveMax || crossedMinFloorOnRange) {
+          throw new TypeError(
+            `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) lies outside supported_price_range [$${supportedRange[0]}, $${supportedRange[1]}].`,
+          );
+        }
       }
 
       if (scenTargetAsin) {
@@ -2088,31 +1211,47 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
             `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" target_variant_asin "${scenTargetAsin}" belongs to category [${scenCats.join(', ')}], disjoint from candidate category [${[...targetCategoryRoots].join(', ')}].`,
           );
         }
-        const scenObsPrices = [...new Set(scenRecs.flatMap(r => r.observed_prices_usd ?? []))];
-        if (!scenObsPrices.some(p => Math.abs(p - effectiveScPrice) <= 0.05)) {
+        const reconciledScen = reconcileAsinPriceProvenance(scenRecs, {
+          asOfDate: candObsDate,
+          newcomerMaxAgeDays: BUSINESS_THRESHOLDS.newcomer_max_age_days,
+        });
+        const scenObsPrices = reconciledScen.observed_prices_usd;
+        const scenListPrices = reconciledScen.list_prices_usd;
+        if (!scenObsPrices.some(p => pricesMatchWithHardBoundaries(p, effectiveScPrice))) {
+          const matchedListOnly = scenListPrices.some(p => Math.abs(p - effectiveScPrice) <= 0.05);
           throw new TypeError(
-            `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" target_variant_asin "${scenTargetAsin}" observed prices [${scenObsPrices.map(p => `$${p.toFixed(2)}`).join(', ') || 'none'}] do not match $${effectiveScPrice}.`,
+            matchedListOnly
+              ? `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" target_variant_asin "${scenTargetAsin}" cannot use pre-coupon list price ($${effectiveScPrice}) without independent regular-price evidence; realized/verified price(s) are [${scenObsPrices.map(p => `$${p.toFixed(2)}`).join(', ') || 'none'}].`
+              : `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" target_variant_asin "${scenTargetAsin}" observed prices [${scenObsPrices.map(p => `$${p.toFixed(2)}`).join(', ') || 'none'}] do not match $${effectiveScPrice}.`,
           );
         }
-        if (!supportedRange && refPriceScalar !== null && Math.abs(effectiveScPrice - refPriceScalar) > 0.05) {
+        if (eff.valid && eff.has_ongoing_discount && finite(eff.list_price_usd) && (scenListPrices.length > 0 || scenObsPrices.length > 0)) {
+          const allKnownListOrRegular = [...new Set([...scenListPrices, ...scenObsPrices])];
+          if (!allKnownListOrRegular.some(p => pricesMatchWithHardBoundaries(p, eff.list_price_usd))) {
+            throw new TypeError(
+              `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" target_variant_asin "${scenTargetAsin}" list_price_usd ($${eff.list_price_usd}) is not backed by observed list/regular prices [${allKnownListOrRegular.map(p => `$${p.toFixed(2)}`).join(', ')}].`,
+            );
+          }
+        }
+        if (!supportedRange && refPriceScalar !== null && !pricesMatchWithHardBoundaries(refPriceScalar, effectiveScPrice)) {
           throw new TypeError(
             `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) differs from single-point screening.reference_price_usd.value ($${refPriceScalar}) without declaring supported_price_range.`,
           );
         }
       } else if (supportedRange) {
         if ((refPrice?.matched_spec === true || allowedScenarioPrices.length > 0) &&
-          !allowedScenarioPrices.some(p => Math.abs(p - effectiveScPrice) <= 0.05)) {
+          !allowedScenarioPrices.some(p => pricesMatchWithHardBoundaries(p, effectiveScPrice))) {
           throw new TypeError(
             `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) is not backed by any referenced comparable ASIN or denoised P25/P50/P75 quantile in candidate's verified receipts.`,
           );
         }
       } else if (refPriceScalar !== null) {
-        if (Math.abs(effectiveScPrice - refPriceScalar) > 0.05) {
+        if (!pricesMatchWithHardBoundaries(refPriceScalar, effectiveScPrice)) {
           throw new TypeError(
             `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) differs from single-point screening.reference_price_usd.value ($${refPriceScalar}) without an explicit scenario price_anchor.target_variant_asin or supported_price_range.`,
           );
         }
-      } else if (allowedScenarioPrices.length > 0 && !allowedScenarioPrices.some(p => Math.abs(p - effectiveScPrice) <= 0.05)) {
+      } else if (allowedScenarioPrices.length > 0 && !allowedScenarioPrices.some(p => pricesMatchWithHardBoundaries(p, effectiveScPrice))) {
         throw new TypeError(
           `Scenario price provenance violation on candidate "${cand.id}": scenario "${sc?.id ?? 'unknown'}" selling price ($${effectiveScPrice}) is not backed by candidate's verified receipts.`,
         );
@@ -2541,7 +1680,10 @@ export function ingestTrialSpecification(spec, profile, {
 
     let mutated = false;
     let effectiveFeeCal = spCal?.fee_calibration ?? null;
-    if (rawFeesForLookup && (!effectiveFeeCal || !finite(effectiveFeeCal.listing_price_usd) || Math.round(netP * 100) !== Math.round(effectiveFeeCal.listing_price_usd * 100))) {
+    const initialCalBasePrice = finite(effectiveFeeCal?.total_price_usd)
+      ? effectiveFeeCal.total_price_usd
+      : effectiveFeeCal?.listing_price_usd;
+    if (rawFeesForLookup && (!effectiveFeeCal || !finite(initialCalBasePrice) || Math.round(netP * 100) !== Math.round(initialCalBasePrice * 100))) {
       try {
         const perScCal = extractSpApiFinalistCalibration({
           asin: spCal?.asin ?? null,
@@ -2554,7 +1696,9 @@ export function ingestTrialSpecification(spec, profile, {
       } catch { /* ignore */ }
     }
     const refFrac = effectiveFeeCal?.referral_fraction;
-    const calPrice = effectiveFeeCal?.listing_price_usd;
+    const calPrice = finite(effectiveFeeCal?.total_price_usd)
+      ? effectiveFeeCal.total_price_usd
+      : effectiveFeeCal?.listing_price_usd;
     const priceMatchesCalibratedTier = !finite(calPrice) || Math.round(netP * 100) === Math.round(calPrice * 100);
     if (finite(refFrac) && refFrac > 0 && refFrac < 1 && priceMatchesCalibratedTier) {
       ledger.referral_terms = {
@@ -2882,6 +2026,35 @@ export function ingestTrialSpecification(spec, profile, {
         ? entry.raw_receipt_files.map(fp => rawPayloadByResolvedPath.get(resolve(baseDir, String(fp)))).filter(Boolean)
         : rawPayloads)
       : [];
+    const entryAsOfDate = resolveCandidateReferenceAsOfDate(cand, entry?.as_of_date ?? spec.as_of_date ?? null);
+    const entryKeepaByAsin = entryCandPayloads.length > 0
+      ? extractKeepaFactsByAsinFromPayloads(entryCandPayloads, { asOfDate: entryAsOfDate })
+      : new Map();
+    if (entryKeepaByAsin.size > 0) {
+      const keepaPeerFacts = {};
+      for (const [kAsin, kParsed] of entryKeepaByAsin.entries()) {
+        keepaPeerFacts[kAsin] = buildKeepaPeerFactsForMarketJudge(kParsed);
+      }
+      cand.keepa_peer_facts_by_asin = keepaPeerFacts;
+      if (Array.isArray(cand?.newcomer_cohort?.members)) {
+        for (const member of cand.newcomer_cohort.members) {
+          const mAsin = nonemptyStr(member?.asin) ? member.asin.trim().toUpperCase() : null;
+          const mKeepa = mAsin ? entryKeepaByAsin.get(mAsin) : null;
+          if (mKeepa?.review_trajectory?.has_drop_event && member.keepa_review_drop_detected === undefined) {
+            member.keepa_review_drop_detected = true;
+          }
+        }
+      }
+    }
+    if (Array.isArray(entry.peer_listings) && entry.peer_listings.length > 0) {
+      const mergedPeers = mergeKeepaPayloadsIntoPeerListings(entry.peer_listings, entryCandPayloads, {
+        as_of_date: entryAsOfDate,
+      });
+      cand.price_band_analysis = analyzeMainstreamPriceBand(mergedPeers, {
+        ...(entryAsOfDate ? { as_of_date: entryAsOfDate } : {}),
+        ...(entry.price_band_options ?? {}),
+      });
+    }
     const targetVariantAsin = nonemptyStr(entry.sp_api_calibration_inputs?.asin)
       ? entry.sp_api_calibration_inputs.asin.trim().toUpperCase()
       : (nonemptyStr(cand?.screening?.reference_price_usd?.target_variant_asin)
@@ -3373,3 +2546,4 @@ export function ingestTrialSpecification(spec, profile, {
     isolated_candidates: isolatedCandidates,
   };
 }
+

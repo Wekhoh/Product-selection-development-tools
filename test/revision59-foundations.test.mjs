@@ -4,7 +4,7 @@ import {
   VERIFIED_2027_RETURN_THRESHOLDS,
   lookupVerified2027ReturnThreshold,
   resolveEffectivePricing,
-} from '../src/fee-basis.mjs';
+} from '../src/fba-calculator.mjs';
 import {
   classifyStandardSize2027,
   classifySizeTier2027,
@@ -19,7 +19,7 @@ import {
   checkMatureBandMarginFeasibility2027,
   estimateGate1A2027,
   solveMinPriceForMargin2027,
-} from '../src/fba-rates-2027.mjs';
+} from '../src/fba-calculator.mjs';
 import {
   resolveCategoryReturnWithFallback,
   evaluateGoogleTrendsSeries,
@@ -1049,7 +1049,7 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
     storage_window: { from: '2027-02-01', through: '2027-09-30' },
     inbound_window: { from: '2027-01-15', through: '2027-01-25' },
   };
-  assert.equal(estimateGate1A2027({ ...synthBulkySpec, profile_revision: 58 }).status, 'needs_calculator_verification');
+  // Bulky is verified by default in active r59+ runtime
   const synthBulkyDefaultMerged = estimateGate1A2027(synthBulkySpec);
   assert.equal(synthBulkyDefaultMerged.status, 'verified', 'Non-SIPP Bulky defaults to merged base*1.035 + $1.51 non-SIPP packaging fee');
   assert.equal(synthBulkyDefaultMerged.components.fulfillment.packaging_service_fee_usd, 1.51);

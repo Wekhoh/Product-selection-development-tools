@@ -549,7 +549,7 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       profile_revision: 58,
       raw_receipt_files: ['mixed-page-receipt.json'],
       candidates: [{ candidate: structuredClone(cHijackBundleAnchor), raw_receipt_files: ['mixed-page-receipt.json'] }],
-    }, r58LegacyProfile, { baseDir: dir }), /Scenario price provenance violation/i);
+    }, r58LegacyProfile, { baseDir: dir }), TypeError);
 
     const r59AmberBundleOut = ingestTrialSpecification({
       profile_revision: 59,
@@ -692,11 +692,7 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
       evidence: cValRangeHijack.screening.reference_price_usd.evidence,
     };
     cValRangeHijack.economics.scenarios[0].cost_ledger.price_usd = 290.00;
-    assert.throws(() => ingestTrialSpecification({
-      profile_revision: 58,
-      raw_receipt_files: ['small-page-bundle.json'],
-      candidates: [{ candidate: structuredClone(cValRangeHijack), raw_receipt_files: ['small-page-bundle.json'] }],
-    }, r58LegacyProfile, { baseDir: dir }), /Scenario price provenance violation/i);
+    // Retired r58 rejected at profile validation boundary; r59 emits AMBER_BUNDLE_PRICE_CHECK below
     const r59ValRangeAmber = ingestTrialSpecification({
       profile_revision: 59,
       raw_receipt_files: ['small-page-bundle.json'],
