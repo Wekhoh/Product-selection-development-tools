@@ -854,6 +854,21 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
   const sampleCheckItems = rev >= 59
     ? array(target?.sample_check_items ?? candidate?.sample_check_items ?? candidate?.qualification?.sample_check_items)
     : [];
+  const core85Range = rev >= 59
+    ? (Array.isArray(target?.core_85_range) ? target.core_85_range : (Array.isArray(candidate?.core_85_range) ? candidate.core_85_range : null))
+    : null;
+  const confirmedRiskDeduction15 = rev >= 59
+    ? (finite(target?.confirmed_risk_deduction_15) ? target.confirmed_risk_deduction_15 : (finite(candidate?.confirmed_risk_deduction_15) ? candidate.confirmed_risk_deduction_15 : null))
+    : null;
+  const remaining15Summary = rev >= 59
+    ? (target?.remaining_15_summary ?? candidate?.remaining_15_summary ?? null)
+    : null;
+  const productSeasonality = rev >= 59
+    ? string(candidate?.product_seasonality ?? candidate?.qualification?.product_seasonality).trim() || null
+    : null;
+  const unpublished2027Q4PeakNote = rev >= 59
+    ? string(candidate?.unpublished_2027_q4_peak_note ?? candidate?.qualification?.unpublished_2027_q4_peak_note).trim() || null
+    : null;
   return {
     target,
     prices,
@@ -876,7 +891,14 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
     supportedRange: target?.supported_range ?? candidate?.supported_range ?? null,
     coveredWeight: target?.covered_weight ?? candidate?.covered_weight ?? 0,
     sampleCheckItems,
-    periodLabel: candidate?.queue === 'seasonal_review' ? string(target?.label, '主营时段') : '全时段',
+    core85Range,
+    confirmedRiskDeduction15,
+    remaining15Summary,
+    productSeasonality,
+    unpublished2027Q4PeakNote,
+    periodLabel: candidate?.queue === 'seasonal_review'
+      ? string(target?.label, '主营时段')
+      : (rev >= 59 && unpublished2027Q4PeakNote ? '2027 淡季常青窗口' : '全时段'),
   };
 }
 
@@ -3327,6 +3349,43 @@ function r59SamplePendingBanner(snapshot, rev = 58) {
   </section>`;
 }
 
+function r59CoreAndRemainingSection(snapshot, rev = 58) {
+  if (rev < 59 || !snapshot) return '';
+  const hasCore = Array.isArray(snapshot.core85Range);
+  const rem = snapshot.remaining15Summary && typeof snapshot.remaining15Summary === 'object'
+    ? snapshot.remaining15Summary
+    : null;
+  const q4Note = snapshot.unpublished2027Q4PeakNote;
+  const isEvergreen = snapshot.productSeasonality === 'evergreen';
+  if (!hasCore && !rem && !q4Note && !isEvergreen) return '';
+  const sampleIds = new Set(array(snapshot.sampleCheckItems).map(it => it?.id).filter(Boolean));
+  const scoredRem = array(rem?.scored_items);
+  const extraPendingRem = array(rem?.pending_items).filter(it => !sampleIds.has(it?.id));
+  const parts = [];
+  if (isEvergreen || q4Note) {
+    parts.push(`<p class="muted coverage-line" data-meta="evergreen-seasonality"><strong>归类与旺季说明：</strong>${isEvergreen ? '常青品（非季节款）' : '在评款式'}${q4Note ? ` · ${escape(r58CleanCopy(q4Note))}` : ''}</p>`);
+  }
+  if (hasCore || rem) {
+    const coreTxt = hasCore ? `<strong>85 分客观核心：${escape(rangeText(snapshot.core85Range))} / 85</strong>` : '';
+    const remTxt = rem
+      ? `剩余 15 分已证得分 ${escape(rangeText(rem.supported_range))} / ${escape(numberText(rem.covered_weight))}（已确认风险扣分 ${escape(numberText(rem.confirmed_risk_deduction))} 分）`
+      : '';
+    parts.push(`<p class="coverage-line" data-meta="core-85-summary">${[coreTxt, escape(remTxt)].filter(Boolean).join(' · ')}</p>`);
+  }
+  if (scoredRem.length > 0 || extraPendingRem.length > 0) {
+    const rows = [
+      ...scoredRem.map(it =>
+        `<li><strong>${escape(string(it.label ?? it.id))}（已得 ${escape(rangeText(it.score_range))} / ${escape(numberText(it.weight))} 分）</strong>${it.reason ? ` · <span>${escape(r58CleanCopy(reasonText(it.reason)))}</span>` : ''}</li>`
+      ),
+      ...extraPendingRem.map(it =>
+        `<li><strong>${escape(string(it.label ?? it.id))}（${escape(numberText(it.weight))} 分待核）</strong> · <span>${escape(r58CleanCopy(reasonText(it.reason)))}</span></li>`
+      ),
+    ];
+    parts.push(`<details class="quiet-fold" data-section="remaining-15-breakdown"><summary>剩余 15 分已证项与待核原因明细（已证 ${scoredRem.length} 项${extraPendingRem.length > 0 ? ` · 待核 ${extraPendingRem.length} 项` : ''}）</summary><ul class="brief-list">${rows.join('')}</ul></details>`);
+  }
+  return parts.join('');
+}
+
 function r59CompetitionReferenceBar(original, rev = 58) {
   if (rev < 59) return '';
   const mkt = object(original?.market);
@@ -3523,7 +3582,7 @@ function r58SeasonalCard(result, original, index, rev = 58, reportOptions = {}) 
         ${renderR58SculpturalLedger(snapshot, '待补证')}
         <p class="spec-copy">${escape(result.form ?? '具体可售规格尚待明确')}</p>
         ${starReferenceSection(original)}
-        ${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与核查清单">
+        ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与核查清单">
           ${r57BriefList('风险与边界提示', presentation.risks, rev)}
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
           ${blockers.length ? `<div class="brief-col"><h3>共同问题与后续处理</h3><ul class="brief-list">${blockers.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
@@ -3599,7 +3658,7 @@ function r58SingleCard(result, original, index, rev = 58, reportOptions = {}) {
           ${typeof presentation.subtitle_en === 'string' && presentation.subtitle_en.trim() ? `<span class="st-en">${escape(presentation.subtitle_en.trim())}</span><span class="pc-sep">·</span>` : ''}
           ${renderDotStatus(result, snapshot, rev)}
           <span class="pc-sep">·</span>
-          <span class="muted queue-tag">${hasSamplePendingSingleR59 ? '入围（含拿样待核）' : QUEUES[queue]}</span>
+          <span class="muted queue-tag">${rev >= 59 && snapshot.productSeasonality === 'evergreen' ? `常青款 · ${hasSamplePendingSingleR59 ? '入围（含拿样待核）' : QUEUES[queue]}` : (hasSamplePendingSingleR59 ? '入围（含拿样待核）' : QUEUES[queue])}</span>
         </div>
         ${typeof presentation.summary === 'string' ? `<p class="lead-copy">${escape(r58PolishRangeCopy(presentation.summary))}</p>` : ''}
         ${renderR58SculpturalLedger(snapshot, incompleteLabel)}
@@ -3611,7 +3670,7 @@ function r58SingleCard(result, original, index, rev = 58, reportOptions = {}) {
           ${result.conditional_total_range ? `<p class="muted">满足准入后可能范围 ${escape(rangeText(result.conditional_total_range))}。这是数学界限，不是已获得总分或预测。</p>` : ''}
           ${result.may_exceed_comparable_leader ? '<p class="ink-pass">有效可能上界高于当前完整队列首项的保守端点，值得补证；这不代表已经胜出。</p>' : ''}
         </div>
-        ${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与缺口">
+        ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与缺口">
           ${r57BriefList('风险与边界提示', presentation.risks, rev)}
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
           ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}

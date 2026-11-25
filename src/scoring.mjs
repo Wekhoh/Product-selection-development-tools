@@ -3074,6 +3074,8 @@ function selectDisplayPeriodR58(periods, primaryPeriodId) {
   return ranked[0].id;
 }
 
+export const UNPUBLISHED_2027_Q4_PEAK_METADATA_NOTE = '2027 Q4 旺季费率待亚马逊公布';
+
 const R59_MANDATORY_CORE_ITEM_IDS = Object.freeze([
   'refund_adjusted_pre_ad_margin',
   'unit_contribution',
@@ -3100,6 +3102,69 @@ const R59_SAMPLE_DEFERRED_ITEM_LABELS = Object.freeze({
   specific_design_rights: '具体外观／结构权利（待拿实物比对 1–2 件近似专利号）',
   applicable_public_requirements: '适用合规与材料申报（如木头拉丁学名／检测报价待问工厂）',
 });
+
+const R59_REMAINING_15_SHORT_LABELS = Object.freeze({
+  existing_solution_fit: '现有方案契合度',
+  feasible_light_differentiation: '低成本微改可行性',
+  storage_tolerance: '仓储耐受度',
+  transport_tolerance: '运输耐受度',
+  routine_complexity: '日常运营复杂度',
+  specific_design_rights: '具体外观／结构权利',
+  applicable_public_requirements: '适用合规与材料申报',
+});
+
+function computeR59CoreAndRemainingSummary(items, profit) {
+  const itemById = new Map((Array.isArray(items) ? items : []).map(it => [it.id, it]));
+  const allCoreScored = R59_MANDATORY_CORE_ITEM_IDS.every(id => itemById.get(id)?.status === 'scored');
+  const coreNonProfitScoredSum = R59_MANDATORY_CORE_ITEM_IDS
+    .filter(id => id !== 'refund_adjusted_pre_ad_margin' && id !== 'unit_contribution')
+    .reduce((sum, id) => {
+      const it = itemById.get(id);
+      return it?.status === 'scored' && Array.isArray(it.score_range) ? addRanges(sum, it.score_range) : sum;
+    }, [0, 0]);
+  const coreCoveredWeight = R59_MANDATORY_CORE_ITEM_IDS.reduce(
+    (sum, id) => sum + (itemById.get(id)?.status === 'scored' ? itemById.get(id).weight : 0),
+    0,
+  );
+  const core85Range = allCoreScored && Array.isArray(profit?.supported_range)
+    ? addRanges(coreNonProfitScoredSum, profit.supported_range)
+    : null;
+  const remIds = Object.keys(R59_SAMPLE_DEFERRED_ITEM_LABELS);
+  const remItems = remIds.map(id => itemById.get(id)).filter(Boolean);
+  const scoredRem = remItems.filter(it => it.status === 'scored' && Array.isArray(it.score_range));
+  const pendingRem = remItems.filter(it => it.status !== 'scored');
+  const remCoveredWeight = scoredRem.reduce((sum, it) => sum + it.weight, 0);
+  const remSupportedRange = scoredRem.reduce((sum, it) => addRanges(sum, it.score_range), [0, 0]);
+  const confirmedRiskDeduction15 = Math.round(
+    scoredRem.reduce((acc, it) => acc + Math.max(0, it.weight - it.score_range[0]), 0) * 1e6,
+  ) / 1e6;
+  return {
+    core_85_range: core85Range,
+    core_85_score: core85Range ? point(core85Range) : null,
+    core_85_covered_weight: coreCoveredWeight,
+    confirmed_risk_deduction_15: confirmedRiskDeduction15,
+    remaining_15_summary: {
+      covered_weight: remCoveredWeight,
+      supported_range: remSupportedRange,
+      confirmed_risk_deduction: confirmedRiskDeduction15,
+      scored_items: scoredRem.map(it => ({
+        id: it.id,
+        label: R59_REMAINING_15_SHORT_LABELS[it.id] ?? it.id,
+        weight: it.weight,
+        score: it.score ?? null,
+        score_range: it.score_range,
+        reason: it.reason ?? null,
+      })),
+      pending_items: pendingRem.map(it => ({
+        id: it.id,
+        label: R59_SAMPLE_DEFERRED_ITEM_LABELS[it.id] ?? it.id,
+        weight: it.weight,
+        status: it.status,
+        reason: text(it.reason) ? it.reason.trim() : 'Required evidence has not been supplied.',
+      })),
+    },
+  };
+}
 
 function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, screening, periodCoverageOk) {
   if (!periodCoverageOk) return { eligible: false, items: [] };
@@ -3682,14 +3747,24 @@ export function scoreCandidate(candidate, profile, internal = null) {
   const isR58 = profile.revision >= 58;
   const isR59 = profile.revision >= 59;
   const isOperatingPeriod = internal === INTERNAL_PERIOD_TOKEN;
-  if (!isOperatingPeriod && candidate.economics && Object.hasOwn(candidate.economics, 'operating_periods')) {
-    validateOperatingPeriods(candidate.economics, isR58, isR59);
+  const isExplicitSeasonal = candidate?.product_seasonality === 'seasonal' ||
+    candidate?.seasonality === 'seasonal' ||
+    candidate?.is_seasonal === true;
+  const isExplicitEvergreen = !isExplicitSeasonal && (
+    candidate?.product_seasonality === 'evergreen' ||
+    candidate?.seasonality === 'evergreen' ||
+    candidate?.is_evergreen === true
+  );
+  let effectiveCandidateEcon = candidate.economics;
+  let unwrappedFromUnpublishedQ4Companion = false;
+  if (!isOperatingPeriod && effectiveCandidateEcon && Object.hasOwn(effectiveCandidateEcon, 'operating_periods')) {
+    validateOperatingPeriods(effectiveCandidateEcon, isR58, isR59);
     const {
       operating_periods: rawPeriods,
       expected_primary_scenarios: rootExpected,
       stress_scenarios: rootStress,
       ...economics
-    } = candidate.economics;
+    } = effectiveCandidateEcon;
     const orderedPeriods = isR58 ? [...rawPeriods].sort(comparePeriodOrder) : rawPeriods;
     const evaluatedPeriods = orderedPeriods.map(period => {
       const mergedExpected = isR58 ? mergeExpectedPrimaryScenarios(rootExpected, period.expected_primary_scenarios) : period.expected_primary_scenarios;
@@ -3714,41 +3789,73 @@ export function scoreCandidate(candidate, profile, internal = null) {
         ...(isPeakWithPendingFul ? { unpublished_peak_note: period.unpublished_peak_note ?? '待亚马逊公布 2027 旺季费率后补充' } : {}),
       };
     });
-    const isPrivateMoldReserved = isR59 && candidate.sourcing_disposition === 'private_mold_reserved';
-    const qualR58 = isR58 ? buildSeasonalQualificationR58(evaluatedPeriods, isR59, isPrivateMoldReserved) : null;
-    const displayPeriodForOps = isR58
-      ? (evaluatedPeriods.find(p => p.id === qualR58?.display_period_id) ?? evaluatedPeriods[0] ?? null)
+    const primaryOffPeakRaw = isR59 && isExplicitEvergreen
+      ? orderedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, true))
       : null;
-    const seasonalOps = isR58
-      ? buildOperationalDisclosuresR58(candidate, displayPeriodForOps?.diagnostics?.economics?.scenarios ?? [])
-      : null;
-    const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, isR59));
-    const seasonalDispR59 = !isR59 ? undefined
-      : isPrivateMoldReserved ? 'private_mold_reserved'
-        : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
-          : primaryOffPeak?.queue === 'deferred' ? 'deferred'
-            : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
-              : qualR58?.mode === 'crossing_30pct_interval' || primaryOffPeak?.diagnostics?.economics?.crossing_margin_floor === true ? 'crossing_30pct_interval'
-                : 'pending_evidence';
-    const allowShortlistSeasonal = !isR59;
-    const allowPkgShortlistSeasonal = isR59 && seasonalDispR59 === 'hard_excluded';
-    return {
-      candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
-      profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [],
-      operating_periods: evaluatedPeriods,
-      total: null, total_range: null, conditional_total_range: null, supported_score: null, supported_range: null,
-      covered_weight: null, unscored_weight: null, scoring_complete: null, queue: 'seasonal_review',
-      ...(isR59 ? { effective_disposition: seasonalDispR59 } : {}),
-      ...(isR59 && Array.isArray(qualR58?.sample_check_items) && qualR58.sample_check_items.length > 0 ? { sample_check_items: qualR58.sample_check_items } : {}),
-      ...(isR58 ? { qualification: qualR58, diagnostics: { operational_disclosures: seasonalOps } } : {}),
-      ...(isR58 && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
-      ...(isR58 && allowShortlistSeasonal && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
-      ...(allowPkgShortlistSeasonal && candidate.packaging_redesign_shortlist ? { packaging_redesign_shortlist: candidate.packaging_redesign_shortlist } : {}),
-    };
+    const otherPeriodsAreUnpublishedPeak = Boolean(
+      primaryOffPeakRaw &&
+      evaluatedPeriods
+        .filter(p => p.id !== primaryOffPeakRaw.id)
+        .every(p => isValidCompanionPeakPanelR58(p, true) && !Array.isArray(p.diagnostics?.economics?.margin_range)),
+    );
+    if (isR59 && isExplicitEvergreen && primaryOffPeakRaw && otherPeriodsAreUnpublishedPeak) {
+      const mergedExpected = mergeExpectedPrimaryScenarios(rootExpected, primaryOffPeakRaw.expected_primary_scenarios);
+      const mergedStress = mergeStressScenarios(rootStress, primaryOffPeakRaw.stress_scenarios);
+      effectiveCandidateEcon = {
+        ...economics,
+        scenarios: primaryOffPeakRaw.scenarios,
+        ...(mergedExpected !== undefined ? { expected_primary_scenarios: mergedExpected } : {}),
+        ...(mergedStress !== undefined ? { stress_scenarios: mergedStress } : {}),
+      };
+      unwrappedFromUnpublishedQ4Companion = true;
+    } else {
+      const isPrivateMoldReserved = isR59 && candidate.sourcing_disposition === 'private_mold_reserved';
+      const qualR58 = isR58 ? buildSeasonalQualificationR58(evaluatedPeriods, isR59, isPrivateMoldReserved) : null;
+      const displayPeriodForOps = isR58
+        ? (evaluatedPeriods.find(p => p.id === qualR58?.display_period_id) ?? evaluatedPeriods[0] ?? null)
+        : null;
+      const seasonalOps = isR58
+        ? buildOperationalDisclosuresR58(candidate, displayPeriodForOps?.diagnostics?.economics?.scenarios ?? [])
+        : null;
+      const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, isR59));
+      const coreSourcePeriod = isR59
+        ? (evaluatedPeriods.find(p => p.id === (qualR58?.primary_period_id ?? qualR58?.display_period_id)) ?? primaryOffPeak ?? evaluatedPeriods[0] ?? null)
+        : null;
+      const seasonalDispR59 = !isR59 ? undefined
+        : isPrivateMoldReserved ? 'private_mold_reserved'
+          : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
+            : primaryOffPeak?.queue === 'deferred' ? 'deferred'
+              : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
+                : qualR58?.mode === 'crossing_30pct_interval' || primaryOffPeak?.diagnostics?.economics?.crossing_margin_floor === true ? 'crossing_30pct_interval'
+                  : 'pending_evidence';
+      const allowShortlistSeasonal = !isR59;
+      const allowPkgShortlistSeasonal = isR59 && seasonalDispR59 === 'hard_excluded';
+      return {
+        candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
+        profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [],
+        operating_periods: evaluatedPeriods,
+        total: null, total_range: null, conditional_total_range: null, supported_score: null, supported_range: null,
+        covered_weight: null, unscored_weight: null, scoring_complete: null, queue: 'seasonal_review',
+        ...(isR59 && isExplicitSeasonal ? { product_seasonality: 'seasonal' } : {}),
+        ...(isR59 && coreSourcePeriod ? {
+          core_85_range: coreSourcePeriod.core_85_range ?? null,
+          core_85_score: coreSourcePeriod.core_85_score ?? null,
+          core_85_covered_weight: coreSourcePeriod.core_85_covered_weight ?? null,
+          confirmed_risk_deduction_15: coreSourcePeriod.confirmed_risk_deduction_15 ?? null,
+          remaining_15_summary: coreSourcePeriod.remaining_15_summary ?? null,
+        } : {}),
+        ...(isR59 ? { effective_disposition: seasonalDispR59 } : {}),
+        ...(isR59 && Array.isArray(qualR58?.sample_check_items) && qualR58.sample_check_items.length > 0 ? { sample_check_items: qualR58.sample_check_items } : {}),
+        ...(isR58 ? { qualification: qualR58, diagnostics: { operational_disclosures: seasonalOps } } : {}),
+        ...(isR58 && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
+        ...(isR58 && allowShortlistSeasonal && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
+        ...(allowPkgShortlistSeasonal && candidate.packaging_redesign_shortlist ? { packaging_redesign_shortlist: candidate.packaging_redesign_shortlist } : {}),
+      };
+    }
   }
-  const economicsInput = isR58 && !isOperatingPeriod && candidate.economics && Object.hasOwn(candidate.economics, 'operating_months')
-    ? (() => { const { operating_months: _ignored, ...rest } = candidate.economics; return rest; })()
-    : candidate.economics;
+  const economicsInput = isR58 && !isOperatingPeriod && effectiveCandidateEcon && Object.hasOwn(effectiveCandidateEcon, 'operating_months')
+    ? (() => { const { operating_months: _ignored, ...rest } = effectiveCandidateEcon; return rest; })()
+    : effectiveCandidateEcon;
   const priceRefR58 = isR58 ? validateR58PriceAnchor(candidate.screening?.reference_price_usd, ctx) : null;
   const newcomers = scoreNewcomers(candidate.newcomer_cohort, ctx, profile, defs);
   const profit = scoreEconomics(economicsInput, ctx, profile, defs, priceRefR58);
@@ -3783,12 +3890,32 @@ export function scoreCandidate(candidate, profile, internal = null) {
   }
   const totals = aggregate(items, profile.group_budgets, profit);
   const screening = screenCandidate(candidate, ctx, profit, items, profile);
+  const coreSummaryR59 = isR59 ? computeR59CoreAndRemainingSummary(items, profit) : null;
 
   const isTopLevelFlatR58 = isR58 && !isOperatingPeriod;
   const isPrimaryOffPeakPeriodR58 = isR58 && isOperatingPeriod && isPrimaryOffPeakMonthsList(economicsInput?.operating_months, isR59);
-  const fullYearDatesOk = !isTopLevelFlatR58 || coversFullCalendarYearDates(profit.diagnostics.scenarios);
+  const flatHasFullCalendarYear = coversFullCalendarYearDates(profit.diagnostics.scenarios);
+  const flatHasEvergreen2027OffPeak = isR59 && isTopLevelFlatR58 && !isExplicitSeasonal &&
+    coversPrimaryOffPeakDates(profit.diagnostics.scenarios, true);
+  const fullYearDatesOk = !isTopLevelFlatR58 || flatHasFullCalendarYear || flatHasEvergreen2027OffPeak;
   const offPeakDatesOk = !isPrimaryOffPeakPeriodR58 || coversPrimaryOffPeakDates(profit.diagnostics.scenarios, isR59);
   const periodCoverageOk = fullYearDatesOk && offPeakDatesOk;
+  const strongDateCondStatus = screening.conditions?.find(c => c.id === 'strong_date_dependency')?.status ?? null;
+  const isEvergreenFlatR59 = isR59 && !isOperatingPeriod && !isExplicitSeasonal &&
+    (strongDateCondStatus === 'pass' || isExplicitEvergreen);
+  const usesUnpublished2027Q4Note = isR59 && !isOperatingPeriod && !isExplicitSeasonal && (
+    (flatHasEvergreen2027OffPeak && !flatHasFullCalendarYear) ||
+    unwrappedFromUnpublishedQ4Companion ||
+    text(candidate?.unpublished_2027_q4_peak_note) ||
+    text(effectiveCandidateEcon?.unpublished_2027_q4_peak_note)
+  );
+  const resolvedUnpublishedQ4Note = usesUnpublished2027Q4Note
+    ? (text(candidate?.unpublished_2027_q4_peak_note)
+        ? candidate.unpublished_2027_q4_peak_note.trim()
+        : text(effectiveCandidateEcon?.unpublished_2027_q4_peak_note)
+          ? effectiveCandidateEcon.unpublished_2027_q4_peak_note.trim()
+          : UNPUBLISHED_2027_Q4_PEAK_METADATA_NOTE)
+    : null;
   const isPrivateMoldFlatR59 = isR59 && !isOperatingPeriod && candidate.sourcing_disposition === 'private_mold_reserved';
   const strictComplete = !isPrivateMoldFlatR59 && candidate.ingest_isolated_pending !== true && totals.covered_weight === 100 && screening.status === 'eligible' && periodCoverageOk;
   const crossingCompleteR59 = !isPrivateMoldFlatR59 && candidate.ingest_isolated_pending !== true && isR59 && totals.covered_weight === 100 && screening.status === 'crossing_eligible' && periodCoverageOk;
@@ -3803,12 +3930,17 @@ export function scoreCandidate(candidate, profile, internal = null) {
 
   let qualification = null;
   if (isTopLevelFlatR58) {
+    const evergreenQualFields = {
+      ...(isEvergreenFlatR59 ? { product_seasonality: 'evergreen' } : {}),
+      ...(resolvedUnpublishedQ4Note ? { unpublished_2027_q4_peak_note: resolvedUnpublishedQ4Note } : {}),
+    };
     if (isPrivateMoldFlatR59) {
       qualification = {
         counts_toward_target: false,
         mode: 'private_mold_reserved',
         primary_period_id: null,
         display_period_id: null,
+        ...evergreenQualFields,
         reasons: ['Candidate is routed to private_mold_reserved (no open 1688 public mold verified) and never counts toward ready-stock qualifying target.'],
       };
     } else if (strictComplete) {
@@ -3817,7 +3949,10 @@ export function scoreCandidate(candidate, profile, internal = null) {
         mode: 'comparable',
         primary_period_id: null,
         display_period_id: null,
-        reasons: ['All 21 items supported and full 12-month target-year calendar coverage verified.'],
+        ...evergreenQualFields,
+        reasons: [flatHasEvergreen2027OffPeak && !flatHasFullCalendarYear
+          ? 'All 21 items supported on verified 2027 off-peak window (2027-02-01..2027-10-14 sales / 2027-02-01..2027-09-30 storage); evergreen product with 2027 Q4 peak fulfillment rate pending official Amazon publication.'
+          : 'All 21 items supported and full 12-month target-year calendar coverage verified.'],
       };
     } else if (samplePendingQualifyingR59) {
       qualification = {
@@ -3827,6 +3962,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
         display_period_id: null,
         covered_weight: totals.covered_weight,
         sample_check_items: samplePendingEvalR59.items,
+        ...evergreenQualFields,
         reasons: [
           `Qualifies at ${totals.covered_weight}/100 covered weight with ${samplePendingEvalR59.items.length} post-sample/supplier verification item(s) held honestly blank and no proven patent/compliance conflict.`,
         ],
@@ -3838,11 +3974,16 @@ export function scoreCandidate(candidate, profile, internal = null) {
         mode: 'crossing_30pct_interval',
         primary_period_id: null,
         display_period_id: null,
+        ...evergreenQualFields,
         reasons: ['All 21 items scored across a crossing-30% scenario interval (held separate from strict all-scenario qualifying count).'],
       };
     } else {
       const reasons = [];
-      if (!fullYearDatesOk) reasons.push('Flat annual mode requires every primary scenario to cover all 12 calendar months and all days of one target year (YYYY-01-01..YYYY-12-31).');
+      if (!fullYearDatesOk) {
+        reasons.push(isR59 && !isExplicitSeasonal
+          ? 'Flat mode in revision 59 requires every primary scenario to cover either all 12 calendar months of one target year (YYYY-01-01..YYYY-12-31) or the verified 2027 off-peak window (2027-02-01..2027-10-14 sales / 2027-02-01..2027-09-30 storage).'
+          : 'Flat annual mode requires every primary scenario to cover all 12 calendar months and all days of one target year (YYYY-01-01..YYYY-12-31).');
+      }
       if (screening.status !== 'eligible') reasons.push(`Initial screening status is ${screening.status}.`);
       if (totals.covered_weight < 100) reasons.push(`Scored weight coverage is ${totals.covered_weight}/100.`);
       qualification = {
@@ -3850,6 +3991,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
         mode: 'none',
         primary_period_id: null,
         display_period_id: null,
+        ...evergreenQualFields,
         reasons,
       };
     }
@@ -3871,6 +4013,15 @@ export function scoreCandidate(candidate, profile, internal = null) {
     supported_score: point(totals.supported_range), scoring_complete: totals.covered_weight === 100,
     total: hasFullTotalRange ? point(totals.supported_range) : null, total_range: hasFullTotalRange ? totals.supported_range : null,
     conditional_total_range: conditional, queue, screening,
+    ...(coreSummaryR59 ? {
+      core_85_range: coreSummaryR59.core_85_range,
+      core_85_score: coreSummaryR59.core_85_score,
+      core_85_covered_weight: coreSummaryR59.core_85_covered_weight,
+      confirmed_risk_deduction_15: coreSummaryR59.confirmed_risk_deduction_15,
+      remaining_15_summary: coreSummaryR59.remaining_15_summary,
+    } : {}),
+    ...(isEvergreenFlatR59 ? { product_seasonality: 'evergreen' } : (isR59 && !isOperatingPeriod && isExplicitSeasonal ? { product_seasonality: 'seasonal' } : {})),
+    ...(resolvedUnpublishedQ4Note ? { unpublished_2027_q4_peak_note: resolvedUnpublishedQ4Note } : {}),
     ...(flatDispR59 ? { effective_disposition: flatDispR59 } : {}),
     ...(samplePendingQualifyingR59 ? { sample_check_items: samplePendingEvalR59.items } : {}),
     ...(qualification ? { qualification } : {}),
@@ -3901,15 +4052,45 @@ export function scoreBatch(batch, profile) {
   });
 
   const periodById = (result, periodId) => result.operating_periods?.find(p => p.id === periodId) ?? result.operating_periods?.[0] ?? null;
+  const effRangeR59 = r => {
+    if (r.queue === 'seasonal_review') {
+      const p = periodById(r, r.qualification?.primary_period_id);
+      return p?.total_range ?? p?.supported_range ?? null;
+    }
+    return r.total_range ?? r.supported_range ?? null;
+  };
+  const effCoveredR59 = r => {
+    if (r.queue === 'seasonal_review') {
+      const p = periodById(r, r.qualification?.primary_period_id);
+      return p?.covered_weight ?? -1;
+    }
+    return r.covered_weight ?? -1;
+  };
+  const compareR59Qualifying = (a, b) =>
+    compareRangeDesc(a.core_85_range, b.core_85_range) ||
+    ((a.confirmed_risk_deduction_15 ?? 0) - (b.confirmed_risk_deduction_15 ?? 0)) ||
+    compareRangeDesc(effRangeR59(a), effRangeR59(b)) ||
+    (effCoveredR59(b) - effCoveredR59(a)) ||
+    compareText(a.candidate_id, b.candidate_id);
 
   const comparable = results.filter(result => result.queue === 'comparable')
-    .sort((a, b) => isR58
-      ? (compareRangeDesc(a.total_range, b.total_range) || compareText(a.candidate_id, b.candidate_id))
-      : (b.total_range[0] - a.total_range[0]));
+    .sort((a, b) => isR59
+      ? compareR59Qualifying(a, b)
+      : isR58
+        ? (compareRangeDesc(a.total_range, b.total_range) || compareText(a.candidate_id, b.candidate_id))
+        : (b.total_range[0] - a.total_range[0]));
   const pending = results.filter(result => result.queue === 'pending')
-    .sort((a, b) => isR58
-      ? (compareRangeDesc(a.supported_range, b.supported_range) || (b.covered_weight - a.covered_weight) || compareText(a.candidate_id, b.candidate_id))
-      : (b.supported_range[0] - a.supported_range[0] || b.covered_weight - a.covered_weight));
+    .sort((a, b) => {
+      if (isR59) {
+        const qa = a.qualification?.counts_toward_target === true;
+        const qb = b.qualification?.counts_toward_target === true;
+        if (qa && qb) return compareR59Qualifying(a, b);
+        if (qa !== qb) return qa ? -1 : 1;
+      }
+      return isR58
+        ? (compareRangeDesc(a.supported_range, b.supported_range) || (b.covered_weight - a.covered_weight) || compareText(a.candidate_id, b.candidate_id))
+        : (b.supported_range[0] - a.supported_range[0] || b.covered_weight - a.covered_weight);
+    });
   const deferred = results.filter(result => result.queue === 'deferred');
   const excluded = results.filter(result => result.queue === 'excluded');
   if (isR58) {
@@ -3936,12 +4117,10 @@ export function scoreBatch(batch, profile) {
   const seasonalRemaining = rawSeasonalReview.filter(result => !isSeasonalEligible(result));
   if (isR58) {
     seasonalEligible.sort((a, b) => {
+      if (isR59) return compareR59Qualifying(a, b);
       const pa = periodById(a, a.qualification.primary_period_id);
       const pb = periodById(b, b.qualification.primary_period_id);
-      const ra = isR59 ? (pa?.total_range ?? pa?.supported_range) : pa?.total_range;
-      const rb = isR59 ? (pb?.total_range ?? pb?.supported_range) : pb?.total_range;
-      return compareRangeDesc(ra, rb) ||
-        (isR59 ? ((pb?.covered_weight ?? -1) - (pa?.covered_weight ?? -1)) : 0) ||
+      return compareRangeDesc(pa?.total_range, pb?.total_range) ||
         compareText(a.candidate_id, b.candidate_id);
     });
     seasonalRemaining.sort((a, b) => {
@@ -3963,15 +4142,12 @@ export function scoreBatch(batch, profile) {
   const nonQualifyingPendingR59 = isR59
     ? pending.filter(r => r.qualification?.counts_toward_target !== true)
     : pending;
-  const flatQualifyingOrderedR59 = isR59
-    ? [...comparable, ...samplePendingFlatR59].sort((a, b) =>
-        compareRangeDesc(a.total_range ?? a.supported_range, b.total_range ?? b.supported_range) ||
-        ((b.covered_weight ?? -1) - (a.covered_weight ?? -1)) ||
-        compareText(a.candidate_id, b.candidate_id))
-    : comparable;
+  const unifiedQualifyingOrderedR59 = isR59
+    ? [...comparable, ...samplePendingFlatR59, ...seasonalEligible].sort(compareR59Qualifying)
+    : [];
   const queues = { comparable, pending, deferred, excluded, ...(seasonalReview.length ? { seasonal_review: seasonalReview } : {}) };
   const orderedCandidates = isR59
-    ? [...flatQualifyingOrderedR59, ...seasonalEligible, ...nonQualifyingPendingR59, ...seasonalRemaining, ...deferred, ...excluded]
+    ? [...unifiedQualifyingOrderedR59, ...nonQualifyingPendingR59, ...seasonalRemaining, ...deferred, ...excluded]
     : profile.revision >= 57
       ? [...comparable, ...seasonalEligible, ...pending, ...seasonalRemaining, ...deferred, ...excluded]
       : Object.values(queues).flat();
@@ -4000,6 +4176,7 @@ export function scoreBatch(batch, profile) {
   return {
     schema_version: 1, profile_revision: profile.revision, total_budget: 100,
     candidates: orderedCandidates,
+    ...(isR59 ? { qualifying_order: unifiedQualifyingOrderedR59.map(r => r.candidate_id) } : {}),
     order: Object.fromEntries(Object.entries(queues).map(([key, values]) => [key, values.map(result => result.candidate_id)])),
     comparable_leader: leader ? { candidate_id: leader.candidate_id, total_range: leader.total_range, conservative_score: leader.total_range[0] } : null,
     ...(filteredNegotiationShortlist.length > 0 ? { negotiation_shortlist: filteredNegotiationShortlist } : {}),

@@ -1675,6 +1675,52 @@ export function buildPairedSeasonalOperatingPeriods({
   };
 }
 
+export function buildEvergreen2027OffPeakEconomics({
+  saleable_unit,
+  off_peak_scenarios = null,
+  scenarios = null,
+  declared_off_peak_scenario_ids = null,
+  required_quote_ids = null,
+  required_prices_usd = null,
+  strict_declared_completeness = true,
+  cubic_feet_per_unit = 0.1,
+  average_inventory_days = 45,
+  size_tier = 'large_standard',
+  is_dangerous_goods = false,
+  stress_scenarios = undefined,
+  profile_revision = 59,
+  off_peak_window = null,
+  unpublished_2027_q4_peak_note = '2027 Q4 旺季费率待亚马逊公布',
+} = {}) {
+  const inputScenarios = Array.isArray(off_peak_scenarios) ? off_peak_scenarios : scenarios;
+  const paired = buildPairedSeasonalOperatingPeriods({
+    saleable_unit,
+    off_peak_scenarios: inputScenarios,
+    declared_off_peak_scenario_ids,
+    required_quote_ids,
+    required_prices_usd,
+    strict_declared_completeness,
+    cubic_feet_per_unit: finite(cubic_feet_per_unit) && cubic_feet_per_unit > 0 ? cubic_feet_per_unit : 0.1,
+    average_inventory_days,
+    size_tier,
+    is_dangerous_goods,
+    stress_scenarios,
+    profile_revision,
+    off_peak_window,
+  });
+  const offPeakPeriod = paired.operating_periods.find(p => p.id === 'off_peak') ?? paired.operating_periods[0];
+  return {
+    saleable_unit: paired.saleable_unit,
+    product_seasonality: 'evergreen',
+    unpublished_2027_q4_peak_note,
+    expected_primary_scenarios: offPeakPeriod.expected_primary_scenarios,
+    scenarios: offPeakPeriod.scenarios,
+    ...(Array.isArray(paired.stress_scenarios) && paired.stress_scenarios.length > 0
+      ? { stress_scenarios: paired.stress_scenarios }
+      : {}),
+  };
+}
+
 function extractQuantileSupportedPricesFromPayloads(candPayloads = [], {
   asOfDate = null,
   excludedAsins = new Set(),
@@ -2922,7 +2968,19 @@ export function ingestTrialSpecification(spec, profile, {
           }
         : null);
 
-    let activePairedSeasonal = entry.paired_seasonal ? structuredClone(entry.paired_seasonal) : null;
+    const wantsEvergreen2027 = effectiveRev >= 59 && Boolean(
+      entry.evergreen_2027 ||
+      entry.product_seasonality === 'evergreen' ||
+      cand.product_seasonality === 'evergreen' ||
+      entry.is_evergreen === true ||
+      cand.is_evergreen === true,
+    );
+    let activeEvergreen2027 = entry.evergreen_2027
+      ? structuredClone(entry.evergreen_2027)
+      : (wantsEvergreen2027 && entry.paired_seasonal ? structuredClone(entry.paired_seasonal) : null);
+    let activePairedSeasonal = !activeEvergreen2027 && entry.paired_seasonal
+      ? structuredClone(entry.paired_seasonal)
+      : null;
     if (mergedSpInputs && !hasUpstreamSpApiError) {
       let spCal = null;
       try {
@@ -2964,16 +3022,18 @@ export function ingestTrialSpecification(spec, profile, {
 
       if (spCal.official_pkg || spCal.fee_calibration?.referral_fraction || mergedSpInputs.feesEstimateRaw) {
         const rawFeesForLookup = mergedSpInputs.feesEstimateRaw ?? null;
-        if (activePairedSeasonal) {
+        for (const builderObj of [activeEvergreen2027, activePairedSeasonal]) {
+          if (!builderObj) continue;
           if (spCal.official_pkg) {
-            activePairedSeasonal.cubic_feet_per_unit = Number(
+            builderObj.cubic_feet_per_unit = Number(
               ((spCal.official_pkg.length_in * spCal.official_pkg.width_in * spCal.official_pkg.height_in) / 1728).toFixed(6),
             );
             const offTier = spCal.local_2027_off_peak_fulfillment?.size_tier ?? classifySizeTier2027(spCal.official_pkg)?.size_tier;
-            if (offTier) activePairedSeasonal.size_tier = offTier;
+            if (offTier) builderObj.size_tier = offTier;
           }
-          if (Array.isArray(activePairedSeasonal.off_peak_scenarios)) {
-            for (const sc of activePairedSeasonal.off_peak_scenarios) {
+          const bScens = Array.isArray(builderObj.off_peak_scenarios) ? builderObj.off_peak_scenarios : builderObj.scenarios;
+          if (Array.isArray(bScens)) {
+            for (const sc of bScens) {
               applySpApiCalibrationToScenario(sc, spCal, rawFeesForLookup);
             }
           }
@@ -3025,7 +3085,31 @@ export function ingestTrialSpecification(spec, profile, {
     }
 
     const dbConstraints = dbFormConstraintsById.get(cand.id) ?? null;
-    if (activePairedSeasonal) {
+    if (activeEvergreen2027) {
+      const mergedReqQuotes = [
+        ...(Array.isArray(activeEvergreen2027.required_quote_ids) ? activeEvergreen2027.required_quote_ids : []),
+        ...((dbConstraints?.verifiedQuoteIds?.length ?? 0) > 1 ? dbConstraints.verifiedQuoteIds : []),
+      ];
+      const mergedReqPrices = [
+        ...(Array.isArray(activeEvergreen2027.required_prices_usd) ? activeEvergreen2027.required_prices_usd : []),
+        ...(dbConstraints?.declaredPricesUsd ?? []),
+      ];
+      try {
+        cand.economics = buildEvergreen2027OffPeakEconomics({
+          profile_revision: effectiveRev,
+          ...activeEvergreen2027,
+          ...(mergedReqQuotes.length > 0 ? { required_quote_ids: mergedReqQuotes } : {}),
+          ...(mergedReqPrices.length > 0 ? { required_prices_usd: mergedReqPrices } : {}),
+        });
+        cand.product_seasonality = 'evergreen';
+        cand.unpublished_2027_q4_peak_note = cand.economics.unpublished_2027_q4_peak_note;
+      } catch (err) {
+        if (!isMissingFieldIngestError(err)) throw err;
+        const reason = `Candidate "${cand.id}" evergreen_2027 missing required field (${err.message}); isolated to pending.`;
+        ensureCandidatePendingShellOnMissingFields(cand, reason);
+        isolatedCandidates.push({ candidate_id: cand.id, reason });
+      }
+    } else if (activePairedSeasonal) {
       const mergedReqQuotes = [
         ...(Array.isArray(activePairedSeasonal.required_quote_ids) ? activePairedSeasonal.required_quote_ids : []),
         ...((dbConstraints?.verifiedQuoteIds?.length ?? 0) > 1 ? dbConstraints.verifiedQuoteIds : []),

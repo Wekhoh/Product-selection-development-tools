@@ -931,7 +931,12 @@ export function attachGate1APriceCliffStress(inputCand, gate1aRecord) {
     const primaryScenarios = collectPrimaryScenariosFromCandidate(inputCand);
     const templateSc = primaryScenarios.find(s => s?.cost_ledger && Array.isArray(s.cost_ledger.lines));
     if (templateSc) {
-      attachForContainer(templateSc, cliffScenarios[0].price_cliff_50, null);
+      const tplSalesWin = templateSc.cost_ledger?.fee_context?.sales ?? null;
+      const isPeakFlat = isPeakOperatingContainer(null, primaryScenarios) ||
+        Boolean(tplSalesWin && tplSalesWin.through > '2027-10-14' && tplSalesWin.from >= '2027-10-01');
+      if (!isPeakFlat) {
+        attachForContainer(templateSc, cliffScenarios[0].price_cliff_50, null);
+      }
     }
   }
 
