@@ -17,7 +17,7 @@ import {
   extractNewcomerReviewOriginBreakdown,
 } from './observations.mjs';
 import { scoreBatch } from './scoring.mjs';
-import { calculateEconomics } from './economics.mjs';
+import { calculateEconomics, netReferral } from './economics.mjs';
 import { assertNoRawPii, containsSecretToken } from './contracts.mjs';
 import { analyzeMainstreamPriceBand, parseSingleUnitUsdCoupon } from './price-band.mjs';
 import { resolveEffectivePricing, computeHeadhaulWithA4Rules } from './fee-basis.mjs';
@@ -154,6 +154,15 @@ function extractItemCategoryRoot(obj) {
 }
 
 function extractStructuredPricesFromObject(obj) {
+  // Never treat SP-API productFees request/estimate echo structures as observed market selling prices.
+  if (obj && typeof obj === 'object' && (
+    obj.PriceToEstimateFees !== undefined ||
+    obj.FeesEstimateIdentifier !== undefined ||
+    obj.FeesEstimate !== undefined ||
+    obj.FeesEstimateResult !== undefined
+  )) {
+    return { observed_prices_usd: [], has_keepa_series: false };
+  }
   const prices = new Set();
   const addPrice = p => {
     if (finite(p) && p > 0) prices.add(round2(p));
@@ -399,9 +408,22 @@ export function extractSifThreeTierBidPlan({
   const entries = [];
   const opportunistic = [];
   const mainQueriesMeta = [];
+  const validQueries = Array.isArray(queries) ? queries.filter(q => q && nonemptyStr(q.query)) : [];
+  const queryHasAnyBid = q => {
+    const ssExact = finite(q.ss_row?.exactPpc) ? q.ss_row.exactPpc
+      : finite(q.ss_row?.ppc?.exact?.value) ? q.ss_row.ppc.exact.value
+        : finite(q.ss_exact_usd) ? q.ss_exact_usd : null;
+    const sig = q.sif_row?.supporting_signals ?? q.sif_row ?? {};
+    const hasSif = finite(sig.cpc_fixed_exact) || finite(sig.cpc_raise_exact);
+    const effSs = (q.ss_channel === 'ss_web' && hasSif) ? null : ssExact;
+    return effSs !== null || hasSif;
+  };
+  const nonOpportunisticMainCount = validQueries.filter(q => {
+    const wc = q.query.trim().split(/\s+/).length;
+    return queryHasAnyBid(q) || (wc < 5 && q.is_long_tail_opportunistic !== true);
+  }).length;
 
-  for (const q of queries) {
-    if (!q || !nonemptyStr(q.query)) continue;
+  for (const q of validQueries) {
     const queryText = q.query.trim();
     const wordCount = queryText.split(/\s+/).length;
     const ssExact = finite(q.ss_row?.exactPpc) ? q.ss_row.exactPpc
@@ -424,8 +446,9 @@ export function extractSifThreeTierBidPlan({
     const effectiveSsExact = (q.ss_channel === 'ss_web' && hasSifTier1Or2) ? null : ssExact;
     const hasAnyExactBid = effectiveSsExact !== null || hasSifTier1Or2;
 
-    // Tier 1: unbid 5+-word ultra-long-tail queries move to opportunistic list instead of locking the 15-pt item!
-    if (!hasAnyExactBid && (wordCount >= 5 || q.is_long_tail_opportunistic === true)) {
+    // Tier 1: unbid 5+-word ultra-long-tail queries move to opportunistic list ONLY when >=1 other main entry remains
+    // (if the sole 5-word main query is unbid across all tiers, keep it in entries so scoring resolves 0/15 honestly).
+    if (!hasAnyExactBid && (wordCount >= 5 || q.is_long_tail_opportunistic === true) && nonOpportunisticMainCount >= 1) {
       opportunistic.push({
         query: queryText,
         volume: finite(q.monthly_searches) ? q.monthly_searches : null,
@@ -560,6 +583,12 @@ export function extractSpApiFinalistCalibration({
   sellerSpriteCachedRow = null,
   price_usd = null,
   target_is_own_white_label = true,
+  is_apparel = undefined,
+  is_shoes = undefined,
+  is_apparel_or_shoes = undefined,
+  is_dangerous_goods = undefined,
+  is_sipp = undefined,
+  fee_category = null,
 } = {}) {
   if (catalogItemRaw && isPayloadUpstreamFailure(catalogItemRaw)) {
     throw new TypeError('SP-API catalogItems_getCatalogItem receipt contains an upstream error.');
@@ -640,6 +669,7 @@ export function extractSpApiFinalistCalibration({
     );
     const asinScopedNodes = candidateNodes.filter(node => {
       const ident = node?.FeesEstimateIdentifier ?? node?.feesEstimateIdentifier ?? null;
+      const idType = nonemptyStr(ident?.IdType) ? ident.IdType.trim().toUpperCase() : null;
       const idVal = nonemptyStr(ident?.IdValue) ? ident.IdValue.trim().toUpperCase() : null;
       const mktId = nonemptyStr(ident?.MarketplaceId) ? ident.MarketplaceId.trim() : null;
       const curCode = nonemptyStr(ident?.PriceToEstimateFees?.ListingPrice?.CurrencyCode)
@@ -647,13 +677,30 @@ export function extractSpApiFinalistCalibration({
         : null;
       const isFba = ident?.IsAmazonFulfilled;
       const lp = ident?.PriceToEstimateFees?.ListingPrice?.Amount;
+      const shipAmt = finite(ident?.PriceToEstimateFees?.Shipping?.Amount)
+        ? ident.PriceToEstimateFees.Shipping.Amount
+        : 0;
+      const totalInputPrice = finite(lp) ? lp + shipAmt : null;
+      if ((asin || finite(price_usd)) && !ident) return false;
+      if (asin && idType && idType !== 'ASIN') return false;
       if (asin && idVal && idVal !== asin) return false;
       if (asin && !idVal && candidateNodes.length > 1) return false;
       if (!asin && candidateNodes.length > 1) return false;
       if (mktId && mktId !== targetMkt) return false;
       if (curCode && curCode !== targetCur) return false;
       if (isFba === false) return false;
-      if (finite(price_usd) && price_usd > 0 && finite(lp) && Math.round(lp * 100) !== Math.round(price_usd * 100)) return false;
+      if (finite(price_usd) && price_usd > 0 && finite(totalInputPrice) && Math.round(totalInputPrice * 100) !== Math.round(price_usd * 100)) return false;
+      const est = node?.FeesEstimate ?? node?.feesEstimate ?? null;
+      if (est && typeof est === 'object') {
+        const totalCur = nonemptyStr(est.TotalFeesEstimate?.CurrencyCode) ? est.TotalFeesEstimate.CurrencyCode.trim().toUpperCase() : null;
+        if (totalCur && totalCur !== targetCur) return false;
+        const details = Array.isArray(est.FeeDetailList) ? est.FeeDetailList : [];
+        for (const d of details) {
+          const fc = nonemptyStr(d?.FinalFee?.CurrencyCode) ? d.FinalFee.CurrencyCode.trim().toUpperCase()
+            : (nonemptyStr(d?.FeeAmount?.CurrencyCode) ? d.FeeAmount.CurrencyCode.trim().toUpperCase() : null);
+          if (fc && fc !== targetCur) return false;
+        }
+      }
       return true;
     });
 
@@ -664,10 +711,27 @@ export function extractSpApiFinalistCalibration({
       }
     }
 
-    const matchedNodes = asinScopedNodes.filter(node => {
+    const rawMatchedNodes = asinScopedNodes.filter(node => {
       const est = node?.FeesEstimate ?? node?.feesEstimate ?? null;
       return Boolean(est && typeof est === 'object');
     });
+    const dedupedBySignature = new Map();
+    for (const node of rawMatchedNodes) {
+      const est = node?.FeesEstimate ?? node?.feesEstimate ?? null;
+      const ident = node?.FeesEstimateIdentifier ?? node?.feesEstimateIdentifier ?? null;
+      const idVal = nonemptyStr(ident?.IdValue) ? ident.IdValue.trim().toUpperCase() : '';
+      const lpCents = finite(ident?.PriceToEstimateFees?.ListingPrice?.Amount)
+        ? Math.round(ident.PriceToEstimateFees.ListingPrice.Amount * 100)
+        : '';
+      const details = Array.isArray(est?.FeeDetailList) ? est.FeeDetailList : [];
+      const refRow = details.find(d => String(d?.FeeType || '').toLowerCase() === 'referralfee');
+      const fbaRow = details.find(d => String(d?.FeeType || '').toLowerCase() === 'fbafees');
+      const refAmt = refRow?.FinalFee?.Amount ?? refRow?.FeeAmount?.Amount ?? '';
+      const fbaAmt = fbaRow?.FinalFee?.Amount ?? fbaRow?.FeeAmount?.Amount ?? '';
+      const sig = `${idVal}::${lpCents}::${refAmt}::${fbaAmt}`;
+      if (!dedupedBySignature.has(sig)) dedupedBySignature.set(sig, node);
+    }
+    const matchedNodes = [...dedupedBySignature.values()];
 
     if (matchedNodes.length === 1) {
       const resNode = matchedNodes[0];
@@ -732,6 +796,12 @@ export function extractSpApiFinalistCalibration({
       pkg: officialPkg,
       price_usd: evalPrice,
       sales_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+      is_apparel,
+      is_shoes,
+      is_apparel_or_shoes,
+      is_dangerous_goods,
+      is_sipp,
+      fee_category,
     })
     : null;
 
@@ -753,6 +823,12 @@ export function extractSpApiFinalistCalibration({
         pkg: ssPkg,
         price_usd: evalPrice,
         sales_window: FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+        is_apparel,
+        is_shoes,
+        is_apparel_or_shoes,
+        is_dangerous_goods,
+        is_sipp,
+        fee_category,
       });
       const weightDeltaLb = Number((officialPkg.unit_weight_lb - ssTier.unit_weight_lb).toFixed(4));
       const fbaDeltaUsd = (local2027?.status === 'verified' && ssFul2027.status === 'verified')
@@ -848,8 +924,9 @@ export function ingestSellerSpriteMonthlyArchiveMarket(archiveRaw, {
   const categoryAvgReviews = finite(row.avgReviews ?? row.average_reviews ?? row.category_avg_reviews)
     ? Number(row.avgReviews ?? row.average_reviews ?? row.category_avg_reviews)
     : null;
-  let top10ReviewSampleCount = finite(row.top10_review_sample_count ?? row.top10ReviewSampleCount)
-    ? Math.round(Number(row.top10_review_sample_count ?? row.top10ReviewSampleCount))
+  const rawSampleCount = row.top10_review_sample_count ?? row.top10ReviewSampleCount ?? body?.stat?.top10_review_sample_count ?? body?.top10_review_sample_count;
+  let top10ReviewSampleCount = finite(rawSampleCount)
+    ? Math.round(Number(rawSampleCount))
     : null;
   if (top10MedianReviews === null && Array.isArray(body?.items) && body.items.length > 0) {
     const revNums = body.items
@@ -857,11 +934,17 @@ export function ingestSellerSpriteMonthlyArchiveMarket(archiveRaw, {
       .map(it => it?.ratings ?? it?.reviews ?? it?.reviewCount)
       .filter(v => finite(v) && v >= 0)
       .sort((a, b) => a - b);
-    top10ReviewSampleCount = revNums.length;
+    if (top10ReviewSampleCount === null) top10ReviewSampleCount = revNums.length;
     if (revNums.length >= 2) {
       const mid = Math.floor(revNums.length / 2);
       top10MedianReviews = revNums.length % 2 === 1 ? revNums[mid] : (revNums[mid - 1] + revNums[mid]) / 2;
     }
+  } else if (top10ReviewSampleCount === null && Array.isArray(body?.items) && body.items.length > 1) {
+    const revNums = body.items
+      .slice(0, 10)
+      .map(it => it?.ratings ?? it?.reviews ?? it?.reviewCount)
+      .filter(v => finite(v) && v >= 0);
+    if (revNums.length > 0) top10ReviewSampleCount = revNums.length;
   }
   const avgStarRef = Array.isArray(body?.items) && body.items.length > 0
     ? extractNicheAverageStarReference(body.items)
@@ -1011,6 +1094,8 @@ export function resolveStage1QualitativeJudgments({
   rights_prescreen = null,
   market_seller_count = null,
   reference_price_usd = null,
+  default_target_variant_asin = null,
+  default_target_variant_sku = null,
 } = {}) {
   const objectiveTags = [];
 
@@ -1042,13 +1127,43 @@ export function resolveStage1QualitativeJudgments({
 
   // #17 feasible_light_differentiation (0..1): uninspected reviews MUST remain null (never 0)
   let lightDiff;
-  const targetReviewAsin = nonemptyStr(review_judge?.target_variant_asin)
+  const frozenTargetAsin = nonemptyStr(default_target_variant_asin)
+    ? default_target_variant_asin.trim().toUpperCase()
+    : null;
+  const judgeTargetAsin = nonemptyStr(review_judge?.target_variant_asin)
     ? review_judge.target_variant_asin.trim().toUpperCase()
     : null;
-  const hasSkuVerifiedReview = Array.isArray(review_judge?.review_citations) &&
+  const targetReviewAsin = frozenTargetAsin ?? judgeTargetAsin;
+
+  const frozenTargetSku = nonemptyStr(spec_verification?.target_variant_sku)
+    ? spec_verification.target_variant_sku.trim()
+    : (nonemptyStr(default_target_variant_sku) ? default_target_variant_sku.trim() : null);
+  const judgeTargetSku = nonemptyStr(review_judge?.target_variant_sku)
+    ? review_judge.target_variant_sku.trim()
+    : null;
+  const targetReviewSku = frozenTargetSku ?? judgeTargetSku;
+
+  const explicitTaskTargetMismatch =
+    Boolean(frozenTargetAsin && judgeTargetAsin && frozenTargetAsin !== judgeTargetAsin) ||
+    Boolean(frozenTargetSku && judgeTargetSku && frozenTargetSku.toLowerCase() !== judgeTargetSku.toLowerCase());
+
+  const hasSkuVerifiedReview = !explicitTaskTargetMismatch &&
+    Array.isArray(review_judge?.review_citations) &&
     review_judge.review_citations.some(
-      c => c?.sku_verified === true && (!targetReviewAsin || !nonemptyStr(c?.asin) || c.asin.trim().toUpperCase() === targetReviewAsin),
+      c =>
+        c?.sku_verified === true &&
+        (!targetReviewAsin || !nonemptyStr(c?.asin) || c.asin.trim().toUpperCase() === targetReviewAsin) &&
+        (!targetReviewSku || (nonemptyStr(c?.variant_sku) && c.variant_sku.trim().toLowerCase() === targetReviewSku.toLowerCase())),
     );
+  const hasConflictingSkuReview = explicitTaskTargetMismatch || (
+    Array.isArray(review_judge?.review_citations) &&
+    review_judge.review_citations.length > 0 &&
+    !hasSkuVerifiedReview &&
+    review_judge.review_citations.some(c =>
+      (targetReviewAsin && nonemptyStr(c?.asin) && c.asin.trim().toUpperCase() !== targetReviewAsin) ||
+      (targetReviewSku && nonemptyStr(c?.variant_sku) && c.variant_sku.trim().toLowerCase() !== targetReviewSku.toLowerCase()),
+    )
+  );
   const reviewsInspected = Boolean(
     review_judge &&
     review_judge.reviews_inspected !== false &&
@@ -1064,20 +1179,28 @@ export function resolveStage1QualitativeJudgments({
     (supportLevel === 'strong' || (supportLevel === null && review_judge?.proposed_score === 1));
   const isModerateSupported = reviewsInspected && review_judge?.status === 'supported' && hasSkuVerifiedReview &&
     (supportLevel === 'moderate' || (supportLevel === null && review_judge?.proposed_score === 0.5));
+  const preservedCitationMeta = {
+    reviews_inspected: reviewsInspected,
+    ...(targetReviewAsin ? { target_variant_asin: targetReviewAsin } : {}),
+    ...(targetReviewSku ? { target_variant_sku: targetReviewSku } : {}),
+    ...(Array.isArray(review_judge?.review_citations) ? { review_citations: structuredClone(review_judge.review_citations) } : {}),
+  };
 
   if (isStrongSupported) {
     lightDiff = {
       anchor: 1,
+      ...preservedCitationMeta,
       reason: review_judge.reason || '已验证子体差评痛点可通过低成本现货微改明确解决（strong -> 1/1）。',
       evidence,
     };
   } else if (isModerateSupported) {
     lightDiff = {
       anchor: 0.5,
+      ...preservedCitationMeta,
       reason: review_judge.reason || '已验证子体差评存在部分可低成本微改空间（moderate -> 0.5/1）。',
       evidence,
     };
-  } else if (reviewsInspected && (
+  } else if (reviewsInspected && !hasConflictingSkuReview && (
     review_judge?.status !== 'supported' ||
     supportLevel === 'weak' ||
     supportLevel === 'none' ||
@@ -1085,44 +1208,88 @@ export function resolveStage1QualitativeJudgments({
   )) {
     lightDiff = {
       anchor: 0,
+      ...preservedCitationMeta,
       reason: review_judge.reason || '已抽检子体差评，现成公模现货无需额外改模或未见低成本可微改痛点，记 0/1。',
       evidence,
     };
   } else {
     lightDiff = {
       anchor: null,
+      ...(review_judge ? preservedCitationMeta : {}),
       ...(deferLightDiffToSample ? { sample_check_required: true } : {}),
-      reason: review_judge?.reason || '尚未完成 Gate 1B 后子体差评抽检（未查差评须保持待定 null，不得默认记 0）。',
+      reason: hasConflictingSkuReview
+        ? '差评引文归属子体 ASIN／variant_sku 与当前目标规格冲突，保持待定 null 待重新核验对应子体评论。'
+        : (review_judge?.reason || '尚未完成 Gate 1B 后子体差评抽检（未查差评须保持待定 null，不得默认记 0）。'),
       evidence,
     };
   }
 
-  const PRESCREEN_ACCESS_FAILURE_RE = /(?:registry\s+unavailable|access\s+failed|connection\s+failed|unreachable|search\s+(?:failed|unavailable|not\s+completed|incomplete)|http\s+[45]\d\d|could\s+not\s+(?:access|reach|query|search|verify)|timeout|未完成公开|连接失败|访问失败|检索失败|无法访问|未能查验|查询失败|暂不可用)/i;
-  const isPrescreenCompletedCleanly = sec => Boolean(
-    sec &&
-    sec.prescreen_completed !== false &&
-    sec.registry_unavailable !== true &&
-    !PRESCREEN_ACCESS_FAILURE_RE.test(String(sec.summary ?? '')),
-  );
+  const PRESCREEN_ACCESS_FAILURE_RE = /(?:registry\s+unavailable|access\s+failed|connection\s+failed|unreachable|search\s+(?:failed|unavailable|not\s+completed|incomplete)|not\s+yet\s+searched|(?:further|additional)\s+(?:register|registry|official)\s+search|(?:listed\s+goods|goods\s+coverage)[^\r\n]{0,40}require\s+(?:follow[- ]?up|further\s+search)|http\s+[45]\d\d|\b(?:429|500|502|503|504)\b|rate[- ]?limit\w*|too\s+many\s+requests|quota\s*exceeded|throttl\w*|could\s+not\s+(?:access|reach|query|search|verify)|timeout|(?:查询|检索|公开初筛|初查)?未完成|尚未检索|未检索|未返回|须补查|待补查|进一步检索|状态未知|连接失败|访问失败|检索失败|返回\s*(?:429|5\d\d)|限流|频率限制|请求过多|稍后重试|无法(?:访问|连接|查询|查验|核实)|未能(?:查验|查询|访问|检索)|查询失败|暂[时]?不可用|登记库.*不可用|超时)/i;
+  const NON_ENFORCEABLE_RIGHTS_TEXT_RE = /\b(?:expired|abandoned|lapsed|invalidated|inactive)\b|(?:已过期|已失效|权利终止|放弃专利)/i;
+  const UNKNOWN_RIGHTS_SCOPE_RE = /\b(?:unknown|unclear|unverified|possible\s+match|may\s+match)\b|(?:未知|未明|待核|可能命中|尚未核实)/i;
+  const isPrescreenCompletedCleanly = sec => {
+    if (!sec || sec.prescreen_completed === false || sec.registry_unavailable === true) return false;
+    if (sec.status !== 'no_public_hit_observed' && sec.status !== 'needs_sample_comparison' && sec.status !== 'needs_verification') {
+      return false;
+    }
+    const summaryText = String(sec.summary ?? '');
+    if (PRESCREEN_ACCESS_FAILURE_RE.test(summaryText)) return false;
+    const noCitations = !Array.isArray(sec.citations) || sec.citations.length === 0;
+    if (noCitations && sec.status === 'needs_verification' &&
+      /(?:failed|unavailable|unreachable|incomplete|error|timeout|retry|429|5\d\d|失败|不可用|未完成|无法|未能|重试|限流)/i.test(summaryText)) {
+      return false;
+    }
+    return true;
+  };
 
-  // #20 specific_design_rights (0..3) (+ target-spec trademark conflict check)
+  // #20 specific_design_rights (0..3) (+ target-spec trademark conflict & completion check)
   let specificRights;
   const sdrSec = rights_prescreen?.specific_design_rights;
   const tmSec = rights_prescreen?.trademark_conflicts;
   const sdrStatus = sdrSec?.status ?? 'unknown';
-  const tmProvenTargetConflict = Boolean(
-    tmSec?.status === 'proven_conflict' && tmSec?.applies_to_target_spec !== false,
+  const tmClean = !tmSec || isPrescreenCompletedCleanly(tmSec);
+  const tmNeedsSampleOrVerification = Boolean(
+    tmSec && (tmSec.status === 'needs_verification' || tmSec.status === 'needs_sample_comparison'),
   );
-  if (sdrStatus === 'proven_conflict' || tmProvenTargetConflict) {
+  const sectionHasEnforceableTargetHit = sec => {
+    if (!sec || sec.applies_to_target_spec === false) return false;
+    if (sec.legal_status === 'expired' || sec.legal_status === 'abandoned') return false;
+    const secSummary = String(sec.summary ?? '');
+    if (Array.isArray(sec.citations) && sec.citations.length > 0) {
+      return sec.citations.some(c => {
+        if (c?.applies_to_target_spec === false || c?.legal_status === 'expired' || c?.legal_status === 'abandoned') {
+          return false;
+        }
+        if (c && typeof c === 'object' && ('applies_to_target_spec' in c || 'legal_status' in c)) {
+          return c.applies_to_target_spec === true && (c.legal_status === 'active' || c.legal_status === 'reexamination');
+        }
+        const combinedText = `${String(c?.title ?? '')} ${secSummary}`;
+        return !NON_ENFORCEABLE_RIGHTS_TEXT_RE.test(combinedText) && !UNKNOWN_RIGHTS_SCOPE_RE.test(combinedText);
+      });
+    }
+    if (NON_ENFORCEABLE_RIGHTS_TEXT_RE.test(secSummary) && sec.legal_status !== 'active') {
+      return false;
+    }
+    return !UNKNOWN_RIGHTS_SCOPE_RE.test(secSummary);
+  };
+  const sdrProvenTargetConflict = Boolean(
+    sdrStatus === 'proven_conflict' && sectionHasEnforceableTargetHit(sdrSec),
+  );
+  const tmProvenTargetConflict = Boolean(
+    tmSec?.status === 'proven_conflict' && sectionHasEnforceableTargetHit(tmSec),
+  );
+  if (sdrProvenTargetConflict || tmProvenTargetConflict) {
     specificRights = {
       anchor: 0,
       proven_conflict: true,
-      reason: sdrStatus === 'proven_conflict'
+      applies_to_target_spec: true,
+      legal_status: sdrProvenTargetConflict ? (sdrSec?.legal_status ?? 'active') : (tmSec?.legal_status ?? 'active'),
+      reason: sdrProvenTargetConflict
         ? (sdrSec.summary || '公开专利检索命中具体外观／结构冲突，直接一票否决。')
         : (tmSec.summary || '公开商标检索命中目标规格／词条冲突，直接一票否决。'),
       evidence,
     };
-  } else if (sdrStatus === 'no_public_hit_observed' && isPrescreenCompletedCleanly(sdrSec)) {
+  } else if (sdrStatus === 'no_public_hit_observed' && isPrescreenCompletedCleanly(sdrSec) && tmClean && !tmNeedsSampleOrVerification) {
     objectiveTags.push('留存后二阶段实物细节专利复核');
     if (finite(market_seller_count) && market_seller_count >= 1 && market_seller_count <= 3 &&
       finite(reference_price_usd) && reference_price_usd >= 45) {
@@ -1134,20 +1301,29 @@ export function resolveStage1QualitativeJudgments({
       reason: `${sdrSec.summary || '有界公开专利初查未见同结构冲突。'}（初筛记 3/3，留存后复核实物细节权利要求）。`,
       evidence,
     };
-  } else if ((sdrStatus === 'needs_sample_comparison' || sdrStatus === 'needs_verification') && isPrescreenCompletedCleanly(sdrSec)) {
+  } else if (
+    (sdrStatus === 'needs_sample_comparison' || sdrStatus === 'needs_verification' || (sdrStatus === 'no_public_hit_observed' && tmNeedsSampleOrVerification)) &&
+    isPrescreenCompletedCleanly(sdrSec) &&
+    tmClean
+  ) {
     objectiveTags.push('留存后拿样比对近似专利结构细节');
     specificRights = {
       anchor: null,
       prescreen_completed: true,
       sample_check_required: true,
-      reason: sdrSec?.summary || '公开专利初筛无实锤侵权冲突；1–2 件近似专利号待拿样与实物结构比对。',
+      reason: tmNeedsSampleOrVerification && sdrStatus === 'no_public_hit_observed'
+        ? (tmSec?.summary || '公开商标检索存在待人工／拿样核对项。')
+        : (sdrSec?.summary || '公开专利初筛无实锤侵权冲突；1–2 件近似专利号待拿样与实物结构比对。'),
       evidence,
     };
   } else {
     specificRights = {
       anchor: null,
       prescreen_completed: false,
-      reason: sdrSec?.summary || '具体款式公开专利初查尚未完成或存在待排冲突。',
+      ...(!tmClean || !isPrescreenCompletedCleanly(sdrSec) ? { registry_unavailable: true } : {}),
+      reason: !tmClean
+        ? (tmSec?.summary || '公开商标登记库查询未完成，保持待定。')
+        : (sdrSec?.summary || '具体款式公开专利初查尚未完成或存在待排冲突。'),
       evidence,
     };
   }
@@ -1158,7 +1334,7 @@ export function resolveStage1QualitativeJudgments({
   const fws = Array.isArray(apr?.frameworks_checked)
     ? apr.frameworks_checked.filter(fw => nonemptyStr(fw) && fw !== 'NONE_IDENTIFIED')
     : [];
-  if (apr?.status === 'proven_conflict') {
+  if (apr?.status === 'proven_conflict' && sectionHasEnforceableTargetHit(apr)) {
     publicReq = {
       anchor: 0,
       proven_conflict: true,
@@ -1191,7 +1367,8 @@ export function resolveStage1QualitativeJudgments({
   } else {
     publicReq = {
       anchor: null,
-      reason: '尚未完成适用公共法规与类目准入路径初查。',
+      prescreen_completed: false,
+      reason: apr?.summary || '尚未完成适用公共法规与类目准入路径初查。',
       evidence,
     };
   }
@@ -1412,7 +1589,8 @@ export function buildPairedSeasonalOperatingPeriods({
           if (l.fee_basis.effective_through === '2027-12-31') {
             l.fee_basis.effective_through = '2028-01-14';
           }
-          if (Array.isArray(l.fee_basis.months)) {
+          const basisCoversPeak = !l.fee_basis.effective_through || l.fee_basis.effective_through >= '2027-12-31';
+          if (Array.isArray(l.fee_basis.months) && basisCoversPeak && l.fee_basis.months.includes(10)) {
             l.fee_basis.months = [10, 11, 12, 1];
           }
         }
@@ -2330,8 +2508,12 @@ export function ingestTrialSpecification(spec, profile, {
       };
       const refLine = lines.find(l => l?.id === 'referral');
       if (refLine && refLine.status !== 'pending') {
-        const minRef = finite(ledger.referral_terms.minimum_referral_usd) ? ledger.referral_terms.minimum_referral_usd : 0.30;
-        refLine.amount_usd = Math.max(minRef, Number((netP * refFrac).toFixed(6)));
+        const netRef = netReferral({
+          ...ledger.referral_terms,
+          price_usd: netP,
+          refund_fraction: finite(ledger.refund_fraction) ? ledger.refund_fraction : 0,
+        });
+        refLine.amount_usd = netRef.net_usd;
         mutated = true;
       }
     }
@@ -2339,6 +2521,13 @@ export function ingestTrialSpecification(spec, profile, {
     const officialPkg = !isFactoryPkg ? spCal?.official_pkg : null;
     if (officialPkg && typeof officialPkg === 'object') {
       ledger.pkg = { ...officialPkg };
+      if (Array.isArray(ledger.packages) && ledger.fee_context?.package_ref) {
+        for (let pi = 0; pi < ledger.packages.length; pi++) {
+          if (ledger.packages[pi]?.id === ledger.fee_context.package_ref) {
+            ledger.packages[pi] = { ...ledger.packages[pi], ...officialPkg, id: ledger.fee_context.package_ref };
+          }
+        }
+      }
       if (ledger.unit_weight_lb !== undefined) ledger.unit_weight_lb = officialPkg.unit_weight_lb;
       const salesWin = ledger.fee_context?.sales;
       const storWin = ledger.fee_context?.storage;
@@ -2591,7 +2780,11 @@ export function ingestTrialSpecification(spec, profile, {
     }
 
     if (entry.qualitative_inputs) {
-      const qual = resolveStage1QualitativeJudgments(entry.qualitative_inputs);
+      const qual = resolveStage1QualitativeJudgments({
+        default_target_variant_asin: cand?.screening?.reference_price_usd?.target_variant_asin ?? cand?.target_variant_asin ?? null,
+        default_target_variant_sku: cand?.screening?.reference_price_usd?.target_variant_sku ?? cand?.target_variant_sku ?? cand?.economics?.target_variant_sku ?? null,
+        ...entry.qualitative_inputs,
+      });
       cand.judgments = { ...(cand.judgments ?? {}), ...qual.judgments };
       if (qual.objective_tags.length > 0) {
         cand.presentation = {
@@ -2641,7 +2834,9 @@ export function ingestTrialSpecification(spec, profile, {
     let autoSpRestrictionsRaw = null;
     const findSpApiErrorsDeep = (obj, depth = 0) => {
       if (!obj || typeof obj !== 'object' || depth > 5) return null;
-      if (Array.isArray(obj.errors) && obj.errors.length > 0 && obj.code === undefined && !Array.isArray(obj.items)) {
+      if (Array.isArray(obj.errors) && obj.errors.length > 0 &&
+        (obj.code === undefined || !['OK', '0', 0, 200].includes(obj.code)) &&
+        !Array.isArray(obj.items)) {
         return obj.errors[0];
       }
       for (const k of ['structuredContent', 'data', 'result', 'response', 'payload']) {
@@ -2650,11 +2845,14 @@ export function ingestTrialSpecification(spec, profile, {
       }
       if (Array.isArray(obj.content)) {
         for (const blk of obj.content) {
-          if (typeof blk?.text === 'string' && blk.text.trim().startsWith('{')) {
-            try {
-              const hit = findSpApiErrorsDeep(JSON.parse(blk.text), depth + 1);
-              if (hit) return hit;
-            } catch { /* ignore */ }
+          if (typeof blk?.text === 'string') {
+            const st = blk.text.trim();
+            if (st.startsWith('{') || st.startsWith('[')) {
+              try {
+                const hit = findSpApiErrorsDeep(JSON.parse(st), depth + 1);
+                if (hit) return hit;
+              } catch { /* ignore */ }
+            }
           }
         }
       }

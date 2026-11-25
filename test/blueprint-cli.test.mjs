@@ -133,7 +133,7 @@ test('rights-prescreen CLI uses uncapped background, stores validated results, a
   const f = fixture(t);
   const input = f.file('rights-input.json', { form_id: 'SYNTH-FORM-A', label: 'Compass jig', buyer_task: 'Mark drill points' });
   const section = { status: 'needs_verification', summary: 'Synthetic review needs source confirmation.',
-    citations: [{ title: 'Synthetic public record', url: 'https://example.org/fixture', identifier: null }] };
+    citations: [{ title: 'Synthetic public record', url: 'https://example.org/fixture', identifier: null, applies_to_target_spec: null, legal_status: null }] };
   const parsed = { schema_version: 1, contract: 'RightsAndCompliancePreScreener', specific_design_rights: section,
     trademark_conflicts: section, trade_duty_alerts: section, applicable_public_requirements: { ...section, frameworks_checked: ['CPSC'] },
     disclaimer: 'Initial public pre-screen only; this is not final legal clearance or legal advice.' };

@@ -1175,7 +1175,15 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
     : (finite(headhaul.order_units) && headhaul.order_units > 0 ? headhaul.order_units : null);
   const needsUnits = !isR58 || hasShipmentBond || hasA4Extras || isR59;
 
-  const hasValidCartonCm = Array.isArray(carton_cm) && carton_cm.length === 3 && carton_cm.every(v => finite(v) && v > 0);
+  const normalizedCartonCm = Array.isArray(carton_cm) && carton_cm.length === 3 && carton_cm.every(v => finite(v) && v > 0)
+    ? carton_cm
+    : (carton_cm && typeof carton_cm === 'object' &&
+      finite(carton_cm.length_cm ?? carton_cm.l_cm) && (carton_cm.length_cm ?? carton_cm.l_cm) > 0 &&
+      finite(carton_cm.width_cm ?? carton_cm.w_cm) && (carton_cm.width_cm ?? carton_cm.w_cm) > 0 &&
+      finite(carton_cm.height_cm ?? carton_cm.h_cm) && (carton_cm.height_cm ?? carton_cm.h_cm) > 0
+      ? [carton_cm.length_cm ?? carton_cm.l_cm, carton_cm.width_cm ?? carton_cm.w_cm, carton_cm.height_cm ?? carton_cm.h_cm]
+      : null);
+  const hasValidCartonCm = normalizedCartonCm !== null;
   const canDeriveWeight = (finite(kgPerUnit) && kgPerUnit > 0) ||
     (finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0) ||
     (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) ||
@@ -1189,7 +1197,13 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
 
   const unitsR = effectiveUnits !== null ? toBigRat(effectiveUnits) : { n: 100n, d: 1n };
   const divisorVal = finite(volumetric_divisor) && volumetric_divisor > 0 ? volumetric_divisor : 6000;
-  const cartonCountInt = Number.isSafeInteger(carton_count) && carton_count > 0 ? carton_count : null;
+  const derivedCartonsFromPack = Number.isSafeInteger(headhaul.units_per_carton) && headhaul.units_per_carton > 0 &&
+    finite(effectiveUnits) && effectiveUnits > 0
+    ? Math.ceil(effectiveUnits / headhaul.units_per_carton)
+    : null;
+  const cartonCountInt = Number.isSafeInteger(carton_count) && carton_count > 0
+    ? carton_count
+    : derivedCartonsFromPack;
 
   let actualTotalR = null;
   if (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) {
@@ -1202,7 +1216,7 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
 
   let volTotalR = null;
   if (hasValidCartonCm) {
-    if (isR59 && cartonCountInt === null && headhaul.single_carton_verified !== true) {
+    if (cartonCountInt === null && headhaul.single_carton_verified !== true && !(effectiveUnits === 1)) {
       return {
         amount_usd: null,
         exact_usd_rational: null,
@@ -1215,7 +1229,7 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
       };
     }
     const volOneR = divBigRat(
-      mulBigRat(mulBigRat(toBigRat(carton_cm[0]), toBigRat(carton_cm[1])), toBigRat(carton_cm[2])),
+      mulBigRat(mulBigRat(toBigRat(normalizedCartonCm[0]), toBigRat(normalizedCartonCm[1])), toBigRat(normalizedCartonCm[2])),
       toBigRat(divisorVal),
     );
     volTotalR = mulBigRat(volOneR, toBigRat(cartonCountInt ?? 1));

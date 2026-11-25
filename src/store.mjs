@@ -464,6 +464,7 @@ CREATE TABLE IF NOT EXISTS sourcing_quotes_1688 (
   domestic_freight_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
   pkg_json TEXT,
   fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
+  factory_id TEXT,
   spec_variant_key TEXT,
   kit_note TEXT,
   goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
@@ -935,6 +936,7 @@ export class SelectionStore {
     ensureColumns('sourcing_quotes_1688', [
       ['pkg_json', 'TEXT'],
       ['fx_cny_per_usd', 'REAL CHECK(fx_cny_per_usd > 0)'],
+      ['factory_id', 'TEXT'],
       ['spec_variant_key', 'TEXT'],
       ['kit_note', 'TEXT'],
     ]);
@@ -1165,12 +1167,80 @@ export class SelectionStore {
 
       // Check 3: Reuse exact completed logical request (returns persisted response payload at 0 spend).
       if (reuseCompleted) {
-        const completed = this.db.prepare(`
+        let completed = this.db.prepare(`
           SELECT * FROM api_request_ledger
           WHERE logical_request_key = ? AND status = 'completed'
           ORDER BY created_at DESC
           LIMIT 1
         `).get(keys.logical_request_key);
+        if (!completed) {
+          const rawToolTrimmed = String(spec.tool_name || '').trim();
+          const legacyCandidateKeys = new Set();
+          const parsedNormParams = JSON.parse(keys.normalized_params_json);
+          const paramVariants = [parsedNormParams];
+          if (parsedNormParams && typeof parsedNormParams === 'object' && parsedNormParams.marketplace === 'US' &&
+              !(spec.params && ('marketplace' in spec.params || 'country' in spec.params))) {
+            const { marketplace: _m, ...withoutMarket } = parsedNormParams;
+            paramVariants.push(withoutMarket);
+          }
+          const toolVariants = [
+            rawToolTrimmed,
+            keys.canonical_tool,
+            `amz_spapi_${keys.canonical_tool}`,
+            `amazon_sp_api_${keys.canonical_tool}`,
+          ];
+          for (const legacyProv of ['other', keys.provider]) {
+            for (const legacyTool of toolVariants) {
+              if (!legacyTool) continue;
+              for (const pVar of paramVariants) {
+                const lk = sha256Hex(canonicalJson({
+                  account_scope: keys.account_scope,
+                  provider: legacyProv,
+                  canonical_tool: legacyTool,
+                  tool_version: keys.tool_version,
+                  marketplace: keys.marketplace,
+                  mode: spec.mode ?? 'fresh_observation',
+                  observation_cutoff_date: keys.observation_cutoff_date,
+                  page_or_cursor: keys.page_or_cursor,
+                  normalized_params: pVar,
+                }));
+                if (lk !== keys.logical_request_key) legacyCandidateKeys.add(lk);
+              }
+            }
+          }
+          for (const lk of legacyCandidateKeys) {
+            completed = this.db.prepare(`
+              SELECT * FROM api_request_ledger
+              WHERE logical_request_key = ? AND status = 'completed'
+              ORDER BY created_at DESC
+              LIMIT 1
+            `).get(lk);
+            if (completed) break;
+          }
+          if (!completed && keys.provider === 'sp_api') {
+            completed = this.db.prepare(`
+              SELECT * FROM api_request_ledger
+              WHERE semantic_lock_key = ?
+                AND account_scope = ?
+                AND marketplace = ?
+                AND mode = ?
+                AND observation_cutoff_date = ?
+                AND page_or_cursor = ?
+                AND normalized_params_json = ?
+                AND status = 'completed'
+              ORDER BY created_at DESC
+              LIMIT 1
+            `).get(
+              keys.semantic_lock_key,
+              keys.account_scope,
+              keys.marketplace,
+              spec.mode ?? 'fresh_observation',
+              keys.observation_cutoff_date,
+              keys.page_or_cursor,
+              keys.normalized_params_json,
+            );
+          }
+        }
         if (completed) {
           return {
             allowed: false,
@@ -2567,6 +2637,11 @@ export class SelectionStore {
     const specVariantKey = nonemptyStr(quote.spec_variant_key)
       ? quote.spec_variant_key.trim()
       : null;
+    const resolvedFactoryId = nonemptyStr(quote.factory_id)
+      ? quote.factory_id.trim()
+      : (nonemptyStr(quote.supplier_id)
+        ? quote.supplier_id.trim()
+        : (distinctFactoryIds.size === 1 ? [...distinctFactoryIds][0] : null));
 
     const contractStatus = quoteStatus === 'verified'
       ? 'verified'
@@ -2636,11 +2711,11 @@ export class SelectionStore {
       INSERT INTO sourcing_quotes_1688 (
         quote_id, form_id, spec_version, sku_lines_json, order_plan_json, pack_multiple, moq_sets,
         actual_sets, actual_complete_sets, goods_cny_total, domestic_freight_cny_total, pkg_json, fx_cny_per_usd,
-        spec_variant_key, kit_note,
+        factory_id, spec_variant_key, kit_note,
         goods_first_order_promotion, freight_first_order_promotion, lead_time_days,
         sensitive_freebie_flags_json, redacted_destination, redacted_screenshot_path,
         redacted_webp_sha256, raw_readback_ref, observed_at, expires_at, quote_status, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       quoteId,
       form.form_id,
@@ -2655,6 +2730,7 @@ export class SelectionStore {
       quote.domestic_freight_cny_total ?? null,
       pricingInputs.pkg ? canonicalJson(pricingInputs.pkg) : null,
       pricingInputs.fx_cny_per_usd ?? null,
+      resolvedFactoryId,
       specVariantKey,
       kitNote,
       quote.goods_first_order_promotion ? 1 : 0,
@@ -3138,12 +3214,14 @@ export class SelectionStore {
     if (!nonemptyStr(verification.sku_id)) {
       throw new TypeError('verification.sku_id must be a nonempty string.');
     }
-    if (!validEvidenceDate(verification.quote_validity)) {
-      throw new TypeError('verification.quote_validity must be a valid ISO date or timestamp.');
-    }
-    const asOfDay = assertIsoDateOnly(as_of_date, 'as_of_date');
-    if (verification.quote_validity.slice(0, 10) < asOfDay) {
-      throw new TypeError(`verification.quote_validity (${verification.quote_validity}) is expired relative to ${asOfDay}.`);
+    if (verification.quote_validity !== null && verification.quote_validity !== undefined) {
+      if (!validEvidenceDate(verification.quote_validity)) {
+        throw new TypeError('verification.quote_validity must be a valid ISO date or timestamp when provided.');
+      }
+      const asOfDay = assertIsoDateOnly(as_of_date, 'as_of_date');
+      if (verification.quote_validity.slice(0, 10) < asOfDay) {
+        throw new TypeError(`verification.quote_validity (${verification.quote_validity}) is expired relative to ${asOfDay}.`);
+      }
     }
     assertNoRawPii(verification, 'resume_verification');
 
@@ -3195,7 +3273,7 @@ export class SelectionStore {
       destination_city: destinationCity,
       quantity: verification.quantity,
       sku_id: verification.sku_id.trim(),
-      quote_validity: verification.quote_validity,
+      quote_validity: verification.quote_validity ?? null,
     };
     const now = this._now();
     this.db.prepare(`

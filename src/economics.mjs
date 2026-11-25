@@ -22,6 +22,12 @@ import {
   divBigRat,
   roundBigRat,
 } from './fee-basis.mjs';
+import {
+  classifySizeTier2027,
+  isAmazonOptimizedPlacementVerified2027,
+  lookupUnifiedFulfillmentFee2027,
+  priceBand2027,
+} from './fba-rates-2027.mjs';
 export const REQUIRED_COSTS = Object.freeze([
   'procurement', 'domestic_freight', 'headhaul', 'referral', 'fulfillment',
   'placement', 'storage', 'returns_processing', 'returns_disposal',
@@ -30,6 +36,57 @@ export const REQUIRED_COSTS = Object.freeze([
 const finite = (n) => typeof n === 'number' && Number.isFinite(n);
 const round = (n) => Math.round((n + Number.EPSILON) * 1e10) / 1e10;
 const VERIFIED_LINE_RATIONALS = new WeakMap();
+
+export function resolveSharedLedgerPackage(ledger, { preferredLine = null, externalPackages = undefined } = {}) {
+  if (!ledger || typeof ledger !== 'object') return { pkg: null, conflict: false };
+  const pkgRef = ledger.fee_context?.package_ref;
+  const pool = Array.isArray(ledger.packages) && ledger.packages.length > 0
+    ? ledger.packages
+    : (Array.isArray(externalPackages) && externalPackages.length > 0 ? externalPackages : undefined);
+  const poolRes = resolveUniquePackageByRef(pool, pkgRef);
+  if (poolRes.present && !poolRes.valid) return { pkg: null, conflict: true };
+
+  const candidates = [];
+  if (poolRes.pkg && typeof poolRes.pkg === 'object' && !Array.isArray(poolRes.pkg)) candidates.push(poolRes.pkg);
+  if (ledger.pkg && typeof ledger.pkg === 'object' && !Array.isArray(ledger.pkg)) candidates.push(ledger.pkg);
+  if (preferredLine?.fee_basis?.pkg && typeof preferredLine.fee_basis.pkg === 'object' && !Array.isArray(preferredLine.fee_basis.pkg)) {
+    const pRef = preferredLine.fee_basis.package_ref;
+    if (pRef === undefined || pRef === null || !pkgRef || pRef === pkgRef) {
+      candidates.push(preferredLine.fee_basis.pkg);
+    }
+  }
+  if (Array.isArray(ledger.lines)) {
+    for (const ln of ledger.lines) {
+      const fbPkg = ln?.fee_basis?.pkg;
+      if (!fbPkg || typeof fbPkg !== 'object' || Array.isArray(fbPkg)) continue;
+      const lineRef = ln?.fee_basis?.package_ref;
+      if (lineRef !== undefined && lineRef !== null && pkgRef && lineRef !== pkgRef) continue;
+      candidates.push(fbPkg);
+    }
+  }
+  if (candidates.length === 0) return { pkg: null, conflict: false };
+
+  const sigOf = p => {
+    const cls = classifySizeTier2027(p);
+    if (!cls || cls.status === 'invalid_package') return null;
+    const sides = [cls.longest_in, cls.median_in, cls.shortest_in];
+    if (sides.some(v => !finite(v) || v <= 0) || !finite(cls.unit_weight_lb) || cls.unit_weight_lb <= 0) return null;
+    return [...sides, cls.unit_weight_lb];
+  };
+  let baseSig = null;
+  let chosen = candidates[0];
+  for (const cand of candidates) {
+    const sig = sigOf(cand);
+    if (!sig) continue;
+    if (!baseSig) {
+      baseSig = sig;
+      chosen = cand;
+    } else if (sig.some((v, idx) => Math.abs(v - baseSig[idx]) > 1e-4)) {
+      return { pkg: null, conflict: true };
+    }
+  }
+  return { pkg: chosen, conflict: false };
+}
 
 function toDecimalParts(n) {
   if (!finite(n)) throw new TypeError('Finite number required');
@@ -173,6 +230,7 @@ export function calculateEconomics(input, options = {}) {
   let r58HeadhaulInvalid = false;
   let r58StorageInvalid = false;
   let r58FulfillmentInvalid = false;
+  let r59PlacementInvalid = false;
   const consistentNum = (values, predicate) => {
     const present = values.filter(v => v !== undefined && v !== null);
     if (present.length === 0) return { present: false, valid: true, value: null };
@@ -244,10 +302,15 @@ export function calculateEconomics(input, options = {}) {
 
     const pkgRef = input?.fee_context?.package_ref;
     const pkgRes = resolveUniquePackageByRef(input?.packages, pkgRef);
+    const sharedPkgRes = isR59Plus ? resolveSharedLedgerPackage(input, { externalPackages: options?.externalPackages }) : { pkg: pkgRes.pkg, conflict: false };
     const matchedPkg = pkgRes.pkg;
-    if (pkgRes.present && !pkgRes.valid) {
+    if ((pkgRes.present && !pkgRes.valid) || sharedPkgRes.conflict) {
       r58StorageInvalid = true;
       r58ReturnsInvalid = true;
+      if (isR59Plus) {
+        r58FulfillmentInvalid = true;
+        r59PlacementInvalid = true;
+      }
     }
 
     const storageLine = map.get('storage');
@@ -272,6 +335,76 @@ export function calculateEconomics(input, options = {}) {
     if (fulLine && fulLine.status !== 'pending' && salesWinForFul?.through > '2027-10-14' &&
       hasProhibited2026PeakExtrapolation(fulLine, input)) {
       r58FulfillmentInvalid = true;
+    }
+    if (isR59Plus && fulLine && fulLine.status !== 'pending' && finite(fulLine.amount_usd) &&
+      pricing?.has_ongoing_discount && !pricing.has_prime_discount &&
+      finite(pricing.list_price_usd) && priceBand2027(pricing.list_price_usd) !== priceBand2027(p) &&
+      fulLine.fee_basis?.sp_api_calibrated !== true && fulLine.fee_basis?.calculator_verified !== true) {
+      if (fulLine.fee_basis?.price_band === priceBand2027(p)) {
+        r58FulfillmentInvalid = true;
+      } else {
+        const fulPkg = resolveSharedLedgerPackage(input, { preferredLine: fulLine, externalPackages: options?.externalPackages }).pkg ?? matchedPkg;
+        const in2027OffPeakSales = !salesWinForFul || (
+          typeof salesWinForFul.from === 'string' && typeof salesWinForFul.through === 'string' &&
+          salesWinForFul.from >= '2027-01-15' && salesWinForFul.through <= '2027-10-14'
+        );
+        if (fulPkg && in2027OffPeakSales) {
+          const apparelFlag = collectLedgerFlag(input, 'is_apparel_or_shoes', fulPkg);
+          const dgFlag = collectLedgerFlag(input, 'is_dangerous_goods', fulPkg);
+          if (apparelFlag.valid && dgFlag.valid) {
+            const expectedListFul = lookupUnifiedFulfillmentFee2027({
+              ...fulPkg,
+              price_usd: p,
+              list_price_usd: pricing.list_price_usd,
+              has_ongoing_coupon: true,
+              has_prime_discount: false,
+              fee_category: fulLine.fee_basis?.fee_category ?? input.fee_category,
+              is_apparel: input.is_apparel,
+              is_shoes: input.is_shoes,
+              is_apparel_or_shoes: apparelFlag.value === true,
+              is_dangerous_goods: dgFlag.value === true,
+              is_sipp: fulLine.fee_basis?.is_sipp ?? input.is_sipp ?? fulPkg.is_sipp,
+              requires_amazon_packaging: fulLine.fee_basis?.requires_amazon_packaging ?? input.requires_amazon_packaging ?? fulPkg.requires_amazon_packaging,
+            });
+            if (expectedListFul.status === 'verified' && fulLine.amount_usd < expectedListFul.total_usd - 0.005) {
+              r58FulfillmentInvalid = true;
+            }
+          }
+        }
+      }
+    }
+
+    const placeLine = map.get('placement');
+    if (isR59Plus && placeLine && placeLine.status !== 'pending' && finite(placeLine.amount_usd)) {
+      const placePkg = resolveSharedLedgerPackage(input, { preferredLine: placeLine, externalPackages: options?.externalPackages }).pkg ?? matchedPkg;
+      const placeSplitOpt = placeLine.split_option ?? placeLine.fee_basis?.split_option ?? input.placement_split_option ?? null;
+      const placeOverFlag = collectLedgerFlag(input, 'is_oversize', placePkg);
+      const placeAppFlag = collectLedgerFlag(input, 'is_apparel_or_shoes', placePkg);
+      const placeDgFlag = collectLedgerFlag(input, 'is_dangerous_goods', placePkg);
+      const pkgCls = placePkg && placeAppFlag.valid && placeDgFlag.valid
+        ? classifySizeTier2027(placePkg, { is_apparel: placeAppFlag.value === true, is_dangerous_goods: placeDgFlag.value === true })
+        : null;
+      const isConfirmedOversize = placeOverFlag.value === true ||
+        pkgCls?.tier_family === 'oversize' ||
+        (placeLine.fee_basis?.exempt_oversize_tier === true && (!pkgCls || pkgCls.tier_family === 'oversize'));
+      if (!isConfirmedOversize &&
+        (placeSplitOpt === 'amazon_optimized' || (placePkg !== null && round(placeLine.amount_usd) === 0)) &&
+        placeLine.fee_basis?.sp_api_calibrated !== true &&
+        placeLine.fee_basis?.calculator_verified !== true) {
+        const optVerified = isAmazonOptimizedPlacementVerified2027({
+          identical_cartons_count: placeLine.identical_cartons_count ??
+            placeLine.fee_basis?.identical_cartons_count ??
+            input.identical_cartons_count ??
+            null,
+          multi_destination_headhaul_verified: placeLine.multi_destination_headhaul_verified ??
+            placeLine.fee_basis?.multi_destination_headhaul_verified ??
+            input.multi_destination_headhaul_verified ??
+            false,
+        });
+        if (!optVerified) {
+          r59PlacementInvalid = true;
+        }
+      }
     }
 
     const retLine = map.get('returns_processing');
@@ -374,7 +507,7 @@ export function calculateEconomics(input, options = {}) {
     }
   }
 
-  const couponFeeR59 = isR59Plus && input.include_coupon_fee !== false
+  const computedCouponFeeR59 = isR59Plus
     ? computeAmazonCouponRedemptionFee2027({
       net_effective_price_usd: p,
       ongoing_coupon_usd: input.ongoing_coupon_usd,
@@ -384,16 +517,34 @@ export function calculateEconomics(input, options = {}) {
       include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
     })
     : { applicable: false, per_unit_usd: 0, exact_usd_rational: { n: 0n, d: 1n } };
+  const explicitCouponFeeUsd = isR59Plus && finite(input.coupon_redemption_fee_usd) && input.coupon_redemption_fee_usd > 0
+    ? round(input.coupon_redemption_fee_usd)
+    : 0;
+  const couponFeeR59 = computedCouponFeeR59.applicable && computedCouponFeeR59.per_unit_usd >= explicitCouponFeeUsd
+    ? computedCouponFeeR59
+    : (explicitCouponFeeUsd > 0
+      ? { applicable: true, per_unit_usd: explicitCouponFeeUsd, exact_usd_rational: toBigRat(explicitCouponFeeUsd) }
+      : { applicable: false, per_unit_usd: 0, exact_usd_rational: { n: 0n, d: 1n } });
   let extraCouponAmazonDeductionUsd = 0;
   if (couponFeeR59.applicable && couponFeeR59.per_unit_usd > 0) {
     const otherLine = map.get('other_applicable');
-    const alreadyHasCoupon = Boolean(
+    const declaredInOther = Boolean(
       input.coupon_fee_already_in_other === true ||
       otherLine?.coupon_fee_included === true ||
       (Array.isArray(otherLine?.components) && otherLine.components.includes('coupon_redemption')) ||
-      (typeof otherLine?.basis === 'string' && /coupon/i.test(otherLine.basis) && finite(otherLine.amount_usd) && otherLine.amount_usd >= couponFeeR59.per_unit_usd - 1e-6),
+      (typeof otherLine?.basis === 'string' && /coupon/i.test(otherLine.basis)),
     );
-    if (!alreadyHasCoupon && otherLine && otherLine.status !== 'pending' && finite(otherLine.amount_usd)) {
+    const alreadyHasCoupon = Boolean(
+      declaredInOther &&
+      otherLine &&
+      finite(otherLine.amount_usd) &&
+      otherLine.amount_usd >= couponFeeR59.per_unit_usd - 1e-6,
+    );
+    if (alreadyHasCoupon && otherLine.payee !== 'amazon') {
+      extraCouponAmazonDeductionUsd = finite(otherLine.amazon_portion_usd) && otherLine.amazon_portion_usd > 0
+        ? otherLine.amazon_portion_usd
+        : couponFeeR59.per_unit_usd;
+    } else if (!alreadyHasCoupon && otherLine && otherLine.status !== 'pending' && finite(otherLine.amount_usd)) {
       const priorExternalAmt = otherLine.payee === 'external' && otherLine.amount_usd > 0 ? otherLine.amount_usd : 0;
       const prevAmt = otherLine.amount_usd;
       otherLine.amount_usd = round(prevAmt + couponFeeR59.per_unit_usd);
@@ -410,7 +561,11 @@ export function calculateEconomics(input, options = {}) {
           if (refBasis) otherLine.fee_basis = { ...refBasis };
         }
       } else {
-        extraCouponAmazonDeductionUsd = couponFeeR59.per_unit_usd;
+        otherLine.amazon_portion_usd = round(
+          (finite(otherLine.amazon_portion_usd) && otherLine.amazon_portion_usd > 0 ? otherLine.amazon_portion_usd : 0) +
+          couponFeeR59.per_unit_usd,
+        );
+        extraCouponAmazonDeductionUsd = otherLine.amazon_portion_usd;
       }
       if (prevAmt === 0 && couponFeeR59.exact_usd_rational) {
         otherLine.exact_usd_rational = {
@@ -485,6 +640,14 @@ export function calculateEconomics(input, options = {}) {
   const validation = options.requireFeeBasis
     ? validateFeeBasis({ ...input, lines: validationLines }, { ...options, requireRegularRepeatOrder: Boolean(options.requireRegularRepeatOrder || isR57Plus) })
     : null;
+  if (validation && r59PlacementInvalid && !validation.issues.some(iss => iss.line === 'placement')) {
+    validation.valid = false;
+    validation.issues.push({
+      line: 'placement',
+      code: 'unverified_amazon_optimized_placement',
+      reason: 'Standard/Bulky $0 placement (amazon_optimized) requires identical_cartons_count >= 5 AND multi_destination_headhaul_verified === true.',
+    });
+  }
   const invalid = new Set(validation?.issues.map(issue => issue.line) ?? []);
   const pending = REQUIRED_COSTS.filter(k => !deferred.includes(k) &&
     (!map.has(k) || map.get(k).amount_usd === null || map.get(k).status === 'pending'));
@@ -493,6 +656,7 @@ export function calculateEconomics(input, options = {}) {
   if (r58StorageInvalid && !pending.includes('storage')) pending.push('storage');
   if (r58ReturnsInvalid && !pending.includes('returns_processing')) pending.push('returns_processing');
   if (r58FulfillmentInvalid && !pending.includes('fulfillment')) pending.push('fulfillment');
+  if (r59PlacementInvalid && !pending.includes('placement')) pending.push('placement');
   for (const key of REQUIRED_COSTS) {
     if (invalid.has(key) && !pending.includes(key)) pending.push(key);
   }

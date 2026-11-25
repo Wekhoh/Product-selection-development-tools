@@ -681,19 +681,31 @@ function normalizeStage1Candidate(raw, idx, { defaultTileIndex = null, sheetMode
   return normalized;
 }
 
-function buildDecisionsQuestionsForChunk(chunkEntries) {
+function buildDecisionsQuestionsForChunk(chunkEntries, options = {}) {
+  const includeSoftAvoid = options?.includeSoftAvoidQuestion === true;
   const questions = [];
   for (const { item } of chunkEntries) {
-    const { predicateId, choiceId } = getStage1DecisionQuestionIds(item.candidate_id);
+    const { safeId, predicateId, choiceId } = getStage1DecisionQuestionIds(item.candidate_id);
     const tileLabel = Number.isInteger(item.tile_index) ? ` (tile #${item.tile_index})` : '';
     questions.push({
       id: predicateId,
       name: predicateId,
       type: 'predicate',
       instructions:
-        `Does candidate "${item.candidate_id}"${tileLabel} fall into a prohibited or avoided Gate-0 category ` +
-        '(children/baby/infant/toddler/CPC product, apparel/footwear, commodity 3C phone/computer accessory, or bulky furniture)?',
+        `Is candidate "${item.candidate_id}"${tileLabel} a hard-prohibited statutory <=12y children/baby/infant/toddler/CPC product ` +
+        '(answer false for adult apparel/footwear, commodity 3C phone/computer accessories, or bulky furniture; soft-avoid categories are tracked separately and must NOT be marked true here)?',
     });
+    if (includeSoftAvoid) {
+      const softAvoidId = `gate0_soft_avoid_${safeId}`;
+      questions.push({
+        id: softAvoidId,
+        name: softAvoidId,
+        type: 'predicate',
+        instructions:
+          `Does candidate "${item.candidate_id}"${tileLabel} fall into a soft-avoid red-ocean category ` +
+          '(adult apparel/footwear, commodity 3C phone/computer accessory, or bulky furniture) for advisory review?',
+      });
+    }
     questions.push({
       id: choiceId,
       name: choiceId,
@@ -1375,19 +1387,24 @@ export function parseStage1DecisionsResponses(candidates, responses, {
     }
 
     const isRedOceanSoftWatch = !detGate0.passed && detGate0.hard_exclusion !== true && gate0Config?.enforce_red_ocean_skip !== true;
-    const isProbReviewWatch = modelProhibited === false && prohibitedProb !== null && prohibitedProb >= 0.5 && prohibitedProb < prohibitedThreshold;
+    const softAvoidAns = answerByKey.get(`gate0_soft_avoid_${qIds.safeId}`) ?? null;
+    const softAvoidFlagged = softAvoidAns?.type === 'predicate' && (
+      (typeof softAvoidAns.probability === 'number' && softAvoidAns.probability >= 0.5) ||
+      softAvoidAns.value === true
+    );
+    const isProbReviewWatch = (modelProhibited === false && prohibitedProb !== null && prohibitedProb >= 0.5 && prohibitedProb < prohibitedThreshold) || softAvoidFlagged;
 
     let gate0Status;
     if (!detGate0.passed && !isRedOceanSoftWatch) {
       gate0Status = 'prohibited';
     } else if (modelProhibited === 'unknown') {
       gate0Status = 'unknown';
-    } else if (modelProhibited === true) {
+    } else if (modelProhibited === true && !isRedOceanSoftWatch) {
       gate0Status = 'prohibited';
     } else {
       gate0Status = 'allowed';
     }
-    const gate0ReviewWatch = gate0Status === 'allowed' && (isProbReviewWatch || isRedOceanSoftWatch);
+    const gate0ReviewWatch = gate0Status === 'allowed' && (isProbReviewWatch || isRedOceanSoftWatch || (modelProhibited === true && isRedOceanSoftWatch));
     const triageDisposition = gate0Status === 'prohibited'
       ? 'prohibited_auto_excluded'
       : (gate0Status === 'unknown' || gate0ReviewWatch ? 'amber_manual_review' : 'allowed');
@@ -2075,14 +2092,18 @@ export const parse1688VisionResult = parse1688VisionInspectResult;
 // Task 5: Gate 2 Public Rights & Compliance Pre-Screener (`Terra xhigh` + `web_search`)
 // =============================================================================
 
+const RIGHTS_LEGAL_STATUSES = Object.freeze(['active', 'expired', 'abandoned', 'pending', 'reexamination', 'unknown']);
+
 const CITATION_ITEM_SCHEMA = deepFreeze({
   type: 'object',
   additionalProperties: false,
-  required: ['title', 'url', 'identifier'],
+  required: ['title', 'url', 'identifier', 'applies_to_target_spec', 'legal_status'],
   properties: {
     title: { type: 'string' },
     url: { type: 'string' },
     identifier: { type: ['string', 'null'] },
+    applies_to_target_spec: { type: ['boolean', 'null'] },
+    legal_status: { type: ['string', 'null'], enum: [...RIGHTS_LEGAL_STATUSES, null] },
   },
 });
 
@@ -2283,7 +2304,7 @@ export function buildRightsPreScreenRequest(input, options = {}) {
               'Conduct a bounded initial public rights, regulatory compliance, and US trade/duty pre-screen under contract RightsAndCompliancePreScreener (schema_version: 1).',
               'Rules:',
               `1. Focus web_search strictly on three active screening sections: specific_design_rights (US utility/design patents), trademark_conflicts (USPTO word/trade-dress terms), and applicable_public_requirements (prioritize relevant frameworks: ${fwScope.applicable.join(', ')}${fwScope.focus_notes.length ? ` — ${fwScope.focus_notes.join('; ')}` : ''}). ${pruneLine} NOTE: trade_duty_alerts (HTS/Section 301/AD-CVD) is deferred to post-retention customs review — do NOT spend extra web_search queries digging into tariff schedules; report only incidental alerts already observed or mark trade_duty_alerts status="unknown" with a brief deferral note.`,
-              '2. Every citation url MUST be a verifiable https:// URL. Any section marked "proven_conflict" MUST include at least one https:// citation.',
+              '2. Every citation url MUST be a verifiable https:// URL, with applies_to_target_spec (boolean or null) and legal_status ("active" | "expired" | "abandoned" | "pending" | "reexamination" | "unknown" | null). Any section marked "proven_conflict" MUST include at least one active https:// citation that applies to the target product spec (expired/abandoned patents or non-matching specs are NOT proven conflicts).',
               '3. For each material unresolved question, try 2–3 distinct search angles, such as formal registry terminology, buyer or product synonyms, and a relevant official or technical source. Stop when the public evidence supports a finding or distinct searches stop adding materially new information. Avoid repeating near-identical queries. Return "no_public_hit_observed" when those searches produced no matching public hit, and "needs_verification" when material uncertainties or access gaps remain. Absence of a search hit never establishes legal clearance.',
               '4. Include an explicit disclaimer stating: "Initial public pre-screen only; this is not final legal clearance or legal advice."',
               '5. Product-P3 boundary: NEVER emit Q32 numeric points, weights, FBA fees, or margins.',
@@ -2340,7 +2361,7 @@ function validateRightsSection(section, sectionName, { hasFrameworks = false } =
     assertPlainObject(cit, `${sectionName}.citations[${idx}]`);
     assertAllowedObjectKeys(
       cit,
-      ['title', 'url', 'identifier'],
+      ['title', 'url', 'identifier', 'applies_to_target_spec', 'legal_status'],
       `${sectionName}.citations[${idx}]`,
       ['title', 'url', 'identifier'],
     );
@@ -2349,11 +2370,55 @@ function validateRightsSection(section, sectionName, { hasFrameworks = false } =
     const identifier = cit.identifier === null
       ? null
       : assertNonemptyString(cit.identifier, `${sectionName}.citations[${idx}].identifier`, { maxLength: 128 });
-    return { title, url, identifier };
+    const appliesToTargetSpec = cit.applies_to_target_spec === undefined || cit.applies_to_target_spec === null
+      ? null
+      : (() => {
+          if (typeof cit.applies_to_target_spec !== 'boolean') {
+            throw new TypeError(`${sectionName}.citations[${idx}].applies_to_target_spec must be boolean or null.`);
+          }
+          return cit.applies_to_target_spec;
+        })();
+    const legalStatus = cit.legal_status === undefined || cit.legal_status === null
+      ? null
+      : (() => {
+          if (typeof cit.legal_status !== 'string' || !RIGHTS_LEGAL_STATUSES.includes(cit.legal_status)) {
+            throw new TypeError(`${sectionName}.citations[${idx}].legal_status must be one of ${RIGHTS_LEGAL_STATUSES.join(', ')} or null.`);
+          }
+          return cit.legal_status;
+        })();
+    return {
+      title,
+      url,
+      identifier,
+      ...(cit.applies_to_target_spec !== undefined ? { applies_to_target_spec: appliesToTargetSpec } : {}),
+      ...(cit.legal_status !== undefined ? { legal_status: legalStatus } : {}),
+    };
   });
 
-  if (section.status === 'proven_conflict' && normalizedCitations.length === 0) {
-    throw new TypeError(`${sectionName} with status "proven_conflict" requires at least one https:// citation.`);
+  if (section.status === 'proven_conflict') {
+    if (normalizedCitations.length === 0) {
+      throw new TypeError(`${sectionName} with status "proven_conflict" requires at least one https:// citation.`);
+    }
+    const nonEnforceableRe = /\b(?:expired|abandoned|lapsed|invalidated|inactive)\b|(?:已过期|已失效|权利终止|放弃专利)/i;
+    const unknownScopeOrStatusRe = /\b(?:unknown|unclear|unverified|possible\s+match|may\s+match)\b|(?:未知|未明|待核|可能命中|尚未核实)/i;
+    const hasPositiveStructuredHit = normalizedCitations.some(
+      c => c.applies_to_target_spec === true && (c.legal_status === 'active' || c.legal_status === 'reexamination'),
+    );
+    const hasEnforceableTargetMatch = hasPositiveStructuredHit || normalizedCitations.some(c => {
+      if (c.applies_to_target_spec === false || c.legal_status === 'expired' || c.legal_status === 'abandoned') {
+        return false;
+      }
+      if ('applies_to_target_spec' in c || 'legal_status' in c) {
+        return c.applies_to_target_spec === true && (c.legal_status === 'active' || c.legal_status === 'reexamination');
+      }
+      const combinedText = `${c.title} ${summary}`;
+      return !nonEnforceableRe.test(combinedText) && !unknownScopeOrStatusRe.test(combinedText);
+    });
+    if (!hasEnforceableTargetMatch) {
+      throw new TypeError(
+        `${sectionName} cannot be marked "proven_conflict" when cited rights are expired/abandoned or lack positive active target-spec confirmation.`,
+      );
+    }
   }
 
   if (hasFrameworks) {
@@ -2649,8 +2714,15 @@ export function parseReviewJudgeResult(rawResponse, taskInput = null) {
           `PainPointAndRubricJudge review_citations[${cIdx}] cites unknown review_id "${cit.review_id}" not in taskInput.reviews.`,
         );
       }
+      const normalizeExcerptForMatch = str => String(str)
+        .replace(/[\u2018\u2019\u201A\u201B\u2032]/g, "'")
+        .replace(/[\u201C\u201D\u201E\u201F\u2033]/g, '"')
+        .replace(/\s+/g, ' ')
+        .trim();
       const sourceText = sourceRev.text ?? sourceRev.body ?? sourceRev.content ?? sourceRev.excerpt ?? '';
-      if (typeof sourceText !== 'string' || !sourceText.includes(cit.excerpt)) {
+      const normSource = typeof sourceText === 'string' ? normalizeExcerptForMatch(sourceText) : '';
+      const normExcerpt = typeof cit.excerpt === 'string' ? normalizeExcerptForMatch(cit.excerpt) : '';
+      if (typeof sourceText !== 'string' || !normExcerpt || (!sourceText.includes(cit.excerpt) && !normSource.includes(normExcerpt))) {
         throw new TypeError(
           `PainPointAndRubricJudge review_citations[${cIdx}] excerpt was not found verbatim in source review "${cit.review_id}".`,
         );
@@ -2717,8 +2789,17 @@ export function parseReviewJudgeResult(rawResponse, taskInput = null) {
     }
   }
 
+  const resolvedTargetVariantSku = typeof taskInput?.target_variant_sku === 'string' && taskInput.target_variant_sku.trim()
+    ? taskInput.target_variant_sku.trim()
+    : null;
+  const targetVariantAsin = typeof taskInput?.target_variant_asin === 'string' && taskInput.target_variant_asin.trim()
+    ? taskInput.target_variant_asin.trim().toUpperCase()
+    : null;
+
   return {
     ...validated,
+    ...(resolvedTargetVariantSku !== null ? { target_variant_sku: resolvedTargetVariantSku } : {}),
+    ...(targetVariantAsin !== null ? { target_variant_asin: targetVariantAsin } : {}),
     support_level: payload.support_level,
     proposed_score: null,
     reason: cleanReason,
@@ -3039,8 +3120,22 @@ export function parseMarketObservationResult(rawResponse, taskInput = null) {
           }
         }
       }
-      const hasVisualAttachments = Array.isArray(taskInput?.images) && taskInput.images.length > 0;
-      const hasKeepaSource = hasVisualAttachments || rawHigh !== null || rawLow !== null ||
+      const peerHasOwnImage = Boolean(
+        hasStr(rawPeer.image_url) ||
+        hasStr(rawPeer.main_image_url) ||
+        (Array.isArray(rawPeer.images) && rawPeer.images.length > 0) ||
+        (taskInput?.peer_images && hasStr(taskInput.peer_images[asin])),
+      );
+      const peerHasKeepaChart = Boolean(
+        hasStr(rawPeer.keepa_image) ||
+        hasStr(rawPeer.keepa_chart_image) ||
+        (taskInput?.keepa_images && hasStr(taskInput.keepa_images[asin])),
+      );
+      const sharedVisualsCoverAllPeers = Array.isArray(taskInput?.images) &&
+        Array.isArray(taskInput?.peers) &&
+        taskInput.peers.length > 0 &&
+        taskInput.images.length >= taskInput.peers.length;
+      const hasKeepaSource = peerHasKeepaChart || rawHigh !== null || rawLow !== null ||
         hasStr(rawPeer.keepa_90d_trend) || hasStr(rawPeer.keepa_trajectory) || hasStr(rawPeer.keepa_90d_summary) ||
         typeof rawPeer.keepa_price_steady === 'boolean' || typeof rawPeer.keepa_90d_median_usd === 'number';
       if (!hasKeepaSource && keepa90dTrend !== null && !UNKNOWN_FACT_SENTINEL_RE.test(keepa90dTrend.trim())) {
@@ -3048,7 +3143,10 @@ export function parseMarketObservationResult(rawResponse, taskInput = null) {
           `peer_observations[${idx}] ("${asin}") fabricated keepa_90d_trend ("${keepa90dTrend}") when raw Keepa data is absent.`,
         );
       }
-      const hasCouponSource = hasVisualAttachments || hasStr(rawPeer.coupon_status) || hasStr(rawPeer.coupon) || hasStr(rawPeer.coupon_text) ||
+      const rawCouponStr = hasStr(rawPeer.coupon_status)
+        ? rawPeer.coupon_status.trim()
+        : (hasStr(rawPeer.coupon) ? rawPeer.coupon.trim() : (hasStr(rawPeer.coupon_text) ? rawPeer.coupon_text.trim() : null));
+      const hasCouponSource = peerHasKeepaChart || rawCouponStr !== null ||
         (typeof rawPeer.ongoing_coupon_usd === 'number' && rawPeer.ongoing_coupon_usd > 0) ||
         (typeof rawPeer.ongoing_coupon_pct === 'number' && rawPeer.ongoing_coupon_pct > 0) ||
         (typeof rawPeer.coupon_usd === 'number' && rawPeer.coupon_usd > 0) ||
@@ -3058,9 +3156,12 @@ export function parseMarketObservationResult(rawResponse, taskInput = null) {
           `peer_observations[${idx}] ("${asin}") fabricated coupon_status ("${couponStatus}") when raw coupon data is absent.`,
         );
       }
+      const strPctMatch = rawCouponStr ? rawCouponStr.match(/(\d+(?:\.\d+)?)\s*%/) : null;
       const rawPctVal = typeof rawPeer.ongoing_coupon_pct === 'number' && rawPeer.ongoing_coupon_pct > 0
         ? rawPeer.ongoing_coupon_pct
-        : (typeof rawPeer.coupon_pct === 'number' && rawPeer.coupon_pct > 0 ? rawPeer.coupon_pct : null);
+        : (typeof rawPeer.coupon_pct === 'number' && rawPeer.coupon_pct > 0
+          ? rawPeer.coupon_pct
+          : (strPctMatch ? Number(strPctMatch[1]) : null));
       if (rawPctVal !== null && couponStatus !== null) {
         const expectedPct = rawPctVal < 1 ? Math.round(rawPctVal * 100) : Math.round(rawPctVal);
         const pctMatches = [...couponStatus.matchAll(/(\d+(?:\.\d+)?)\s*%/g)].map(m => Math.round(Number(m[1])));
@@ -3069,21 +3170,55 @@ export function parseMarketObservationResult(rawResponse, taskInput = null) {
             `peer_observations[${idx}] ("${asin}") distorted coupon_status percentage ("${couponStatus}" vs raw ${expectedPct}%).`,
           );
         }
+        if (pctMatches.length === 0 && UNKNOWN_FACT_SENTINEL_RE.test(couponStatus.trim())) {
+          throw new TypeError(
+            `peer_observations[${idx}] ("${asin}") omitted active ${expectedPct}% coupon in coupon_status ("${couponStatus}").`,
+          );
+        }
       }
-      const hasReviewCurveSource = hasVisualAttachments || hasStr(rawPeer.review_curve_change) || hasStr(rawPeer.review_delta_text) ||
-        Array.isArray(rawPeer.review_history);
+      const strUsdMatch = rawCouponStr ? rawCouponStr.match(/\$\s*(\d+(?:\.\d+)?)/) : null;
+      const rawUsdVal = typeof rawPeer.ongoing_coupon_usd === 'number' && rawPeer.ongoing_coupon_usd > 0
+        ? rawPeer.ongoing_coupon_usd
+        : (typeof rawPeer.coupon_usd === 'number' && rawPeer.coupon_usd > 0
+          ? rawPeer.coupon_usd
+          : (strUsdMatch ? Number(strUsdMatch[1]) : null));
+      if (rawUsdVal !== null && couponStatus !== null) {
+        const usdMatches = [...couponStatus.matchAll(/\$\s*(\d+(?:\.\d+)?)/g)].map(m => Math.round(Number(m[1]) * 100));
+        const expectedCents = Math.round(rawUsdVal * 100);
+        if (usdMatches.length > 0 && usdMatches.some(c => c !== expectedCents)) {
+          throw new TypeError(
+            `peer_observations[${idx}] ("${asin}") distorted coupon_status USD amount ("${couponStatus}" vs raw $${rawUsdVal}).`,
+          );
+        }
+      }
+      const hasReviewCurveSource = peerHasKeepaChart || hasStr(rawPeer.review_curve_change) || hasStr(rawPeer.review_delta_text) ||
+        (Array.isArray(rawPeer.review_history) && rawPeer.review_history.length > 0);
       if (!hasReviewCurveSource && reviewCurveChange !== null && !UNKNOWN_FACT_SENTINEL_RE.test(reviewCurveChange.trim())) {
         throw new TypeError(
           `peer_observations[${idx}] ("${asin}") fabricated review_curve_change ("${reviewCurveChange}") when raw review curve history is absent.`,
         );
       }
-      const hasDimsOrTitleSource = hasVisualAttachments || hasStr(rawPeer.key_appearance_and_dims) || hasStr(rawPeer.dimensions_text) ||
+      const NUMERIC_MEASUREMENT_RE = /\b\d+(?:\.\d+)?\s*(?:x|×)\s*\d+|\b\d+(?:\.\d+)?\s*(?:in|inch|inches|cm|mm|lb|lbs|oz|kg|g)\b/i;
+      const hasDimsOrTitleSource = peerHasOwnImage || sharedVisualsCoverAllPeers || hasStr(rawPeer.key_appearance_and_dims) || hasStr(rawPeer.dimensions_text) ||
         hasStr(rawPeer.title) || Boolean(rawPeer.pkg) ||
         rawPeer.length_in !== undefined || rawPeer.length_cm !== undefined ||
         rawPeer.unit_weight_lb !== undefined || rawPeer.weight_lb !== undefined;
       if (!hasDimsOrTitleSource && keyAppearanceAndDims !== null && !UNKNOWN_FACT_SENTINEL_RE.test(keyAppearanceAndDims.trim())) {
         throw new TypeError(
           `peer_observations[${idx}] ("${asin}") fabricated key_appearance_and_dims ("${keyAppearanceAndDims}") when raw appearance/dimension data is absent.`,
+        );
+      }
+      const hasNumericDimSource = peerHasOwnImage || sharedVisualsCoverAllPeers || Boolean(rawPeer.pkg) ||
+        rawPeer.length_in !== undefined || rawPeer.length_cm !== undefined ||
+        rawPeer.width_in !== undefined || rawPeer.width_cm !== undefined ||
+        rawPeer.height_in !== undefined || rawPeer.height_cm !== undefined ||
+        rawPeer.unit_weight_lb !== undefined || rawPeer.weight_lb !== undefined ||
+        (hasStr(rawPeer.key_appearance_and_dims) && NUMERIC_MEASUREMENT_RE.test(rawPeer.key_appearance_and_dims)) ||
+        (hasStr(rawPeer.dimensions_text) && NUMERIC_MEASUREMENT_RE.test(rawPeer.dimensions_text)) ||
+        (hasStr(rawPeer.title) && NUMERIC_MEASUREMENT_RE.test(rawPeer.title));
+      if (!hasNumericDimSource && keyAppearanceAndDims !== null && NUMERIC_MEASUREMENT_RE.test(keyAppearanceAndDims)) {
+        throw new TypeError(
+          `peer_observations[${idx}] ("${asin}") fabricated numeric dimensions in key_appearance_and_dims ("${keyAppearanceAndDims}") when raw dimension/weight data is absent.`,
         );
       }
     }

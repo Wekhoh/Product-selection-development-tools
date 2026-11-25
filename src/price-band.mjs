@@ -8,7 +8,7 @@
  *  3. Stage-2 visual cluster band tightening (tightenClusterBands).
  * Pure deterministic module; performs zero I/O or network calls.
  */
-import { classifyStandardSize2027, estimateGate1A2027 } from './fba-rates-2027.mjs';
+import { classifySizeTier2027, estimateGate1A2027 } from './fba-rates-2027.mjs';
 import { toBigRat } from './fee-basis.mjs';
 
 const finite = v => typeof v === 'number' && Number.isFinite(v);
@@ -17,8 +17,8 @@ const isoDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
 
 const CHILDRENS_RE = /\b(baby|babies|toddler|infant|newborn|kids?|children|child's|childrens|nursery|stroller|crib|pacifier|teether|diaper|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?)|montessori|plush\s+toy|baby\s+monitor)\b|(?:婴童|母婴|婴儿|儿童|宝宝|幼儿|童装|儿童玩具|奶瓶|安全座椅)/i;
 const STRICT_CHILD_USE_ITEM_RE = /\b(toddler\s+(?:toy|bed|cup|fork|spoon|plate|bowl|seat|bike|scooter|shoes?|apparel|dress)|infant\s+toy|pacifier|teether|crib|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?|kids?|toddlers?|babies)|plush\s+toy|montessori\s+toy)\b|(?:儿童玩具|婴儿玩具|牙胶|安抚奶嘴|奶瓶|安全座椅|童装)/i;
-const HOUSEHOLD_CONTAINER_CONTENT_RE = /\b(?:pockets?|compartments?|bags?|pouches?|shelves|shelf|shelving|racks?|baskets?|hampers?|bins?|drawers?|organizers?|caddies|caddy|hooks?|storage|holds?|fits?|stores?|storing)\s+(?:for\s+)?(?:baby|babies|infant|toddler|kids?|children(?:'s)?|nursery)\s+(?:clothes?|clothing|bedding|blankets?|towels?|wipes?|diapers?|bottles?|supplies|essentials|items?|gear)\b/gi;
-const ADULT_CAREGIVER_EXEMPTION_RE = /\b(?:diaper\s+(?:bag|backpack|tote|caddy|organizer|pouch)|stroller\s+(?:organizer|cup\s+holder|hook|hooks|caddy|bag|phone\s+mount)|baby\s+monitor\s+(?:mount|stand|holder|shelf|bracket)|nursery\s+(?:wall\s+)?(?:floating\s+)?(?:shelf|shelves|shelving|organizer|caddy|hamper|basket|storage|bin)|nursing\s+(?:cover|pillow\s+for\s+mom|bag)|breast\s+pump\s+bag|(?:for|designed\s+for|used\s+by)\s+(?:new\s+)?(?:parents?|moms?|dads?|mothers?|fathers?|caregivers?|adults?))\b|(?:妈咪包|尿布收纳包|推车挂包|推车杯架|父母用|家长用|宝妈包)/gi;
+const HOUSEHOLD_CONTAINER_CONTENT_RE = /\b(?:pockets?|compartments?|bags?|pouches?|shelves|shelf|shelving|racks?|baskets?|hampers?|bins?|drawers?|organizers?|caddies|caddy|hooks?|sorters?|cabinets?|closets?|storage|holds?|fits?|stores?|storing)\s+(?:for\s+)?(?:storing\s+)?(?:baby|babies|infant|toddler|newborn|kids?|children(?:'s)?|nursery|linens?|bedding)\s*(?:clothes?|clothing|bedding|linens?|blankets?|towels?|wipes?|diapers?|bottles?|laundry|supplies|essentials|items?|gear)?\b/gi;
+const ADULT_CAREGIVER_EXEMPTION_RE = /\b(?:diaper\s+(?:bag|backpack|tote|caddy|organizer|pouch)|stroller\s+(?:organizer|cup\s+holder|hook|hooks|caddy|bag|phone\s+mount)|baby\s+monitor\s+(?:mount|stand|holder|shelf|shelving|bracket)|(?:newborn\s+)?nursery\s+(?:(?:adjustable|modular|heavy(?:-|\s+)duty|wall(?:-|\s+)mounted|wall|floating|hanging|wooden|metal|wire|bamboo|acrylic|corner|tiered|multi(?:-|\s+)tier|foldable|portable|rolling|closet|laundry|linen|bedding|storage|over(?:-|\s+)the(?:-|\s+)door)\s+)*(?:shelf|shelves|shelving|organizer|organizers|caddy|caddies|hamper|hampers|basket|baskets|storage|bin|bins|sorter|sorters|rack|racks|stand|mount|hook|hooks|bracket|rod|drawer|drawers|cabinet)|nursing\s+(?:cover|pillow\s+for\s+mom|bag)|breast\s+pump\s+bag|(?:for|designed\s+for|used\s+by|operated\s+by|intended\s+for|carried\s+by|worn\s+by)\s+(?:new\s+)?(?:parents?|moms?|dads?|mothers?|fathers?|caregivers?|adults?))\b|(?:妈咪包|尿布收纳包|推车挂包|推车杯架|育婴室(?:置物架|收纳架|壁挂架|脏衣篓)|父母用|家长用|成人收纳|宝妈包)/gi;
 
 const CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE = /\b(?:baby\s+(?:blue|pink|breath|greens?|spinach|corn|back\s+ribs|oil|powder\s+scent|alpaca|goat)|kid\s+(?:leather|skin|gloves?|suede)|child[- ]?(?:resistant|proof|lock\w*))\b/gi;
 const CHILDRENS_NEGATION_OR_WARNING_RE = /\b(?:not\s+(?:for|intended\s+for|suitable\s+for|designed\s+for|a\s+toy\s+for)|keep\s+(?:away\s+from|out\s+of\s+(?:the\s+)?reach\s+of)|out\s+of\s+(?:the\s+)?reach\s+of|for\s+adults?\s+only[^.;,|]*not\s+for)\s+(?:all\s+|young\s+|small\s+)?(?:children|kids?|babies|infants?|toddlers?|minors?)(?:\s+and\s+(?:pets?|animals?|children|kids?))?\b|(?:非儿童(?:用品|玩具|产品)?|不适合儿童|勿让儿童(?:接触|触碰|玩耍)?|请勿让儿童(?:接触|触碰|使用)?|儿童勿[用近触碰]|远离儿童|放在儿童接触不到的地方|仅供成人)/gi;
@@ -52,12 +52,12 @@ function matchesChildrensStatutoryBoundary(item, textBlob, { profileRevision = 5
     .replace(CHILDRENS_NEGATION_OR_WARNING_RE, ' ')
     .replace(CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE, ' ');
   if (!STRICT_CHILD_USE_ITEM_RE.test(scrubbed)) {
-    scrubbed = scrubbed.replace(HOUSEHOLD_CONTAINER_CONTENT_RE, ' ');
-    if (ADULT_CAREGIVER_EXEMPTION_RE.test(scrubbed)) {
-      scrubbed = scrubbed
-        .replace(ADULT_CAREGIVER_EXEMPTION_RE, ' ')
-        .replace(/\b(?:baby|babies|toddler|infant|newborn|diaper|stroller|nursery)\b/gi, ' ');
+    const beforeCaregiver = scrubbed;
+    scrubbed = scrubbed.replace(ADULT_CAREGIVER_EXEMPTION_RE, ' ');
+    if (scrubbed !== beforeCaregiver) {
+      scrubbed = scrubbed.replace(/\b(?:baby|babies|toddler|infant|newborn|diaper|stroller|nursery)\b/gi, ' ');
     }
+    scrubbed = scrubbed.replace(HOUSEHOLD_CONTAINER_CONTENT_RE, ' ');
   }
   return CHILDRENS_RE.test(scrubbed);
 }
@@ -273,45 +273,62 @@ function resolveListingNetPrice(raw) {
   const explicitNet = raw?.net_effective_price_usd ?? raw?.net_price_usd;
   if (finite(explicitNet) && explicitNet > 0) {
     const discFrac = listPrice > explicitNet ? round((listPrice - explicitNet) / listPrice, 6) : 0;
-    return { valid: true, list_price_usd: listPrice, net_price_usd: explicitNet, discount_fraction: discFrac };
+    let singleCouponFrac = discFrac;
+    const hasPrime = (finite(raw?.prime_exclusive_discount_usd) && raw.prime_exclusive_discount_usd > 0) ||
+      (finite(raw?.prime_exclusive_discount_pct) && raw.prime_exclusive_discount_pct > 0 && raw.prime_exclusive_discount_pct < 1);
+    if (hasPrime && listPrice > 0) {
+      let cUsd = 0;
+      if (finite(raw?.ongoing_coupon_usd) && raw.ongoing_coupon_usd > 0) cUsd += raw.ongoing_coupon_usd;
+      else if (finite(raw?.coupon_usd) && raw.coupon_usd > 0) cUsd += raw.coupon_usd;
+      if (finite(raw?.ongoing_coupon_pct) && raw.ongoing_coupon_pct > 0 && raw.ongoing_coupon_pct < 1) cUsd += listPrice * raw.ongoing_coupon_pct;
+      else if (finite(raw?.coupon_pct) && raw.coupon_pct > 0 && raw.coupon_pct < 1) cUsd += listPrice * raw.coupon_pct;
+      else if (raw?.coupon !== undefined) cUsd += parseCouponValue(raw.coupon, listPrice);
+      singleCouponFrac = cUsd > 0 ? round(Math.min(listPrice, cUsd) / listPrice, 6) : 0;
+    }
+    return { valid: true, list_price_usd: listPrice, net_price_usd: explicitNet, discount_fraction: discFrac, single_coupon_fraction: singleCouponFrac };
   }
-  if (listPrice === null) return { valid: false, list_price_usd: null, net_price_usd: null, discount_fraction: 0 };
+  if (listPrice === null) return { valid: false, list_price_usd: null, net_price_usd: null, discount_fraction: 0, single_coupon_fraction: 0 };
   if (finite(raw?.promo_price_usd) && raw.promo_price_usd > 0 && raw.promo_price_usd < listPrice) {
     const net = raw.promo_price_usd;
-    return { valid: true, list_price_usd: listPrice, net_price_usd: net, discount_fraction: round((listPrice - net) / listPrice, 6) };
+    const discFrac = round((listPrice - net) / listPrice, 6);
+    return { valid: true, list_price_usd: listPrice, net_price_usd: net, discount_fraction: discFrac, single_coupon_fraction: discFrac };
   }
 
-  let discountUsd = 0;
+  let couponDiscountUsd = 0;
+  let primeDiscountUsd = 0;
   const hasExplicitCouponUsd = (finite(raw?.ongoing_coupon_usd) && raw.ongoing_coupon_usd > 0) ||
     (finite(raw?.coupon_usd) && raw.coupon_usd > 0);
   const hasExplicitCouponPct = (finite(raw?.ongoing_coupon_pct) && raw.ongoing_coupon_pct > 0 && raw.ongoing_coupon_pct < 1) ||
     (finite(raw?.coupon_pct) && raw.coupon_pct > 0 && raw.coupon_pct < 1);
 
-  if (finite(raw?.ongoing_coupon_usd) && raw.ongoing_coupon_usd > 0) discountUsd += raw.ongoing_coupon_usd;
-  else if (finite(raw?.coupon_usd) && raw.coupon_usd > 0) discountUsd += raw.coupon_usd;
+  if (finite(raw?.ongoing_coupon_usd) && raw.ongoing_coupon_usd > 0) couponDiscountUsd += raw.ongoing_coupon_usd;
+  else if (finite(raw?.coupon_usd) && raw.coupon_usd > 0) couponDiscountUsd += raw.coupon_usd;
 
   if (finite(raw?.ongoing_coupon_pct) && raw.ongoing_coupon_pct > 0 && raw.ongoing_coupon_pct < 1) {
-    discountUsd += listPrice * raw.ongoing_coupon_pct;
+    couponDiscountUsd += listPrice * raw.ongoing_coupon_pct;
   } else if (finite(raw?.coupon_pct) && raw.coupon_pct > 0 && raw.coupon_pct < 1) {
-    discountUsd += listPrice * raw.coupon_pct;
+    couponDiscountUsd += listPrice * raw.coupon_pct;
   } else if (!hasExplicitCouponUsd && !hasExplicitCouponPct && raw?.coupon !== undefined) {
-    discountUsd += parseCouponValue(raw.coupon, listPrice);
+    couponDiscountUsd += parseCouponValue(raw.coupon, listPrice);
   }
   if (finite(raw?.prime_exclusive_discount_usd) && raw.prime_exclusive_discount_usd > 0) {
-    discountUsd += raw.prime_exclusive_discount_usd;
+    primeDiscountUsd += raw.prime_exclusive_discount_usd;
   }
   if (finite(raw?.prime_exclusive_discount_pct) && raw.prime_exclusive_discount_pct > 0 && raw.prime_exclusive_discount_pct < 1) {
-    discountUsd += listPrice * raw.prime_exclusive_discount_pct;
+    primeDiscountUsd += listPrice * raw.prime_exclusive_discount_pct;
   }
+  const discountUsd = couponDiscountUsd + primeDiscountUsd;
 
   // Settle discounted US checkout prices in whole cents (matching fee-basis.mjs resolveEffectivePricing across $10/$50 FBA cliffs).
   const net = discountUsd > 0 ? round(listPrice - discountUsd, 2) : round(listPrice, 4);
-  if (net <= 0) return { valid: false, list_price_usd: listPrice, net_price_usd: null, discount_fraction: 1 };
+  if (net <= 0) return { valid: false, list_price_usd: listPrice, net_price_usd: null, discount_fraction: 1, single_coupon_fraction: 1 };
+  const couponNet = couponDiscountUsd > 0 ? Math.max(0, round(listPrice - couponDiscountUsd, 2)) : listPrice;
   return {
     valid: true,
     list_price_usd: listPrice,
     net_price_usd: net,
     discount_fraction: discountUsd > 0 ? round((listPrice - net) / listPrice, 6) : 0,
+    single_coupon_fraction: couponDiscountUsd > 0 ? round((listPrice - couponNet) / listPrice, 6) : 0,
   };
 }
 
@@ -525,7 +542,7 @@ function resolveSizeTier(raw) {
     return raw.size_tier.trim().toLowerCase().replace(/\s+/g, '_');
   }
   if (raw?.pkg && typeof raw.pkg === 'object') {
-    const cls = classifyStandardSize2027(raw.pkg);
+    const cls = classifySizeTier2027(raw.pkg);
     if (cls.size_tier) return cls.size_tier;
   }
   return null;
@@ -545,29 +562,54 @@ function resolveParentAsinKey(raw) {
 }
 
 /**
- * Deterministic sales-weighted quantile over rows sorted by (net_price_usd ASC, asin ASC).
- * Uses cumulative weight midpoint interpolation for smooth, permutation-invariant P25/P50/P75.
+ * Deterministic sales-weighted quantile over distinct net_price_usd levels.
+ * Under profileRevision >= 59, aggregates monthly_units across tied net prices first and
+ * uses first-passage empirical quantile (never inventing untraded midpoint prices).
+ * Under profileRevision < 59, preserves exact legacy midpoint interpolation for frozen replay.
  */
-export function weightedQuantile(rows, q) {
+export function weightedQuantile(rows, q, { profileRevision = 59 } = {}) {
   if (!Array.isArray(rows) || rows.length === 0) return null;
   const sorted = [...rows].sort((a, b) => a.net_price_usd - b.net_price_usd || String(a.asin || '').localeCompare(String(b.asin || '')));
-  if (sorted.length === 1) return sorted[0].net_price_usd;
-  const weights = sorted.map(r => (finite(r.monthly_units) && r.monthly_units > 0 ? r.monthly_units : 1));
-  const totalWeight = weights.reduce((s, w) => s + w, 0);
+  if ((profileRevision ?? 59) < 59) {
+    if (sorted.length === 1) return sorted[0].net_price_usd;
+    const weights = sorted.map(r => (finite(r.monthly_units) && r.monthly_units > 0 ? r.monthly_units : 1));
+    const totalWeight = weights.reduce((s, w) => s + w, 0);
+    const target = q * totalWeight;
+    let cum = 0;
+    for (let i = 0; i < sorted.length; i++) {
+      const prevCum = cum;
+      const mid = prevCum + weights[i] / 2;
+      if (target <= mid) {
+        if (i === 0) return sorted[0].net_price_usd;
+        const prevMid = prevCum - weights[i - 1] / 2;
+        const frac = (target - prevMid) / (mid - prevMid);
+        return round(sorted[i - 1].net_price_usd + frac * (sorted[i].net_price_usd - sorted[i - 1].net_price_usd), 4);
+      }
+      cum += weights[i];
+    }
+    return sorted[sorted.length - 1].net_price_usd;
+  }
+  const grouped = [];
+  for (const r of sorted) {
+    const w = finite(r.monthly_units) && r.monthly_units > 0 ? r.monthly_units : 1;
+    const last = grouped[grouped.length - 1];
+    if (last && Math.abs(last.net_price_usd - r.net_price_usd) <= 1e-9) {
+      last.weight += w;
+    } else {
+      grouped.push({ net_price_usd: r.net_price_usd, weight: w });
+    }
+  }
+  if (grouped.length === 1) return grouped[0].net_price_usd;
+  const totalWeight = grouped.reduce((s, g) => s + g.weight, 0);
   const target = q * totalWeight;
   let cum = 0;
-  for (let i = 0; i < sorted.length; i++) {
-    const prevCum = cum;
-    const mid = prevCum + weights[i] / 2;
-    if (target <= mid) {
-      if (i === 0) return sorted[0].net_price_usd;
-      const prevMid = prevCum - weights[i - 1] / 2;
-      const frac = (target - prevMid) / (mid - prevMid);
-      return round(sorted[i - 1].net_price_usd + frac * (sorted[i].net_price_usd - sorted[i - 1].net_price_usd), 4);
+  for (let i = 0; i < grouped.length; i++) {
+    cum += grouped[i].weight;
+    if (cum >= target - 1e-9) {
+      return grouped[i].net_price_usd;
     }
-    cum += weights[i];
   }
-  return sorted[sorted.length - 1].net_price_usd;
+  return grouped[grouped.length - 1].net_price_usd;
 }
 
 function unweightedMedian(values) {
@@ -651,7 +693,7 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     ? target_size_tier.trim().toLowerCase().replace(/\s+/g, '_')
     : null;
   if (!resolvedTargetTier && target_pkg && typeof target_pkg === 'object') {
-    const cls = classifyStandardSize2027(target_pkg);
+    const cls = classifySizeTier2027(target_pkg);
     if (cls.size_tier) resolvedTargetTier = cls.size_tier;
   }
 
@@ -719,7 +761,9 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       raw?.matched_spec === false ||
       raw?.is_bare_part === true ||
       raw?.is_accessory_only === true ||
-      rawAiBucket === 'spec_mismatch_or_accessory'
+      rawAiBucket === 'spec_mismatch_or_accessory' ||
+      rawAiBucket === 'bare_part_or_different_spec' ||
+      rawAiBucket === 'multi_pack_or_bundle_variant'
     );
     if (isExplicitSpecMismatch) {
       const reasonZh = rawAiReasonZh ?? '裸件／非齐套配件或规格不匹配，移出同规格主价位带留底';
@@ -790,6 +834,7 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
 
     const gate0 = evaluateGate0CategoryBoundary(raw, {
       ...gate0_config,
+      profile_revision: gate0_config.profile_revision ?? profile_revision,
       avoid_red_ocean: gate0_config.avoid_red_ocean ?? { apparel: false, consumer_electronics_3c: false, red_ocean_furniture: false, fda_ingestible_topical: false },
     });
     if (!gate0.passed && gate0.verdict === 'excluded_childrens_product') {
@@ -847,9 +892,23 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       profile_revision,
     });
     const steadyKeepaRef = (!isR59 || !detectKeepaVeteranClearanceOrWar(raw)) ? (regularReference ?? historicalPrices(raw)[0] ?? null) : null;
-    const isNewcomerR59 = isR59 ? (ageDays !== null && ageDays <= spiral_max_age_days) : (ageDays !== null && ageDays < spiral_max_age_days);
+    const isAiNewcomerRef = rawAiBucket !== null && ['newcomer_reference', 'newcomer_launch_reference', 'newcomer_le_90d_launch_ref'].includes(rawAiBucket);
+    const isNewcomerR59 = isR59
+      ? ((ageDays !== null && ageDays <= spiral_max_age_days) || (ageDays === null && isAiNewcomerRef))
+      : (ageDays !== null && ageDays < spiral_max_age_days);
     const isVeteranClearanceOrWar = isR59 && ageDays !== null && !isNewcomerR59 && (
       detectKeepaVeteranClearanceOrWar(raw) || aiBucket === 'veteran_clearance_or_war'
+    );
+    const hasExplicitKeepaSteady = Boolean(
+      !isVeteranClearanceOrWar &&
+      raw?.keepa_price_steady !== false &&
+      (
+        raw?.keepa_price_steady === true ||
+        steadyKeepaRef !== null ||
+        (raw?.keepa && typeof raw.keepa === 'object') ||
+        ['steady', 'stable', 'flat'].includes(String(raw?.keepa_trajectory ?? raw?.keepa_90d_stability ?? '').trim().toLowerCase()) ||
+        aiBucket === 'primary_comparable'
+      ),
     );
     const seedMergedUnverified = Boolean(
       (raw?.old_reviews_predate_launch === true || raw?.seed_merged_reviews === true) &&
@@ -867,8 +926,10 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
         list_price_usd: priceRes.list_price_usd,
         net_price_usd: priceRes.net_price_usd,
         discount_fraction: priceRes.discount_fraction,
+        single_coupon_fraction: priceRes.single_coupon_fraction ?? priceRes.discount_fraction,
         ...(regularReference ? { regular_price_reference: regularReference } : {}),
         ...(steadyKeepaRef ? { keepa_steady_reference: steadyKeepaRef } : {}),
+        ...(hasExplicitKeepaSteady ? { keepa_steady_verified: true } : {}),
         ...(isVeteranClearanceOrWar ? { veteran_clearance_or_war_watch: true, watch_label_zh: aiReasonZh ?? '老品清仓／恶战波动' } : {}),
         ...(aiBucket ? { ai_qualitative_bucket: aiBucket, ...(aiReasonZh ? { ai_reason_zh: aiReasonZh } : {}) } : {}),
         ...(raw?.keepa_price_steady === false ? { keepa_price_unsteady: true } : {}),
@@ -882,10 +943,27 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       },
       isNewcomerR59,
       isVeteranClearanceOrWar,
+      hasExplicitKeepaSteady,
       seedMergedUnverified,
       steadyKeepaRef,
     });
   }
+
+  const poolHasKeepaEvidence = Boolean(
+    isR59 && (
+      options.require_keepa_steady_evidence === true ||
+      market_observation_result !== null ||
+      preParentDedupCandidates.some(e =>
+        e.hasExplicitKeepaSteady ||
+        e.cand.keepa_price_unsteady === true ||
+        e.isVeteranClearanceOrWar === true ||
+        e.raw?.keepa !== undefined ||
+        e.raw?.keepa_price_steady !== undefined ||
+        e.raw?.keepa_trajectory !== undefined ||
+        e.raw?.keepa_90d_stability !== undefined,
+      )
+    ),
+  );
 
   // Step 3 (r59): Parent-ASIN deduplication over eligible FBA complete-kit candidates
   let keptCandidateEntries = preParentDedupCandidates;
@@ -907,12 +985,14 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
         parentWinners.push(group[0]);
         continue;
       }
+      const singleCouponFrac = e => e.cand.single_coupon_fraction ?? e.cand.discount_fraction;
       const isPrimarySteady = e =>
         !e.isNewcomerR59 &&
         !e.cand.veteran_clearance_or_war_watch &&
         !e.cand.seed_merged_unverified_price &&
         !e.cand.keepa_price_unsteady &&
-        !(isolate_heavy_coupon_outliers && e.cand.discount_fraction >= heavy_coupon_threshold && !e.cand.keepa_steady_reference) &&
+        !(poolHasKeepaEvidence && e.cand.age_days !== null && e.cand.age_days >= veteran_min_age_days && !e.hasExplicitKeepaSteady) &&
+        !(isolate_heavy_coupon_outliers && singleCouponFrac(e) >= heavy_coupon_threshold && !e.cand.keepa_steady_reference) &&
         (!e.cand.ai_qualitative_bucket || e.cand.ai_qualitative_bucket === 'primary_comparable');
       const ageTierRank = e => {
         if (!isPrimarySteady(e)) return 0;
@@ -924,8 +1004,8 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
         const aRank = ageTierRank(a);
         const bRank = ageTierRank(b);
         if (bRank !== aRank) return bRank - aRank;
-        const aHeavyCoupon = isolate_heavy_coupon_outliers && a.cand.discount_fraction >= heavy_coupon_threshold && !a.cand.keepa_steady_reference ? 1 : 0;
-        const bHeavyCoupon = isolate_heavy_coupon_outliers && b.cand.discount_fraction >= heavy_coupon_threshold && !b.cand.keepa_steady_reference ? 1 : 0;
+        const aHeavyCoupon = isolate_heavy_coupon_outliers && singleCouponFrac(a) >= heavy_coupon_threshold && !a.cand.keepa_steady_reference ? 1 : 0;
+        const bHeavyCoupon = isolate_heavy_coupon_outliers && singleCouponFrac(b) >= heavy_coupon_threshold && !b.cand.keepa_steady_reference ? 1 : 0;
         if (aHeavyCoupon !== bHeavyCoupon) return aHeavyCoupon - bHeavyCoupon;
         const aBest = a.raw?.is_best_selling_variant === true || a.raw?.bestSellingVariant === true ? 1 : 0;
         const bBest = b.raw?.is_best_selling_variant === true || b.raw?.bestSellingVariant === true ? 1 : 0;
@@ -1025,9 +1105,9 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     const matureRegularBand = matureRegularRows.length > 0 ? {
       basis: 'mature_peers_ge_120d_regular_net',
       peer_count: matureRegularRows.length,
-      p25_usd: weightedQuantile(matureRegularRows, 0.25),
-      p50_usd: weightedQuantile(matureRegularRows, 0.50),
-      p75_usd: weightedQuantile(matureRegularRows, 0.75),
+      p25_usd: weightedQuantile(matureRegularRows, 0.25, { profileRevision: profile_revision }),
+      p50_usd: weightedQuantile(matureRegularRows, 0.50, { profileRevision: profile_revision }),
+      p75_usd: weightedQuantile(matureRegularRows, 0.75, { profileRevision: profile_revision }),
       min_usd: Math.min(...matureRegularRows.map(r => r.net_price_usd)),
       max_usd: Math.max(...matureRegularRows.map(r => r.net_price_usd)),
     } : null;
@@ -1039,17 +1119,17 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       advisory_only: true,
       never_triggers_elimination: true,
       peer_count: newcomerLaunchRows.length,
-      p25_usd: weightedQuantile(newcomerLaunchRows, 0.25),
-      p50_usd: weightedQuantile(newcomerLaunchRows, 0.50),
-      p75_usd: weightedQuantile(newcomerLaunchRows, 0.75),
+      p25_usd: weightedQuantile(newcomerLaunchRows, 0.25, { profileRevision: profile_revision }),
+      p50_usd: weightedQuantile(newcomerLaunchRows, 0.50, { profileRevision: profile_revision }),
+      p75_usd: weightedQuantile(newcomerLaunchRows, 0.75, { profileRevision: profile_revision }),
       min_usd: newcomerLaunchRows.length ? Math.min(...newcomerLaunchRows.map(r => r.net_price_usd)) : null,
       max_usd: newcomerLaunchRows.length ? Math.max(...newcomerLaunchRows.map(r => r.net_price_usd)) : null,
     };
 
     const prices = mainstreamPool.map(r => r.net_price_usd);
-    const p25 = weightedQuantile(mainstreamPool, 0.25);
-    const p50 = weightedQuantile(mainstreamPool, 0.50);
-    const p75 = weightedQuantile(mainstreamPool, 0.75);
+    const p25 = weightedQuantile(mainstreamPool, 0.25, { profileRevision: profile_revision });
+    const p50 = weightedQuantile(mainstreamPool, 0.50, { profileRevision: profile_revision });
+    const p75 = weightedQuantile(mainstreamPool, 0.75, { profileRevision: profile_revision });
     const minPrice = prices.length ? Math.min(...prices) : null;
     const maxPrice = prices.length ? Math.max(...prices) : null;
     const widthRatio = p25 !== null && p25 > 0 && p75 !== null ? round(p75 / p25, 4) : null;
@@ -1092,9 +1172,9 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       regular_band_reference: historicalPeers.length ? {
         basis: 'observed_historical_regular_prices',
         peer_count: historicalPeers.length,
-        p25_usd: weightedQuantile(historicalPeers, 0.25),
-        p50_usd: weightedQuantile(historicalPeers, 0.50),
-        p75_usd: weightedQuantile(historicalPeers, 0.75),
+        p25_usd: weightedQuantile(historicalPeers, 0.25, { profileRevision: profile_revision }),
+        p50_usd: weightedQuantile(historicalPeers, 0.50, { profileRevision: profile_revision }),
+        p75_usd: weightedQuantile(historicalPeers, 0.75, { profileRevision: profile_revision }),
         min_usd: Math.min(...historicalPeers.map(p => p.net_price_usd)),
         max_usd: Math.max(...historicalPeers.map(p => p.net_price_usd)),
         sources: Object.fromEntries(['keepa_90d_median_usd', 'historical_regular_price_usd']
@@ -1132,20 +1212,28 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     c.keepa_price_unsteady === true ||
     (c.ai_qualitative_bucket && c.ai_qualitative_bucket !== 'primary_comparable');
 
+  const singleCouponFractionOf = c => c.single_coupon_fraction ?? c.discount_fraction;
+
   const resolveEffectiveRegularBandPrice = c => {
     if (c.regular_price_reference) return c.regular_price_reference.price_usd;
-    if (c.discount_fraction >= heavy_coupon_threshold && c.keepa_steady_reference) {
+    if (singleCouponFractionOf(c) >= heavy_coupon_threshold && c.keepa_steady_reference) {
       return c.keepa_steady_reference.price_usd;
     }
     return c.net_price_usd;
   };
 
   for (const item of candidates) {
-    const isNewcomer = item.age_days !== null && item.age_days <= spiral_max_age_days;
-    const isVeteran = item.age_days !== null
+    const isAiNewcomerBucket = Boolean(
+      item.ai_qualitative_bucket &&
+      ['newcomer_reference', 'newcomer_launch_reference', 'newcomer_le_90d_launch_ref'].includes(item.ai_qualitative_bucket),
+    );
+    const isNewcomer = (item.age_days !== null && item.age_days <= spiral_max_age_days) ||
+      (item.age_days === null && isAiNewcomerBucket);
+    const isVeteran = !isNewcomer && (item.age_days !== null
       ? item.age_days >= veteran_min_age_days
-      : !strict_mature_only;
+      : !strict_mature_only);
     const isGrowth = item.age_days !== null && item.age_days > spiral_max_age_days && item.age_days < veteran_min_age_days;
+    const itemSingleCouponFrac = singleCouponFractionOf(item);
 
     if (isNewcomer) {
       const newcomerAiExcluded = Boolean(
@@ -1159,7 +1247,7 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
         item.seed_merged_unverified_price
           ? 'seed_merged_unverified_regular_price'
           : (newcomerAiExcluded ? item.ai_qualitative_bucket : 'newcomer_le_90d_launch_ref'),
-        ...(item.discount_fraction >= heavy_coupon_threshold ? ['young_heavy_coupon_outlier'] : []),
+        ...(itemSingleCouponFrac >= heavy_coupon_threshold ? ['young_heavy_coupon_outlier'] : []),
       ];
       const reasonZh = item.seed_merged_unverified_price
         ? '90天内链接携带合并老评，稳态原价未核实，单列观察栏'
@@ -1178,17 +1266,25 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       continue;
     }
 
-    // Check qualitative/AI exclusions, unsteady Keepa curves, or >=20% heavy coupon without Keepa steady reference
+    // Check qualitative/AI exclusions, unsteady/missing Keepa curves, or >=20% single heavy coupon without Keepa steady reference
+    const veteranMissingKeepaSteady = Boolean(poolHasKeepaEvidence && isVeteran && !item.keepa_steady_verified);
+    const growthMissingKeepaSteady = Boolean(poolHasKeepaEvidence && isGrowth && !item.keepa_steady_verified);
     const heavyCouponWithoutKeepa = isolate_heavy_coupon_outliers &&
-      item.discount_fraction >= heavy_coupon_threshold &&
+      itemSingleCouponFrac >= heavy_coupon_threshold &&
       !item.keepa_steady_reference;
     const hasEventPromoDrop = Boolean(item.regular_price_reference);
 
-    if (isQualitativeExcluded(item) || heavyCouponWithoutKeepa || (strict_mature_only && item.age_days === null)) {
+    if (isQualitativeExcluded(item) || veteranMissingKeepaSteady || growthMissingKeepaSteady || heavyCouponWithoutKeepa || (strict_mature_only && item.age_days === null)) {
       const watchReasons = [];
       if (item.veteran_clearance_or_war_watch) watchReasons.push('veteran_clearance_or_war_watch');
       if (item.keepa_price_unsteady && !item.veteran_clearance_or_war_watch) {
         watchReasons.push(isVeteran ? 'veteran_keepa_price_unsteady' : 'growth_stage_price_unsteady');
+      }
+      if (veteranMissingKeepaSteady && !item.keepa_price_unsteady && !item.veteran_clearance_or_war_watch) {
+        watchReasons.push('veteran_missing_keepa_steady_evidence');
+      }
+      if (growthMissingKeepaSteady && !item.keepa_price_unsteady) {
+        watchReasons.push('growth_missing_keepa_steady_evidence');
       }
       if (item.ai_qualitative_bucket && item.ai_qualitative_bucket !== 'primary_comparable') {
         watchReasons.push(item.ai_qualitative_bucket);
@@ -1200,9 +1296,11 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       const reasonZh = item.ai_reason_zh ?? (
         item.veteran_clearance_or_war_watch ? '老品清仓／价格战异常波动，单列观察栏不拉垮主毛利'
           : item.keepa_price_unsteady ? (isVeteran ? '满365天老品近期Keepa价格曲线不稳，单列观察栏并允许稳态成长期递补' : '91–364天成长期链接近期价格尚未走稳，列于观察栏参考')
-            : item.seed_merged_unverified_price ? '合并老评稳态价未核实，单列观察栏'
-              : heavyCouponWithoutKeepa ? `单件大额券（≥${Math.round(heavy_coupon_threshold * 100)}% OFF）且缺Keepa常态价，单列观察栏`
-                : 'AI定性核验移出主价位带，保留原价列于观察栏'
+            : veteranMissingKeepaSteady ? '满365天老品缺Keepa稳态证据，单列观察栏并允许已证稳态成长期递补'
+              : growthMissingKeepaSteady ? '91–364天成长期链接缺Keepa稳态证据，单列观察栏待核'
+                : item.seed_merged_unverified_price ? '合并老评稳态价未核实，单列观察栏'
+                  : heavyCouponWithoutKeepa ? `单张大额券（≥${Math.round(heavy_coupon_threshold * 100)}% OFF）且缺Keepa常态价，单列观察栏`
+                    : 'AI定性核验移出主价位带，保留原价列于观察栏'
       );
       const watchedRow = { ...item, watch_reasons: watchReasons, watch_reason_zh: reasonZh };
       spiralWatch.push(watchedRow);
@@ -1223,9 +1321,9 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       ...item,
       observed_checkout_net_price_usd: item.net_price_usd,
       net_price_usd: resolveEffectiveRegularBandPrice(item),
-      ...(hasEventPromoDrop || item.discount_fraction >= heavy_coupon_threshold ? {
+      ...(hasEventPromoDrop || itemSingleCouponFrac >= heavy_coupon_threshold ? {
         advisory_promo_indicator: true,
-        advisory_promo_note_zh: `当前折扣 ≥${Math.round(heavy_coupon_threshold * 100)}%，已采用 Keepa 平时稳态价 $${resolveEffectiveRegularBandPrice(item)} 计入主价位带`,
+        advisory_promo_note_zh: `当前单券折扣 ≥${Math.round(heavy_coupon_threshold * 100)}%，已采用 Keepa 平时稳态价 $${resolveEffectiveRegularBandPrice(item)} 计入主价位带`,
       } : {}),
     };
 
@@ -1242,7 +1340,13 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
   // 3) If both steady >= 365d and steady 91-364d are empty and <= 90d newcomers exist -> reference band (marking
   //    `allUnder90dBlueOcean: true` ONLY when zero >90d matched peers exist!).
   const hasAnyOver90dMatchedPeer = preParentDedupCandidates.some(
-    e => (e.cand.age_days !== null && e.cand.age_days > spiral_max_age_days) || e.cand.age_days === null,
+    e => !e.isNewcomerR59 && ((e.cand.age_days !== null && e.cand.age_days > spiral_max_age_days) || e.cand.age_days === null),
+  );
+  const hasOlderPeerMissingKeepaSteady = spiralWatch.some(
+    w => Array.isArray(w.watch_reasons) && (
+      w.watch_reasons.includes('veteran_missing_keepa_steady_evidence') ||
+      w.watch_reasons.includes('growth_missing_keepa_steady_evidence')
+    ),
   );
   let mainstreamPool = [];
   let growthSupplementUsed = false;
@@ -1273,7 +1377,7 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
       primaryBandBasis = 'veteran_ge_365d_plus_steady_growth_91_364d_supplement';
       primaryBandLabelZh = `主价位带（≥365天老品 ${veteranEligible.length} 款 + 价格走稳 91–364 天成长期补位 ${growthSteadyEligible.length} 款）`;
     }
-  } else if (newcomerCandidates.length > 0) {
+  } else if (newcomerCandidates.length > 0 && !hasOlderPeerMissingKeepaSteady) {
     allUnder90dBlueOcean = !hasAnyOver90dMatchedPeer;
     topAmberBannerZh = allUnder90dBlueOcean
       ? '全员 90 天内新品蓝海，暂无一年期老品稳态价'
@@ -1284,11 +1388,12 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     primaryBandLabelZh = allUnder90dBlueOcean
       ? '超新蓝海参考价位带（全员≤90天新品·剔除≥20%大额券常规价）'
       : '临时参考价位带（老品波动观察期·暂取≤90天新品常规价）';
-    const exHeavy = newcomerCandidates.filter(c => c.discount_fraction < heavy_coupon_threshold);
-    mainstreamPool = (exHeavy.length > 0 ? exHeavy : newcomerCandidates).map(c => ({
+    const exHeavy = newcomerCandidates.filter(c => singleCouponFractionOf(c) < heavy_coupon_threshold);
+    const keepaBacked = exHeavy.length > 0 ? exHeavy : newcomerCandidates.filter(c => Boolean(c.keepa_steady_reference));
+    mainstreamPool = (keepaBacked.length > 0 ? keepaBacked : newcomerCandidates).map(c => ({
       ...c,
-      net_price_usd: c.discount_fraction >= heavy_coupon_threshold
-        ? (c.keepa_steady_reference?.price_usd ?? c.list_price_usd ?? c.net_price_usd)
+      net_price_usd: singleCouponFractionOf(c) >= heavy_coupon_threshold
+        ? (c.keepa_steady_reference?.price_usd ?? c.net_price_usd)
         : c.net_price_usd,
       ...(allUnder90dBlueOcean ? { blue_ocean_under_90d_reference: true } : {}),
     }));
@@ -1450,9 +1555,9 @@ export function tightenClusterBands(analysisOrListings, clusters, options = {}) 
     const spiralAsins = asins.filter(a => !mainstreamByAsin.has(a) && spiralByAsin.has(a));
     const missingAsins = asins.filter(a => !mainstreamByAsin.has(a) && !spiralByAsin.has(a));
 
-    const p25 = weightedQuantile(matchedRows, 0.25);
-    const p50 = weightedQuantile(matchedRows, 0.50);
-    const p75 = weightedQuantile(matchedRows, 0.75);
+    const p25 = weightedQuantile(matchedRows, 0.25, { profileRevision: options.profile_revision ?? baseAnalysis?.profile_revision ?? 58 });
+    const p50 = weightedQuantile(matchedRows, 0.50, { profileRevision: options.profile_revision ?? baseAnalysis?.profile_revision ?? 58 });
+    const p75 = weightedQuantile(matchedRows, 0.75, { profileRevision: options.profile_revision ?? baseAnalysis?.profile_revision ?? 58 });
     const widthRatio = p25 !== null && p25 > 0 && p75 !== null ? round(p75 / p25, 4) : null;
     const marginSpreadPp = computeImpliedMarginSpreadPp(p25, p75, options);
     const maxWidthRatio = options.max_width_ratio ?? baseAnalysis.guardrail?.max_width_ratio ?? 1.35;

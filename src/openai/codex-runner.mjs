@@ -72,13 +72,13 @@ export const DEFAULT_CODEX_MODEL = 'gpt-6.2-astra';
 export const ALLOWED_CODEX_EFFORTS = Object.freeze(['high', 'xhigh', 'max']);
 export const ALLOWED_GATE4_EFFORTS = Object.freeze(['xhigh', 'max']);
 export const ALLOWED_CODEX_WEB_SEARCH = Object.freeze(['disabled', 'live']);
-export const ALLOWED_CODEX_SERVICE_TIERS = Object.freeze(['standard', 'fast', 'ultrafast']);
+export const ALLOWED_CODEX_SERVICE_TIERS = Object.freeze(['default', 'standard', 'fast', 'ultrafast']);
 export const ALLOWED_CODEX_IMAGE_EXTS = Object.freeze(['.png', '.jpg', '.jpeg', '.webp']);
 
 const SAFE_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
 export const MAX_CAPTURE_BYTES = 2 * 1024 * 1024;
-const MAX_RECEIPT_FILE_BYTES = 8 * 1024 * 1024;
+const MAX_RECEIPT_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
 const MAX_AUTH_FILE_BYTES = 1024 * 1024;
 const MAX_ENTITLEMENT_STDERR_CHARS = 2048;
@@ -2421,12 +2421,26 @@ export function verifySavedCodexReceipt(envelope, {
       return Object.freeze({ verified: false, reason: 'Envelope review body is missing or differs from verified receipt original output.' });
     }
 
-    if (typeof rec.model !== 'string' || !SAFE_MODEL_ID_RE.test(rec.model.trim()) ||
-      (envelope.model !== undefined && String(envelope.model).trim() !== rec.model.trim())) {
+    const resolvedRecModel = rec.model === null
+      ? null
+      : (typeof rec.model === 'string' ? rec.model.trim() : '');
+    if ((resolvedRecModel !== null && !SAFE_MODEL_ID_RE.test(resolvedRecModel)) ||
+      (envelope.model !== undefined && (
+        resolvedRecModel === null
+          ? envelope.model !== null
+          : (envelope.model === null || String(envelope.model).trim() !== resolvedRecModel)
+      ))) {
       return Object.freeze({ verified: false, reason: 'Saved Codex receipt lacks a valid matching model identifier.' });
     }
-    if (!ALLOWED_GATE4_EFFORTS.includes(rec.reasoning_effort) || (envelope.reasoning_effort !== undefined && envelope.reasoning_effort !== rec.reasoning_effort)) {
-      return Object.freeze({ verified: false, reason: 'Saved Codex receipt reasoning_effort must be xhigh or max.' });
+    const resolvedRecEffort = rec.reasoning_effort === null || rec.reasoning_effort === 'default'
+      ? null
+      : rec.reasoning_effort;
+    const envEffortNorm = envelope.reasoning_effort === undefined
+      ? undefined
+      : (envelope.reasoning_effort === null || envelope.reasoning_effort === 'default' ? null : envelope.reasoning_effort);
+    if ((resolvedRecEffort !== null && !ALLOWED_GATE4_EFFORTS.includes(resolvedRecEffort)) ||
+      (envEffortNorm !== undefined && envEffortNorm !== resolvedRecEffort)) {
+      return Object.freeze({ verified: false, reason: 'Saved Codex receipt reasoning_effort must be xhigh, max, or null (inherited config).' });
     }
 
     const prov = rec.execution_provenance;
@@ -2445,7 +2459,7 @@ export function verifySavedCodexReceipt(envelope, {
       });
     }
 
-    const reviewerLabel = formatReviewerLabel(rec.model, rec.reasoning_effort, prov);
+    const reviewerLabel = formatReviewerLabel(resolvedRecModel, resolvedRecEffort, prov);
 
     return Object.freeze({
       verified: true,
@@ -2456,8 +2470,8 @@ export function verifySavedCodexReceipt(envelope, {
       reviewed_spec_sha256: actualReviewedSpec ?? rec.candidate_spec_sha256 ?? null,
       receipt_sha256: expectedReceiptSha,
       execution_provenance: prov,
-      model: rec.model,
-      reasoning_effort: rec.reasoning_effort,
+      model: resolvedRecModel,
+      reasoning_effort: resolvedRecEffort,
       reviewer_label: reviewerLabel,
       review_id: rec.review_id,
       packet_sha256: rec.packet_sha256,
@@ -2842,8 +2856,8 @@ export async function runCodexExecJson({
   prompt,
   schema = null,
   outputFormat = undefined,
-  model = DEFAULT_CODEX_MODEL,
-  reasoningEffort = 'xhigh',
+  model = null,
+  reasoningEffort = null,
   webSearch = 'live',
   serviceTier = null,
   allowStandardTierFallback = true,
@@ -3019,11 +3033,12 @@ export async function runCodexExecJson({
     ],
   });
 
-  const effectiveModelName = typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_CODEX_MODEL;
+  const explicitModel = typeof model === 'string' && model.trim() ? model.trim() : null;
+  const effectiveModelName = explicitModel ?? DEFAULT_CODEX_MODEL;
   const payloadSha256 = sha256Hex(canonicalJson({
     runner: 'codex_exec_v1',
-    model: effectiveModelName,
-    reasoning_effort: reasoningEffort ?? 'default',
+    model: explicitModel ?? 'inherited_config',
+    reasoning_effort: reasoningEffort ?? 'inherited_config',
     web_search: webSearch ?? 'live',
     requested_service_tier: serviceTier ?? 'default',
     prompt_sha256: sha256Hex(prompt),
@@ -3165,8 +3180,8 @@ export async function runCodexExecJson({
           validationError: null,
           terminationUncertain: false,
           cliArgsRedacted: redactArgsForReceipt(firstRun.codexArgs),
-          model: model.trim(),
-          reasoningEffort,
+          model: explicitModel,
+          reasoningEffort: reasoningEffort ?? null,
           effectiveServiceTier: 'ultrafast',
           tierFallbackUsed: false,
         });
@@ -3185,12 +3200,16 @@ export async function runCodexExecJson({
         );
       }
 
+      let scrubbedFirstStderr = sanitizeDiagnosticText(firstStderr);
+      if (containsSecretToken(scrubbedFirstStderr)) {
+        scrubbedFirstStderr = '[REDACTED_SECRET_STDERR]';
+      }
       firstAttemptDiagnostics = {
         attempt: 1,
         requested_service_tier: 'ultrafast',
         exit_code: firstRun.procRes.exitCode,
         first_attempt_receipt_sha256: firstAttemptReceiptSha256,
-        stderr_scrubbed: sanitizeDiagnosticText(firstStderr),
+        stderr_scrubbed: scrubbedFirstStderr,
       };
       tierFallbackUsed = true;
       effectiveServiceTier = 'standard';
@@ -3264,8 +3283,8 @@ export async function runCodexExecJson({
           validationError,
           terminationUncertain: procRes.terminationUncertain,
           cliArgsRedacted: redactedArgs,
-          model: model.trim(),
-          reasoningEffort,
+          model: explicitModel,
+          reasoningEffort: reasoningEffort ?? null,
           effectiveServiceTier,
           tierFallbackUsed,
         });
@@ -3421,8 +3440,8 @@ export async function runCodexExecJson({
         private_receipt_ref: savedReceipt?.privateReceiptRef ?? null,
         recorded_at: savedReceipt?.recordedAt ?? new Date().toISOString(),
         ...(firstAttemptReceiptSha256 ? { first_attempt_receipt_sha256: firstAttemptReceiptSha256 } : {}),
-        model: model.trim(),
-        reasoning_effort: reasoningEffort,
+        model: explicitModel,
+        reasoning_effort: reasoningEffort ?? null,
         web_search: webSearch,
         requested_service_tier: serviceTier ?? null,
         effective_service_tier: effectiveServiceTier,
@@ -3496,8 +3515,8 @@ export async function runCodexExecJson({
       private_receipt_ref: savedReceipt?.privateReceiptRef ?? null,
       recorded_at: savedReceipt?.recordedAt ?? new Date().toISOString(),
       ...(firstAttemptReceiptSha256 ? { first_attempt_receipt_sha256: firstAttemptReceiptSha256 } : {}),
-      model: effectiveModelName,
-      reasoning_effort: reasoningEffort ?? 'default',
+      model: explicitModel,
+      reasoning_effort: reasoningEffort ?? null,
       web_search: webSearch ?? 'live',
       requested_service_tier: serviceTier ?? null,
       effective_service_tier: effectiveServiceTier,
@@ -3518,12 +3537,14 @@ export async function runCodexExecJson({
 }
 
 function formatReviewerLabel(model, effort, executionProvenance = 'live_subscription_codex') {
+  const effDisp = effort || 'inherited';
   if (executionProvenance === 'synthetic_test_double') {
-    return `Synthetic Test Double · ${effort}`;
+    return `Synthetic Test Double · ${effDisp}`;
   }
-  const m = String(model || '').trim().toLowerCase();
-  const displayModel = m === 'gpt-6.2-astra' ? 'GPT-6.2 Astra' : String(model || DEFAULT_CODEX_MODEL).trim();
-  return `${displayModel} · ${effort}`;
+  const rawModel = String(model || '').trim();
+  const m = rawModel.toLowerCase();
+  const displayModel = !rawModel ? 'Codex CLI' : (m === 'gpt-6.2-astra' ? 'GPT-6.2 Astra' : rawModel);
+  return `${displayModel} · ${effDisp}`;
 }
 
 export async function runCodexExecMarkdown(options = {}) {
@@ -3540,8 +3561,8 @@ export async function runCodexExecMarkdown(options = {}) {
  * verify a content-addressed receipt, and return a sanitized advisory execution envelope.
  */
 export async function runCodexEvidenceReview(packetInput, {
-  model = DEFAULT_CODEX_MODEL,
-  reasoningEffort = 'xhigh',
+  model = null,
+  reasoningEffort = null,
   webSearch = 'live',
   serviceTier = null,
   allowStandardTierFallback = true,
@@ -3598,16 +3619,67 @@ export async function runCodexEvidenceReview(packetInput, {
     );
   }
 
-  const normalizedModel = typeof model === 'string' && model.trim() ? model.trim() : DEFAULT_CODEX_MODEL;
-  if (!SAFE_MODEL_ID_RE.test(normalizedModel) || !ALLOWED_GATE4_EFFORTS.includes(reasoningEffort)) {
+  const explicitGateModel = model === null || model === undefined
+    ? null
+    : (typeof model === 'string' ? model.trim() : String(model));
+  const explicitGateEffort = reasoningEffort === null || reasoningEffort === undefined
+    ? null
+    : (typeof reasoningEffort === 'string' ? reasoningEffort.trim() : String(reasoningEffort));
+  const normalizedModel = explicitGateModel;
+  reasoningEffort = explicitGateEffort;
+  if ((explicitGateModel !== null && !SAFE_MODEL_ID_RE.test(explicitGateModel)) ||
+    (explicitGateEffort !== null && !ALLOWED_GATE4_EFFORTS.includes(explicitGateEffort))) {
     throw new CodexRunnerError(
-      `Gate-4 evidence review requires a valid model identifier and reasoningEffort in [xhigh, max] (got model="${String(model)}", reasoningEffort="${String(reasoningEffort)}").`,
+      `Gate-4 evidence review requires a valid model identifier (or null/omitted to inherit config) and reasoningEffort in [xhigh, max, null] (got model="${String(model)}", reasoningEffort="${String(explicitGateEffort)}").`,
       { code: 'INVALID_GATE4_MODEL_OR_EFFORT' },
     );
   }
 
   const executionProvenance = testMode === true ? 'synthetic_test_double' : 'live_subscription_codex';
   const reviewerLabel = formatReviewerLabel(normalizedModel, reasoningEffort, executionProvenance);
+  const pktDeclaredSha = typeof packetInput?.form_spec_sha256 === 'string' && packetInput.form_spec_sha256.trim()
+    ? packetInput.form_spec_sha256.trim()
+    : (typeof packetInput?.candidate?.form_spec_sha256 === 'string' && packetInput.candidate.form_spec_sha256.trim()
+      ? packetInput.candidate.form_spec_sha256.trim()
+      : (typeof packetInput?.candidate?.spec_sha256 === 'string' && packetInput.candidate.spec_sha256.trim()
+        ? packetInput.candidate.spec_sha256.trim()
+        : null));
+  const reqFormSpecSha = typeof formSpecSha256 === 'string' && formSpecSha256.trim() ? formSpecSha256.trim() : null;
+  if (pktDeclaredSha && reqFormSpecSha && pktDeclaredSha !== reqFormSpecSha) {
+    const mismatchMsg = `Review packet declared form_spec_sha256 (${pktDeclaredSha}) does not match target formSpecSha256 (${reqFormSpecSha}).`;
+    if (throwOnFailure) {
+      throw new CodexRunnerError(mismatchMsg, { code: 'PACKET_FORM_SPEC_MISMATCH' });
+    }
+    return Object.freeze({
+      status: 'unavailable',
+      execution_status: 'not_submitted',
+      content_status: null,
+      dry_run: Boolean(dryRun),
+      advisory_only: true,
+      execution_provenance: executionProvenance,
+      receipt_sha256: null,
+      private_receipt_ref: null,
+      schema_version: SCHEMA_VERSION,
+      review_id: typeof packetInput?.review_id === 'string' ? packetInput.review_id : null,
+      packet_sha256: null,
+      payload_sha256: null,
+      attachment_sha256s: Object.freeze([]),
+      raw_output_sha256: null,
+      reviewer_label: reviewerLabel,
+      model: normalizedModel,
+      reasoning_effort: reasoningEffort,
+      error_code: 'PACKET_FORM_SPEC_MISMATCH',
+      tier_fallback_used: false,
+      disposition_counts: null,
+      review: null,
+      subjects: Object.freeze([]),
+      answers: Object.freeze([]),
+      contradictions: Object.freeze([]),
+      gaps: Object.freeze([]),
+      conclusion: null,
+      reason: sanitizeDiagnosticText(mismatchMsg),
+    });
+  }
   const hasSuppliedImages = Array.isArray(imagePaths) && imagePaths.length > 0;
 
   if (enabled === true && dryRun === false) {
@@ -3718,7 +3790,7 @@ export async function runCodexEvidenceReview(packetInput, {
   const attachmentSha256s = admittedAttachments.attachmentSha256s;
 
   const previewArgs = buildCodexExecArgs({
-    model: normalizedModel,
+    model: explicitGateModel,
     reasoningEffort,
     webSearch,
     serviceTier,
@@ -3732,8 +3804,8 @@ export async function runCodexEvidenceReview(packetInput, {
 
   const payloadSha256 = sha256Hex(canonicalJson({
     runner: 'codex_exec_v1',
-    model: normalizedModel,
-    reasoning_effort: reasoningEffort,
+    model: explicitGateModel ?? 'inherited_config',
+    reasoning_effort: reasoningEffort ?? 'inherited_config',
     web_search: webSearch,
     requested_service_tier: serviceTier ?? 'default',
     prompt_sha256: sha256Hex(prompt),
@@ -4138,7 +4210,7 @@ export async function runCodexEvidenceReview(packetInput, {
     execResult = await runCodexExecJson({
       prompt,
       schema: EVIDENCE_REVIEW_JSON_SCHEMA,
-      model: normalizedModel,
+      model: explicitGateModel,
       reasoningEffort,
       webSearch,
       serviceTier,

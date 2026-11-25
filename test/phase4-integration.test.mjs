@@ -694,7 +694,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       assert.equal(drySummary.dry_run, true);
       assert.equal(drySummary.status, 'unavailable');
       assert.equal(drySummary.execution_status, 'not_submitted');
-      assert.equal(drySummary.reviewer_label, 'GPT-6.2 Astra · max');
+      assert.equal(drySummary.reviewer_label, 'Codex CLI · max');
       assert.equal(detectRawPii(sDry.getOut()), null);
 
       const dryFile = JSON.parse(readFileSync(dryOutPath, 'utf8'));

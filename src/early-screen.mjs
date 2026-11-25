@@ -34,9 +34,13 @@ import {
   roundBigRat,
 } from './fee-basis.mjs';
 import {
+  classifySizeTier2027,
   computeOrderPlan,
   computeNegotiationShortlist,
   computePackagingRedesignShortlist2027,
+  isAmazonOptimizedPlacementVerified2027,
+  lookupUnifiedFulfillmentFee2027,
+  priceBand2027,
 } from './fba-rates-2027.mjs';
 
 const finite = value => typeof value === 'number' && Number.isFinite(value);
@@ -702,10 +706,64 @@ export function evaluateEarlyScreen(input, options = {}) {
     is_oversize: input.is_oversize, is_dangerous_goods: input.is_dangerous_goods, packages: input.packages,
     overCheck: overCheckR58, dgCheck: dgCheckR58, badPackages: badPackagesR58,
   });
-  const resolvedPlacementUsd = resolvePlacementUsd(placement_usd, dateCtxR58, placement_fee_basis, registeredIds, expectedPackageRef);
-  const resolvedFulfillmentUsd = resolveFulfillmentUsd(fulfillment_usd, {
+  let resolvedPlacementUsd = resolvePlacementUsd(placement_usd, dateCtxR58, placement_fee_basis, registeredIds, expectedPackageRef);
+  let resolvedFulfillmentUsd = resolveFulfillmentUsd(fulfillment_usd, {
     sales_window, fee_context, fulfillment_fee_basis, operating_period, operating_months, rawInput: input,
   }, dateCtxR58, registeredIds, expectedPackageRef);
+  if (isR59 && resolvedPlacementUsd !== null) {
+    const splitOpt = input.placement_split_option ?? placement_fee_basis?.split_option ?? null;
+    const pkgTier = effectivePkg
+      ? classifySizeTier2027(effectivePkg, { is_apparel: is_apparel_or_shoes, is_dangerous_goods: dgCheckR58.value === true })
+      : null;
+    const isConfirmedOversize = overCheckR58.value === true ||
+      pkgTier?.tier_family === 'oversize' ||
+      (placement_fee_basis?.exempt_oversize_tier === true && (!pkgTier || pkgTier.tier_family === 'oversize'));
+    if (!isConfirmedOversize &&
+      (splitOpt === 'amazon_optimized' || (effectivePkg && round(resolvedPlacementUsd) === 0)) &&
+      placement_fee_basis?.sp_api_calibrated !== true &&
+      placement_fee_basis?.calculator_verified !== true) {
+      const optOk = isAmazonOptimizedPlacementVerified2027({
+        identical_cartons_count: input.identical_cartons_count ?? placement_fee_basis?.identical_cartons_count ?? null,
+        multi_destination_headhaul_verified: input.multi_destination_headhaul_verified ?? placement_fee_basis?.multi_destination_headhaul_verified ?? false,
+      });
+      if (!optOk) resolvedPlacementUsd = null;
+    }
+  }
+  if (isR59 && resolvedFulfillmentUsd !== null && pricing?.valid) {
+    const hasCouponNoPrime = (
+      (pricing.ongoing_coupon_usd ?? 0) > 0 ||
+      (pricing.ongoing_coupon_pct ?? 0) > 0 ||
+      (finite(input.coupon_redemption_fee_usd) && input.coupon_redemption_fee_usd > 0)
+    ) && !((pricing.prime_exclusive_discount_usd ?? 0) > 0 || (pricing.prime_exclusive_discount_pct ?? 0) > 0);
+    if (hasCouponNoPrime && finite(pricing.list_price_usd) &&
+      priceBand2027(pricing.list_price_usd) !== priceBand2027(price_usd) &&
+      fulfillment_fee_basis?.sp_api_calibrated !== true &&
+      fulfillment_fee_basis?.calculator_verified !== true) {
+      if (fulfillment_fee_basis?.price_band === priceBand2027(price_usd)) {
+        resolvedFulfillmentUsd = null;
+      } else if (effectivePkg && dateCtxR58?.valid &&
+        dateCtxR58.salesWin.from >= '2027-01-15' && dateCtxR58.salesWin.through <= '2027-10-14') {
+        const expectedListFul = lookupUnifiedFulfillmentFee2027({
+          pkg: effectivePkg,
+          price_usd,
+          list_price_usd: pricing.list_price_usd,
+          has_ongoing_coupon: true,
+          has_prime_discount: false,
+          sales_window: dateCtxR58.salesWin,
+          is_apparel: input.is_apparel,
+          is_shoes: input.is_shoes,
+          is_apparel_or_shoes,
+          is_dangerous_goods: dgCheckR58.value === true,
+          is_sipp: input.is_sipp,
+          requires_amazon_packaging: input.requires_amazon_packaging,
+          fee_category: fee_category ?? null,
+        });
+        if (expectedListFul.status === 'verified' && resolvedFulfillmentUsd < expectedListFul.total_usd - 0.005) {
+          resolvedFulfillmentUsd = null;
+        }
+      }
+    }
+  }
 
   const rightsCheck = rightsState === true ? 'fail' : rightsState === false ? 'pass' : 'rights_unsearched';
   const dateCheck = dateState === true ? 'defer' : dateState === false ? 'pass' : 'date_unverified';
@@ -924,7 +982,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     }
   }
 
-  const couponFeeR59 = isR59 && input.include_coupon_fee !== false && input.coupon_fee_already_in_other !== true
+  const computedCouponFeeR59 = isR59
     ? computeAmazonCouponRedemptionFee2027({
       net_effective_price_usd: price_usd,
       ongoing_coupon_usd,
@@ -934,10 +992,25 @@ export function evaluateEarlyScreen(input, options = {}) {
       include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
     })
     : { applicable: false, per_unit_usd: 0 };
-  const couponFeeUsd = couponFeeR59.applicable && couponFeeR59.per_unit_usd > 0 ? couponFeeR59.per_unit_usd : 0;
+  const explicitCouponFeeUsd = isR59 && finite(input.coupon_redemption_fee_usd) && input.coupon_redemption_fee_usd > 0
+    ? round(input.coupon_redemption_fee_usd)
+    : 0;
+  const requiredCouponFeeUsd = Math.max(
+    computedCouponFeeR59.applicable && computedCouponFeeR59.per_unit_usd > 0 ? computedCouponFeeR59.per_unit_usd : 0,
+    explicitCouponFeeUsd,
+  );
+  const couponAlreadyInOther = Boolean(
+    input.coupon_fee_already_in_other === true &&
+    resolvedOtherApplicable !== null &&
+    resolvedOtherApplicable >= requiredCouponFeeUsd - 1e-6,
+  );
+  const couponFeeUsd = !couponAlreadyInOther ? requiredCouponFeeUsd : 0;
   const effectiveOtherWithCoupon = resolvedOtherApplicable === null
     ? null
     : round(resolvedOtherApplicable + couponFeeUsd);
+  const predeclaredAmazonCouponInExternal = couponAlreadyInOther && other_payee !== 'amazon' && requiredCouponFeeUsd > 0
+    ? requiredCouponFeeUsd
+    : 0;
 
   const amazonKnown = referral !== null && collectionRateValid &&
     [resolvedFulfillmentUsd, resolvedPlacementUsd, storageUsd, resolvedReturnsProcessing,
@@ -947,7 +1020,7 @@ export function evaluateEarlyScreen(input, options = {}) {
   const amazonDeductions = amazonKnown
     ? [referral.net_usd, resolvedFulfillmentUsd, resolvedPlacementUsd, storageUsd, resolvedReturnsProcessing,
       ...(defer_return_outcomes ? [] : [returns_disposal_usd]),
-      ...(couponFeeUsd > 0 ? [couponFeeUsd] : []),
+      ...(couponFeeUsd > 0 ? [couponFeeUsd] : (predeclaredAmazonCouponInExternal > 0 ? [predeclaredAmazonCouponInExternal] : [])),
       ...(other_payee === 'amazon' && resolvedOtherApplicable > 0 ? [resolvedOtherApplicable] : [])]
     : null;
   const payout = amazonDeductions
@@ -991,9 +1064,14 @@ export function evaluateEarlyScreen(input, options = {}) {
     line('collection', payout ? payout.collection_usd : null, collectionRateValid ? 'Collection fee on estimated Amazon disbursement' : 'Missing collection rate'),
     {
       ...line('other_applicable', effectiveOtherWithCoupon,
-        effectiveOtherWithCoupon === 0 ? 'Declared ordinary scenario has no extra conditional charge' : effectiveOtherWithCoupon === null ? 'Missing other_applicable_usd declaration' : (couponFeeUsd > 0 ? 'Amazon ongoing coupon redemption fee ($5/100 + 2.5%) plus declared conditional charges' : 'Additional applicable charge'),
+        effectiveOtherWithCoupon === 0 ? 'Declared ordinary scenario has no extra conditional charge' : effectiveOtherWithCoupon === null ? 'Missing other_applicable_usd declaration' : (requiredCouponFeeUsd > 0 ? 'Amazon ongoing coupon redemption fee ($5/100 + 2.5%) plus declared conditional charges' : 'Additional applicable charge'),
         effectiveOtherWithCoupon === 0 ? 'not_applicable' : effectiveOtherWithCoupon === null ? 'pending' : 'estimated'),
-      ...(couponFeeUsd > 0 ? { coupon_fee_included: true, payee: 'amazon' } : {}),
+      ...(requiredCouponFeeUsd > 0 ? {
+        coupon_fee_included: true,
+        ...(other_payee === 'amazon' || (couponFeeUsd > 0 && (resolvedOtherApplicable ?? 0) === 0)
+          ? { payee: 'amazon' }
+          : { payee: other_payee, amazon_portion_usd: requiredCouponFeeUsd }),
+      } : {}),
     },
     defer_return_outcomes
       ? { id: 'recovery_credit', amount_usd: null, status: 'deferred', basis: 'Paired return disposition and recovery deferred in initial screen' }
@@ -1004,6 +1082,10 @@ export function evaluateEarlyScreen(input, options = {}) {
   const ledger = calculateEconomics(
     {
       id, saleable_unit, price_usd, refund_fraction,
+      ...(isR59 && requiredCouponFeeUsd > 0 ? {
+        coupon_redemption_fee_usd: requiredCouponFeeUsd,
+        coupon_fee_already_in_other: true,
+      } : {}),
       ...(isR58 && hasExplicitPhysical ? { physical_return_fraction } : {}),
       ...(isR58 && orderPlan && finite(fx) && fx > 0 ? { source_inputs: { fx_cny_per_usd: fx } } : {}),
       assumptions, lines,
@@ -1128,13 +1210,14 @@ export function evaluateEarlyScreen(input, options = {}) {
     const pkgCheck = computePackagingRedesignShortlist2027({
       pkg: effectivePkg,
       price_usd,
-      list_price_usd: input.list_price_usd,
-      net_effective_price_usd: input.net_effective_price_usd,
+      list_price_usd: pricing?.valid ? pricing.list_price_usd : input.list_price_usd,
+      net_effective_price_usd: price_usd,
       ongoing_coupon_usd: input.ongoing_coupon_usd,
       ongoing_coupon_pct: input.ongoing_coupon_pct,
+      coupon_redemption_fee_usd: requiredCouponFeeUsd > 0 ? requiredCouponFeeUsd : undefined,
       prime_exclusive_discount_usd: input.prime_exclusive_discount_usd,
       prime_exclusive_discount_pct: input.prime_exclusive_discount_pct,
-      promo_basis_already_net: input.promo_basis_already_net,
+      promo_basis_already_net: true,
       fx_cny_per_usd: fx,
       landed_domestic_usd: round(procurementUsd + domesticUsd),
       refund_fraction,
@@ -1144,8 +1227,13 @@ export function evaluateEarlyScreen(input, options = {}) {
       referral_terms,
       headhaul_usd: headhaulUsd,
       collection_rate,
-      other_applicable_usd: resolvedOtherApplicable ?? 0,
+      other_applicable_usd: couponAlreadyInOther
+        ? Math.max(0, round((resolvedOtherApplicable ?? 0) - requiredCouponFeeUsd))
+        : (resolvedOtherApplicable ?? 0),
       other_payee,
+      placement_split_option: input.placement_split_option ?? placement_fee_basis?.split_option,
+      identical_cartons_count: input.identical_cartons_count ?? placement_fee_basis?.identical_cartons_count,
+      multi_destination_headhaul_verified: input.multi_destination_headhaul_verified ?? placement_fee_basis?.multi_destination_headhaul_verified,
       sales_window: dateCtxR58.salesWin,
       storage_window: dateCtxR58.storageWin,
       inbound_window: dateCtxR58.inboundWin,

@@ -586,25 +586,50 @@ const FBA_2027_METADATA_R58_FROZEN = Object.freeze({
   }),
 });
 
+const VERIFIED_2027_RETURN_THRESHOLDS_R57_NOV19 = Object.freeze({
+  'Business, Industrial, and Scientific Supplies': 0.06,
+  'Base Equipment Power Tools': 0.071,
+  'Tools and Home Improvement': 0.087,
+  'Everything Else': 0.048,
+});
+
+export function getHistoricalFba2027RateTableSnapshots() {
+  const r57Nov19 = {
+    metadata: FBA_2027_METADATA_R58_FROZEN,
+    small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
+    large_standard_2027_lb: LARGE_STANDARD_2027_LB,
+    large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
+    placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
+    placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
+    storage_usd_per_cuft_month: STORAGE_2027_RATES,
+    verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS_R57_NOV19,
+  };
+  const r58Frozen = {
+    metadata: FBA_2027_METADATA_R58_FROZEN,
+    small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
+    large_standard_2027_lb: LARGE_STANDARD_2027_LB,
+    large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
+    bulky_2027_tiers: BULKY_2027_TIERS,
+    placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
+    placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
+    storage_usd_per_cuft_month: STORAGE_2027_RATES,
+    bulky_storage_usd_per_cuft_month: BULKY_STORAGE_2027_RATES,
+    verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS,
+  };
+  return [r57Nov19, r58Frozen];
+}
+
 /**
  * Return the live 2027 US FBA rate tables & metadata for immutable evaluation fingerprinting.
  * Shares exact live rate objects with lookup functions so any rate-cell change alters evidence_bundle_sha256.
- * When `profileRevision <= 58` is requested, returns the frozen r58 snapshot for historical SQLite replay parity.
+ * When `profileRevision <= 57` is requested, returns the Nov-19 r57 snapshot; when `profileRevision === 58`, returns the frozen r58 snapshot.
  */
 export function getFba2027RateTableSnapshot({ profileRevision = 59 } = {}) {
+  if (Number.isFinite(profileRevision) && profileRevision <= 57) {
+    return getHistoricalFba2027RateTableSnapshots()[0];
+  }
   if (Number.isFinite(profileRevision) && profileRevision <= 58) {
-    return {
-      metadata: FBA_2027_METADATA_R58_FROZEN,
-      small_standard_2027_oz: SMALL_STANDARD_2027_OZ,
-      large_standard_2027_lb: LARGE_STANDARD_2027_LB,
-      large_standard_over_3lb: LARGE_STANDARD_OVER_3LB,
-      bulky_2027_tiers: BULKY_2027_TIERS,
-      placement_minimal_small_oz: PLACEMENT_MINIMAL_SMALL_OZ,
-      placement_minimal_large_lb: PLACEMENT_MINIMAL_LARGE_LB,
-      storage_usd_per_cuft_month: STORAGE_2027_RATES,
-      bulky_storage_usd_per_cuft_month: BULKY_STORAGE_2027_RATES,
-      verified_2027_return_thresholds: VERIFIED_2027_RETURN_THRESHOLDS,
-    };
+    return getHistoricalFba2027RateTableSnapshots()[1];
   }
   return {
     metadata: FBA_2027_METADATA,
@@ -1031,6 +1056,11 @@ export function lookupBulkyPackagingServiceFee2027({
 export function lookupBulkyFulfillmentFee2027({
   pkg,
   price_usd,
+  list_price_usd = undefined,
+  has_ongoing_coupon = false,
+  has_prime_discount = false,
+  ongoing_coupon_usd = undefined,
+  ongoing_coupon_pct = undefined,
   sales_window = null,
   include_fuel_surcharge = true,
   is_apparel,
@@ -1096,7 +1126,15 @@ export function lookupBulkyFulfillmentFee2027({
   });
   if (cls.status !== 'verified') return cls;
 
-  const rawBand = priceBand2027(price_usd);
+  const couponActive = Boolean(
+    has_ongoing_coupon === true ||
+    (finite(ongoing_coupon_usd) && ongoing_coupon_usd > 0) ||
+    (finite(ongoing_coupon_pct) && ongoing_coupon_pct > 0),
+  );
+  const tierBasisPriceUsd = couponActive && has_prime_discount !== true && finite(list_price_usd) && list_price_usd > 0
+    ? list_price_usd
+    : price_usd;
+  const rawBand = priceBand2027(tierBasisPriceUsd);
   const catLowPriceEligible = isCategoryLowPriceEligible2027(fee_category);
   if (rawBand === 'under_10' && !low_price_eligible && catLowPriceEligible) {
     return { status: 'needs_calculator_verification', reason: 'Category is marked ineligible for 2027 Low-Price FBA rates without a listed 2027 fee_category.' };
@@ -1372,6 +1410,9 @@ export function lookupBulkyPlacementFee2027({
   split_option = 'minimal_west_conservative',
   is_apparel,
   is_dangerous_goods,
+  carton_count = null,
+  identical_cartons_count = null,
+  multi_destination_headhaul_verified = false,
 } = {}) {
   if (inbound_window !== null) {
     if (!validWindow(inbound_window)) {
@@ -1387,8 +1428,26 @@ export function lookupBulkyPlacementFee2027({
   }
   const cls = classifySizeTier2027(pkg, { is_apparel, is_dangerous_goods: dgCheck.value });
   if (cls.status !== 'verified') return cls;
+  const effOptCartons = Number.isInteger(identical_cartons_count) ? identical_cartons_count : null;
+  const optVerified = isAmazonOptimizedPlacementVerified2027({
+    identical_cartons_count: effOptCartons,
+    multi_destination_headhaul_verified,
+  });
   if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
     if (split_option === 'amazon_optimized') {
+      if (!optVerified) {
+        return {
+          status: 'sensitivity_only',
+          version: FBA_2027_METADATA.version,
+          size_tier: cls.size_tier,
+          split_option,
+          range_usd: [0, 0],
+          selected_usd: 0,
+          reason: 'Standard-size amazon_optimized ($0 placement) requires >= 5 identical cartons AND verified multi-destination headhaul freight; sensitivity-only otherwise.',
+          effective_from: FBA_2027_METADATA.placement_effective_from,
+          source_url: FBA_2027_METADATA.official_sources.placement,
+        };
+      }
       return {
         status: 'verified',
         version: FBA_2027_METADATA.version,
@@ -1396,7 +1455,9 @@ export function lookupBulkyPlacementFee2027({
         split_option,
         range_usd: [0, 0],
         selected_usd: 0,
-        note: 'Amazon-optimized splits incur $0 placement fee, but multi-location carrier freight still applies.',
+        identical_cartons_count: effOptCartons,
+        multi_destination_headhaul_verified: true,
+        note: 'Amazon-optimized splits incur $0 placement fee (>=5 identical cartons and multi-destination headhaul verified).',
         effective_from: FBA_2027_METADATA.placement_effective_from,
         source_url: FBA_2027_METADATA.official_sources.placement,
       };
@@ -1432,6 +1493,19 @@ export function lookupBulkyPlacementFee2027({
     };
   }
   if (split_option === 'amazon_optimized') {
+    if (!optVerified) {
+      return {
+        status: 'sensitivity_only',
+        version: 'US-FBA-2027-nonpeak-bulky4-v1',
+        size_tier: cls.size_tier,
+        split_option,
+        range_usd: [0, 0],
+        selected_usd: 0,
+        reason: 'Bulky amazon_optimized ($0 placement) requires >= 5 identical cartons AND verified multi-destination headhaul freight; sensitivity-only otherwise.',
+        effective_from: FBA_2027_METADATA.placement_effective_from,
+        source_url: FBA_2027_METADATA.official_sources.placement,
+      };
+    }
     return {
       status: 'verified',
       version: 'US-FBA-2027-nonpeak-bulky4-v1',
@@ -1439,7 +1513,9 @@ export function lookupBulkyPlacementFee2027({
       split_option,
       range_usd: [0, 0],
       selected_usd: 0,
-      note: 'Amazon-optimized splits incur $0 placement fee (requires >=5 identical cartons/pallets per item).',
+      identical_cartons_count: effOptCartons,
+      multi_destination_headhaul_verified: true,
+      note: 'Amazon-optimized splits incur $0 placement fee (>=5 identical cartons and multi-destination headhaul verified).',
       effective_from: FBA_2027_METADATA.placement_effective_from,
       source_url: FBA_2027_METADATA.official_sources.placement,
     };
@@ -1805,15 +1881,35 @@ export function checkMatureBandMarginFeasibility2027({
     Math.round(min_mature_price_usd * 100) / 100,
     Math.round(max_mature_price_usd * 100) / 100,
   ]);
+  const cpnUsd = finite(gate1aParams.ongoing_coupon_usd) && gate1aParams.ongoing_coupon_usd > 0 ? gate1aParams.ongoing_coupon_usd : 0;
+  const cpnPct = finite(gate1aParams.ongoing_coupon_pct) && gate1aParams.ongoing_coupon_pct > 0 && gate1aParams.ongoing_coupon_pct < 1 ? gate1aParams.ongoing_coupon_pct : 0;
+  const boundsAreNet = gate1aParams.promo_basis_already_net === true;
   for (const cliffPrice of [9.99, 10.00, 49.99, 50.00, 50.01]) {
     if (cliffPrice >= min_mature_price_usd - 1e-6 && cliffPrice <= max_mature_price_usd + 1e-6) {
       candidatePrices.add(cliffPrice);
+    }
+    if (boundsAreNet && (cpnUsd > 0 || cpnPct > 0)) {
+      const shiftedNet = cpnUsd > 0
+        ? Math.round((cliffPrice - cpnUsd) * 100) / 100
+        : Math.round(cliffPrice * (1 - cpnPct) * 100) / 100;
+      if (shiftedNet > 0 && shiftedNet >= min_mature_price_usd - 1e-6 && shiftedNet <= max_mature_price_usd + 1e-6) {
+        candidatePrices.add(shiftedNet);
+      }
     }
   }
   const landedRat = toRat(landed_domestic_usd);
   const evaluated = [];
   for (const p of [...candidatePrices].sort((a, b) => a - b)) {
-    const est = estimateGate1AWithLandedCost({ ...gate1aParams, price_usd: p, margin_floor, min_landed_domestic_usd: null }, landedRat);
+    const derivedListP = boundsAreNet && (cpnUsd > 0 || cpnPct > 0)
+      ? (cpnUsd > 0 ? Math.round((p + cpnUsd) * 100) / 100 : Math.round((p / (1 - cpnPct)) * 100) / 100)
+      : gate1aParams.list_price_usd;
+    const est = estimateGate1AWithLandedCost({
+      ...gate1aParams,
+      price_usd: p,
+      ...(boundsAreNet && derivedListP !== undefined ? { list_price_usd: derivedListP, net_effective_price_usd: p, promo_basis_already_net: true } : {}),
+      margin_floor,
+      min_landed_domestic_usd: null,
+    }, landedRat);
     if (est.status !== 'verified') {
       return { status: 'needs_calculator_verification', reason: est.reason, failed_at_price_usd: p };
     }
@@ -1856,6 +1952,11 @@ function extraQuarterLbStepsRat(r) {
 export function lookupFulfillmentFee2027({
   pkg,
   price_usd,
+  list_price_usd = undefined,
+  has_ongoing_coupon = false,
+  has_prime_discount = false,
+  ongoing_coupon_usd = undefined,
+  ongoing_coupon_pct = undefined,
   sales_window = null,
   include_fuel_surcharge = true,
   is_apparel,
@@ -1883,7 +1984,15 @@ export function lookupFulfillmentFee2027({
   }
   const cls = classifyStandardSize2027(pkg, { is_apparel, is_dangerous_goods, is_sipp });
   if (cls.status !== 'verified') return cls;
-  const band = priceBand2027(price_usd);
+  const couponActive = Boolean(
+    has_ongoing_coupon === true ||
+    (finite(ongoing_coupon_usd) && ongoing_coupon_usd > 0) ||
+    (finite(ongoing_coupon_pct) && ongoing_coupon_pct > 0),
+  );
+  const tierBasisPriceUsd = couponActive && has_prime_discount !== true && finite(list_price_usd) && list_price_usd > 0
+    ? list_price_usd
+    : price_usd;
+  const band = priceBand2027(tierBasisPriceUsd);
   if (band === 'under_10' && !low_price_eligible) {
     return {
       status: 'needs_calculator_verification',
@@ -1994,11 +2103,25 @@ export function lookupStorageFee2027({
   };
 }
 
+export function isAmazonOptimizedPlacementVerified2027({
+  identical_cartons_count = null,
+  multi_destination_headhaul_verified = false,
+} = {}) {
+  return Boolean(
+    Number.isInteger(identical_cartons_count) &&
+    identical_cartons_count >= 5 &&
+    multi_destination_headhaul_verified === true,
+  );
+}
+
 export function lookupPlacementFee2027({
   pkg,
   inbound_window = null,
   split_option = 'minimal_west_conservative',
   is_dangerous_goods,
+  carton_count = null,
+  identical_cartons_count = null,
+  multi_destination_headhaul_verified = false,
 } = {}) {
   if (inbound_window !== null) {
     if (!validWindow(inbound_window)) {
@@ -2011,6 +2134,24 @@ export function lookupPlacementFee2027({
   const cls = classifyStandardSize2027(pkg, { is_dangerous_goods });
   if (cls.status !== 'verified') return cls;
   if (split_option === 'amazon_optimized') {
+    const effOptCartons = Number.isInteger(identical_cartons_count) ? identical_cartons_count : null;
+    const optVerified = isAmazonOptimizedPlacementVerified2027({
+      identical_cartons_count: effOptCartons,
+      multi_destination_headhaul_verified,
+    });
+    if (!optVerified) {
+      return {
+        status: 'sensitivity_only',
+        version: FBA_2027_METADATA.version,
+        size_tier: cls.size_tier,
+        split_option,
+        range_usd: [0, 0],
+        selected_usd: 0,
+        reason: 'Standard-size amazon_optimized ($0 placement) requires >= 5 identical cartons AND verified multi-destination headhaul freight; sensitivity-only otherwise.',
+        effective_from: FBA_2027_METADATA.placement_effective_from,
+        source_url: FBA_2027_METADATA.official_sources.placement,
+      };
+    }
     return {
       status: 'verified',
       version: FBA_2027_METADATA.version,
@@ -2018,7 +2159,9 @@ export function lookupPlacementFee2027({
       split_option,
       range_usd: [0, 0],
       selected_usd: 0,
-      note: 'Amazon-optimized splits incur $0 placement fee, but multi-location carrier freight still applies.',
+      identical_cartons_count: effOptCartons,
+      multi_destination_headhaul_verified: true,
+      note: 'Amazon-optimized splits incur $0 placement fee (>=5 identical cartons and multi-destination headhaul verified).',
       effective_from: FBA_2027_METADATA.placement_effective_from,
       source_url: FBA_2027_METADATA.official_sources.placement,
     };
@@ -2518,6 +2661,9 @@ function estimateGate1AWithLandedCost({
   average_inventory_days = 45,
   placement_usd = null,
   placement_split_option = 'minimal_west_conservative',
+  carton_count = null,
+  identical_cartons_count = null,
+  multi_destination_headhaul_verified = false,
   margin_floor = 0.30,
   domestic_freight_usd = null,
   min_landed_domestic_usd = null,
@@ -2535,6 +2681,8 @@ function estimateGate1AWithLandedCost({
   profile_revision = 59,
   coupon_campaign_units = 100,
   coupon_redemption_share = 1,
+  coupon_redemption_fee_usd = undefined,
+  coupon_fee_already_in_other = false,
   include_coupon_fee = undefined,
   include_coupon_campaign_flat = true,
   calculator_verified_override = null,
@@ -2598,7 +2746,7 @@ function estimateGate1AWithLandedCost({
     ? refund_fraction
     : physical_return_fraction;
 
-  const hasOngoingCoupon = ((ongoing_coupon_usd ?? 0) > 0 || (ongoing_coupon_pct ?? 0) > 0);
+  const hasOngoingCoupon = ((ongoing_coupon_usd ?? 0) > 0 || (ongoing_coupon_pct ?? 0) > 0 || (coupon_redemption_fee_usd ?? 0) > 0);
   const hasPrimeDiscount = ((prime_exclusive_discount_usd ?? 0) > 0 || (prime_exclusive_discount_pct ?? 0) > 0);
   const isR59Coupon = Boolean((profile_revision ?? 0) >= 59 && hasOngoingCoupon);
   // Under official Amazon US Coupon rules (r59), $10/$50 FBA fulfillment tier is determined by standard list price when a Coupon is active.
@@ -2651,11 +2799,38 @@ function estimateGate1AWithLandedCost({
       is_dangerous_goods,
     });
     if (storage.status !== 'verified') return storage;
-    placement = finite(placement_usd) && placement_usd >= 0
+    const requiresVerifiedOptForExplicitPlacement = Boolean(
+      finite(placement_usd) &&
+      placement_usd >= 0 &&
+      fulfillment.tier_family !== 'oversize' &&
+      (placement_split_option === 'amazon_optimized' || ((profile_revision ?? 0) >= 59 && round(placement_usd) === 0)) &&
+      !isAmazonOptimizedPlacementVerified2027({
+        identical_cartons_count,
+        multi_destination_headhaul_verified,
+      }),
+    );
+    placement = finite(placement_usd) && placement_usd >= 0 && !requiresVerifiedOptForExplicitPlacement
       ? { status: 'verified', selected_usd: round(placement_usd), range_usd: [round(placement_usd), round(placement_usd)], split_option: 'explicit' }
       : (useUnified2027Tiers
-        ? lookupBulkyPlacementFee2027({ pkg, inbound_window: effectiveInboundWindow, split_option: placement_split_option, is_apparel, is_dangerous_goods })
-        : lookupPlacementFee2027({ pkg, inbound_window: effectiveInboundWindow, split_option: placement_split_option, is_dangerous_goods }));
+        ? lookupBulkyPlacementFee2027({
+          pkg,
+          inbound_window: effectiveInboundWindow,
+          split_option: requiresVerifiedOptForExplicitPlacement ? 'amazon_optimized' : placement_split_option,
+          is_apparel,
+          is_dangerous_goods,
+          carton_count,
+          identical_cartons_count,
+          multi_destination_headhaul_verified,
+        })
+        : lookupPlacementFee2027({
+          pkg,
+          inbound_window: effectiveInboundWindow,
+          split_option: requiresVerifiedOptForExplicitPlacement ? 'amazon_optimized' : placement_split_option,
+          is_dangerous_goods,
+          carton_count,
+          identical_cartons_count,
+          multi_destination_headhaul_verified,
+        }));
     if (placement.status !== 'verified') return placement;
     returns = useUnified2027Tiers
       ? lookupBulkyReturnsProcessing2027({
@@ -2688,7 +2863,7 @@ function estimateGate1AWithLandedCost({
     return { status: 'needs_calculator_verification', reason: err.message };
   }
 
-  const couponFee = isR59Coupon && include_coupon_fee !== false
+  const computedCouponFee = isR59Coupon && include_coupon_fee !== false
     ? computeAmazonCouponRedemptionFee2027({
       net_effective_price_usd: effectivePriceUsd,
       ongoing_coupon_usd,
@@ -2698,6 +2873,23 @@ function estimateGate1AWithLandedCost({
       include_campaign_flat_usd: include_coupon_campaign_flat,
     })
     : { applicable: false, per_unit_usd: 0, variable_2_5pct_usd: 0, campaign_flat_per_unit_usd: 0, exact_usd_rational: { n: 0n, d: 1n } };
+  const explicitCouponUsd = isR59Coupon && include_coupon_fee !== false && finite(coupon_redemption_fee_usd) && coupon_redemption_fee_usd > 0
+    ? round(coupon_redemption_fee_usd)
+    : 0;
+  const couponFee = computedCouponFee.applicable && computedCouponFee.per_unit_usd >= explicitCouponUsd
+    ? computedCouponFee
+    : (explicitCouponUsd > 0
+      ? { applicable: true, per_unit_usd: explicitCouponUsd, variable_2_5pct_usd: explicitCouponUsd, campaign_flat_per_unit_usd: 0, exact_usd_rational: toBigRat(explicitCouponUsd) }
+      : { applicable: false, per_unit_usd: 0, variable_2_5pct_usd: 0, campaign_flat_per_unit_usd: 0, exact_usd_rational: { n: 0n, d: 1n } });
+
+  const couponAlreadyInOther = Boolean(
+    coupon_fee_already_in_other === true &&
+    couponFee.applicable &&
+    couponFee.per_unit_usd > 0 &&
+    finite(other_applicable_usd) &&
+    other_applicable_usd >= couponFee.per_unit_usd - 0.005,
+  );
+  const extraCouponFeeUsd = couponAlreadyInOther ? 0 : couponFee.per_unit_usd;
 
   const netRevenue = effectivePriceUsd * (1 - refund_fraction);
   const amazonDeductions = [
@@ -2706,7 +2898,9 @@ function estimateGate1AWithLandedCost({
     placement.selected_usd,
     storage.per_unit_usd,
     returns.expected_fee_per_shipped_unit_usd,
-    ...(couponFee.applicable && couponFee.per_unit_usd > 0 ? [couponFee.per_unit_usd] : []),
+    ...(couponFee.applicable && couponFee.per_unit_usd > 0 && !(couponAlreadyInOther && other_payee === 'amazon')
+      ? [couponFee.per_unit_usd]
+      : []),
     ...(other_payee === 'amazon' && other_applicable_usd > 0 ? [other_applicable_usd] : []),
   ];
   const payout = collectionFromDisbursement({
@@ -2723,7 +2917,7 @@ function estimateGate1AWithLandedCost({
     placement.selected_usd +
     storage.per_unit_usd +
     returns.expected_fee_per_shipped_unit_usd +
-    couponFee.per_unit_usd +
+    extraCouponFeeUsd +
     payout.collection_usd +
     other_applicable_usd,
   );
@@ -2749,7 +2943,7 @@ function estimateGate1AWithLandedCost({
     placement.selected_usd,
     storage.per_unit_usd,
     returns.expected_fee_per_shipped_unit_usd,
-    couponFee.per_unit_usd,
+    extraCouponFeeUsd,
     payout.collection_usd,
     other_applicable_usd,
   ];
@@ -3009,6 +3203,12 @@ export function solveMinPriceForMargin2027({
   landedCnyRat ??= mulBigRat(landedUsdRat, fxRat);
   const landedCny = hasCny ? landed_domestic_cny : roundBigRat(landedCnyRat.n, landedCnyRat.d, 10);
 
+  const solverCouponUsd = finite(gate1aParams.ongoing_coupon_usd) && gate1aParams.ongoing_coupon_usd > 0 ? gate1aParams.ongoing_coupon_usd : 0;
+  const solverCouponPct = finite(gate1aParams.ongoing_coupon_pct) && gate1aParams.ongoing_coupon_pct > 0 && gate1aParams.ongoing_coupon_pct < 1 ? gate1aParams.ongoing_coupon_pct : 0;
+  const solverHasPrime = (finite(gate1aParams.prime_exclusive_discount_usd) && gate1aParams.prime_exclusive_discount_usd > 0) ||
+    (finite(gate1aParams.prime_exclusive_discount_pct) && gate1aParams.prime_exclusive_discount_pct > 0);
+  const solverCouponActive = Boolean((gate1aParams.profile_revision ?? 59) >= 59 && !solverHasPrime && (solverCouponUsd > 0 || solverCouponPct > 0));
+
   const cleanParams = { ...gate1aParams, ...(quoteInputs ? { pkg: quoteInputs.pkg } : {}), fx_cny_per_usd, margin_floor };
   delete cleanParams.price_usd;
   delete cleanParams.list_price_usd;
@@ -3019,10 +3219,25 @@ export function solveMinPriceForMargin2027({
   delete cleanParams.prime_exclusive_discount_pct;
   delete cleanParams.promo_basis_already_net;
 
+  const listPriceAtNetCents = cents => {
+    const netUsd = cents / 100;
+    if (!solverCouponActive) return netUsd;
+    return solverCouponUsd > 0
+      ? Math.round((netUsd + solverCouponUsd) * 100) / 100
+      : Math.round((netUsd / (1 - solverCouponPct)) * 100) / 100;
+  };
+
   const evalAtCents = cents => estimateGate1AWithLandedCost({
     ...cleanParams,
     low_price_eligible,
     price_usd: cents / 100,
+    ...(solverCouponActive ? {
+      list_price_usd: listPriceAtNetCents(cents),
+      net_effective_price_usd: cents / 100,
+      ongoing_coupon_usd: solverCouponUsd > 0 ? solverCouponUsd : undefined,
+      ongoing_coupon_pct: solverCouponPct > 0 ? solverCouponPct : undefined,
+      promo_basis_already_net: true,
+    } : {}),
     min_landed_domestic_usd: null,
   }, landedUsdRat);
 
@@ -3066,14 +3281,25 @@ export function solveMinPriceForMargin2027({
     return { state: 'feasible', sol: { cents: hi, price_usd: hi / 100, estimate: bestEst }, reason: null };
   };
 
-  const resUnder10 = low_price_eligible
-    ? searchBand(100, Math.min(999, maxCents))
+  const under10MaxNetCents = solverCouponActive
+    ? (solverCouponUsd > 0 ? Math.max(0, Math.round((9.99 - solverCouponUsd) * 100)) : Math.max(0, Math.floor(9.99 * (1 - solverCouponPct) * 100)))
+    : 999;
+  const band10To50MinNetCents = Math.max(100, under10MaxNetCents + 1);
+  const band10To50MaxNetCents = solverCouponActive
+    ? (solverCouponUsd > 0 ? Math.max(0, Math.round((50.00 - solverCouponUsd) * 100)) : Math.max(0, Math.floor(50.00 * (1 - solverCouponPct) * 100)))
+    : 5000;
+  const over50MinNetCents = Math.max(100, band10To50MaxNetCents + 1);
+
+  const resUnder10 = low_price_eligible && under10MaxNetCents >= 100
+    ? searchBand(100, Math.min(under10MaxNetCents, maxCents))
     : { state: 'out_of_range', sol: null, reason: null };
-  const res10To50 = searchBand(1000, Math.min(5000, maxCents));
+  const res10To50 = band10To50MaxNetCents >= band10To50MinNetCents
+    ? searchBand(band10To50MinNetCents, Math.min(band10To50MaxNetCents, maxCents))
+    : { state: 'out_of_range', sol: null, reason: null };
 
   let resOver50 = { state: 'out_of_range', sol: null, reason: null };
-  if (maxCents >= 5001) {
-    let hi = Math.min(5001, maxCents);
+  if (maxCents >= over50MinNetCents) {
+    let hi = Math.min(over50MinNetCents, maxCents);
     let hiEst = evalAtCents(hi);
     if (hiEst.status !== 'verified') {
       resOver50 = { state: 'unverified', sol: null, reason: hiEst.reason };
@@ -3085,7 +3311,7 @@ export function solveMinPriceForMargin2027({
       if (hiEst.status !== 'verified') {
         resOver50 = { state: 'unverified', sol: null, reason: hiEst.reason };
       } else if (!hiEst.zero_browser_fail) {
-        resOver50 = searchBand(5001, hi);
+        resOver50 = searchBand(over50MinNetCents, hi);
       } else {
         resOver50 = { state: 'infeasible', sol: null, reason: null };
       }
@@ -3093,9 +3319,9 @@ export function solveMinPriceForMargin2027({
   }
 
   const bandEntries = [
-    { key: 'under_10', lo: 100, hi: Math.min(999, maxCents), res: resUnder10 },
-    { key: '10_to_50', lo: 1000, hi: Math.min(5000, maxCents), res: res10To50 },
-    { key: 'over_50', lo: 5001, hi: maxCents, res: resOver50 },
+    { key: 'under_10', lo: 100, hi: Math.min(under10MaxNetCents, maxCents), res: resUnder10 },
+    { key: '10_to_50', lo: band10To50MinNetCents, hi: Math.min(band10To50MaxNetCents, maxCents), res: res10To50 },
+    { key: 'over_50', lo: over50MinNetCents, hi: maxCents, res: resOver50 },
   ].filter(b => b.res.state !== 'out_of_range');
 
   const overlappingBands = bandEntries.filter(b => b.hi >= floorCents && b.lo <= maxCents);
@@ -3160,16 +3386,18 @@ export function solveMinPriceForMargin2027({
 
   const unconstrained = orderedSolutions[0];
 
-  // Detect $50.00 FBA fulfillment tier cliff dead zone: $50.00 passes, $50.01 fails, recovers at solOver50.
+  // Detect $50.00 FBA fulfillment tier cliff dead zone: list $50.00 passes, list $50.01 fails, recovers at solOver50.
   let cliffDeadZone = null;
-  if (sol10To50 && solOver50 && solOver50.cents > 5001) {
-    const est5001 = evalAtCents(5001);
-    if (est5001.status === 'verified' && est5001.zero_browser_fail) {
+  if (sol10To50 && solOver50 && solOver50.cents > over50MinNetCents) {
+    const estOver50Start = evalAtCents(over50MinNetCents);
+    if (estOver50Start.status === 'verified' && estOver50Start.zero_browser_fail) {
+      const deadStartUsd = round(over50MinNetCents / 100);
+      const sweetSpotUsd = round(band10To50MaxNetCents / 100);
       cliffDeadZone = {
-        from_usd: 50.01,
+        from_usd: deadStartUsd,
         through_usd: round((solOver50.cents - 1) / 100),
         over_50_recovery_price_usd: solOver50.price_usd,
-        note: `定价悬崖死区：$50.00 达标，但 $50.01 至 $${((solOver50.cents - 1) / 100).toFixed(2)} 因跳入 over_50 FBA 费档跌破 ${(margin_floor * 100).toFixed(0)}% 红线，需涨至 $${solOver50.price_usd.toFixed(2)} 才重新达标。`,
+        note: `定价悬崖死区：$${sweetSpotUsd.toFixed(2)} 达标，但 $${deadStartUsd.toFixed(2)} 至 $${((solOver50.cents - 1) / 100).toFixed(2)} 因跳入 over_50 FBA 费档跌破 ${(margin_floor * 100).toFixed(0)}% 红线，需涨至 $${solOver50.price_usd.toFixed(2)} 才重新达标。`,
       };
     }
   }
@@ -3255,7 +3483,9 @@ export function computeOrderPlan({
   min_sets = 100,
   allow_remainder = false,
   target_sets = null,
-  lcm_cap = 200,
+  lcm_cap = undefined,
+  profile_revision = undefined,
+  profileRevision = undefined,
 } = {}) {
   if (!Array.isArray(sku_lines) || sku_lines.length === 0) {
     throw new TypeError('A nonempty sku_lines array is required.');
@@ -3263,7 +3493,9 @@ export function computeOrderPlan({
   if (!Number.isSafeInteger(min_sets) || min_sets < 100) {
     throw new TypeError('min_sets must be a safe integer >= 100.');
   }
-  if (!Number.isSafeInteger(lcm_cap) || lcm_cap < 1) {
+  const hasExplicitLcmCap = lcm_cap !== undefined && lcm_cap !== null;
+  const effectiveLcmCap = hasExplicitLcmCap ? lcm_cap : 200;
+  if (!Number.isSafeInteger(effectiveLcmCap) || effectiveLcmCap < 1) {
     throw new TypeError('lcm_cap must be a positive safe integer.');
   }
   if (target_sets !== null && target_sets !== undefined && (!Number.isSafeInteger(target_sets) || target_sets < min_sets)) {
@@ -3283,6 +3515,9 @@ export function computeOrderPlan({
       throw new TypeError(`sku_lines[${index}].unit_price_cny must be a nonnegative finite number.`);
     }
     return {
+      ...(typeof line.component_id === 'string' && line.component_id.trim() ? { component_id: line.component_id.trim() } : {}),
+      ...(typeof line.factory_id === 'string' && line.factory_id.trim() ? { factory_id: line.factory_id.trim() } : {}),
+      ...(typeof line.supplier_id === 'string' && line.supplier_id.trim() ? { supplier_id: line.supplier_id.trim() } : {}),
       offer_id: line.offer_id ?? null,
       sku_id: line.sku_id ?? `sku-${index + 1}`,
       quote_unit: line.quote_unit ?? 'piece',
@@ -3306,7 +3541,10 @@ export function computeOrderPlan({
     return Number(bigVal);
   };
 
-  const useRemainderPath = Boolean(allow_remainder) || K > BigInt(lcm_cap);
+  const effProfileRev = profile_revision ?? profileRevision ?? 58;
+  const isR59AdvisoryLcm = effProfileRev >= 59 && !hasExplicitLcmCap;
+  const highLcmAdvisory = K > BigInt(effectiveLcmCap);
+  const useRemainderPath = Boolean(allow_remainder) || (!isR59AdvisoryLcm && highLcmAdvisory);
   let allocatedSets;
   let plannedLines;
 
@@ -3374,8 +3612,12 @@ export function computeOrderPlan({
     all_promo_clear: linesWithRemainders.every(l => l.regular_goods_promo_false),
     total_goods_cny: totalGoodsCny,
     per_allocated_set_goods_cny: perAllocatedRat ? roundBigRat(perAllocatedRat.n, perAllocatedRat.d, 10) : null,
-    per_complete_set_goods_cny: perCompleteRat ? roundBigRat(perCompleteRat.n, perCompleteRat.d, 10) : null,
+    per_complete_set_goods_cny: perCompleteRat ? roundBigRat(perAllocatedRat.n, perCompleteRat.d, 10) : null,
     moq_capital_alert: allocatedSets >= 300 || actualCompleteSets >= 300,
+    ...(isR59AdvisoryLcm && highLcmAdvisory ? {
+      high_lcm_advisory: true,
+      advisory_note: `装箱最小公倍数 K=${K.toString()} > ${effectiveLcmCap}，当前按零尾货整箱对齐核算，建议向工厂核实散箱／混装可行性以降低起订套数。`,
+    } : {}),
     sku_lines: linesWithRemainders,
   };
 }
@@ -3441,6 +3683,7 @@ export function computePackagingRedesignShortlist2027({
   net_effective_price_usd = undefined,
   ongoing_coupon_usd = undefined,
   ongoing_coupon_pct = undefined,
+  coupon_redemption_fee_usd = undefined,
   prime_exclusive_discount_usd = undefined,
   prime_exclusive_discount_pct = undefined,
   promo_basis_already_net = false,
@@ -3462,6 +3705,9 @@ export function computePackagingRedesignShortlist2027({
   inbound_window = FBA_2027_DEFAULT_INBOUND_WINDOW,
   average_inventory_days = 45,
   placement_split_option = 'minimal_west_conservative',
+  carton_count = null,
+  identical_cartons_count = null,
+  multi_destination_headhaul_verified = false,
   is_apparel,
   is_shoes,
   is_apparel_or_shoes,
@@ -3544,6 +3790,7 @@ export function computePackagingRedesignShortlist2027({
     net_effective_price_usd,
     ongoing_coupon_usd,
     ongoing_coupon_pct,
+    coupon_redemption_fee_usd,
     prime_exclusive_discount_usd,
     prime_exclusive_discount_pct,
     promo_basis_already_net,
@@ -3562,6 +3809,9 @@ export function computePackagingRedesignShortlist2027({
     average_inventory_days,
     placement_usd: null,
     placement_split_option,
+    carton_count,
+    identical_cartons_count,
+    multi_destination_headhaul_verified,
     margin_floor,
     is_apparel,
     is_shoes,

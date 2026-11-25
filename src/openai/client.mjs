@@ -4384,11 +4384,17 @@ export class OpenAiClient {
 
     const wantCleanup = Boolean(cleanupRequired && desiredTerminalStatus !== 'pending_recovery');
 
+    const hasEnrichedUsageForSettled =
+      alreadyFinanciallySettled &&
+      usageCostMicros !== null &&
+      !attempt.confirmed_zero_charge &&
+      (attempt.usage_cost_micros === null || usageCostMicros > attempt.usage_cost_micros);
+
     // Persist sanitized raw receipt, original_body_sha256, & terminal usage BEFORE optional DELETE + 404 readback!
-    const persistedBeforeDelete = alreadyFinanciallySettled
+    const persistedBeforeDelete = (alreadyFinanciallySettled && !hasEnrichedUsageForSettled)
       ? ledger.getAttemptById(attempt.attempt_id)
       : ledger.recordTerminalOutcome(attempt.attempt_id, {
-        status: desiredTerminalStatus,
+        status: alreadyFinanciallySettled ? attempt.status : desiredTerminalStatus,
         contentStatus: finalContentStatus,
         usageCostMicros,
         usage: isPlainObject(sanitizedBody.usage)
@@ -4404,7 +4410,7 @@ export class OpenAiClient {
         originalBodySha256,
         rawBodyText: scrubbedRawText,
         rawBodySha256: scrubbedRawSha256,
-        diagnosticReason: diagReason,
+        diagnosticReason: alreadyFinanciallySettled ? (attempt.diagnostic_reason ?? diagReason) : diagReason,
       });
 
     let ledgerStatus = persistedBeforeDelete.status;
@@ -4617,13 +4623,11 @@ export class OpenAiClient {
       }
     } else if (boundAttempt && !activeBackground && !hasPersistedBackgroundTerminal(boundAttempt) &&
       rawBytes && rawBytes.length > 0) {
-      const stage = boundAttempt.background_mode === true
-        ? `response_get_${originalBodySha256.slice(0, 32)}`
-        : 'response_get';
+      const stage = `response_get_${originalBodySha256.slice(0, 32)}`;
       const saved = eff.ledger.savePrivatePayload(boundAttempt.attempt_id, stage, rawBytes, {
         literalSecret: apiKey,
       });
-      if (saved.stored) {
+      if (saved.stored && saved.raw_sha256 === originalBodySha256) {
         privateReceiptRef = saved.private_receipt_ref;
       }
     }

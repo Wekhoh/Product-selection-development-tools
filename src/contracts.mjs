@@ -130,15 +130,36 @@ export function sanitizeDiagnosticText(text) {
         : '[REDACTED_PHONE]'
     ),
   );
-  out = out.replace(/(收货人|收件人|联系人)\s*[:：]\s*[^\s,，;；]+/g, '$1:[REDACTED_NAME]');
-  out = out.replace(/\b(receiver_name|recipient_name|contact_name)\s*[:=]\s*[^\s,，;；]+/gi, '$1=[REDACTED_NAME]');
+  out = out.replace(
+    /(?<![A-Za-z0-9.])(?:\+\d{1,3}[-.\s]?(?:\(\d{1,4}\)[-.\s]?)?(?:\d[-.\s]?){6,13}\d|\b(?:tel|telephone|phone|mobile|cell|fax)\s*[:=]?\s*\+?\d[\d\s().-]{6,18}\d)(?!(?:\.\d|[A-Za-z0-9]))/gi,
+    '[REDACTED_PHONE]',
+  );
+  out = out.replace(/(收货人|收件人|联系人)\s*[:：]\s*[^\n\r,，;；"'}]+/g, '$1:[REDACTED_NAME]');
+  out = out.replace(
+    /(?:"(receiver_name|recipient_name|contact_name|registrant_name)"\s*:\s*"[^"]*"|\b(receiver_name|recipient_name|contact_name|registrant_name)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\n\r,，;；"'}]+))/gi,
+    (_, qk, bk) => (qk ? `"${qk}":"[REDACTED_NAME]"` : `${bk}=[REDACTED_NAME]`),
+  );
   out = out.replace(/(?:路|大道|街|巷|弄)\s*[零一二三四五六七八九十百千\d]+\s*号/g, '[REDACTED_STREET]');
   out = out.replace(/(?:栋|幢|单元|室|号楼|楼层)\s*[零一二三四五六七八九十百千\d]+|[零一二三四五六七八九十百千\d]+\s*(?:栋|幢|单元|室|号楼|层)/g, '[REDACTED_UNIT]');
   out = out.replace(/[A-Za-z]:\\Users\\[^\\\s"'<>]+(?:\\[^\s"'<>]*)*/gi, '[REDACTED_PATH]');
   out = out.replace(/(?:file:\/\/\/)?\/?(?:Users|home)\/[^/\s"'<>]+(?:\/[^\s"'<>]*)*/gi, '[REDACTED_PATH]');
-  out = out.replace(/\b(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9_]{6,}|github_pat_[A-Za-z0-9_]{6,}|xox[bpas]-[A-Za-z0-9-]{6,}|AIza[A-Za-z0-9_-]{10,}|AKIA[0-9A-Z]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{6,})/g, '[REDACTED_TOKEN]');
-  out = out.replace(/\b(Bearer\s+)[^\s,;"']+/gi, '$1[REDACTED_TOKEN]');
-  out = out.replace(/\b(api[_-]?key|access[_-]?token|secret[_-]?key|token|authorization|cookie|password)\s*[:=]\s*[^\s,;]+/gi, '$1=[REDACTED_SECRET]');
+  out = out.replace(/\b(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9_]{6,}|github_pat_[A-Za-z0-9_]{6,}|xox[bpas]-[A-Za-z0-9-]{6,}|pk_live_[A-Za-z0-9_-]{6,}|rk_live_[A-Za-z0-9_-]{6,}|ya29\.[A-Za-z0-9._-]{8,}|1\/\/[0-9A-Za-z_-]{12,}|oauth_[A-Za-z0-9._-]{8,}|AIza[A-Za-z0-9_-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{6,})/g, '[REDACTED_TOKEN]');
+  out = out.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi, '$1[REDACTED_TOKEN]');
+  out = out.replace(
+    /(\\+)"(api[_-]?key|access[_-]?token|refresh[_-]?token|oauth[_-]?token|client[_-]?secret|id[_-]?token|secret[_-]?key|token|authorization|cookie|set-cookie|password)\1"\s*:\s*\1"[\s\S]*?\1"/gi,
+    (_, bs, qk) => `${bs}"${qk}${bs}":${bs}"[REDACTED_SECRET]${bs}"`,
+  );
+  out = out.replace(
+    /"(api[_-]?key|access[_-]?token|refresh[_-]?token|oauth[_-]?token|client[_-]?secret|id[_-]?token|secret[_-]?key|token|authorization|cookie|set-cookie|password)"\s*:\s*"(?:\\.|[^"\\])*"/gi,
+    (_, qk) => `"${qk}":"[REDACTED_SECRET]"`,
+  );
+  out = out.replace(/\b((?:Proxy-)?Authorization)\s*:\s*(?!\[REDACTED_SECRET\])(?:Bearer|Basic|Digest|Token|AWS4-HMAC-SHA256)?\s*[^\r\n]+/gi, '$1: [REDACTED_SECRET]');
+  out = out.replace(/\b(Set-Cookie|Cookie)\s*:\s*(?!\[REDACTED_SECRET\])[^\r\n]+/gi, '$1: [REDACTED_SECRET]');
+  out = out.replace(/(?:__Host-|__Secure-)?[A-Za-z0-9_.-]*(?:session|session_id|sessionid|sid|phpsessid|jsessionid|connect\.sid|auth_token|csrf_token)[A-Za-z0-9_.-]*\s*=\s*[^\s,;"'}]+/gi, '[REDACTED_COOKIE]=[REDACTED_SECRET]');
+  out = out.replace(
+    /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|oauth[_-]?token|client[_-]?secret|id[_-]?token|secret[_-]?key|token|authorization|cookie|password)\s*[:=]\s*(?!\[REDACTED_SECRET\])(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
+    (_, bk) => `${bk}=[REDACTED_SECRET]`,
+  );
   return out;
 }
 
@@ -327,10 +348,10 @@ function isVerifiedDedicatedRasterDataUri(value) {
   return false;
 }
 
-const SECRET_CASE_INSENSITIVE_RE = /\b(?:sk-[a-z0-9_-]{6,}|gh[pousr]_[a-z0-9_]{6,}|github_pat_[a-z0-9_]{6,}|xox[bpas]-[a-z0-9-]{6,}|pk_live_[a-z0-9_-]{6,}|rk_live_[a-z0-9_-]{6,}|eyj[a-z0-9_-]{10,}\.[a-z0-9._-]{6,})|\bbearer\s+\S+/i;
+const SECRET_CASE_INSENSITIVE_RE = /\b(?:sk-[a-z0-9_-]{6,}|gh[pousr]_[a-z0-9_]{6,}|github_pat_[a-z0-9_]{6,}|xox[bpas]-[a-z0-9-]{6,}|pk_live_[a-z0-9_-]{6,}|rk_live_[a-z0-9_-]{6,}|ya29\.[a-z0-9._-]{8,}|1\/\/[0-9a-z_-]{12,}|oauth_[a-z0-9._-]{8,}|eyj[a-z0-9_-]{10,}\.[a-z0-9._-]{6,})|\bbearer\s+(?!\[redacted)[a-z0-9._~+/=-]{6,}|\b(?:proxy-)?authorization\s*:\s*(?:bearer|basic|digest|token)\s+(?!\[redacted)[a-z0-9._~+/=-]{6,}|\b(?:set-cookie|cookie)\s*:\s*(?!\[redacted)[^\r\n]{6,}|\b(?:session|session_id|sessionid|connect\.sid|phpsessid|jsessionid|auth_token|csrf_token)\s*=\s*(?!\[redacted)[a-z0-9._~+/=-]{8,}|\b(?:api[_-]?key|access[_-]?token|refresh[_-]?token|oauth[_-]?token|client[_-]?secret|id[_-]?token|secret[_-]?key|password|cookie)\b(?:\\*["'])?\s*[:=]\s*(?:\\*["'])?(?!\[redacted)[a-z0-9._~+/=-]{8,}/i;
 const SECRET_CASE_EXACT_RE = /\b(?:(?:AKIA|ASIA)[0-9A-Z]{10,}|AIza[0-9A-Za-z_-]{10,})/;
 const SENSITIVE_SECRET_KEYS = new Set([
-  'api_key', 'apikey', 'access_token', 'refresh_token', 'secret_key', 'authorization', 'cookie', 'password',
+  'api_key', 'apikey', 'access_token', 'refresh_token', 'oauth_token', 'client_secret', 'id_token', 'secret_key', 'authorization', 'cookie', 'password',
 ]);
 
 function matchesSecretText(text) {
@@ -347,7 +368,20 @@ export function containsSecretToken(value, seen = new Set(), depth = 0, inDedica
     if ((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']'))) {
       try {
         return containsSecretToken(JSON.parse(s), seen, depth + 1, false);
-      } catch { /* fall through to plain-text scan on invalid JSON */ }
+      } catch { /* fall through to line/plain-text scan on invalid or multi-line JSON */ }
+    }
+    if (s.includes('\n')) {
+      for (const rawLine of s.split(/\r?\n/)) {
+        const ln = rawLine.trim();
+        if (!ln) continue;
+        if ((ln.startsWith('{') && ln.endsWith('}')) || (ln.startsWith('[') && ln.endsWith(']'))) {
+          try {
+            if (containsSecretToken(JSON.parse(ln), seen, depth + 1, false)) return true;
+            continue;
+          } catch { /* fall through */ }
+        }
+        if (matchesSecretText(ln)) return true;
+      }
     }
     return matchesSecretText(value);
   }

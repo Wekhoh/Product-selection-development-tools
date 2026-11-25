@@ -5415,7 +5415,16 @@ export class OpenAiBudgetLedger {
         return existing;
       }
 
-      if (!['in_progress', 'pending_recovery'].includes(existing.status)) {
+      const canEnrichManuallySettledReadback =
+        ['completed', 'failed_known'].includes(existing.status) &&
+        status === existing.status &&
+        !existing.confirmed_zero_charge &&
+        (cleanRespId === null || existing.provider_response_id === null || existing.provider_response_id === cleanRespId) &&
+        usageCostMicros !== null &&
+        usageCostMicros !== undefined &&
+        (existing.usage_cost_micros === null || usageCostMicros >= existing.usage_cost_micros);
+
+      if (!['in_progress', 'pending_recovery'].includes(existing.status) && !canEnrichManuallySettledReadback) {
         throw new OpenAiBudgetError(
           `Cannot transition attempt "${existing.attempt_id}" from terminal state "${existing.status}" to "${status}".`,
           { code: 'INVALID_STATE_TRANSITION' },

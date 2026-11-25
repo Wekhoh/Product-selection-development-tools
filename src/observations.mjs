@@ -250,10 +250,11 @@ export function resolveTargetChildSalesObservation(input = {}) {
   const reviewDelta = finite(input?.child_review_delta_30d) ? input.child_review_delta_30d : 0;
   const leafRank = finite(input?.leaf_bsr_rank) && input.leaf_bsr_rank > 0 ? input.leaf_bsr_rank : null;
   const sifChildKeywords = finite(input?.sif_child_keyword_count) ? input.sif_child_keyword_count : 0;
-  const hasActiveSignal = reviewDelta > 0 || (leafRank !== null && leafRank <= 200) || sifChildKeywords > 0 || (parentUnits !== null && parentUnits > 0 && input?.is_primary_spec_variant === true);
+  const hasActiveSignal = reviewDelta > 0 || leafRank !== null || sifChildKeywords > 0 || (parentUnits !== null && parentUnits > 0 && input?.is_primary_spec_variant === true);
 
   if (hasActiveSignal) {
     const cap = parentUnits !== null && parentUnits > 0 ? Math.min(49, parentUnits) : 49;
+    const highLeafRankAdvisory = leafRank !== null && leafRank > 200;
     return {
       asin,
       grain: 'target_child_units',
@@ -264,6 +265,10 @@ export function resolveTargetChildSalesObservation(input = {}) {
       range_basis: 'Multi-variant child below 50+ badge threshold with active review/BSR/keyword traction (<50/mo)',
       label: `<50/月（蓝海起步档/待核 · 1–${Math.max(1, cap)}/月）`,
       reason: 'Tools return 0/empty below the 50+/mo badge floor; active child BSR/review/traffic signals confirm positive starter traction (<50/mo) rather than zero sales.',
+      ...(highLeafRankAdvisory ? {
+        high_leaf_rank_advisory: true,
+        advisory_note: `细分类目 BSR 排名 #${leafRank}（>200），按 <50/月非阻断起步区间保留，建议结合评论增量或词流复核动销。`,
+      } : {}),
     };
   }
 

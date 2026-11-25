@@ -9,7 +9,7 @@ import { prepareDiscovery, attachDiscovery } from './discovery.mjs';
 import { resolveChannelMeta } from './discovery-channels.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
-import { getFba2027RateTableSnapshot } from './fba-rates-2027.mjs';
+import { getFba2027RateTableSnapshot, getHistoricalFba2027RateTableSnapshots } from './fba-rates-2027.mjs';
 import {
   canonicalJson,
   computeEvidenceBundleHash,
@@ -615,14 +615,32 @@ export function replayBatchIntoStore(store, {
       const inputCand = boundBatch.candidates.find(c => c.id === candId) ?? boundBatch.candidates[i];
       const formId = inputCand?.discovery?.form_id || candId;
       const label = inputCand?.discovery?.label || scored.label || scored.name || formId;
-      const buyerTask = inputCand?.discovery?.description || inputCand?.saleable_unit || label;
+      const isR59Replay = effectiveRev >= 59;
+      const candSaleableUnit = isR59Replay
+        ? (inputCand?.saleable_unit ||
+          inputCand?.economics?.saleable_unit ||
+          inputCand?.operating_periods?.[0]?.scenarios?.[0]?.saleable_unit ||
+          scored?.economics?.saleable_unit ||
+          scored?.operating_periods?.[0]?.scenarios?.[0]?.saleable_unit ||
+          label)
+        : (inputCand?.saleable_unit || label);
+      const buyerTask = inputCand?.discovery?.description || candSaleableUnit || label;
+      const frozenComposition = isR59Replay && inputCand?.saleable_set_composition && typeof inputCand.saleable_set_composition === 'object'
+        ? inputCand.saleable_set_composition
+        : { saleable_unit: candSaleableUnit };
+      const frozenGradeOrMaterial = isR59Replay ? (inputCand?.grade_or_material ?? null) : null;
+      const frozenTargetChildAsin = isR59Replay ? (inputCand?.target_child_asin ?? null) : null;
+      const frozenLeafNodePath = isR59Replay ? (inputCand?.leaf_node_path ?? null) : null;
 
       const { form } = store.upsertCandidateForm({
         form_id: formId,
         product_family_key: candId,
         label,
         buyer_task: buyerTask,
-        saleable_set_composition: { saleable_unit: inputCand?.saleable_unit || label },
+        saleable_set_composition: frozenComposition,
+        grade_or_material: frozenGradeOrMaterial,
+        target_child_asin: frozenTargetChildAsin,
+        leaf_node_path: frozenLeafNodePath,
         lifecycle_status: 'evaluated',
       }, { preserveExisting: true });
 
@@ -642,18 +660,39 @@ export function replayBatchIntoStore(store, {
       // Hash the frozen batch's own spec snapshot so replaying an old batch never attaches stale scores to an upgraded live form spec.
       const replaySpecSha = sha256Hex(canonicalJson({
         buyer_task: buyerTask,
-        saleable_set_composition: { saleable_unit: inputCand?.saleable_unit || label },
-        grade_or_material: null,
-        target_child_asin: null,
-        leaf_node_path: null,
+        saleable_set_composition: frozenComposition,
+        grade_or_material: frozenGradeOrMaterial,
+        target_child_asin: frozenTargetChildAsin,
+        leaf_node_path: frozenLeafNodePath,
       }));
-      const bundleHash = computeEvidenceBundleHash({
+      let activeCandFeeSnapshot = effectiveFeeSnapshot;
+      let bundleHash = computeEvidenceBundleHash({
         form_spec_sha256: replaySpecSha,
         candidate_input: inputCand,
         discovery_manifest: manifest,
         profile_snapshot: profile,
-        fee_table_snapshot: effectiveFeeSnapshot,
+        fee_table_snapshot: activeCandFeeSnapshot,
       });
+      if (fee_table_snapshot === null && !isR59Replay) {
+        const existingEvals = store.getEvaluationsForForm(formId)
+          .filter(ev => Number(ev.profile_revision) === Number(profile.revision));
+        if (existingEvals.length > 0 && !existingEvals.some(ev => ev.evidence_bundle_sha256 === bundleHash)) {
+          for (const histSnap of getHistoricalFba2027RateTableSnapshots()) {
+            const altHash = computeEvidenceBundleHash({
+              form_spec_sha256: replaySpecSha,
+              candidate_input: inputCand,
+              discovery_manifest: manifest,
+              profile_snapshot: profile,
+              fee_table_snapshot: histSnap,
+            });
+            if (existingEvals.some(ev => ev.evidence_bundle_sha256 === altHash)) {
+              activeCandFeeSnapshot = histSnap;
+              bundleHash = altHash;
+              break;
+            }
+          }
+        }
+      }
 
       const perCandidateSha = sha256Hex(canonicalJson(scored));
       const qualification = reconstructVersionQualification(scored, profile.revision);
@@ -692,6 +731,7 @@ export function replayBatchIntoStore(store, {
           receipt: {
             profile_revision: profile.revision,
             form_spec_sha256: replaySpecSha,
+            spec_version: form.spec_sha256 === replaySpecSha ? form.spec_version : null,
             batch_result_sha256: batchResultSha,
             batch_html_sha256: batchHtmlSha,
             summary: result.summary,

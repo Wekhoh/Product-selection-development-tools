@@ -1129,6 +1129,7 @@ test('Round 4 & Unshackled Codex Closure: 3-tier age priority + all-<90d blue oc
       scenarios: [{
         id: 'sc-blue',
         price_usd: 42.99,
+        ongoing_coupon_pct: 0.10,
         pkg: { length_in: 12, width_in: 9, height_in: 3, weight_lb: 1.8 },
         fx_cny_per_usd: 7.2,
         refund_fraction: 0.04,

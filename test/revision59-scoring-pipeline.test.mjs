@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { scoreCandidate, scoreBatch, upgradeProfileToR59 } from '../src/scoring.mjs';
+import { scoreCandidate, scoreBatch } from '../src/scoring.mjs';
 import { validateSourcingVerifier1688Output } from '../src/contracts.mjs';
 import { openSelectionStore } from '../src/store.mjs';
 import { runGate1AForForm, runGate1BForForm, runPhase2Batch, attachCandidateEvidenceReview } from '../src/pipeline.mjs';
@@ -21,7 +21,7 @@ const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.jso
 test('Slice 2A: r59 profile & crossing-30% multi-factory interval linear slope extension (without inflating strict qualifying count)', () => {
   assert.equal(r58Profile.revision, 58, 'reference-profile.draft.json must remain frozen at r58');
   assert.equal(r59Profile.revision, 59, 'reference-profile.r59.draft.json must be r59');
-  const upgraded = upgradeProfileToR59(r58Profile);
+  const upgraded = structuredClone(r59Profile);
   assert.equal(upgraded.revision, 59);
   assert.equal(upgraded.workflow.scoring_and_ordering.revision, 59);
 
@@ -270,6 +270,7 @@ test('Slice 2C: r59 target_child_units grain on demand & Q31 newcomer cohort + m
   const candParentSalesEv = structuredClone(candChild);
   candParentSalesEv.evidence.push({
     id: 'ev-parent-agg-sales',
+    grain: 'parent_units',
     source: 'Synthetic parent family monthlySales aggregated across all variants',
     observed_at: '2026-11-20',
   });
@@ -732,8 +733,8 @@ test('Astra Round-1 Regressions (Scoring & Pipeline): BLOCKER 3 multi-quote Stag
       price_band_analysis: {
         options: { as_of_date: '2026-11-22', strict_mature_only: true },
         listings: [
-          { asin: 'B0MAT28001', price_usd: 28, fulfillment: 'FBA', monthlySales: 120, availableDate: '2025-05-01' },
-          { asin: 'B0MAT28002', price_usd: 27.5, fulfillment: 'FBA', monthlySales: 100, availableDate: '2025-06-01' },
+          { asin: 'B0MAT28001', price_usd: 28, fulfillment: 'FBA', monthlySales: 120, availableDate: '2025-05-01', keepa_price_steady: true },
+          { asin: 'B0MAT28002', price_usd: 27.5, fulfillment: 'FBA', monthlySales: 100, availableDate: '2025-06-01', keepa_price_steady: true },
           { asin: 'B0YNG31001', price_usd: 31, fulfillment: 'FBA', monthlySales: 40, availableDate: '2026-10-03' },
         ],
       },
@@ -1434,6 +1435,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
   candSingleVar.newcomer_cohort.market_reference.mature_age_floor_days = 90;
   candSingleVar.evidence.push({
     id: 'ev-single-var-exact',
+    grain: 'target_child_units',
     source: '单变体同款核实：该链接仅1个子体，父体销量等于目标子体销量',
     observed_at: '2026-11-20',
   });
@@ -2160,17 +2162,13 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
     assert.equal(g1bLeg.status, 'gate1b_pending');
     assert.match(g1bLeg.reason, /ui_readback/i);
 
-    // HIGH 6: Negated prose ("父体销量不等于目标子体销量", "不是唯一子体，未等于", "never equals target child") must NOT pass Q31 as single-variant!
-    for (const negProse of [
-      '多变体同款：父体销量不等于目标子体销量',
-      '父体销量不是唯一子体，未等于目标子体销量',
-      'Parent family sales never equals target child',
-    ]) {
+    // Structured `ev.grain` check (replacing brittle 400-char prose regex): parent_units / family_representative grain blocks Q31!
+    for (const parentGrain of ['parent_units', 'family_representative', 'parent_family_units']) {
       const cNegQ31 = structuredClone(candSingleVar);
-      cNegQ31.evidence.find(e => e.id === 'ev-single-var-exact').source = negProse;
+      cNegQ31.evidence.find(e => e.id === 'ev-single-var-exact').grain = parentGrain;
       const scoredNegQ31 = scoreCandidate(cNegQ31, r59Profile);
       const q31ItemNeg = scoredNegQ31.items.find(i => i.id === 'low_rating_sales_performance');
-      assert.equal(q31ItemNeg.status, 'needs_evidence', `Negated prose (${negProse}) must block Q31`);
+      assert.equal(q31ItemNeg.status, 'needs_evidence', `Structured parent grain (${parentGrain}) must block Q31`);
       assert.equal(scoredNegQ31.qualification.counts_toward_target, false);
     }
   } finally {

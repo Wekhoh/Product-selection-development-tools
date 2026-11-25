@@ -48,6 +48,7 @@ import {
 } from './price-band.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
+import { resolveStage1QualitativeJudgments } from './raw-ingest.mjs';
 import { prepareDiscovery, attachDiscovery, attachStoreDiscoveryProvenance } from './discovery.mjs';
 import { canonicalJson, computeEvidenceBundleHash, isSocialBridgeAlignedWithForm, sha256Hex } from './store.mjs';
 import {
@@ -82,22 +83,27 @@ const PRICE_WATCH_REASONS = [
   'seed_merged_unverified_regular_price',
   'veteran_clearance_or_war_watch',
   'veteran_keepa_price_unsteady',
+  'veteran_missing_keepa_steady_evidence',
   'growth_stage_price_unsteady',
+  'growth_missing_keepa_steady_evidence',
   'growth_stage_held_veterans_sufficient',
   'out_of_primary_band_observation_only',
   'excluded_spec_mismatch_or_bare_part',
   'spec_mismatch_or_accessory',
+  'bare_part_or_different_spec',
+  'multi_pack_or_bundle_variant',
 ];
 const FORWARD_FEE_INPUTS = [
   'pkg', 'fx_cny_per_usd', 'refund_fraction', 'physical_return_fraction',
   'fee_category', 'return_threshold', 'referral_terms', 'headhaul_usd',
   'collection_rate', 'other_applicable_usd', 'other_payee', 'sales_window',
   'storage_window', 'inbound_window', 'average_inventory_days', 'placement_usd',
-  'placement_split_option', 'is_apparel', 'is_shoes', 'is_apparel_or_shoes',
+  'placement_split_option', 'carton_count', 'identical_cartons_count', 'multi_destination_headhaul_verified',
+  'is_apparel', 'is_shoes', 'is_apparel_or_shoes',
   'is_dangerous_goods', 'is_sipp', 'sipp_discount_usd',
   'low_price_eligible', 'allow_bulky_2027', 'allow_all_2027_tiers',
   'profile_revision', 'requires_amazon_packaging', 'calculator_verified_override',
-  'list_price_usd', 'ongoing_coupon_usd', 'ongoing_coupon_pct',
+  'list_price_usd', 'ongoing_coupon_usd', 'ongoing_coupon_pct', 'coupon_redemption_fee_usd',
   'prime_exclusive_discount_usd', 'prime_exclusive_discount_pct', 'promo_basis_already_net',
   'coupon_campaign_units', 'coupon_redemption_share', 'include_coupon_fee', 'include_coupon_campaign_flat',
 ];
@@ -422,13 +428,17 @@ function bindGate1BScenariosToGate1A(rawScenarios, gate1aRecord) {
       issues.push(`Scenario "${decl.id}" ($${effPrice}): Gate 1B fulfillment_usd ($${sc.fulfillment_usd}) conflicts with Gate 1A verified 2027 FBA tier ($${decl.fulfillment_usd}, band ${decl.price_band}).`);
     }
     if (finite(decl.coupon_fee_usd) && decl.coupon_fee_usd > 0) {
+      if (sc.include_coupon_fee === false) {
+        issues.push(`Scenario "${decl.id}" ($${effPrice}): Gate 1B cannot suppress Gate 1A declared ongoing coupon redemption fee ($${decl.coupon_fee_usd}) via include_coupon_fee: false.`);
+      }
       const scHasCouponFields = (finite(sc.ongoing_coupon_usd) && sc.ongoing_coupon_usd > 0) ||
-        (finite(sc.ongoing_coupon_pct) && sc.ongoing_coupon_pct > 0);
-      const scExplicitAmazonOther = sc.other_payee === 'amazon' && finite(sc.other_applicable_usd)
+        (finite(sc.ongoing_coupon_pct) && sc.ongoing_coupon_pct > 0) ||
+        (finite(sc.coupon_redemption_fee_usd) && sc.coupon_redemption_fee_usd >= decl.coupon_fee_usd - PARITY_TOLERANCE_USD);
+      const scExplicitAmazonOther = (sc.other_payee === 'amazon' || sc.coupon_fee_already_in_other === true) && finite(sc.other_applicable_usd)
         ? sc.other_applicable_usd
         : null;
       if (!scHasCouponFields && (!finite(scExplicitAmazonOther) || scExplicitAmazonOther < decl.coupon_fee_usd - PARITY_TOLERANCE_USD)) {
-        issues.push(`Scenario "${decl.id}" ($${effPrice}): Gate 1B omits Gate 1A declared ongoing coupon redemption fee ($${decl.coupon_fee_usd}); supply ongoing_coupon_usd/ongoing_coupon_pct or Amazon other_applicable_usd.`);
+        issues.push(`Scenario "${decl.id}" ($${effPrice}): Gate 1B omits Gate 1A declared ongoing coupon redemption fee ($${decl.coupon_fee_usd}); supply ongoing_coupon_usd/ongoing_coupon_pct/coupon_redemption_fee_usd or Amazon other_applicable_usd.`);
       }
     }
     if (finite(sc.placement_usd) && Array.isArray(decl.placement_range_usd) && decl.placement_range_usd.length === 2) {
@@ -688,11 +698,20 @@ function verifyStage3ContainerBindings({
         }
       }
       if (!isPeak && finite(matchedDecl.coupon_fee_usd) && matchedDecl.coupon_fee_usd > 0) {
-        const ledgerHasCouponFields = (finite(ledger.ongoing_coupon_usd) && ledger.ongoing_coupon_usd > 0) ||
-          (finite(ledger.ongoing_coupon_pct) && ledger.ongoing_coupon_pct > 0);
+        const ledgerHasCouponFields = ledger.include_coupon_fee !== false && (
+          (finite(ledger.ongoing_coupon_usd) && ledger.ongoing_coupon_usd > 0) ||
+          (finite(ledger.ongoing_coupon_pct) && ledger.ongoing_coupon_pct > 0) ||
+          (finite(ledger.coupon_redemption_fee_usd) && ledger.coupon_redemption_fee_usd >= matchedDecl.coupon_fee_usd - PARITY_TOLERANCE_USD)
+        );
         const otherLine = lines.find(l => l?.id === 'other_applicable');
-        const otherLineHasCoupon = otherLine && otherLine.status !== 'pending' &&
-          finite(otherLine.amount_usd) && otherLine.amount_usd >= matchedDecl.coupon_fee_usd - PARITY_TOLERANCE_USD;
+        const otherAmzPortion = otherLine && otherLine.status !== 'pending' && finite(otherLine.amount_usd)
+          ? (otherLine.payee === 'amazon'
+            ? otherLine.amount_usd
+            : (otherLine.coupon_fee_included === true
+              ? (finite(otherLine.amazon_portion_usd) ? otherLine.amazon_portion_usd : otherLine.amount_usd)
+              : 0))
+          : 0;
+        const otherLineHasCoupon = otherAmzPortion >= matchedDecl.coupon_fee_usd - PARITY_TOLERANCE_USD;
         if (!ledgerHasCouponFields && !otherLineHasCoupon) {
           throw new TypeError(
             `Stage 3 ${containerLabel}scenario "${sc.id}" omits Gate 1A declared ongoing coupon redemption fee ($${matchedDecl.coupon_fee_usd}).`,
@@ -708,10 +727,16 @@ function verifyStage3ContainerBindings({
         matchedDecl.placement_range_usd.length === 2
       ) {
         const [lo, hi] = matchedDecl.placement_range_usd;
-        const allowZeroOpt = plcLine.amount_usd === 0 && plcLine.split_option === 'amazon_optimized';
+        const isOversizeDecl = /oversize/i.test(String(matchedDecl.size_tier ?? plcLine.fee_basis?.size_tier ?? ''));
+        const optCartons = plcLine.fee_basis?.identical_cartons_count ?? ledger.identical_cartons_count ?? ledger.carton_count ?? null;
+        const optMultiDestVerified = plcLine.fee_basis?.multi_destination_headhaul_verified === true ||
+          ledger.multi_destination_headhaul_verified === true;
+        const allowZeroOpt = plcLine.amount_usd === 0 &&
+          (plcLine.split_option === 'amazon_optimized' || plcLine.fee_basis?.split_option === 'amazon_optimized') &&
+          (isOversizeDecl || (finite(optCartons) && optCartons >= 5 && optMultiDestVerified));
         if (!allowZeroOpt && finite(lo) && finite(hi) && (plcLine.amount_usd < lo - PARITY_TOLERANCE_USD || plcLine.amount_usd > hi + PARITY_TOLERANCE_USD)) {
           throw new TypeError(
-            `Stage 3 ${containerLabel}scenario "${sc.id}" placement ($${plcLine.amount_usd}) falls outside Gate 1A verified placement range [$${lo}, $${hi}].`,
+            `Stage 3 ${containerLabel}scenario "${sc.id}" placement ($${plcLine.amount_usd}) falls outside Gate 1A verified placement range [$${lo}, $${hi}] (Standard/Bulky amazon_optimized requires >=5 identical cartons and multi_destination_headhaul_verified: true).`,
           );
         }
       }
@@ -1109,7 +1134,11 @@ export function runGate1AForForm(store, {
   const effectiveBandOptions = {
     ...(price_band_analysis?.options ?? {}),
     ...(profile_revision !== undefined ? { profile_revision } : {}),
-    ...(defaultStrictMature ? { strict_mature_only: true, spiral_max_age_days: Math.max(90, finite(requestedSpiralMaxAge) ? requestedSpiralMaxAge : 90) } : {}),
+    ...(defaultStrictMature ? {
+      strict_mature_only: true,
+      spiral_max_age_days: Math.max(90, finite(requestedSpiralMaxAge) ? requestedSpiralMaxAge : 90),
+      require_keepa_steady_evidence: price_band_analysis?.options?.require_keepa_steady_evidence ?? true,
+    } : {}),
   };
   let resolvedPriceBand = null;
   let resolvedClusterBands = cluster_bands ?? null;
@@ -1119,6 +1148,62 @@ export function runGate1AForForm(store, {
       : (Array.isArray(price_band_analysis.listings)
         ? analyzeMainstreamPriceBand(price_band_analysis.listings, effectiveBandOptions)
         : price_band_analysis);
+    if (defaultStrictMature &&
+        effectiveBandOptions.require_keepa_steady_evidence !== false &&
+        resolvedPriceBand &&
+        typeof resolvedPriceBand === 'object' &&
+        !Array.isArray(price_band_analysis) &&
+        !Array.isArray(price_band_analysis.listings) &&
+        Array.isArray(resolvedPriceBand.mainstream_pool) &&
+        resolvedPriceBand.all_under_90d_blue_ocean !== true) {
+      const preCutoff = Math.max(90, finite(requestedSpiralMaxAge) ? requestedSpiralMaxAge : 90);
+      const vetCutoff = finite(resolvedPriceBand?.mature_regular_band?.veteran_cutoff_days)
+        ? resolvedPriceBand.mature_regular_band.veteran_cutoff_days
+        : 365;
+      const unverifiedInMainstream = resolvedPriceBand.mainstream_pool.filter(
+        r => r && (r.age_days === null || r.age_days === undefined || r.age_days > preCutoff) && r.keepa_steady_verified !== true,
+      );
+      if (unverifiedInMainstream.length > 0) {
+        const cloned = structuredClone(resolvedPriceBand);
+        const keptPool = cloned.mainstream_pool.filter(
+          r => !(r && (r.age_days === null || r.age_days === undefined || r.age_days > preCutoff) && r.keepa_steady_verified !== true),
+        );
+        cloned.mainstream_pool = keptPool;
+        cloned.mainstream_count = keptPool.length;
+        cloned.spiral_watch = Array.isArray(cloned.spiral_watch) ? cloned.spiral_watch : [];
+        cloned.observed_out_of_band_peers = Array.isArray(cloned.observed_out_of_band_peers) ? cloned.observed_out_of_band_peers : [];
+        for (const item of unverifiedInMainstream) {
+          const isVet = finite(item.age_days) && item.age_days >= vetCutoff;
+          const rCode = isVet ? 'veteran_missing_keepa_steady_evidence' : 'growth_missing_keepa_steady_evidence';
+          const rZh = isVet ? '满365天老品缺Keepa稳态证据，单列观察栏并允许已证稳态成长期递补' : '91–364天成长期链接缺Keepa稳态证据，单列观察栏待核';
+          cloned.spiral_watch.push({ ...item, watch_reasons: [rCode], watch_reason_zh: rZh });
+          cloned.observed_out_of_band_peers.push({
+            asin: item.asin,
+            title: item.title ?? null,
+            original_price_usd: item.list_price_usd ?? item.net_price_usd ?? null,
+            net_price_usd: item.net_price_usd ?? null,
+            age_days: item.age_days ?? null,
+            reason_code: rCode,
+            reason_zh: rZh,
+          });
+        }
+        if (keptPool.length === 0) {
+          cloned.mature_regular_band = null;
+          cloned.regular_band_reference = null;
+          cloned.band = null;
+        } else {
+          const reAnalyzed = analyzeMainstreamPriceBand(keptPool.map(r => ({
+            ...r,
+            price_usd: r.net_price_usd,
+            keepa_price_steady: true,
+          })), effectiveBandOptions);
+          cloned.mature_regular_band = reAnalyzed.mature_regular_band;
+          cloned.regular_band_reference = reAnalyzed.regular_band_reference;
+          cloned.band = reAnalyzed.band;
+        }
+        resolvedPriceBand = cloned;
+      }
+    }
     if (Array.isArray(price_band_analysis.clusters) && !resolvedClusterBands) {
       resolvedClusterBands = tightenClusterBands(resolvedPriceBand, price_band_analysis.clusters, effectiveBandOptions);
     }
@@ -1224,8 +1309,7 @@ export function runGate1AForForm(store, {
       finite(price) &&
       (
         resolvedPriceBand?.mainstream_pool?.some(m =>
-          (finite(m?.net_price_usd) && Math.abs(price - m.net_price_usd) <= PARITY_TOLERANCE_USD) ||
-          (isAllUnder90dBlueOcean && finite(m?.list_price_usd) && Math.abs(price - m.list_price_usd) <= PARITY_TOLERANCE_USD),
+          finite(m?.net_price_usd) && Math.abs(price - m.net_price_usd) <= PARITY_TOLERANCE_USD,
         ) ||
         (finite(regularBand?.min_usd) && finite(regularBand?.max_usd) && price >= regularBand.min_usd - PARITY_TOLERANCE_USD && price <= regularBand.max_usd + PARITY_TOLERANCE_USD)
       ),
@@ -1235,9 +1319,18 @@ export function runGate1AForForm(store, {
       !scAsinUpper &&
       finite(price) &&
       !matchesInBandMainstreamPriceR59 &&
-      trueOutOfBandPeersR59.some(o =>
-        (finite(o?.net_price_usd) && Math.abs(price - o.net_price_usd) <= PARITY_TOLERANCE_USD) ||
-        (finite(o?.original_price_usd) && Math.abs(price - o.original_price_usd) <= PARITY_TOLERANCE_USD),
+      (
+        trueOutOfBandPeersR59.some(o =>
+          (finite(o?.net_price_usd) && Math.abs(price - o.net_price_usd) <= PARITY_TOLERANCE_USD) ||
+          (finite(o?.original_price_usd) && Math.abs(price - o.original_price_usd) <= PARITY_TOLERANCE_USD),
+        ) ||
+        (isAllUnder90dBlueOcean && !allow_forward_price_discovery) ||
+        [...promoRowsByAsin.values()].some(r =>
+          finite(r?.list_price_usd) &&
+          finite(r?.net_price_usd) &&
+          r.list_price_usd > r.net_price_usd + PARITY_TOLERANCE_USD &&
+          Math.abs(price - r.list_price_usd) <= PARITY_TOLERANCE_USD,
+        )
       ),
     );
     const outOfBandWatchReason = outOfBandPeer
@@ -1322,11 +1415,22 @@ export function runGate1AForForm(store, {
 
   const regularScenarios = scenarioResults.filter(s => !PRICE_WATCH_REASONS.includes(s.price_basis));
   const eligiblePriceScenarios = regularScenarios.filter(s => finite(s.price_usd) && !s.price_below_floor);
+  const MISSING_KEEPA_ONLY_REASONS = new Set([
+    'veteran_missing_keepa_steady_evidence',
+    'growth_missing_keepa_steady_evidence',
+  ]);
+  const floorCheckScenarios = regularScenarios.length > 0
+    ? regularScenarios
+    : scenarioResults.filter(s => s.price_below_floor && MISSING_KEEPA_ONLY_REASONS.has(s.price_basis));
+  const hasUnverifiedAboveFloorPeer = outOfBandPeersR59.some(
+    p => MISSING_KEEPA_ONLY_REASONS.has(p?.reason_code) && finite(p?.net_price_usd) && p.net_price_usd >= minimum_price_usd,
+  );
   const onlyYoungNewcomersObserved = resolvedPriceBand?.all_young_niche === true ||
-    (regularScenarios.length > 0 && regularScenarios.every(s => s.is_young_newcomer === true));
+    (floorCheckScenarios.length > 0 && floorCheckScenarios.every(s => s.is_young_newcomer === true));
   const allPricesBelowFloor = !onlyYoungNewcomersObserved &&
-    regularScenarios.length > 0 &&
-    regularScenarios.every(s => s.price_below_floor) &&
+    !hasUnverifiedAboveFloorPeer &&
+    floorCheckScenarios.length > 0 &&
+    floorCheckScenarios.every(s => s.price_below_floor) &&
     !(finite(regularBand?.max_usd) && regularBand.max_usd >= minimum_price_usd);
   if (allPricesBelowFloor && !allow_forward_price_discovery) {
     const payload = {
@@ -1974,7 +2078,33 @@ export async function runGate1BForForm(store, {
     }
 
     for (const md of qBinding.missingDeclared) missingDeclaredIdsSet.add(`${md.id}@$${md.price_usd}`);
-    const qEvaluations = qRawScenarios.map((raw, i) => {
+    const qEnrichedScenarios = qRawScenarios.map((raw, i) => {
+      const matchedDecl = qBinding.matches[i];
+      if (!matchedDecl || !(finite(matchedDecl.coupon_fee_usd) && matchedDecl.coupon_fee_usd > 0)) {
+        return raw;
+      }
+      const hasExplicitPromo = raw.list_price_usd !== undefined ||
+        raw.ongoing_coupon_usd !== undefined ||
+        raw.ongoing_coupon_pct !== undefined ||
+        raw.prime_exclusive_discount_usd !== undefined ||
+        raw.prime_exclusive_discount_pct !== undefined;
+      return {
+        ...raw,
+        ...(!hasExplicitPromo && finite(matchedDecl.list_price_usd) ? {
+          list_price_usd: matchedDecl.list_price_usd,
+          ...(finite(matchedDecl.ongoing_discount_usd) && matchedDecl.ongoing_discount_usd > 0
+            ? { ongoing_coupon_usd: matchedDecl.ongoing_discount_usd }
+            : (finite(raw.price_usd) && matchedDecl.list_price_usd > raw.price_usd
+              ? { ongoing_coupon_usd: round(matchedDecl.list_price_usd - raw.price_usd) }
+              : {})),
+          promo_basis_already_net: true,
+        } : {}),
+        ...(raw.coupon_redemption_fee_usd === undefined && raw.ongoing_coupon_usd === undefined && raw.ongoing_coupon_pct === undefined
+          ? { coupon_redemption_fee_usd: matchedDecl.coupon_fee_usd }
+          : {}),
+      };
+    });
+    const qEvaluations = qEnrichedScenarios.map((raw, i) => {
       const authoritativeInput = applyAuthoritativeQuoteToScreenInput(raw, activeQuote, activePlan, qQuoteBindings[i], effectiveRevForEval);
       return evaluateEarlyScreen(authoritativeInput, { profileRevision: effectiveRevForEval });
     });
@@ -1985,7 +2115,7 @@ export async function runGate1BForForm(store, {
     }
     for (let i = 0; i < qEvaluations.length; i++) {
       evaluations.push(qEvaluations[i]);
-      rawScenarios.push(qRawScenarios[i]);
+      rawScenarios.push(qEnrichedScenarios[i]);
       matchedDeclList.push(qBinding.matches[i]);
       scenarioQuoteIds.push(activeQuote.quote_id);
     }
@@ -2039,9 +2169,20 @@ export async function runGate1BForForm(store, {
   const evaluatedFinitePrices = evaluatedScenarioSummary.map(s => s.price_usd).filter(finite);
   const minEvaluatedPrice = evaluatedFinitePrices.length > 0 ? Math.min(...evaluatedFinitePrices) : null;
   const maxEvaluatedPrice = evaluatedFinitePrices.length > 0 ? Math.max(...evaluatedFinitePrices) : null;
+  const couponShiftedNetCliffCandidates = [];
+  for (const s of rawScenarios) {
+    const cUsd = finite(s?.ongoing_coupon_usd) && s.ongoing_coupon_usd > 0 ? s.ongoing_coupon_usd : 0;
+    const cPct = finite(s?.ongoing_coupon_pct) && s.ongoing_coupon_pct > 0 && s.ongoing_coupon_pct < 1 ? s.ongoing_coupon_pct : 0;
+    if (cUsd > 0 || cPct > 0) {
+      for (const listCliff of [9.99, 10.00, 49.99, 50.00, 50.01]) {
+        const netAtCliff = Number((listCliff * (1 - cPct) - cUsd).toFixed(2));
+        if (netAtCliff > 0) couponShiftedNetCliffCandidates.push(netAtCliff);
+      }
+    }
+  }
   const interiorCliffProbePrices = !anyRightsHardFail && !anyDeferred && minEvaluatedPrice !== null && maxEvaluatedPrice !== null
     ? [...new Set([
-        ...[9.99, 10.00, 49.99, 50.00, 50.01].filter(
+        ...[9.99, 10.00, 49.99, 50.00, 50.01, ...couponShiftedNetCliffCandidates].filter(
           c => c > minEvaluatedPrice + 1e-9 && c < maxEvaluatedPrice - 1e-9,
         ),
         ...(quotePricing.forward_pricing_by_quote ?? [quotePricing.forward_pricing])
@@ -2223,15 +2364,20 @@ export async function runGate1BForForm(store, {
           candPkgRescue = computePackagingRedesignShortlist2027({
             pkg: rawScenarios[i].pkg,
             price_usd: met.price_usd,
-            list_price_usd: rawScenarios[i].list_price_usd,
-            net_effective_price_usd: rawScenarios[i].net_effective_price_usd,
+            list_price_usd: led?.list_price_usd ?? rawScenarios[i].list_price_usd,
+            net_effective_price_usd: met.price_usd,
             ongoing_coupon_usd: rawScenarios[i].ongoing_coupon_usd,
             ongoing_coupon_pct: rawScenarios[i].ongoing_coupon_pct,
+            coupon_redemption_fee_usd: rawScenarios[i].coupon_redemption_fee_usd,
             prime_exclusive_discount_usd: rawScenarios[i].prime_exclusive_discount_usd,
             prime_exclusive_discount_pct: rawScenarios[i].prime_exclusive_discount_pct,
-            promo_basis_already_net: rawScenarios[i].promo_basis_already_net,
+            promo_basis_already_net: true,
             other_applicable_usd: rawScenarios[i].other_applicable_usd,
             other_payee: rawScenarios[i].other_payee,
+            placement_split_option: rawScenarios[i].placement_split_option ?? rawScenarios[i].placement_fee_basis?.split_option,
+            carton_count: rawScenarios[i].carton_count,
+            identical_cartons_count: rawScenarios[i].identical_cartons_count ?? rawScenarios[i].placement_fee_basis?.identical_cartons_count,
+            multi_destination_headhaul_verified: rawScenarios[i].multi_destination_headhaul_verified ?? rawScenarios[i].placement_fee_basis?.multi_destination_headhaul_verified,
             fx_cny_per_usd: fallbackFx,
             landed_domestic_usd: met.procurement_usd + met.domestic_freight_usd,
             refund_fraction: rawScenarios[i].refund_fraction,
@@ -2270,6 +2416,7 @@ export async function runGate1BForForm(store, {
     }
     const resolveQuoteDistinctFactoryKey = q => {
       if (nonemptyStr(q?.factory_id)) return `fac:${q.factory_id.trim()}`;
+      if (nonemptyStr(q?.supplier_id)) return `fac:${q.supplier_id.trim()}`;
       let lines = Array.isArray(q?.sku_lines) ? q.sku_lines : null;
       if (!lines && nonemptyStr(q?.sku_lines_json)) {
         try {
@@ -2277,6 +2424,13 @@ export async function runGate1BForForm(store, {
           if (Array.isArray(parsed)) lines = parsed;
         } catch { /* ignore */ }
       }
+      const lineFactories = Array.isArray(lines)
+        ? [...new Set(lines.map(l => {
+          const fk = l?.factory_id ?? l?.supplier_id ?? null;
+          return nonemptyStr(fk) ? fk.trim() : null;
+        }).filter(Boolean))].sort()
+        : [];
+      if (lineFactories.length > 0) return `fac:${lineFactories.join('+')}`;
       const offerIds = Array.isArray(lines)
         ? [...new Set(lines.map(l => (nonemptyStr(l?.offer_id) ? l.offer_id.trim() : null)).filter(Boolean))].sort()
         : [];
@@ -3106,9 +3260,176 @@ export function runOptionalSpecMatcher(input, options = {}) {
   return runOptionalTerraWorkflowTask('spec-matcher', input, options);
 }
 
+const ENGLISH_WORD_COUNTS = Object.freeze({
+  one: 1, single: 1, two: 2, pair: 2, three: 3, four: 4, five: 5,
+  six: 6, seven: 7, eight: 8, nine: 9, ten: 10, twelve: 12,
+});
+
+function extractPieceCountFromTextHint(rawText) {
+  if (typeof rawText !== 'string' || !rawText.trim()) return null;
+  const s = rawText.trim();
+  const digitMatch = /\b(\d{1,4})\s*[- ]?(?:pc|pcs|piece|pieces|pack|pk)\b/i.exec(s) ||
+    /\b(?:set|pack|box|kit|bundle)\s+of\s+(\d{1,4})\b/i.exec(s) ||
+    /\b(\d{1,4})\s+(?:unit|units|complete\s+set|complete\s+sets)\b/i.exec(s);
+  if (digitMatch) {
+    const n = Number(digitMatch[1]);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  const wordMatch = /\b(one|single|two|pair|three|four|five|six|seven|eight|nine|ten|twelve)\s*[- ]?(?:pc|pcs|piece|pieces|pack|unit|units|individual)\b/i.exec(s) ||
+    /\b(?:set|pack|box|kit|bundle)\s+of\s+(one|single|two|pair|three|four|five|six|seven|eight|nine|ten|twelve)\b/i.exec(s) ||
+    /^(one|single|two|pair|three|four|five|six|seven|eight|nine|ten|twelve)\s+[a-z]{3,}\b/i.exec(s);
+  if (wordMatch) {
+    const w = wordMatch[1].toLowerCase();
+    if (Object.hasOwn(ENGLISH_WORD_COUNTS, w)) return ENGLISH_WORD_COUNTS[w];
+  }
+  return null;
+}
+
+export function doesReviewPacketMatchDbFormSpec(packet, formRow) {
+  if (!packet || typeof packet !== 'object' || !formRow || typeof formRow !== 'object') {
+    return { matches: true, reason: null, pktQty: null, dbQty: null, pktMaterial: null, dbMaterial: null, pktDeclaredSha: null };
+  }
+  const pktDeclaredSha = typeof packet?.form_spec_sha256 === 'string' && packet.form_spec_sha256.trim()
+    ? packet.form_spec_sha256.trim()
+    : (typeof packet?.candidate?.form_spec_sha256 === 'string' && packet.candidate.form_spec_sha256.trim()
+      ? packet.candidate.form_spec_sha256.trim()
+      : (typeof packet?.candidate?.spec_sha256 === 'string' && packet.candidate.spec_sha256.trim()
+        ? packet.candidate.spec_sha256.trim()
+        : null));
+  const dbSpecSha = typeof formRow.spec_sha256 === 'string' && formRow.spec_sha256.trim()
+    ? formRow.spec_sha256.trim()
+    : null;
+
+  const specObj = packet?.candidate?.saleable_spec ??
+    packet?.candidate?.saleable_specification ??
+    packet?.candidate?.spec ??
+    packet?.candidate?.saleable_set_composition ??
+    (packet?.subjects?.length === 1 ? packet.subjects[0]?.spec : null) ??
+    null;
+
+  const extractComponentMap = val => {
+    const arr = Array.isArray(val) ? val : (Array.isArray(val?.components) ? val.components : null);
+    if (!arr || arr.length === 0) return null;
+    const m = new Map();
+    for (const it of arr) {
+      if (!it || typeof it !== 'object') continue;
+      const cid = String(it.component_id ?? it.id ?? it.name ?? '').trim().toLowerCase();
+      if (!cid) continue;
+      const q = Number(it.qty_per_saleable_set ?? it.qty ?? it.pcs ?? 1) || 1;
+      m.set(cid, (m.get(cid) ?? 0) + q);
+    }
+    return m.size > 0 ? m : null;
+  };
+
+  let pktQty = null;
+  if (typeof specObj === 'string') {
+    pktQty = extractPieceCountFromTextHint(specObj);
+  } else if (Array.isArray(specObj) && specObj.length > 0) {
+    const sum = specObj.reduce((acc, it) => acc + (Number(it?.qty_per_saleable_set ?? it?.qty ?? it?.pcs ?? 0) || 0), 0);
+    if (sum > 0) pktQty = sum;
+  } else if (Array.isArray(specObj?.components) && specObj.components.length > 0) {
+    const sum = specObj.components.reduce((acc, it) => acc + (Number(it?.qty_per_saleable_set ?? it?.qty ?? it?.pcs ?? 0) || 0), 0);
+    if (sum > 0) pktQty = sum;
+  } else if (specObj && typeof specObj === 'object') {
+    for (const k of ['pcs', 'pieces', 'pieces_per_set', 'qty', 'qty_per_saleable_set']) {
+      if (Number.isFinite(Number(specObj[k])) && Number(specObj[k]) > 0) {
+        pktQty = Number(specObj[k]);
+        break;
+      }
+    }
+    if (pktQty === null && typeof specObj.saleable_unit === 'string') {
+      pktQty = extractPieceCountFromTextHint(specObj.saleable_unit);
+    }
+  }
+  const rawPktMat = (specObj && typeof specObj === 'object' ? (specObj.material ?? specObj.grade_or_material ?? specObj.grade) : null) ??
+    packet?.candidate?.grade_or_material ??
+    packet?.candidate?.material ??
+    null;
+  const pktMaterial = typeof rawPktMat === 'string' && rawPktMat.trim() ? rawPktMat.trim().toLowerCase() : null;
+  const pktComponents = extractComponentMap(specObj);
+
+  let comp = formRow.saleable_set_composition ?? null;
+  if (!comp && typeof formRow.saleable_set_composition_json === 'string') {
+    try { comp = JSON.parse(formRow.saleable_set_composition_json); } catch { comp = null; }
+  }
+  let dbQty = null;
+  if (typeof comp === 'string') {
+    dbQty = extractPieceCountFromTextHint(comp);
+  } else if (Array.isArray(comp) && comp.length > 0) {
+    const sum = comp.reduce((acc, it) => acc + (Number(it?.qty_per_saleable_set ?? it?.qty ?? it?.pcs ?? 0) || 0), 0);
+    if (sum > 0) dbQty = sum;
+  } else if (Array.isArray(comp?.components) && comp.components.length > 0) {
+    const sum = comp.components.reduce((acc, it) => acc + (Number(it?.qty_per_saleable_set ?? it?.qty ?? it?.pcs ?? 0) || 0), 0);
+    if (sum > 0) dbQty = sum;
+  } else if (comp && typeof comp === 'object') {
+    for (const k of ['pcs', 'pieces', 'pieces_per_set', 'qty', 'qty_per_saleable_set']) {
+      if (Number.isFinite(Number(comp[k])) && Number(comp[k]) > 0) {
+        dbQty = Number(comp[k]);
+        break;
+      }
+    }
+    if (dbQty === null && typeof comp.saleable_unit === 'string') {
+      dbQty = extractPieceCountFromTextHint(comp.saleable_unit);
+    }
+  }
+  if (dbQty === null && typeof formRow.label === 'string') {
+    dbQty = extractPieceCountFromTextHint(formRow.label);
+  }
+  const rawDbMat = formRow.grade_or_material ??
+    (comp && typeof comp === 'object' ? (comp.grade_or_material ?? comp.material) : null) ??
+    null;
+  const dbMaterial = typeof rawDbMat === 'string' && rawDbMat.trim() ? rawDbMat.trim().toLowerCase() : null;
+  const dbComponents = extractComponentMap(comp);
+
+  if (pktDeclaredSha && dbSpecSha && pktDeclaredSha !== dbSpecSha) {
+    return { matches: false, reason: 'declared_spec_sha256_mismatch', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+  }
+  if (pktQty !== null && dbQty !== null && pktQty !== dbQty) {
+    return { matches: false, reason: 'piece_count_mismatch', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+  }
+  if (dbComponents && pktComponents) {
+    if (dbComponents.size !== pktComponents.size) {
+      return { matches: false, reason: 'component_composition_mismatch', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+    }
+    for (const [cid, qty] of dbComponents.entries()) {
+      if (pktComponents.get(cid) !== qty) {
+        return { matches: false, reason: 'component_composition_mismatch', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+      }
+    }
+  } else if (dbComponents && !pktComponents && (!pktDeclaredSha || pktDeclaredSha !== dbSpecSha)) {
+    const genericPlaceholders = new Set(['item', 'unit', 'set', 'product', 'piece', 'part']);
+    const namedComponentIds = [...dbComponents.keys()].filter(cid => !genericPlaceholders.has(cid));
+    const pktUnitText = typeof specObj === 'string'
+      ? specObj.trim().toLowerCase()
+      : (typeof specObj?.saleable_unit === 'string' ? specObj.saleable_unit.trim().toLowerCase() : '');
+    if (namedComponentIds.length > 0 && pktUnitText) {
+      const escapeRe = str => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      for (const cid of namedComponentIds) {
+        const stem = cid.replace(/[_-]+/g, '\\s*');
+        const compRe = new RegExp(`\\b${escapeRe(cid).replace(/\\[_-]+/g, '[\\s_-]*')}(?:es|s)?\\b`, 'i');
+        void stem;
+        if (!compRe.test(pktUnitText)) {
+          return { matches: false, reason: 'saleable_unit_component_mismatch', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+        }
+      }
+    } else if (namedComponentIds.length > 0 && pktQty === null) {
+      return { matches: false, reason: 'missing_components_for_component_bound_form', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+    }
+  }
+  if (dbMaterial !== null) {
+    if (pktMaterial !== null && pktMaterial !== dbMaterial) {
+      return { matches: false, reason: 'material_mismatch', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+    }
+    if (pktMaterial === null && (!pktDeclaredSha || pktDeclaredSha !== dbSpecSha)) {
+      return { matches: false, reason: 'missing_material_for_material_bound_form', pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+    }
+  }
+  return { matches: true, reason: null, pktQty, dbQty, pktMaterial, dbMaterial, pktDeclaredSha };
+}
+
 /**
  * Optional Gate 4 closed-evidence hostile red-team review (`evidence-review-draft-v1`)
- * via subscription-backed local `Codex CLI` (`gpt-6.2-astra` `xhigh`/`max`) or injected executor.
+ * via subscription-backed local `Codex CLI` (inheriting `~/.codex/config.toml` when model/effort are omitted) or injected executor.
  * Degrades gracefully to `unavailable` when disabled/offline without mutating 21-item scores.
  */
 export async function runOptionalGate4EvidenceReview(packetInput, {
@@ -3119,8 +3440,8 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
   receiptDir = undefined,
   candidateId = undefined,
   formSpecSha256 = undefined,
-  model = 'gpt-6.2-astra',
-  reasoningEffort = 'xhigh',
+  model = null,
+  reasoningEffort = null,
   serviceTier = null,
   imagePaths = [],
   timeoutMs = null,
@@ -3184,8 +3505,14 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
     hasAuthorizedExecutionPolicy = false;
   }
 
-  const normalizedGate4Model = typeof model === 'string' ? model.trim() : '';
-  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(normalizedGate4Model) || !['xhigh', 'max'].includes(reasoningEffort)) {
+  const normalizedGate4Model = model === null || model === undefined
+    ? null
+    : (typeof model === 'string' ? model.trim() : String(model));
+  const normalizedGate4Effort = reasoningEffort === null || reasoningEffort === undefined
+    ? null
+    : (typeof reasoningEffort === 'string' ? reasoningEffort.trim() : String(reasoningEffort));
+  if ((normalizedGate4Model !== null && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(normalizedGate4Model)) ||
+    (normalizedGate4Effort !== null && !['xhigh', 'max'].includes(normalizedGate4Effort))) {
     return {
       status: 'unavailable',
       execution_status: 'not_submitted',
@@ -3194,7 +3521,7 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
       schema_version: EVIDENCE_REVIEW_SCHEMA_VERSION,
       error_code: 'INVALID_GATE4_MODEL_OR_EFFORT',
       review: null,
-      reason: 'Gate-4 evidence review requires a valid safe model identifier and reasoningEffort in ["xhigh", "max"].',
+      reason: 'Gate-4 evidence review requires a valid safe model identifier (or null/omitted) and reasoningEffort in ["xhigh", "max", null].',
     };
   }
 
@@ -3220,7 +3547,7 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
         enabled: false,
         dryRun: true,
         model: normalizedGate4Model,
-        reasoningEffort,
+        reasoningEffort: normalizedGate4Effort,
         serviceTier,
         imagePaths,
         cwd,
@@ -3271,7 +3598,8 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
   }
 
   if (typeof reviewExecutor === 'function') {
-    const reviewerLabel = `Synthetic Executor · ${reasoningEffort}`;
+    const effDisp = normalizedGate4Effort || 'inherited';
+    const reviewerLabel = `Synthetic Executor · ${effDisp}`;
     const tempStageDir = mkdtempSync(join(tmpdir(), 'p4-rev-exec-stage-'));
     let executorAttachmentShas = [];
     try {
@@ -3316,7 +3644,7 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
               packet_sha256: frozenPacket.packet_sha256,
               attachment_sha256s: executorAttachmentShas,
               reviewer_label: reviewerLabel,
-              reasoning_effort: reasoningEffort,
+              reasoning_effort: normalizedGate4Effort,
               review: null,
               reason: sanitizeDiagnosticText(rawOut.reason || 'Evidence review is pending recovery.'),
             };
@@ -3333,7 +3661,7 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
               packet_sha256: frozenPacket.packet_sha256,
               attachment_sha256s: executorAttachmentShas,
               reviewer_label: reviewerLabel,
-              reasoning_effort: reasoningEffort,
+              reasoning_effort: normalizedGate4Effort,
               review: null,
               reason: sanitizeDiagnosticText(rawOut.reason || 'Evidence review unavailable.'),
             };
@@ -3353,7 +3681,7 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
           packet_sha256: frozenPacket.packet_sha256,
           attachment_sha256s: executorAttachmentShas,
           reviewer_label: reviewerLabel,
-          reasoning_effort: reasoningEffort,
+          reasoning_effort: normalizedGate4Effort,
           disposition_counts: validated.disposition_counts,
           review: validated.review,
           subjects: validated.subjects,
@@ -3376,7 +3704,7 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
           packet_sha256: frozenPacket.packet_sha256,
           attachment_sha256s: executorAttachmentShas,
           reviewer_label: reviewerLabel,
-          reasoning_effort: reasoningEffort,
+          reasoning_effort: normalizedGate4Effort,
           review: null,
           reason: sanitizeDiagnosticText(String(err?.message || err)),
         };
@@ -3395,7 +3723,7 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
       ...(candidateId !== undefined ? { candidateId } : {}),
       ...(formSpecSha256 !== undefined ? { formSpecSha256 } : {}),
       model: normalizedGate4Model,
-      reasoningEffort,
+      reasoningEffort: normalizedGate4Effort,
       serviceTier,
       imagePaths,
       timeoutMs,
@@ -4172,39 +4500,8 @@ export async function runPhase2Batch(store, {
       // Propagate Gate 1A $49.99 & $50.00 cliff stress comparisons (per period for seasonal candidates).
       attachGate1APriceCliffStress(rawInputCand, gate1aRecord);
 
-      const manifest = researchOut.discovery
-        ? prepareDiscovery(researchOut.discovery.pool, researchOut.discovery.decisions)
-        : null;
-      const withManifest = manifest ? attachDiscovery(clonedBatch, manifest) : clonedBatch;
-      const boundBatch = attachStoreDiscoveryProvenance(withManifest, store);
-      const scoredResult = scoreBatch(boundBatch, profile);
-      if (manifest) scoredResult.discovery = { ...manifest, summary: boundBatch.discovery_summary };
-
-      // Strictly match scored candidate to formId (NEVER fall back to candidates[0]!).
-      const scoredCand = scoredResult.candidates.find(c => (c.candidate_id || c.id) === formId);
-      if (!scoredCand) {
-        throw new TypeError(`Deep research batch did not contain a scored candidate matching form_id "${formId}".`);
-      }
-      const inputCand = boundBatch.candidates.find(c => c.id === formId);
-      if (!inputCand) {
-        throw new TypeError(`Deep research input batch did not contain an input candidate matching form_id "${formId}".`);
-      }
-
-      // Compute deterministic evidence_bundle_sha256 BEFORE attaching advisory Gate-4 evidence_review
-      // so advisory red-team reviews never fracture deterministic evaluation identity.
-      const deterministicCandInput = Object.hasOwn(inputCand, 'evidence_review')
-        ? (() => { const { evidence_review: _advisory, ...rest } = inputCand; return rest; })()
-        : inputCand;
-      const bundleHash = computeEvidenceBundleHash({
-        form_spec_sha256: latestForm.spec_sha256,
-        candidate_input: deterministicCandInput,
-        discovery_manifest: manifest,
-        profile_snapshot: profile,
-        fee_table_snapshot: effectiveFeeSnapshot,
-      });
-      const perCandidateSha = sha256Hex(canonicalJson(scoredCand));
-
-      // Optional Stage 3 Terra enhancements & Gate 4 Codex CLI Astra evidence_review attachment
+      // Run optional Stage 3 Terra rights_prescreen & review_judge BEFORE scoreBatch so proven IP/compliance
+      // conflicts and SKU-verified review judgments feed directly into deterministic scoring!
       // Re-check live form/spec/rights/deferral BEFORE EVERY paid or external dispatch!
       let rightsPreScreenOut = null;
       const rightsInput = researchOut.rights_prescreen_input ?? item.rights_prescreen_input ?? null;
@@ -4250,6 +4547,80 @@ export async function runPhase2Batch(store, {
         continue;
       }
 
+      if ((profile?.revision ?? 0) >= 59 && (rightsPreScreenOut?.status === 'ready' || reviewJudgeOut?.status === 'ready')) {
+        const fallbackEvIds = Array.isArray(rawInputCand.evidence)
+          ? rawInputCand.evidence.map(e => e?.id).filter(nonemptyStr)
+          : [];
+        const preScoreQual = resolveStage1QualitativeJudgments({
+          evidence: fallbackEvIds.slice(0, 1),
+          rights_prescreen: rightsPreScreenOut?.status === 'ready' ? rightsPreScreenOut.result : null,
+          review_judge: reviewJudgeOut?.status === 'ready' ? reviewJudgeOut.result : null,
+          market_seller_count: rawInputCand.market?.seller_count ?? null,
+          reference_price_usd: rawInputCand.screening?.reference_price_usd?.value ?? null,
+          default_target_variant_asin: rawInputCand.screening?.reference_price_usd?.target_variant_asin ?? null,
+          default_target_variant_sku: rawInputCand.screening?.reference_price_usd?.target_variant_sku ?? null,
+        });
+        rawInputCand.judgments = { ...(rawInputCand.judgments ?? {}) };
+        if (rightsPreScreenOut?.status === 'ready') {
+          for (const key of ['specific_design_rights', 'applicable_public_requirements']) {
+            const incomingJ = preScoreQual.judgments[key];
+            const existingJ = rawInputCand.judgments[key];
+            rawInputCand.judgments[key] = {
+              ...(existingJ ?? {}),
+              ...incomingJ,
+              evidence: existingJ?.evidence?.length ? existingJ.evidence : incomingJ.evidence,
+            };
+          }
+        }
+        if (reviewJudgeOut?.status === 'ready') {
+          const incomingDiff = preScoreQual.judgments.feasible_light_differentiation;
+          const existingDiff = rawInputCand.judgments.feasible_light_differentiation;
+          rawInputCand.judgments.feasible_light_differentiation = {
+            ...(existingDiff ?? {}),
+            ...incomingDiff,
+            evidence: existingDiff?.evidence?.length ? existingDiff.evidence : incomingDiff.evidence,
+          };
+        }
+        if (preScoreQual.objective_tags.length > 0) {
+          rawInputCand.presentation = {
+            ...(rawInputCand.presentation ?? {}),
+            risks: [...new Set([...(rawInputCand.presentation?.risks ?? []), ...preScoreQual.objective_tags])],
+          };
+        }
+      }
+
+      const manifest = researchOut.discovery
+        ? prepareDiscovery(researchOut.discovery.pool, researchOut.discovery.decisions)
+        : null;
+      const withManifest = manifest ? attachDiscovery(clonedBatch, manifest) : clonedBatch;
+      const boundBatch = attachStoreDiscoveryProvenance(withManifest, store);
+      const scoredResult = scoreBatch(boundBatch, profile);
+      if (manifest) scoredResult.discovery = { ...manifest, summary: boundBatch.discovery_summary };
+
+      // Strictly match scored candidate to formId (NEVER fall back to candidates[0]!).
+      const scoredCand = scoredResult.candidates.find(c => (c.candidate_id || c.id) === formId);
+      if (!scoredCand) {
+        throw new TypeError(`Deep research batch did not contain a scored candidate matching form_id "${formId}".`);
+      }
+      const inputCand = boundBatch.candidates.find(c => c.id === formId);
+      if (!inputCand) {
+        throw new TypeError(`Deep research input batch did not contain an input candidate matching form_id "${formId}".`);
+      }
+
+      // Compute deterministic evidence_bundle_sha256 BEFORE attaching advisory Gate-4 evidence_review
+      // so advisory red-team reviews never fracture deterministic evaluation identity.
+      const deterministicCandInput = Object.hasOwn(inputCand, 'evidence_review')
+        ? (() => { const { evidence_review: _advisory, ...rest } = inputCand; return rest; })()
+        : inputCand;
+      const bundleHash = computeEvidenceBundleHash({
+        form_spec_sha256: latestForm.spec_sha256,
+        candidate_input: deterministicCandInput,
+        discovery_manifest: manifest,
+        profile_snapshot: profile,
+        fee_table_snapshot: effectiveFeeSnapshot,
+      });
+      const perCandidateSha = sha256Hex(canonicalJson(scoredCand));
+
       const qualification = scoredCand.qualification ?? {
         counts_toward_target: scoredCand.queue === 'comparable',
         mode: scoredCand.queue === 'comparable' ? 'comparable' : 'none',
@@ -4265,19 +4636,36 @@ export async function runPhase2Batch(store, {
       const reviewPacket = researchOut.evidence_review_packet ?? item.evidence_review_packet ?? null;
       const enforceQualifyingOnlyGate4 = (profile.revision ?? 59) >= 59 || gate4HookOpts.qualifyingOnly === true;
       if (reviewPacket) {
-        const gate4Res = await runOptionalGate4EvidenceReview(reviewPacket, {
-          ...gate4HookOpts,
-          candidateId: formId,
-          formSpecSha256: latestForm.spec_sha256,
-          ...(enforceQualifyingOnlyGate4 ? { candidateQualification: qualification } : {}),
-        });
-        if (gate4Res?.status !== 'skipped_non_qualifying') {
-          attachedEvidenceReview = attachCandidateEvidenceReview(inputCand, gate4Res, reviewPacket, {
-            formSpecSha256: latestForm.spec_sha256,
-            currentImagePaths: Array.isArray(gate4HookOpts.imagePaths) ? gate4HookOpts.imagePaths : null,
-            receiptStoreDir,
-            allowTestDoubleReceipt,
+        const pktSpecCheck = (profile.revision ?? 59) >= 59
+          ? doesReviewPacketMatchDbFormSpec(reviewPacket, latestForm)
+          : { matches: true };
+        if (!pktSpecCheck.matches) {
+          const stalePktMarker = projectSafeAdvisoryMarker({
+            status: 'unavailable',
+            execution_status: 'stale_packet_mismatch',
+            review_id: typeof reviewPacket?.review_id === 'string' ? reviewPacket.review_id : undefined,
+            reason: `Evidence review packet does not match current candidate form spec (${pktSpecCheck.reason}); refusing to stamp current spec_sha256.`,
+          }, {
+            expectedCandId: formId,
+            expectedSpecSha: pktSpecCheck.pktDeclaredSha ?? null,
           });
+          inputCand.evidence_review = stalePktMarker;
+          attachedEvidenceReview = stalePktMarker;
+        } else {
+          const gate4Res = await runOptionalGate4EvidenceReview(reviewPacket, {
+            ...gate4HookOpts,
+            candidateId: formId,
+            formSpecSha256: latestForm.spec_sha256,
+            ...(enforceQualifyingOnlyGate4 ? { candidateQualification: qualification } : {}),
+          });
+          if (gate4Res?.status !== 'skipped_non_qualifying') {
+            attachedEvidenceReview = attachCandidateEvidenceReview(inputCand, gate4Res, reviewPacket, {
+              formSpecSha256: latestForm.spec_sha256,
+              currentImagePaths: Array.isArray(gate4HookOpts.imagePaths) ? gate4HookOpts.imagePaths : null,
+              receiptStoreDir,
+              allowTestDoubleReceipt,
+            });
+          }
         }
       } else if (researchOut.evidence_review && typeof researchOut.evidence_review === 'object') {
         attachedEvidenceReview = attachCandidateEvidenceReview(inputCand, researchOut.evidence_review, null, {

@@ -24,7 +24,7 @@ import {
   importRetainedAssetsManifest,
   replayBatchIntoStore,
 } from './history-import.mjs';
-import { attachGate1APriceCliffStress, runGate1AForForm, runGate1BForForm,
+import { attachGate1APriceCliffStress, doesReviewPacketMatchDbFormSpec, runGate1AForForm, runGate1BForForm,
   runOptionalStage12LunaTriage, runOptionalTerraWorkflowTask } from './pipeline.mjs';
 import {
   evaluateGate0CategoryBoundary,
@@ -1112,6 +1112,7 @@ export async function runPhase2Cli(
           verified_raw_asin_count,
           per_candidate_verified_asin_counts,
           verified_receipt_sha256s,
+          isolated_candidates,
         } = ingestTrialSpecification(
           spec,
           profile,
@@ -1138,6 +1139,7 @@ export async function runPhase2Cli(
           verified_raw_asin_count,
           per_candidate_verified_asin_counts,
           verified_receipt_count: Object.keys(verified_receipt_sha256s ?? {}).length,
+          isolated_candidates: Array.isArray(isolated_candidates) ? isolated_candidates : [],
           summary: scored.summary,
           ...(values.output ? {
             output_path: sanitizeCliDisplayPath(values.output),
@@ -1430,8 +1432,8 @@ export async function runPhase2Cli(
       if (command === 'redteam-review') {
         const packetPath = resolve(requireOption(values.packet, 'packet'));
         const outputPath = resolve(requireOption(values.output, 'output'));
-        const effort = values.effort ? values.effort.trim() : 'xhigh';
-        if (!['xhigh', 'max'].includes(effort)) {
+        const effort = values.effort ? values.effort.trim() : null;
+        if (effort !== null && !['xhigh', 'max'].includes(effort)) {
           throw new Phase2CliError('--effort 必须为 xhigh 或 max。');
         }
         const imagePaths = (values.image ?? []).map(p => resolve(p));
@@ -1482,7 +1484,13 @@ export async function runPhase2Cli(
         let boundFormSpecSha256 = values['form-spec-sha256'] ? values['form-spec-sha256'].trim() : undefined;
         let skipNonQualifyingReason = null;
         const optDbPaths = [];
-        if (values.db && values.db !== ':memory:') {
+        if (values.db === ':memory:') {
+          if (!isDryRun && values.force !== true) {
+            skipNonQualifyingReason = '指定了空内存库 (--db :memory:)，无法核实候选形态当前规格已入围；按 Gate-4 仅复核入围卡片规则自动跳过（如需强制复核请传入 --force）。';
+          }
+        } else if (!values.db && !mockExecutor && !isDryRun && values.force !== true) {
+          skipNonQualifyingReason = '真实 Gate-4 复核必须绑定 --db 数据库核实当前规格已入围（如需无库强制复核请显式传入 --force）。';
+        } else if (values.db && values.db !== ':memory:') {
           const absDb = resolve(values.db);
           optDbPaths.push(absDb);
           if (!existsSync(absDb)) {
@@ -1507,6 +1515,9 @@ export async function runPhase2Cli(
                     `--form-spec-sha256 与数据库中候选形态 "${sanitizeDiagnosticText(boundCandidateId)}" 的当前 spec_sha256 不一致。`,
                   );
                 }
+                const specMatch = doesReviewPacketMatchDbFormSpec(packet, dbForm);
+                const pktDeclaredSha = specMatch.pktDeclaredSha;
+                const packetIsStaleVsDb = !specMatch.matches;
                 if (!isDryRun && values.force !== true) {
                   const effLifecycle = dbForm.effective_lifecycle_status ?? dbForm.lifecycle_status;
                   const NON_QUALIFYING_LIFECYCLES = new Set([
@@ -1523,6 +1534,8 @@ export async function runPhase2Cli(
                   ]);
                   if (NON_QUALIFYING_LIFECYCLES.has(effLifecycle)) {
                     skipNonQualifyingReason = `候选形态 "${boundCandidateId}" 当前状态为 ${effLifecycle}（尚未完成终审入围），按 Gate-4 仅复核入围卡片规则自动跳过；如需强制复核请传入 --force。`;
+                  } else if (packetIsStaleVsDb) {
+                    skipNonQualifyingReason = `候选形态 "${boundCandidateId}" 的复核数据包与当前库规格不一致（原因=${specMatch.reason}，数据包件数=${specMatch.pktQty ?? '未知'}/材质=${specMatch.pktMaterial ?? '未知'} vs 当前库件数=${specMatch.dbQty ?? '未知'}/材质=${specMatch.dbMaterial ?? '未知'}），拒绝将当前 spec_sha256 加盖到旧版数据包；请按当前规格重新生成复核包。`;
                   } else {
                     const evalRows = roStore.getEvaluationsForForm(boundCandidateId);
                     const matchingSpecEvalRows = evalRows.filter(r => {
@@ -1553,8 +1566,10 @@ export async function runPhase2Cli(
                       }
                     }
                   }
-                } else if (dbForm.spec_sha256) {
+                } else if (dbForm.spec_sha256 && !packetIsStaleVsDb) {
                   boundFormSpecSha256 = dbForm.spec_sha256;
+                } else if (packetIsStaleVsDb && pktDeclaredSha) {
+                  boundFormSpecSha256 = pktDeclaredSha;
                 }
               }
             } finally {
@@ -2258,6 +2273,16 @@ export async function runPhase2Cli(
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+const isDirectPhase2CliEntry = (() => {
+  if (!process.argv[1]) return false;
+  const selfPath = fileURLToPath(import.meta.url);
+  if (resolve(process.argv[1]) === selfPath) return true;
+  try {
+    return realpathSync(resolve(process.argv[1])) === realpathSync(selfPath);
+  } catch {
+    return false;
+  }
+})();
+if (isDirectPhase2CliEntry) {
   process.exitCode = await runPhase2Cli();
 }

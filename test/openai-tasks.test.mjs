@@ -2810,7 +2810,7 @@ test('Round 3 codex-runner regressions (P0-24, P0-26, P0-27, P0-28, P1-02, P1-06
     const okTestVerify = verifySavedCodexReceipt(readyR3, { receiptStoreDir: storeDir, allowTestDouble: true });
     assert.equal(okTestVerify.verified, true);
     assert.equal(okTestVerify.execution_provenance, 'synthetic_test_double');
-    assert.equal(okTestVerify.model, 'gpt-6.2-astra');
+    assert.equal(okTestVerify.model, null);
     assert.equal(okTestVerify.reasoning_effort, 'max');
     assert.equal(okTestVerify.reviewer_label, 'Synthetic Test Double · max');
 

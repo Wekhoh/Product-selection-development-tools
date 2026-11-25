@@ -1,8 +1,8 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
 import { validEvidenceDate as validDate } from './observations.mjs';
-import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS } from './economics.mjs';
+import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS, resolveSharedLedgerPackage } from './economics.mjs';
 import { resolveEffectivePricing, resolveUniquePackageByRef, hasProhibited2026PeakExtrapolation } from './fee-basis.mjs';
-import { lookupUnifiedFulfillmentFee2027 } from './fba-rates-2027.mjs';
+import { lookupUnifiedFulfillmentFee2027, priceBand2027 } from './fba-rates-2027.mjs';
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -105,21 +105,8 @@ function threeCalendarMonthsEarlier(isoCalDate) {
 function calendarDayDiff(laterCal, earlierCal) {
   return Math.round((Date.parse(`${laterCal}T00:00:00Z`) - Date.parse(`${earlierCal}T00:00:00Z`)) / 86_400_000);
 }
-
-export function upgradeProfileToR59(baseProfile) {
-  if (!baseProfile || typeof baseProfile !== 'object') {
-    throw new TypeError('A valid base reference profile object is required to upgrade to revision 59.');
-  }
-  const next = structuredClone(baseProfile);
-  next.revision = 59;
-  if (next.workflow?.scoring_and_ordering) {
-    next.workflow.scoring_and_ordering.revision = 59;
-    next.workflow.scoring_and_ordering.crossing_margin_interval_r59 =
-      'When coherent validated primary scenarios cross the 30% pre-ad margin floor (at least one scenario >= 30% and at least one < 30%), extend the below-floor scenario margin score linearly along min(22, max(0, 11 + 55 * (m - 0.30))) paired with the same scenario unit contribution (0-8) so [min_total, max_total] is displayed without inflating strict all-scenario qualifying counts.';
-    next.workflow.scoring_and_ordering.progressive_bid_tiers_r59 =
-      '3-Tier Progressive Suggested Bid: Tier 1 keeps 1-3 searched mid-core purchase terms in entries and moves unbid ultra-long-tail terms to long_tail_opportunistic_terms; Tier 2 accepts SIF cpc_raise_exact (up_and_down) when cpc_fixed_exact is absent plus SellerSprite down_only; Tier 3 allows cold-start parent_functional_proxy with explicit disclosure or deducts the 15-pt item (0/15) when all tiers return zero bids.';
-  }
-  return next;
+function ninetyCalendarDaysEarlier(isoCalDate) {
+  return new Date(Date.parse(`${isoCalDate}T00:00:00Z`) - 90 * 86_400_000).toISOString().slice(0, 10);
 }
 
 function definitions(profile) {
@@ -301,6 +288,22 @@ function scoreMetric(item, input, ctx, profile) {
   return reading.value === null ? missing(item, reading.reason, input) : scored(item, numericScore(item, reading.value), input);
 }
 
+function extractPackCountHint(str) {
+  if (!text(str)) return null;
+  const s = str.trim().toLowerCase();
+  const numMatch = s.match(/(?:^|[\s\-_/|(])(\d+)\s*[-_]?(?:pc|pcs|pack|pk|piece|pieces|count|ct)(?:$|[\s\-_/|)])/i) ??
+    s.match(/\b(?:set|pack)\s+of\s+(\d+)\b/i);
+  if (numMatch) {
+    const n = Number(numMatch[1]);
+    return Number.isInteger(n) && n >= 1 ? n : null;
+  }
+  if (/\b(?:one|single)[-_\s]?(?:pc|pack|piece|unit|set)\b/i.test(s)) return 1;
+  if (/\btwo[-_\s]?(?:pc|pack|piece|unit|set)\b/i.test(s)) return 2;
+  if (/\bthree[-_\s]?(?:pc|pack|piece|unit|set)\b/i.test(s)) return 3;
+  if (/\bfour[-_\s]?(?:pc|pack|piece|unit|set)\b/i.test(s)) return 4;
+  return null;
+}
+
 function scoreJudgment(item, input, ctx, profile = null, candidate = null) {
   if (input?.anchor === null || input?.anchor === undefined) {
     return missing(item, text(input?.reason) ? input.reason : 'The rubric judgment is unavailable and needs evidence.', input);
@@ -309,21 +312,41 @@ function scoreJudgment(item, input, ctx, profile = null, candidate = null) {
     if (input?.reviews_inspected === false) {
       return missing(item, 'feasible_light_differentiation cannot score when reviews_inspected is false.', input);
     }
+    const candTargetAsin = text(candidate?.screening?.reference_price_usd?.target_variant_asin)
+      ? candidate.screening.reference_price_usd.target_variant_asin.trim().toUpperCase()
+      : (text(candidate?.target_variant_asin) ? candidate.target_variant_asin.trim().toUpperCase() : null);
+    const inputTargetAsin = text(input?.target_variant_asin) ? input.target_variant_asin.trim().toUpperCase() : null;
+    if (candTargetAsin && inputTargetAsin && candTargetAsin !== inputTargetAsin) {
+      return missing(item, 'feasible_light_differentiation target_variant_asin conflicts with candidate frozen target_variant_asin.', input);
+    }
+    const rawCandSku = candidate?.screening?.reference_price_usd?.target_variant_sku ??
+      candidate?.target_variant_sku ??
+      candidate?.economics?.target_variant_sku ??
+      null;
+    const candTargetSku = text(rawCandSku) ? rawCandSku.trim().toLowerCase() : null;
+    const rawInputSku = input?.target_variant_sku ?? input?.target_sku ?? null;
+    const inputTargetSku = text(rawInputSku) ? rawInputSku.trim().toLowerCase() : null;
+    if (candTargetSku && inputTargetSku && candTargetSku !== inputTargetSku) {
+      return missing(item, 'feasible_light_differentiation target_variant_sku conflicts with candidate frozen target_variant_sku.', input);
+    }
     if (Array.isArray(input?.review_citations) && input.review_citations.length > 0) {
-      const targetAsin = text(input?.target_variant_asin)
-        ? input.target_variant_asin.trim().toUpperCase()
-        : (text(candidate?.screening?.reference_price_usd?.target_variant_asin)
-          ? candidate.screening.reference_price_usd.target_variant_asin.trim().toUpperCase()
-          : null);
-      const targetSkuText = text(input?.target_sku) ? input.target_sku.trim().toLowerCase() : null;
-      const hasMatchingTargetSkuCitation = input.review_citations.some(
-        c => c?.sku_verified === true &&
-          c?.sku_matches_target !== false &&
-          (!targetAsin || !text(c?.asin) || c.asin.trim().toUpperCase() === targetAsin) &&
-          (!targetSkuText || !text(c?.variant_sku) || c.variant_sku.trim().toLowerCase() === targetSkuText),
+      const targetAsin = candTargetAsin ?? inputTargetAsin;
+      const targetSkuText = candTargetSku ?? inputTargetSku;
+      const candidatePackCount = extractPackCountHint(
+        [candidate?.economics?.saleable_unit, candidate?.saleable_unit, candidate?.form, candidate?.label].filter(text).join(' | '),
       );
+      const hasMatchingTargetSkuCitation = input.review_citations.some(c => {
+        if (c?.sku_verified !== true || c?.sku_matches_target === false) return false;
+        if (targetAsin && text(c?.asin) && c.asin.trim().toUpperCase() !== targetAsin) return false;
+        if (targetSkuText && (!text(c?.variant_sku) || c.variant_sku.trim().toLowerCase() !== targetSkuText)) return false;
+        if (!targetSkuText && candidatePackCount !== null && text(c?.variant_sku)) {
+          const citPack = extractPackCountHint(c.variant_sku);
+          if (citPack !== null && citPack !== candidatePackCount) return false;
+        }
+        return true;
+      });
       if (!hasMatchingTargetSkuCitation) {
-        return missing(item, 'feasible_light_differentiation review_citations do not match a SKU-verified review on target_variant_asin.', input);
+        return missing(item, 'feasible_light_differentiation review_citations do not match a SKU-verified review on target_variant_asin / target_variant_sku.', input);
       }
     }
   }
@@ -1388,21 +1411,18 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       ? 'Revision 59 newcomer cohort requires NEAR_30_DAYS or a verified 30-day rolling period aligned with observation_date.'
       : 'Revision 58 newcomer cohort requires a verified latest-30-day period aligned with observation_date (YYYY-MM-DD/YYYY-MM-DD, 30 days).');
   }
-  const earliestCal = threeCalendarMonthsEarlier(obsCal);
+  const earliestCal = isR59 ? ninetyCalendarDaysEarlier(obsCal) : threeCalendarMonthsEarlier(obsCal);
 
   const hasParentSalesEvidenceSignal = evList => evList.some(ev => {
     if (!ev || typeof ev !== 'object') return false;
-    if (text(ev.grain) && ev.grain.trim() !== 'target_child_units') return true;
-    const prose = [ev.summary, ev.note, ev.source, ev.label, ev.locator].filter(Boolean).join(' ');
-    const hasMultiOrNegation = /(?:多变体|多个子体|多子体|(?:并非|绝非|不是|非|不|未|未必|并不|绝不)(?:是|属于|算)?(?:单变体|唯一子体|仅\s*1\s*个子体|只有一个子体|等于|等同)|不等同|不同于|大于目标子体|高于目标子体|超过目标子体|小于目标子体|低于目标子体|包含(?:其余|其他|多个)子体|!=|≠|\b(?:multi[- ]variant|multiple\s+(?:child(?:ren)?|variants?)|(?:not|never|no|cannot|can't|hardly|rarely)\s+(?:a\s+|an\s+|strictly\s+)?(?:single[- ]variant|sole\s+child|only\s+one\s+child|equals?\b|equal\s+to\b)|does(?:n't|\s+not)\s+equal|do(?:n't|\s+not)\s+equal|is(?:n't|\s+not)\s+equal|unequal)\b)/i.test(prose);
-    if (!hasMultiOrNegation && /(?<!不|非|未|必|是)(?:单变体|唯一子体|仅1个子体|只有一个子体|等于目标子体)|\b(?:single[- ]variant|sole\s+child|only\s+one\s+child|equals?\s+target\s+child)\b/i.test(prose)) {
-      return false;
-    }
-    return /parent_family_units|family_representative|父体销量|父体月销|父体汇总销量|\bparent\s+(?:family\s+)?(?:monthly\s*)?(?:sales|units)\b/i.test(prose);
+    if (text(ev.grain)) return ev.grain.trim() !== 'target_child_units';
+    if (ev.is_multi_variant_parent_sum === true || ev.single_variant_verified === false) return true;
+    return false;
   });
 
   let invalidReference = false;
   const classified = [];
+  const reviewAnomalyAdvisories = [];
 
   for (const member of cohort.members) {
     const record = { ...member, effective_status: member?.status ?? 'pending', age_days: null, launch_calendar_date: null };
@@ -1481,8 +1501,9 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         record.effective_status = 'excluded';
         record.reason = text(member.reason) ? member.reason : 'Supported old reviews predate the purported recent launch; excluded from the normal-start reference.';
         const relevantForStrat = inBsrWindow && !(record.age_days < 30 && unitsReading.exactZero);
-        const missingPoolStats = relevantForStrat && (ratingsReading.value === null || unitsReading.value === null);
-        const poolEligible = relevantForStrat && !missingPoolStats;
+        const missingStatsRaw = ratingsReading.value === null || unitsReading.value === null;
+        const missingPoolStats = !isR59 && relevantForStrat && missingStatsRaw;
+        const poolEligible = relevantForStrat && !missingStatsRaw;
         pushClassified('old_review_excluded', poolEligible, missingPoolStats);
       } else {
         record.effective_status = 'pending';
@@ -1510,8 +1531,9 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         const relevantForStrat = member.sampling_excluded === true && inBsrWindow &&
           R58_COMPARABLE_VERDICTS.has(member.comparability_verdict) &&
           !(record.age_days < 30 && unitsReading.exactZero);
-        const missingPoolStats = relevantForStrat && (ratingsReading.value === null || unitsReading.value === null);
-        const poolEligible = relevantForStrat && !missingPoolStats;
+        const missingStatsRaw = ratingsReading.value === null || unitsReading.value === null;
+        const missingPoolStats = !isR59 && relevantForStrat && missingStatsRaw;
+        const poolEligible = relevantForStrat && !missingStatsRaw;
         pushClassified(member.sampling_excluded === true ? 'sampling_excluded' : 'other_excluded', poolEligible, missingPoolStats);
       }
       continue;
@@ -1548,9 +1570,29 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
 
     if (!inBsrWindow) {
       record.effective_status = 'pending';
-      record.reason = 'A current-category newcomer needs matching rank 1-100 and a valid US-site launch date within three calendar months (not in the future).';
+      record.reason = isR59
+        ? 'A current-category newcomer needs a valid US-site launch date within 90 calendar days (not in the future).'
+        : 'A current-category newcomer needs matching rank 1-100 and a valid US-site launch date within three calendar months (not in the future).';
       pushClassified('pending', false, false);
       continue;
+    }
+
+    if (isR59 && (
+      member?.keepa_review_anomaly === true ||
+      member?.review_velocity_anomaly === true ||
+      member?.suspected_merged_or_vine_spike === true ||
+      (ratingsReading.value !== null && ratingsReading.value >= 100 && record.age_days !== null && record.age_days <= 90)
+    )) {
+      const anomalyNote = text(member?.keepa_review_anomaly_note)
+        ? member.keepa_review_anomaly_note.trim()
+        : `90天内新品 ${member.asin} 评价数达 ${ratingsReading.value ?? '高'} 条或存在 Keepa 评论陡增标记：请人工核查最早评论日期、变体归属与 Vine/VP/直评构成（非阻断提示，不一刀切淘汰）。`;
+      record.keepa_review_anomaly_advisory = anomalyNote;
+      reviewAnomalyAdvisories.push({
+        asin: member.asin,
+        age_days: record.age_days,
+        ratings: ratingsReading.value,
+        note_zh: anomalyNote,
+      });
     }
 
     if (record.effective_status === 'ramp_up_zero_sales') {
@@ -2025,6 +2067,9 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
 
   diagnostics.stratification = stratifiedMeta;
   diagnostics.examples = scoringPool.map(stripInternalRat);
+  if (isR59 && reviewAnomalyAdvisories.length > 0) {
+    diagnostics.review_anomaly_advisories = reviewAnomalyAdvisories;
+  }
 
   const hasScoringInterval = hasRangeRef || scoringPool.some(r => r.e_rat_hi && ratCmp(r.e_rat, r.e_rat_hi) !== 0);
   const mFull = scoringPool.filter(r => r.is_full_month);
@@ -2127,7 +2172,8 @@ function datedScenario(scenario, economics, ctx, profile, forceSensitivityOnly =
     }
     const ledger = forceSensitivityOnly ? { ...rawLedger, sensitivity_only: true } : rawLedger;
     calculation = calculateEconomics(ledger, { requireFeeBasis: true, requireRegularRepeatOrder: profile.revision >= 57,
-      profileRevision: profile.revision, evidenceIds: [...ctx.evidence.keys()], operatingMonths: economics.operating_months });
+      profileRevision: profile.revision, evidenceIds: [...ctx.evidence.keys()], operatingMonths: economics.operating_months,
+      externalPackages: economics?.packages });
     if (profile.revision >= 59 && calculation?.scoring_supported) {
       const effPricing = resolveEffectivePricing(ledger);
       const hasOngoingCouponOnly = effPricing.valid &&
@@ -2135,33 +2181,47 @@ function datedScenario(scenario, economics, ctx, profile, forceSensitivityOnly =
         !((ledger.prime_exclusive_discount_usd ?? 0) > 0 || (ledger.prime_exclusive_discount_pct ?? 0) > 0);
       if (hasOngoingCouponOnly) {
         const fulLine = Array.isArray(ledger.lines) ? ledger.lines.find(l => l?.id === 'fulfillment') : null;
-        const pkgPool = Array.isArray(ledger.packages) && ledger.packages.length > 0
-          ? ledger.packages
-          : economics?.packages;
-        const pkgResolved = resolveUniquePackageByRef(pkgPool, ledger.fee_context?.package_ref).pkg ?? ledger.pkg ?? null;
+        const sharedFulPkg = resolveSharedLedgerPackage(ledger, {
+          preferredLine: fulLine,
+          externalPackages: economics?.packages,
+        });
+        const pkgResolved = sharedFulPkg.pkg;
         const salesWin = ledger.fee_context?.sales;
+        const netBand = priceBand2027(effPricing.net_effective_price_usd);
+        const listBand = priceBand2027(effPricing.list_price_usd);
         if (fulLine && fulLine.status !== 'pending' && number(fulLine.amount_usd) &&
-          pkgResolved && typeof pkgResolved === 'object' &&
-          salesWin?.from >= '2027-01-15' && salesWin?.through <= '2027-10-14') {
-          const expectedFul = lookupUnifiedFulfillmentFee2027({
-            pkg: pkgResolved,
-            price_usd: effPricing.net_effective_price_usd,
-            list_price_usd: effPricing.list_price_usd,
-            has_ongoing_coupon: true,
-            sales_window: salesWin,
-            is_apparel: ledger.is_apparel_or_shoes === true,
-            is_dangerous_goods: ledger.is_dangerous_goods === true,
-            is_sipp: ledger.is_sipp === true,
-            requires_amazon_packaging: ledger.requires_amazon_packaging,
-            fee_category: ledger.fee_category ?? null,
-          });
-          if (expectedFul.status === 'verified' && fulLine.amount_usd < expectedFul.total_usd - 0.005) {
+          fulLine.fee_basis?.sp_api_calibrated !== true && fulLine.fee_basis?.calculator_verified !== true) {
+          if (listBand !== netBand && fulLine.fee_basis?.price_band === netBand) {
             calculation.scoring_supported = false;
             calculation.fee_validation.issues.push({
               line: 'fulfillment',
               code: 'coupon_list_price_tier_understated',
-              reason: `Fulfillment amount ($${fulLine.amount_usd}) understates 2027 list-price band (${expectedFul.price_band} @ $${effPricing.list_price_usd} -> $${expectedFul.total_usd}) under ongoing coupon.`,
+              reason: `Fulfillment fee_basis.price_band (${netBand}) uses post-coupon net price instead of pre-coupon list price band (${listBand} @ $${effPricing.list_price_usd}).`,
             });
+          } else if (pkgResolved && typeof pkgResolved === 'object' &&
+            (!salesWin || (salesWin.from >= '2027-01-15' && salesWin.through <= '2027-10-14'))) {
+            const expectedFul = lookupUnifiedFulfillmentFee2027({
+              pkg: pkgResolved,
+              price_usd: effPricing.net_effective_price_usd,
+              list_price_usd: effPricing.list_price_usd,
+              has_ongoing_coupon: true,
+              sales_window: salesWin ?? { from: '2027-02-01', through: '2027-10-14' },
+              is_apparel: ledger.is_apparel_or_shoes === true || ledger.is_apparel === true,
+              is_shoes: ledger.is_shoes === true,
+              is_apparel_or_shoes: ledger.is_apparel_or_shoes === true,
+              is_dangerous_goods: ledger.is_dangerous_goods === true,
+              is_sipp: ledger.is_sipp === true,
+              requires_amazon_packaging: ledger.requires_amazon_packaging,
+              fee_category: ledger.fee_category ?? null,
+            });
+            if (expectedFul.status === 'verified' && fulLine.amount_usd < expectedFul.total_usd - 0.005) {
+              calculation.scoring_supported = false;
+              calculation.fee_validation.issues.push({
+                line: 'fulfillment',
+                code: 'coupon_list_price_tier_understated',
+                reason: `Fulfillment amount ($${fulLine.amount_usd}) understates 2027 list-price band (${expectedFul.price_band} @ $${effPricing.list_price_usd} -> $${expectedFul.total_usd}) under ongoing coupon.`,
+              });
+            }
           }
         }
       }
@@ -2473,10 +2533,26 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
     const allFail = profile.revision >= 57 ? scenarios.every(s => !s.margin_eligible) : diagnostics.margin_range[1] < floor;
     const allPass = profile.revision >= 57 ? scenarios.every(s => s.margin_eligible) : diagnostics.margin_range[0] >= floor;
     if (isR59) {
-      const distinctQuotes = new Set(
-        scenarios.map(s => s?.input?.quote_id ?? s?.input?.cost_ledger?.source_inputs?.quote_id ?? s.id),
+      const distinctFactories = new Set(
+        scenarios.map(s => {
+          const procLine = Array.isArray(s?.input?.cost_ledger?.lines)
+            ? s.input.cost_ledger.lines.find(l => l?.id === 'procurement')
+            : null;
+          const firstSku = Array.isArray(procLine?.sku_lines) ? procLine.sku_lines[0] : null;
+          const fKey = s?.input?.factory_id ??
+            s?.input?.supplier_id ??
+            s?.input?.cost_ledger?.source_inputs?.factory_id ??
+            s?.input?.cost_ledger?.source_inputs?.supplier_id ??
+            firstSku?.factory_id ??
+            firstSku?.supplier_id ??
+            firstSku?.offer_id ??
+            s?.input?.quote_id ??
+            s?.input?.cost_ledger?.source_inputs?.quote_id ??
+            s.id;
+          return String(fKey).trim();
+        }),
       );
-      diagnostics.second_factory_quote_needed = !allPass && distinctQuotes.size < 3;
+      diagnostics.second_factory_quote_needed = !allPass && distinctFactories.size < 3;
     }
     if (allFail) {
       marginStatus = 'fail';
@@ -3059,6 +3135,7 @@ function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, scre
   const aprItem = itemById.get('applicable_public_requirements');
   const aprInput = candidate?.judgments?.applicable_public_requirements;
   const sdrInput = candidate?.judgments?.specific_design_rights;
+  const REGISTRY_ACCESS_FAILURE_RE = /(?:registry\s+unavailable|access\s+failed|connection\s+failed|unreachable|search\s+(?:failed|unavailable|not\s+completed|incomplete)|http\s+[45]\d\d|\b(?:429|500|502|503|504)\b|rate[- ]?limit\w*|too\s+many\s+requests|quota\s*exceeded|throttl\w*|could\s+not\s+(?:access|reach|query|search|verify)|timeout|(?:查询|检索|公开初筛|初查)?未完成|连接失败|访问失败|检索失败|返回\s*(?:429|5\d\d)|限流|频率限制|请求过多|稍后重试|无法(?:访问|连接|查询|查验|核实)|未能(?:查验|查询|访问|检索)|查询失败|暂[时]?不可用|登记库.*不可用|超时)/i;
   if (
     aprInput?.proven_conflict === true ||
     aprInput?.hard_ban === true ||
@@ -3066,6 +3143,10 @@ function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, scre
     candidate?.sp_api_calibration?.restrictions?.hard_category_ban === true ||
     aprInput?.prescreen_completed === false ||
     sdrInput?.prescreen_completed === false ||
+    aprInput?.registry_unavailable === true ||
+    sdrInput?.registry_unavailable === true ||
+    REGISTRY_ACCESS_FAILURE_RE.test(String(aprInput?.reason ?? '')) ||
+    REGISTRY_ACCESS_FAILURE_RE.test(String(sdrInput?.reason ?? '')) ||
     (aprItem?.status === 'scored' && aprItem.score === 0 && aprInput?.hard_ban === true)
   ) {
     return { eligible: false, items: [] };
@@ -3177,6 +3258,8 @@ function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldRese
 
     const crossingOffPeak = periods.filter(period =>
       Array.isArray(period.total_range) &&
+      !['excluded', 'deferred'].includes(period.queue) &&
+      period.screening?.status === 'crossing_eligible' &&
       period.diagnostics?.economics?.crossing_margin_floor === true &&
       isPrimaryOffPeakMonthsList(period.months, isR59) &&
       period.diagnostics?.economics?.scenarios?.length > 0 &&
@@ -3642,10 +3725,10 @@ export function scoreCandidate(candidate, profile, internal = null) {
     const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, isR59));
     const seasonalDispR59 = !isR59 ? undefined
       : isPrivateMoldReserved ? 'private_mold_reserved'
-        : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
-          : qualR58?.mode === 'crossing_30pct_interval' || primaryOffPeak?.diagnostics?.economics?.crossing_margin_floor === true ? 'crossing_30pct_interval'
-            : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
-              : primaryOffPeak?.queue === 'deferred' ? 'deferred'
+        : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
+          : primaryOffPeak?.queue === 'deferred' ? 'deferred'
+            : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
+              : qualR58?.mode === 'crossing_30pct_interval' || primaryOffPeak?.diagnostics?.economics?.crossing_margin_floor === true ? 'crossing_30pct_interval'
                 : 'pending_evidence';
     const allowShortlistSeasonal = !isR59;
     const allowPkgShortlistSeasonal = isR59 && seasonalDispR59 === 'hard_excluded';
@@ -3774,10 +3857,10 @@ export function scoreCandidate(candidate, profile, internal = null) {
 
   const flatDispR59 = !isR59 || isOperatingPeriod ? undefined
     : candidate.sourcing_disposition === 'private_mold_reserved' ? 'private_mold_reserved'
-      : (strictComplete || samplePendingQualifyingR59) ? 'full_annual_qualifying'
-        : crossingCompleteR59 || profit.diagnostics.crossing_margin_floor === true ? 'crossing_30pct_interval'
-          : queue === 'excluded' ? 'hard_excluded'
-            : queue === 'deferred' ? 'deferred'
+      : queue === 'excluded' ? 'hard_excluded'
+        : queue === 'deferred' ? 'deferred'
+          : (strictComplete || samplePendingQualifyingR59) ? 'full_annual_qualifying'
+            : crossingCompleteR59 || profit.diagnostics.crossing_margin_floor === true ? 'crossing_30pct_interval'
               : 'pending_evidence';
 
   const allowShortlistFlat = !isR59;
@@ -3935,7 +4018,13 @@ export function scoreBatch(batch, profile) {
           ? results.filter(r => r.qualification?.counts_toward_target === true).length
           : comparable.length + seasonalEligible.length,
       } : {}),
-      ...(isR59 && samplePendingFlatR59.length > 0 ? { sample_pending_qualifying: samplePendingFlatR59.length } : {}),
+      ...(isR59 ? (() => {
+        const allSamplePendingCount = results.filter(
+          r => r.qualification?.counts_toward_target === true &&
+            (r.qualification?.mode === 'sample_pending_qualifying' || r.qualification?.mode === 'seasonal_sample_pending_qualifying'),
+        ).length;
+        return allSamplePendingCount > 0 ? { sample_pending_qualifying: allSamplePendingCount } : {};
+      })() : {}),
       ...(profile.revision >= 59 ? {
         dispositions: {
           full_annual_qualifying: results.filter(r => r.effective_disposition === 'full_annual_qualifying').length,
