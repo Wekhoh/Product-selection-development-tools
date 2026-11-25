@@ -902,12 +902,16 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
     const hasExplicitKeepaSteady = Boolean(
       !isVeteranClearanceOrWar &&
       raw?.keepa_price_steady !== false &&
+      raw?.keepa?.price_steady !== false &&
       (
         raw?.keepa_price_steady === true ||
+        raw?.keepa?.price_steady === true ||
         steadyKeepaRef !== null ||
-        (raw?.keepa && typeof raw.keepa === 'object') ||
-        ['steady', 'stable', 'flat'].includes(String(raw?.keepa_trajectory ?? raw?.keepa_90d_stability ?? '').trim().toLowerCase()) ||
-        aiBucket === 'primary_comparable'
+        ['steady', 'stable', 'flat'].includes(
+          String(raw?.keepa_trajectory ?? raw?.keepa_90d_stability ?? raw?.keepa?.trajectory ?? raw?.keepa?.stability ?? '')
+            .trim()
+            .toLowerCase(),
+        )
       ),
     );
     const seedMergedUnverified = Boolean(

@@ -3792,11 +3792,25 @@ export function scoreCandidate(candidate, profile, internal = null) {
     const primaryOffPeakRaw = isR59 && isExplicitEvergreen
       ? orderedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, true))
       : null;
+    const isUnpublishedPeakCompanionPeriodR59 = p => {
+      if (Array.isArray(p.diagnostics?.economics?.margin_range)) return false;
+      if (isValidCompanionPeakPanelR58(p, true)) return true;
+      if (!hasExactPeakMonthsR58(p, true)) return false;
+      const scs = p.diagnostics?.economics?.scenarios ?? [];
+      if (scs.length === 0) return false;
+      return !scs.some(sc => {
+        const ledger = sc?.input?.cost_ledger;
+        const lines = ledger?.lines ?? ledger?.costs ?? [];
+        const ful = Array.isArray(lines) ? lines.find(x => x?.id === 'fulfillment') : null;
+        return hasProhibited2026PeakExtrapolation(ful, ledger);
+      });
+    };
     const otherPeriodsAreUnpublishedPeak = Boolean(
       primaryOffPeakRaw &&
+      evaluatedPeriods.length > 1 &&
       evaluatedPeriods
         .filter(p => p.id !== primaryOffPeakRaw.id)
-        .every(p => isValidCompanionPeakPanelR58(p, true) && !Array.isArray(p.diagnostics?.economics?.margin_range)),
+        .every(isUnpublishedPeakCompanionPeriodR59),
     );
     if (isR59 && isExplicitEvergreen && primaryOffPeakRaw && otherPeriodsAreUnpublishedPeak) {
       const mergedExpected = mergeExpectedPrimaryScenarios(rootExpected, primaryOffPeakRaw.expected_primary_scenarios);

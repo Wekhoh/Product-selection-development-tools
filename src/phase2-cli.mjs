@@ -668,9 +668,11 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
             };
           }
         }
+        const stampValidated = recCheck?.verified === true ? { validated_envelope: true } : {};
         if (allowStaleSpecR59 && (specChanged || fromHistoricalBundle || recCheck?.stale_spec || parsedEvRev.stale_spec === true)) {
           return {
             ...parsedEvRev,
+            ...stampValidated,
             stale_spec: true,
             reviewed_spec_sha256: recCheck?.reviewed_spec_sha256 ?? reviewedSpecSha,
             ...(reviewedSpecSha ? { spec_sha256: reviewedSpecSha } : {}),
@@ -679,7 +681,7 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
               : {}),
           };
         }
-        return parsedEvRev;
+        return recCheck?.verified === true ? { ...parsedEvRev, ...stampValidated } : parsedEvRev;
       };
 
       if (cand.evidence_review !== undefined && cand.evidence_review !== null) {
@@ -1747,7 +1749,7 @@ export async function runPhase2Cli(
             }
           }
         }
-        const serviceTier = values['service-tier'] ? values['service-tier'].trim() : null;
+        const serviceTier = values['service-tier'] ? values['service-tier'].trim() : 'ultrafast';
         const skippedForNonQualifying = Boolean(skipNonQualifyingReason);
 
         // P2-11: Preflight and stage protected destination (including directory, special-file, PATH/shim/JS target & --codex-bin checks) BEFORE invoking Codex CLI!
@@ -2514,14 +2516,34 @@ export async function runPhase2Cli(
           if ((profile.revision ?? 59) >= 59 && rawItem.disallow_pre1688_cost_guess_kill === false) {
             throw new Phase2CliError('Revision 59 严禁启用 Gate 1A 倒推价前置砍品（disallow_pre1688_cost_guess_kill 不可为 false）。');
           }
+          const targetFormId = rawItem.form && typeof rawItem.form === 'object'
+            ? requireOption(rawItem.form.form_id, 'form_id')
+            : requireOption(rawItem.form_id, 'form_id');
+          const existingDbForm = store.getCandidateForm(targetFormId);
+          let existingDbComp = existingDbForm?.saleable_set_composition ?? null;
+          if (!existingDbComp && typeof existingDbForm?.saleable_set_composition_json === 'string') {
+            try { existingDbComp = JSON.parse(existingDbForm.saleable_set_composition_json); } catch { existingDbComp = null; }
+          }
+          const hasExplicitFormSpec = Boolean(
+            (rawItem.form && typeof rawItem.form === 'object') ||
+            rawItem.saleable_set_composition ||
+            rawItem.buyer_task ||
+            rawItem.grade_or_material !== undefined,
+          );
           const formObj = rawItem.form && typeof rawItem.form === 'object'
-            ? rawItem.form
+            ? {
+                ...rawItem.form,
+                saleable_set_composition: rawItem.form.saleable_set_composition ?? existingDbComp ?? [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+              }
             : {
-                form_id: requireOption(rawItem.form_id, 'form_id'),
-                label: rawItem.label ?? rawItem.form_id,
-                buyer_task: rawItem.buyer_task ?? rawItem.label ?? rawItem.form_id,
-                ...(rawItem.core_form ? { core_form: rawItem.core_form } : {}),
-                ...(Array.isArray(rawItem.saleable_set_composition) ? { saleable_set_composition: rawItem.saleable_set_composition } : {}),
+                form_id: targetFormId,
+                product_family_key: rawItem.product_family_key ?? existingDbForm?.product_family_key ?? targetFormId,
+                label: rawItem.label ?? existingDbForm?.label ?? targetFormId,
+                buyer_task: rawItem.buyer_task ?? existingDbForm?.buyer_task ?? rawItem.label ?? targetFormId,
+                saleable_set_composition: rawItem.saleable_set_composition ?? existingDbComp ?? [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+                grade_or_material: rawItem.grade_or_material ?? existingDbForm?.grade_or_material ?? null,
+                target_child_asin: rawItem.target_child_asin ?? existingDbForm?.target_child_asin ?? null,
+                leaf_node_path: rawItem.leaf_node_path ?? existingDbForm?.leaf_node_path ?? null,
               };
           let leads = Array.isArray(rawItem.leads) ? [...rawItem.leads] : [];
           if (leads.length === 0) {
@@ -2554,8 +2576,10 @@ export async function runPhase2Cli(
             }
           }
 
-          // Pre-register form & any supplied verified 1688 quotes so runPhase2Batch reuses them cleanly.
-          const { form: upsertedForm } = store.upsertCandidateForm(formObj);
+          // Pre-register form & any supplied verified 1688 quotes so runPhase2Batch reuses them cleanly without bumping spec_version on existing forms.
+          const { form: upsertedForm } = store.upsertCandidateForm(formObj, {
+            preserveExisting: Boolean(existingDbForm && !hasExplicitFormSpec),
+          });
           const quoteList = (Array.isArray(rawItem.quotes)
             ? rawItem.quotes
             : (rawItem.quote && typeof rawItem.quote === 'object' ? [rawItem.quote] : [])

@@ -2490,8 +2490,20 @@ export function ingestTrialSpecification(spec, profile, {
         const expiredQuoteIds = allVerifiedQuotesForSpec
           .filter(q => q.expires_at && String(q.expires_at).slice(0, 10) < candAsOf)
           .map(q => q.quote_id);
+        let parsedDbComp = dbForm.saleable_set_composition ?? null;
+        if (!parsedDbComp && typeof dbForm.saleable_set_composition_json === 'string') {
+          try { parsedDbComp = JSON.parse(dbForm.saleable_set_composition_json); } catch { parsedDbComp = null; }
+        }
         dbFormConstraintsById.set(cid, {
           dbFormPresent: true,
+          dbFormSpec: {
+            spec_sha256: dbForm.spec_sha256 ?? null,
+            buyer_task: dbForm.buyer_task ?? null,
+            saleable_set_composition: parsedDbComp,
+            grade_or_material: dbForm.grade_or_material ?? null,
+            target_child_asin: dbForm.target_child_asin ?? null,
+            leaf_node_path: dbForm.leaf_node_path ?? null,
+          },
           candAsOf,
           declaredPricesUsd,
           declaredFxCnyPerUsd,
@@ -3085,6 +3097,17 @@ export function ingestTrialSpecification(spec, profile, {
     }
 
     const dbConstraints = dbFormConstraintsById.get(cand.id) ?? null;
+    if (effectiveRev >= 59 && dbConstraints?.dbFormSpec) {
+      const s = dbConstraints.dbFormSpec;
+      if (cand.buyer_task === undefined && s.buyer_task) cand.buyer_task = s.buyer_task;
+      if (cand.saleable_set_composition === undefined && s.saleable_set_composition) {
+        cand.saleable_set_composition = structuredClone(s.saleable_set_composition);
+      }
+      if (cand.grade_or_material === undefined && s.grade_or_material !== null) cand.grade_or_material = s.grade_or_material;
+      if (cand.target_child_asin === undefined && s.target_child_asin !== null) cand.target_child_asin = s.target_child_asin;
+      if (cand.leaf_node_path === undefined && s.leaf_node_path !== null) cand.leaf_node_path = s.leaf_node_path;
+      if (cand.spec_sha256 === undefined && s.spec_sha256) cand.spec_sha256 = s.spec_sha256;
+    }
     if (activeEvergreen2027) {
       const mergedReqQuotes = [
         ...(Array.isArray(activeEvergreen2027.required_quote_ids) ? activeEvergreen2027.required_quote_ids : []),

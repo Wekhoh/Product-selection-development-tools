@@ -624,7 +624,9 @@ export function replayBatchIntoStore(store, {
           scored?.operating_periods?.[0]?.scenarios?.[0]?.saleable_unit ||
           label)
         : (inputCand?.saleable_unit || label);
-      const buyerTask = inputCand?.discovery?.description || candSaleableUnit || label;
+      const buyerTask = (isR59Replay && typeof inputCand?.buyer_task === 'string' && inputCand.buyer_task.trim())
+        ? inputCand.buyer_task.trim()
+        : (inputCand?.discovery?.description || candSaleableUnit || label);
       const frozenComposition = isR59Replay && inputCand?.saleable_set_composition && typeof inputCand.saleable_set_composition === 'object'
         ? inputCand.saleable_set_composition
         : { saleable_unit: candSaleableUnit };
@@ -666,9 +668,12 @@ export function replayBatchIntoStore(store, {
         leaf_node_path: frozenLeafNodePath,
       }));
       let activeCandFeeSnapshot = effectiveFeeSnapshot;
+      const deterministicCandInput = (isR59Replay && inputCand && typeof inputCand === 'object' && Object.hasOwn(inputCand, 'evidence_review'))
+        ? (() => { const { evidence_review: _adv, ...rest } = inputCand; return rest; })()
+        : inputCand;
       let bundleHash = computeEvidenceBundleHash({
         form_spec_sha256: replaySpecSha,
-        candidate_input: inputCand,
+        candidate_input: deterministicCandInput,
         discovery_manifest: manifest,
         profile_snapshot: profile,
         fee_table_snapshot: activeCandFeeSnapshot,
@@ -694,7 +699,18 @@ export function replayBatchIntoStore(store, {
         }
       }
 
-      const perCandidateSha = sha256Hex(canonicalJson(scored));
+      const intrinsicScoredForHash = (isR59Replay && scored && typeof scored === 'object')
+        ? (() => {
+            const {
+              may_exceed_comparable_leader: _batchLeaderCmp,
+              review_visible_state: _visState,
+              qualifying_order: _qOrd,
+              ...rest
+            } = scored;
+            return rest;
+          })()
+        : scored;
+      const perCandidateSha = sha256Hex(canonicalJson(intrinsicScoredForHash));
       const qualification = reconstructVersionQualification(scored, profile.revision);
       const linkedAttempts = findMatchingAttemptIdsForCandidate(store, inputCand, source_attempt_ids, repoRoot);
 
@@ -737,6 +753,7 @@ export function replayBatchIntoStore(store, {
             summary: result.summary,
             batch_id: batch.batch_id ?? null,
           },
+          ...(isR59Replay && inputCand?.evidence_review ? { evidence_review: inputCand.evidence_review } : {}),
           source_attempt_ids: linkedAttempts,
         });
         recorded.push(evRes);

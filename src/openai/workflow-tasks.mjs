@@ -2921,9 +2921,9 @@ export function buildMarketObservationRequest(input, options = {}) {
             text: [
               'Evaluate competitor market observations (veteran clearance/price war, temporary promos, single-vs-bundle packs, review trajectory anomalies, and spec comparability) under contract MarketObservationJudge (schema_version: 1).',
               'Rules:',
-              '1. Anti-laziness & anti-hallucination mandatory_facts: for EVERY peer in input.peers[] (1:1 by ASIN, zero omissions), FIRST echo observed_price_usd, keepa_high_usd, keepa_low_usd, and review_count verbatim from the raw peer record, and fill non-empty factual summaries for keepa_90d_trend, coupon_status, review_curve_change, and key_appearance_and_dims.',
+              '1. Anti-laziness & anti-hallucination mandatory_facts: for EVERY peer in input.peers[] (1:1 by ASIN, zero omissions), FIRST echo observed_price_usd, keepa_high_usd, keepa_low_usd, and review_count verbatim from the raw peer record. For keepa_90d_trend, coupon_status, review_curve_change, and key_appearance_and_dims, summarize ONLY observed facts from the raw peer record (including any keepa_rle_segments / keepa_12m_rle_segments / keepa_series / review_history / coupon_text / title / dimensions_text); if raw evidence for any of those fields is absent on a peer, set that field to null (or exact "未提供"), and NEVER invent numeric dimensions/weights/percentages not present in the raw peer input.',
               '2. Flexible qualitative_judgment: AFTER filling mandatory_facts, classify each peer into bucket (primary_comparable | veteran_clearance_or_war | temporary_promo | multi_pack_or_bundle_variant | bare_part_or_different_spec | review_anomaly_watch | newcomer_launch_reference) with a concise Chinese reason_zh.',
-              '3. Zero silent deletion: whenever include_in_primary_band is false, keep_in_observation_bar MUST be true so every moved-out competitor remains explicitly visible on the card observation bar with its original price and reason.',
+              '3. Strict bucket-flag coupling & zero silent deletion: set include_in_primary_band = true ONLY when bucket === "primary_comparable" (keep_in_observation_bar may be false or true); for EVERY non-primary bucket (veteran_clearance_or_war | temporary_promo | multi_pack_or_bundle_variant | bare_part_or_different_spec | review_anomaly_watch | newcomer_launch_reference), you MUST set include_in_primary_band = false AND keep_in_observation_bar = true so every moved-out competitor remains explicitly visible on the card observation bar with its original price and reason.',
               '4. Product-P3 boundary: NEVER emit FBA fees, margins, or 21-item numeric scores.',
             ].join('\n'),
           },
@@ -3135,7 +3135,11 @@ export function parseMarketObservationResult(rawResponse, taskInput = null) {
         Array.isArray(taskInput?.peers) &&
         taskInput.peers.length > 0 &&
         taskInput.images.length >= taskInput.peers.length;
-      const hasKeepaSource = peerHasKeepaChart || rawHigh !== null || rawLow !== null ||
+      const hasKeepaSegments =
+        (Array.isArray(rawPeer.keepa_rle_segments) && rawPeer.keepa_rle_segments.length > 0) ||
+        (Array.isArray(rawPeer.keepa_12m_rle_segments) && rawPeer.keepa_12m_rle_segments.length > 0) ||
+        (rawPeer.keepa_series && typeof rawPeer.keepa_series === 'object');
+      const hasKeepaSource = peerHasKeepaChart || hasKeepaSegments || rawHigh !== null || rawLow !== null ||
         hasStr(rawPeer.keepa_90d_trend) || hasStr(rawPeer.keepa_trajectory) || hasStr(rawPeer.keepa_90d_summary) ||
         typeof rawPeer.keepa_price_steady === 'boolean' || typeof rawPeer.keepa_90d_median_usd === 'number';
       if (!hasKeepaSource && keepa90dTrend !== null && !UNKNOWN_FACT_SENTINEL_RE.test(keepa90dTrend.trim())) {
@@ -3146,7 +3150,12 @@ export function parseMarketObservationResult(rawResponse, taskInput = null) {
       const rawCouponStr = hasStr(rawPeer.coupon_status)
         ? rawPeer.coupon_status.trim()
         : (hasStr(rawPeer.coupon) ? rawPeer.coupon.trim() : (hasStr(rawPeer.coupon_text) ? rawPeer.coupon_text.trim() : null));
-      const hasCouponSource = peerHasKeepaChart || rawCouponStr !== null ||
+      const hasCouponInSegments =
+        (Array.isArray(rawPeer.keepa_rle_segments) && rawPeer.keepa_rle_segments.some(s => s && ('coupon' in s || 'oneTimeCoupon' in s))) ||
+        (Array.isArray(rawPeer.keepa_12m_rle_segments) && rawPeer.keepa_12m_rle_segments.some(s => s && ('coupon' in s || 'oneTimeCoupon' in s))) ||
+        Array.isArray(rawPeer.keepa_series?.couponHistory) ||
+        Array.isArray(rawPeer.keepa_series?.oneTimeCouponHistory);
+      const hasCouponSource = peerHasKeepaChart || hasCouponInSegments || rawCouponStr !== null ||
         (typeof rawPeer.ongoing_coupon_usd === 'number' && rawPeer.ongoing_coupon_usd > 0) ||
         (typeof rawPeer.ongoing_coupon_pct === 'number' && rawPeer.ongoing_coupon_pct > 0) ||
         (typeof rawPeer.coupon_usd === 'number' && rawPeer.coupon_usd > 0) ||
