@@ -867,11 +867,7 @@ function r57NewcomerDetails(result, rev = result?.profile_revision ?? 0) {
         const raw = members.find(member => member?.family_id === example.family_id && member?.asin === example.asin) ?? {};
         const natural = object(example.natural);
         const ageTag = finite(example.age_days) ? ` · 上架 ${escape(numberText(example.age_days))} 天（${example.is_full_month ? '满30天强制' : '未满30天起量期'}）` : '';
-        const revOrigin = rev >= 59
-          ? ((raw?.review_origin_breakdown && typeof raw.review_origin_breakdown === 'object')
-            ? raw.review_origin_breakdown
-            : extractNewcomerReviewOriginBreakdown(raw))
-          : null;
+        const revOrigin = rev >= 59 ? extractNewcomerReviewOriginBreakdown(raw) : null;
         const revOriginText = revOrigin ? (revOrigin.display_zh ?? revOrigin.summary_zh ?? '') : '';
         const revOriginLine = rev >= 59 && typeof revOriginText === 'string' && revOriginText.trim()
           ? `<p class="muted">代表新品评论构成：${escape(revOriginText.trim())}</p>`

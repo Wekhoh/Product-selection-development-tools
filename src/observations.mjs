@@ -492,38 +492,125 @@ export function classifyKeepaReviewTrajectory(points = [], {
   };
 }
 
-/**
- * Extract Vine / Verified Purchase (VP) / unverified direct review breakdown for Q31 exemplar display.
- * Never fabricates zero when fields are unreported.
- */
-export function extractNewcomerReviewOriginBreakdown(raw = {}) {
-  if (!raw || typeof raw !== 'object') return null;
-  let listVine = null;
-  let listVp = null;
-  let listDirect = null;
-  if (Array.isArray(raw.reviews_list) && raw.reviews_list.length > 0) {
-    let vCnt = 0;
-    let vpCnt = 0;
-    let dCnt = 0;
-    let anyKnown = false;
-    for (const r of raw.reviews_list) {
-      if (!r || typeof r !== 'object') continue;
-      if (r.is_vine === true || r.vine === true || /vine/i.test(String(r.badge ?? r.origin ?? ''))) {
-        vCnt += 1;
-        anyKnown = true;
-      } else if (r.verified_purchase === true || r.is_vp === true || r.vp === true) {
-        vpCnt += 1;
-        anyKnown = true;
-      } else if (r.verified_purchase === false || r.is_vp === false || r.direct === true) {
-        dCnt += 1;
-        anyKnown = true;
+const WRITTEN_REVIEW_TEXT_KEYS = Object.freeze([
+  'content',
+  'body',
+  'text',
+  'review_text',
+  'reviewText',
+  'comment',
+  'title',
+  'headline',
+]);
+
+function hasUpstreamReviewFailure(obj) {
+  if (!obj || typeof obj !== 'object') return false;
+  if (obj.isError === true) return true;
+  if (obj.error !== undefined && obj.error !== null && obj.error !== false && obj.error !== '') return true;
+  if (Array.isArray(obj.errors) && obj.errors.length > 0) return true;
+  if (obj.status === 'failed' || obj.status === 'error') return true;
+  if (obj.dataStatus === 'NO_DATA') return true;
+  if (obj.code !== undefined && obj.code !== null && !['OK', '0', 0, 200].includes(obj.code)) return true;
+  return false;
+}
+
+function extractRawReviewRows(source, depth = 0) {
+  if (!source || depth > 4) return { hasRawArray: false, rows: null, failed: false };
+  if (Array.isArray(source)) return { hasRawArray: true, rows: source, failed: false };
+  if (typeof source !== 'object') return { hasRawArray: false, rows: null, failed: false };
+  if (hasUpstreamReviewFailure(source)) return { hasRawArray: false, rows: null, failed: true };
+
+  if (source.reviews_raw !== undefined && source.reviews_raw !== null) {
+    const nested = extractRawReviewRows(source.reviews_raw, depth + 1);
+    if (nested.failed || nested.hasRawArray) return nested;
+  }
+  if (Array.isArray(source.reviews_list)) return { hasRawArray: true, rows: source.reviews_list, failed: false };
+  if (Array.isArray(source.reviews)) return { hasRawArray: true, rows: source.reviews, failed: false };
+  if (source.data && typeof source.data === 'object') {
+    const nested = extractRawReviewRows(source.data, depth + 1);
+    if (nested.failed || nested.hasRawArray) return nested;
+  }
+  if (source.structuredContent && typeof source.structuredContent === 'object') {
+    const nested = extractRawReviewRows(source.structuredContent, depth + 1);
+    if (nested.failed || nested.hasRawArray) return nested;
+  }
+  if (Array.isArray(source.content)) {
+    for (const block of source.content) {
+      if (!block) continue;
+      if (block.isError === true) return { hasRawArray: false, rows: null, failed: true };
+      if (typeof block.text !== 'string') continue;
+      const trimmed = block.text.trim();
+      if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) continue;
+      try {
+        const parsed = JSON.parse(trimmed);
+        const nested = extractRawReviewRows(parsed, depth + 1);
+        if (nested.failed || nested.hasRawArray) return nested;
+      } catch {
+        // Ignore non-JSON text blocks.
       }
     }
-    if (anyKnown) {
-      listVine = vCnt;
-      listVp = vpCnt;
-      listDirect = dCnt;
+  }
+  return { hasRawArray: false, rows: null, failed: false };
+}
+
+function isWrittenReviewRow(row) {
+  if (!row || typeof row !== 'object' || Array.isArray(row)) return false;
+  if (
+    row.star_only === true ||
+    row.rating_only === true ||
+    row.is_rating_only === true ||
+    row.has_text === false ||
+    /^(?:star|rating)[-_ ]?only$/i.test(String(row.review_type ?? row.type ?? '').trim())
+  ) {
+    return false;
+  }
+  return WRITTEN_REVIEW_TEXT_KEYS.some(key => typeof row[key] === 'string' && row[key].trim().length > 0);
+}
+
+function tallyReviewSample(rows) {
+  if (!Array.isArray(rows)) return null;
+  const sample = { size: 0, vine_count: 0, vp_count: 0, direct_count: 0, unknown_count: 0 };
+  for (const row of rows) {
+    if (!isWrittenReviewRow(row)) continue;
+    sample.size++;
+    const explicitNotVine = row.vine === false || row.is_vine === false;
+    const badgeOrigin = String(row.badge ?? row.origin ?? '');
+    const badgeIsVine = !explicitNotVine && /vine/i.test(badgeOrigin) && !/non[-_ ]?vine/i.test(badgeOrigin);
+    if (row.is_vine === true || row.vine === true || badgeIsVine) {
+      sample.vine_count++;
+    } else if (row.purchased === true || row.verified_purchase === true || row.is_vp === true || row.vp === true) {
+      sample.vp_count++;
+    } else if (
+      row.direct === true ||
+      row.verified_purchase === false ||
+      row.is_vp === false ||
+      row.vp === false ||
+      (row.purchased === false && explicitNotVine)
+    ) {
+      sample.direct_count++;
+    } else {
+      sample.unknown_count++;
     }
+  }
+  return sample.size > 0 ? sample : null;
+}
+
+function isValidTalliedSample(sample) {
+  return Boolean(
+    sample &&
+    typeof sample === 'object' &&
+    !Array.isArray(sample) &&
+    finite(sample.size) && sample.size > 0 &&
+    finite(sample.vine_count) && sample.vine_count >= 0 &&
+    finite(sample.vp_count) && sample.vp_count >= 0 &&
+    finite(sample.direct_count) && sample.direct_count >= 0 &&
+    finite(sample.unknown_count) && sample.unknown_count >= 0,
+  );
+}
+
+function extractIndependentReviewSummaryFields(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+    return { vine: null, vp: null, direct: null, vineShare: null, vpShare: null, directShare: null };
   }
   const pickNonNeg = (...vals) => {
     for (const v of vals) {
@@ -531,27 +618,67 @@ export function extractNewcomerReviewOriginBreakdown(raw = {}) {
     }
     return null;
   };
-  const vine = pickNonNeg(raw.vine_count, raw.vineCount, raw.vine_reviews, raw.vineReviews, listVine);
-  const vp = pickNonNeg(raw.vp_count, raw.vpCount, raw.vp_reviews, raw.verified_purchase_count, raw.verifiedPurchaseCount, raw.vpReviews, listVp);
+  const vine = pickNonNeg(obj.vine_count, obj.vineCount, obj.vine_reviews, obj.vineReviews);
+  const vp = pickNonNeg(obj.vp_count, obj.vpCount, obj.vp_reviews, obj.verified_purchase_count, obj.verifiedPurchaseCount, obj.vpReviews);
   const direct = pickNonNeg(
-    raw.direct_count,
-    raw.directCount,
-    raw.direct_review_count,
-    raw.directReviewCount,
-    raw.non_vp_direct_reviews,
-    raw.direct_reviews,
-    raw.unverified_review_count,
-    raw.unverifiedReviewCount,
-    raw.directReviews,
-    listDirect,
+    obj.direct_count,
+    obj.directCount,
+    obj.direct_review_count,
+    obj.directReviewCount,
+    obj.non_vp_direct_reviews,
+    obj.direct_reviews,
+    obj.unverified_review_count,
+    obj.unverifiedReviewCount,
+    obj.directReviews,
   );
-  const vineShare = finite(raw.vine_share) && raw.vine_share >= 0 && raw.vine_share <= 1 ? raw.vine_share : null;
-  const vpShare = finite(raw.vp_share) && raw.vp_share >= 0 && raw.vp_share <= 1 ? raw.vp_share : null;
-  const directShare = finite(raw.direct_share) && raw.direct_share >= 0 && raw.direct_share <= 1 ? raw.direct_share : null;
+  const vineShare = finite(obj.vine_share) && obj.vine_share >= 0 && obj.vine_share <= 1 ? obj.vine_share : null;
+  const vpShare = finite(obj.vp_share) && obj.vp_share >= 0 && obj.vp_share <= 1 ? obj.vp_share : null;
+  const directShare = finite(obj.direct_share) && obj.direct_share >= 0 && obj.direct_share <= 1 ? obj.direct_share : null;
+  return { vine, vp, direct, vineShare, vpShare, directShare };
+}
 
-  if (vine === null && vp === null && direct === null && vineShare === null && vpShare === null && directShare === null) {
-    return null;
+/**
+ * Summarize reported totals and inspected written-review samples at their respective scopes.
+ * Counts written text reviews only (excluding star-only / empty-text ratings), classifies complete rows strictly
+ * into Vine / VP / 直评, reserves `来源字段缺失` for omitted upstream origin flags, and never resurrects a stale
+ * cached breakdown when a raw review array is supplied.
+ */
+export function extractNewcomerReviewOriginBreakdown(raw = {}) {
+  if (!raw || typeof raw !== 'object' || hasUpstreamReviewFailure(raw)) return null;
+  const { hasRawArray, rows, failed } = extractRawReviewRows(raw);
+  let sample = hasRawArray && !failed ? tallyReviewSample(rows) : null;
+  const cached = raw.review_origin_breakdown;
+  const rawFields = extractIndependentReviewSummaryFields(raw);
+  const extSummary = !failed && raw.reviews_raw && typeof raw.reviews_raw === 'object' && !Array.isArray(raw.reviews_raw)
+    ? extractIndependentReviewSummaryFields(raw.reviews_raw)
+    : null;
+  let vine = rawFields.vine ?? extSummary?.vine ?? null;
+  let vp = rawFields.vp ?? extSummary?.vp ?? null;
+  let direct = rawFields.direct ?? extSummary?.direct ?? null;
+  let vineShare = rawFields.vineShare ?? extSummary?.vineShare ?? null;
+  let vpShare = rawFields.vpShare ?? extSummary?.vpShare ?? null;
+  let directShare = rawFields.directShare ?? extSummary?.directShare ?? null;
+
+  const hasIndependent = vine !== null || vp !== null || direct !== null || vineShare !== null || vpShare !== null || directShare !== null;
+  if (!hasRawArray && !failed && cached && typeof cached === 'object' && !Array.isArray(cached)) {
+    if (!sample && isValidTalliedSample(cached.sample)) {
+      sample = cached.sample;
+    }
+    if (!hasIndependent && !sample) {
+      if ((typeof cached.display_zh === 'string' && cached.display_zh.trim()) ||
+        (typeof cached.summary_zh === 'string' && cached.summary_zh.trim())) {
+        return cached;
+      }
+      const cachedFields = extractIndependentReviewSummaryFields(cached);
+      vine = cachedFields.vine;
+      vp = cachedFields.vp;
+      direct = cachedFields.direct;
+      vineShare = cachedFields.vineShare;
+      vpShare = cachedFields.vpShare;
+      directShare = cachedFields.directShare;
+    }
   }
+
   const parts = [];
   if (vine !== null) parts.push(`Vine ${vine}`);
   else if (vineShare !== null) parts.push(`Vine ${(vineShare * 100).toFixed(0)}%`);
@@ -559,14 +686,34 @@ export function extractNewcomerReviewOriginBreakdown(raw = {}) {
   else if (vpShare !== null) parts.push(`VP ${(vpShare * 100).toFixed(0)}%`);
   if (direct !== null) parts.push(`直评 ${direct}`);
   else if (directShare !== null) parts.push(`直评 ${(directShare * 100).toFixed(0)}%`);
-  const summaryText = parts.join(' · ');
+
+  if (!parts.length && !sample) return null;
+  let summaryText = parts.join(' · ');
+  if (sample) {
+    let sampleText;
+    if (sample.unknown_count === 0) {
+      sampleText = `抽查 ${sample.size} 篇文字评：Vine ${sample.vine_count} · VP ${sample.vp_count} · 直评 ${sample.direct_count}`;
+    } else {
+      const observed = [
+        ['Vine', sample.vine_count],
+        ['VP', sample.vp_count],
+        ['直评', sample.direct_count],
+        ['来源字段缺失', sample.unknown_count],
+      ].filter(([, count]) => count > 0).map(([label, count]) => `${label} ${count}`);
+      sampleText = `抽查 ${sample.size} 篇文字评：${observed.join(' · ')}`;
+    }
+    summaryText = summaryText ? `来源汇总 ${summaryText}。${sampleText}` : sampleText;
+  }
+  // A zero among identified rows cannot establish absence when other rows lack origin flags.
+  const sampleCount = key => (sample && (sample[key] > 0 || sample.unknown_count === 0) ? sample[key] : null);
   return {
-    vine_count: vine,
-    vp_count: vp,
-    direct_count: direct,
+    vine_count: vine ?? sampleCount('vine_count'),
+    vp_count: vp ?? sampleCount('vp_count'),
+    direct_count: direct ?? sampleCount('direct_count'),
     vine_share: vineShare,
     vp_share: vpShare,
     direct_share: directShare,
+    ...(sample ? { sample } : {}),
     summary_zh: summaryText,
     display_zh: summaryText,
   };

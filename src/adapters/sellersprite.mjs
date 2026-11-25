@@ -5,7 +5,6 @@
 import { BUSINESS_THRESHOLDS } from '../business-thresholds.mjs';
 import {
   deduplicateParentSalesRows,
-  extractNewcomerReviewOriginBreakdown,
   resolveCategoryReturnWithFallback,
 } from '../observations.mjs';
 import { parseSingleUnitUsdCoupon } from '../price-band.mjs';

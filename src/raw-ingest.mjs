@@ -1967,11 +1967,76 @@ export function ingestTrialSpecification(spec, profile, {
       }
     }
     if (Array.isArray(cand?.newcomer_cohort?.members)) {
+      const extractBundleAsin = (src, depth = 0) => {
+        if (!src || typeof src !== 'object' || Array.isArray(src) || depth > 3) return null;
+        if (typeof src.asin === 'string' && src.asin.trim().length > 0) {
+          return src.asin.trim().toUpperCase();
+        }
+        if (src.data && typeof src.data === 'object') {
+          const nested = extractBundleAsin(src.data, depth + 1);
+          if (nested) return nested;
+        }
+        if (src.structuredContent && typeof src.structuredContent === 'object') {
+          const nested = extractBundleAsin(src.structuredContent, depth + 1);
+          if (nested) return nested;
+        }
+        if (Array.isArray(src.content)) {
+          for (const block of src.content) {
+            if (!block || block.isError === true || typeof block.text !== 'string') continue;
+            const trimmed = block.text.trim();
+            if (!trimmed.startsWith('{')) continue;
+            try {
+              const nested = extractBundleAsin(JSON.parse(trimmed), depth + 1);
+              if (nested) return nested;
+            } catch {
+              // Ignore non-JSON text blocks.
+            }
+          }
+        }
+        return null;
+      };
       for (const member of cand.newcomer_cohort.members) {
         if (!member || typeof member !== 'object') continue;
-        if (!member.review_origin_breakdown) {
-          const rob = extractNewcomerReviewOriginBreakdown(member);
-          if (rob) member.review_origin_breakdown = rob;
+        const memberAsin = typeof member.asin === 'string' && member.asin.trim().length > 0
+          ? member.asin.trim().toUpperCase()
+          : null;
+        const reviewSource = entry.q31_review_sources?.[member.asin];
+        const hasExternalReviewSource = reviewSource !== undefined && reviewSource !== null;
+        const activeRawBundle = hasExternalReviewSource
+          ? reviewSource
+          : (member.reviews_raw ?? member.data);
+        const sourceAsin = extractBundleAsin(activeRawBundle);
+        if (memberAsin && sourceAsin && sourceAsin !== memberAsin) {
+          throw new TypeError(
+            `Candidate "${cand.id}" Q31 review source ASIN (${sourceAsin}) does not match newcomer member ASIN (${memberAsin}).`,
+          );
+        }
+        const reviewInput = hasExternalReviewSource
+          ? {
+            ...member,
+            reviews_raw: reviewSource,
+            reviews_list: undefined,
+            reviews: undefined,
+            ...(member.data && typeof member.data === 'object'
+              ? { data: { ...member.data, reviews: undefined, reviews_list: undefined } }
+              : {}),
+          }
+          : member;
+        const originBreakdown = extractNewcomerReviewOriginBreakdown(reviewInput);
+        if (originBreakdown) {
+          member.review_origin_breakdown = originBreakdown;
+        } else {
+          delete member.review_origin_breakdown;
+        }
+        if (hasExternalReviewSource || member.reviews_raw !== undefined || member.reviews !== undefined || member.data?.reviews !== undefined) {
+          // Strip raw review payloads (author names / review bodies) and superseded arrays after deriving the sanitized summary.
+          delete member.reviews_raw;
+          delete member.reviews;
+          if (hasExternalReviewSource) delete member.reviews_list;
+          if (member.data && typeof member.data === 'object') {
+            delete member.data.reviews;
+            delete member.data.reviews_list;
+          }
         }
         const nat = member.natural_visibility ?? member.natural;
         if (nat && typeof nat === 'object' && !nat.keyword_counts && entry.q31_keyword_sources?.[member.asin]) {
