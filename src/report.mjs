@@ -3034,7 +3034,19 @@ function redactShareableReviewTree(value, parentKey = '') {
 
 function renderR58EvidenceReview(result, original, reportOptions = {}, rev = 58) {
   const raw = resolveR58EvidenceReview(result, original);
-  if (!raw) return '';
+  const eligibleForCurrentSpecReview = rev >= 59 && isCandidateEligible(result, rev);
+  if (!raw) {
+    if (!eligibleForCurrentSpecReview) return '';
+    return `<section class="quiet-surface rt-audit" data-section="evidence-review" aria-label="独立红队复核">
+    <div class="section-head rt-head">
+      <h3>独立红队复核 · Red-Team Audit</h3>
+      <span class="muted">顾问式证据复核 · 不改动 21 项计分</span>
+    </div>
+    <div class="rt-meta-row">
+      <span class="state-inline state-pending"><i class="dot" aria-hidden="true"></i>业务入围、当前规格待复核</span>
+    </div>
+  </section>`;
+  }
   const sanitizedPaths = sanitizeDisplayTree(raw);
   const ev = rev >= 59 ? redactShareableReviewTree(sanitizedPaths) : sanitizedPaths;
   const body = ev.review && typeof ev.review === 'object' && !Array.isArray(ev.review)
@@ -3139,16 +3151,24 @@ function renderR58EvidenceReview(result, original, reportOptions = {}, rev = 58)
     ['pending_recovery', 'in_progress', 'recovering', 'unknown'].includes(execStatusKey)
   ) {
     statusInfo = { tone: 'pending', text: '待恢复' };
+  } else if (statusKey === 'pending_current_spec_review') {
+    statusInfo = { tone: 'pending', text: '业务入围、当前规格待复核' };
   } else if (rawStatus === '未启用' || ['disabled', 'not_submitted', 'off', 'unavailable', 'skipped'].includes(statusKey)) {
-    statusInfo = { tone: 'muted', text: '未启用' };
+    statusInfo = eligibleForCurrentSpecReview
+      ? { tone: 'pending', text: '业务入围、当前规格待复核' }
+      : { tone: 'muted', text: '未启用' };
   } else if (isValidatedReviewedEnvelope) {
     statusInfo = isStaleSpecReview
-      ? { tone: 'pending', text: '已复核 · 基于旧版参数复核' }
+      ? { tone: 'pending', text: eligibleForCurrentSpecReview ? '已复核 · 基于旧版参数复核（业务入围、当前规格待复核）' : '已复核 · 基于旧版参数复核' }
       : (rev >= 59 && hasOpenAuditItems
           ? { tone: 'pending', text: '已复核 · 含待定／冲突项' }
           : { tone: 'pass', text: '已复核' });
   } else if (['failed_known', 'rejected', 'invalid', 'refused', 'error'].includes(statusKey)) {
-    statusInfo = { tone: 'fail', text: '未启用' };
+    statusInfo = eligibleForCurrentSpecReview
+      ? { tone: 'pending', text: '业务入围、当前规格待复核' }
+      : { tone: 'fail', text: '未启用' };
+  } else if (eligibleForCurrentSpecReview) {
+    statusInfo = { tone: 'pending', text: '业务入围、当前规格待复核' };
   }
 
   const hasDispositions = isValidatedReviewedEnvelope;

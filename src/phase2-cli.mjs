@@ -16,7 +16,12 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { canonicalJson, computeEvidenceBundleHash, openSelectionStore, sha256Hex } from './store.mjs';
-import { getFba2027RateTableSnapshot, solveMinPriceForMargin2027 } from './fba-rates-2027.mjs';
+import {
+  buildOutOfTableLookupDirective,
+  getFba2027RateTableSnapshot,
+  registerSupplementalOutOfTableRule2027,
+  solveMinPriceForMargin2027,
+} from './fba-rates-2027.mjs';
 import { buildFunnelLedger, checkFormDuplicates } from './funnel-ledger.mjs';
 import {
   importRecoveryLockFile,
@@ -24,8 +29,17 @@ import {
   importRetainedAssetsManifest,
   replayBatchIntoStore,
 } from './history-import.mjs';
-import { attachGate1APriceCliffStress, doesReviewPacketMatchDbFormSpec, runGate1AForForm, runGate1BForForm,
-  runOptionalStage12LunaTriage, runOptionalTerraWorkflowTask } from './pipeline.mjs';
+import {
+  attachGate1APriceCliffStress,
+  buildAutoEarlyScreenScenariosFromGate1A,
+  doesReviewPacketMatchDbFormSpec,
+  runFastProfitHealthcheck2027,
+  runGate1AForForm,
+  runGate1BForForm,
+  runOptionalStage12LunaTriage,
+  runOptionalTerraWorkflowTask,
+  runPhase2Batch,
+} from './pipeline.mjs';
 import {
   evaluateGate0CategoryBoundary,
   analyzeMainstreamPriceBand,
@@ -93,12 +107,22 @@ const USAGE = [
   '  sp-api-calibrate   --input <sp-api-bundle.json> [--output <out.json>]  (无状态，从只读 SP-API 终审回执提取官方包装尺寸、佣金比例与限售状态)',
   '  serve-report       --dir <report-dir> [--port <port>] [--check | --once]  (无状态，在 127.0.0.1 启动本地 HTML 报告渲染预览服务)',
   '  redteam-review     --packet <packet.json> --output <review.json> [--effort <xhigh|max>] [--image <file>...] [--dry-run | --offline]  (未传 --dry-run/--offline 时调用本地订阅 codex exec)',
+  '  daily-batch        --db <sqlite> --input <daily-batch.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (日常 80% 站内 + 20% 站外 + 1688 源头厂小批入口，支持滑块暂停续跑)',
+  '  single-dive        --db <sqlite> --input <asin-or-post.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (扔单 ASIN 或站外帖子单品深挖)',
+  '  reverse-1688       --db <sqlite> --input <1688-spec.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (1688 源头厂反向测美亚 30% 保底零售价与深挖)',
+  '  profit-check       --input <profit-spec.json> [--output <out.json>]  (无状态，快速 2027 淡季利润体检 + 非 SIPP 合并费 + <=10mm 改盒可救检测)',
+  '  openai-recover     --db <sqlite> --credential-file <json> --attempt <id> [--output <out.json>]  (零重复 POST 读取 GET /v1/responses/{id} 断点恢复并补记新用量)',
+  '  openai-batch-poll  --db <sqlite> --credential-file <json> (--batch-id <id> | --submit-jsonl <batch.jsonl>) [--attempt <id>] [--download-output] [--output <out.json>]  (Batch API 提交/轮询)',
+  '  rate-lookup        --input <rate-spec.json> [--persist-file <supplemental-rates.json>] [--output <out.json>]  (无状态，表外官网费率查证指令与落库助手)',
+  '  calibration-track  --db <sqlite> [--input <tracking.json>] [--list] [--batch-id <id>] [--form <form-id>] [--output <out.json>]  (记录/查询四项校准追踪)',
   '',
 ].join('\n');
 
 const STATELESS_COMMANDS = new Set([
   'price-band',
   'solve-min-price',
+  'profit-check',
+  'rate-lookup',
   'contact-sheet',
   'openai-batch-build',
   'ingest-trial',
@@ -106,7 +130,7 @@ const STATELESS_COMMANDS = new Set([
   'serve-report',
   'redteam-review',
 ]);
-const LIVE_COMMANDS = new Set(['luna-triage', 'openai-task', 'openai-cancel']);
+const LIVE_COMMANDS = new Set(['luna-triage', 'openai-task', 'openai-cancel', 'openai-recover', 'openai-batch-poll']);
 const OPENAI_DB_COMMANDS = new Set(['openai-status', 'openai-reconcile', ...LIVE_COMMANDS]);
 const READ_ONLY_DB_COMMANDS = new Set(['status', 'trace', 'coverage', 'plan-discovery', 'openai-status', 'dedupe-forms', 'funnel-ledger']);
 
@@ -878,15 +902,23 @@ async function runLiveCommand(command, values, streams, dbPath, budgetDbPath, ac
     }
   }
   const credentialFile = resolve(requireOption(values['credential-file'], 'credential-file'));
-  const inputPath = command === 'openai-cancel' ? null : command === 'luna-triage'
-    ? resolve(requireOption(values.listings, 'listings')) : resolve(requireOption(values.input, 'input'));
-  const output = command === 'openai-cancel' ? values.output : requireOption(values.output, 'output');
+  const submitJsonlPath = command === 'openai-batch-poll' && values['submit-jsonl']
+    ? resolve(values['submit-jsonl'])
+    : null;
+  const inputPath = (command === 'openai-cancel' || command === 'openai-recover' || command === 'openai-batch-poll')
+    ? null
+    : command === 'luna-triage'
+      ? resolve(requireOption(values.listings, 'listings'))
+      : resolve(requireOption(values.input, 'input'));
+  const output = (command === 'openai-cancel' || command === 'openai-recover' || command === 'openai-batch-poll')
+    ? values.output
+    : requireOption(values.output, 'output');
   const sheet = values['contact-sheet'] && resolve(values['contact-sheet']);
   const progress = values['progress-file'] && resolve(values['progress-file']);
-  const inputs = [credentialFile, inputPath, sheet].filter(Boolean);
+  const inputs = [credentialFile, inputPath, submitJsonlPath, sheet].filter(Boolean);
   const allProtectedSqlitePaths = [...new Set([...sqlitePaths(dbPath), ...sqlitePaths(budgetDbPath)])];
   if (inputs.some(p => allProtectedSqlitePaths.some(s => isSamePhysicalFileCli(p, s))) ||
-      [inputPath, sheet].some(p => isSamePhysicalFileCli(p, credentialFile))) throw new Phase2CliError('凭据、输入与数据库需要各自独立的路径。');
+      [inputPath, submitJsonlPath, sheet].some(p => isSamePhysicalFileCli(p, credentialFile))) throw new Phase2CliError('凭据、输入与数据库需要各自独立的路径。');
   const input = inputPath && await readJsonFileSafe(inputPath, '任务输入文件');
   if (input) checkOperatorPayload(input);
   const ledger = openOpenAiBudgetLedger(budgetDbPath, testHooks?.testLedgerOptions);
@@ -901,7 +933,61 @@ async function runLiveCommand(command, values, streams, dbPath, budgetDbPath, ac
     const client = new OpenAiClient({ ...testHooks?.openAiClientOptions, ledger, credentialFile });
     const policy = { accountScope, maxRetries: 0 };
     let result, receipts, ok;
-    if (command === 'openai-cancel') {
+    if (command === 'openai-recover') {
+      const attemptRef = requireOption(values.attempt, 'attempt');
+      const recovered = await client.recoverPendingResponse(attemptRef, policy);
+      const resolvedAttemptId = recovered?.attempt?.attempt_id ?? attemptRef;
+      const receipt = spendReceipt(ledger, resolvedAttemptId, accountScope);
+      result = {
+        recovered: recovered.recovered === true,
+        already_settled: recovered.already_settled === true,
+        fenced: recovered.fenced === true,
+        response_status: recovered.status ?? receipt?.status ?? null,
+        receipt,
+      };
+      ok = recovered.recovered === true && ['completed', 'failed_known', 'rejected'].includes(receipt?.status ?? recovered.status);
+    } else if (command === 'openai-batch-poll') {
+      if (submitJsonlPath) {
+        const jsonlText = await readFile(submitJsonlPath, 'utf8');
+        checkOperatorPayload(jsonlText);
+        const uploaded = await client.uploadBatchFile({ jsonlText }, policy);
+        const logicalId = 'cli-batch-' + sha256Hex(canonicalJson([accountScope, uploaded.file_id, sha256Hex(jsonlText)]));
+        const submitted = await client.submitBatch({
+          input_file_id: uploaded.file_id,
+          endpoint: '/v1/responses',
+          completion_window: '24h',
+          jsonlText,
+        }, { ...policy, logicalRequestId: logicalId });
+        const attempt = ledger.getAttemptByLogicalId(logicalId, { accountScope });
+        const receipt = attempt ? spendReceipt(ledger, attempt.attempt_id, accountScope) : null;
+        result = {
+          mode: 'submitted',
+          file_id: uploaded.file_id,
+          batch_id: submitted.batch_id ?? submitted.id ?? null,
+          batch_status: submitted.batch_status ?? submitted.status ?? null,
+          receipt,
+        };
+        ok = Boolean(result.batch_id);
+      } else {
+        const batchId = requireOption(values['batch-id'], 'batch-id');
+        const pollPolicy = {
+          ...policy,
+          ...(values.attempt ? { attemptId: values.attempt.trim() } : {}),
+          downloadOutput: values['download-output'] === true,
+        };
+        const polled = await client.retrieveBatch(batchId, pollPolicy);
+        const receipt = values.attempt ? spendReceipt(ledger, values.attempt.trim(), accountScope) : null;
+        result = {
+          mode: 'polled',
+          batch_id: polled.batch_id ?? batchId,
+          batch_status: polled.batch_status ?? polled.status ?? null,
+          already_settled: polled.already_settled === true,
+          ...(polled.parsed_output ? { parsed_output_count: Array.isArray(polled.parsed_output.items) ? polled.parsed_output.items.length : null, parsed_output: polled.parsed_output } : {}),
+          ...(receipt ? { receipt } : {}),
+        };
+        ok = polled.ok !== false;
+      }
+    } else if (command === 'openai-cancel') {
       const attemptId = requireOption(values.attempt, 'attempt');
       let response;
       try {
@@ -1072,6 +1158,11 @@ export async function runPhase2Cli(
           port: { type: 'string' },
           once: { type: 'boolean' },
           check: { type: 'boolean' },
+          'batch-id': { type: 'string' },
+          'submit-jsonl': { type: 'string' },
+          'download-output': { type: 'boolean' },
+          'persist-file': { type: 'string' },
+          list: { type: 'boolean' },
         },
       });
     } catch {
@@ -1082,6 +1173,85 @@ export async function runPhase2Cli(
 
     // Stateless commands that do not require SQLite.
     if (STATELESS_COMMANDS.has(command)) {
+      if (command === 'profit-check') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const spec = await readJsonFileSafe(inputPath, '快速利润体检输入文件');
+        checkOperatorPayload(spec);
+        const healthcheck = runFastProfitHealthcheck2027(spec);
+        const out = { ok: true, command, healthcheck };
+        checkOperatorPayload(out);
+        const json = `${stringifyCliJson(out)}\n`;
+        if (values.output) {
+          await writeSingleFileSafe(resolve(values.output), Buffer.from(json, 'utf8'), [inputPath]);
+        }
+        streams.stdout.write(json);
+        return 0;
+      }
+
+      if (command === 'rate-lookup') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const spec = await readJsonFileSafe(inputPath, '表外官网费率查证输入文件');
+        checkOperatorPayload(spec);
+        const persistPath = values['persist-file'] ? resolve(values['persist-file']) : null;
+        let out;
+        if (typeof spec?.official_source_url === 'string' && spec.official_source_url.trim()) {
+          const registered = registerSupplementalOutOfTableRule2027(spec, {
+            test_price_usd: spec.test_price_usd ?? null,
+          });
+          let persistedFileSha = null;
+          if (persistPath) {
+            let existingRegistry = { schema_version: 1, rules: {} };
+            if (existsSync(persistPath)) {
+              const rawPrev = await readJsonFileSafe(persistPath, '表外费率沉淀文件');
+              if (rawPrev && typeof rawPrev === 'object' && !Array.isArray(rawPrev)) {
+                existingRegistry = {
+                  schema_version: 1,
+                  rules: rawPrev.rules && typeof rawPrev.rules === 'object' ? { ...rawPrev.rules } : {},
+                };
+              }
+            }
+            existingRegistry.rules[registered.rule.canonical_key] = registered.rule;
+            persistedFileSha = await writeSingleFileSafe(
+              persistPath,
+              Buffer.from(`${JSON.stringify(existingRegistry, null, 2)}\n`, 'utf8'),
+              [inputPath],
+            );
+          }
+          out = {
+            ok: true,
+            command,
+            mode: 'verified_rule_registered',
+            rule: registered.rule,
+            ...(registered.sample_referral_calculation ? { sample_referral_calculation: registered.sample_referral_calculation } : {}),
+            ...(persistPath ? {
+              persisted_file: sanitizeCliDisplayPath(persistPath),
+              persisted_sha256: persistedFileSha,
+            } : {}),
+          };
+        } else {
+          out = {
+            ok: true,
+            command,
+            mode: 'lookup_directive',
+            directive: buildOutOfTableLookupDirective({
+              reason: spec?.reason ?? 'Category or tiered referral schedule not yet in local 2027 rate table.',
+              fee_category: spec?.fee_category ?? null,
+              asin: spec?.asin ?? spec?.comparable_asin ?? null,
+            }),
+          };
+        }
+        checkOperatorPayload(out);
+        const json = `${JSON.stringify(out, null, 2)}\n`;
+        if (values.output) {
+          await writeSingleFileSafe(
+            resolve(values.output),
+            Buffer.from(json, 'utf8'),
+            [inputPath, ...(persistPath ? [persistPath] : [])],
+          );
+        }
+        streams.stdout.write(json);
+        return 0;
+      }
       if (command === 'ingest-trial') {
         const inputPath = resolve(requireOption(values.input, 'input'));
         const profilePath = resolve(requireOption(values.profile, 'profile'));
@@ -1855,7 +2025,8 @@ export async function runPhase2Cli(
 
     const rawDb = requireOption(values.db, 'db');
     const dbPath = rawDb === ':memory:' ? ':memory:' : resolve(rawDb);
-    const isReadOnlyCmd = READ_ONLY_DB_COMMANDS.has(command);
+    const isReadOnlyCmd = READ_ONLY_DB_COMMANDS.has(command) ||
+      (command === 'calibration-track' && values.list === true && !values.input);
     const openReadOnly = (isReadOnlyCmd || (command === 'export-report' && existsSync(dbPath))) && dbPath !== ':memory:';
     const reconcileOnOpen = command === 'init' && values['reconcile-crashed'] === true;
 
@@ -2256,6 +2427,284 @@ export async function runPhase2Cli(
         const lineage = store.traceFormLineage(formId);
         if (!lineage) throw new Phase2CliError(`未找到候选形态：${formId}`);
         streams.stdout.write(`${JSON.stringify({ ok: true, command, lineage }, null, 2)}\n`);
+        return 0;
+      }
+
+      if (command === 'calibration-track') {
+        const inputPath = values.input ? resolve(values.input) : null;
+        if (!inputPath && values.list !== true) {
+          throw new Phase2CliError('calibration-track 需要传入 --input <tracking.json> 写入，或传入 --list 查询。');
+        }
+        let saved = [];
+        if (inputPath) {
+          const payload = await readJsonFileSafe(inputPath, '校准追踪输入文件');
+          checkOperatorPayload(payload);
+          const rawRows = Array.isArray(payload)
+            ? payload
+            : (Array.isArray(payload?.records) ? payload.records : [payload]);
+          for (const rawRow of rawRows) {
+            if (!rawRow || typeof rawRow !== 'object') continue;
+            let computedMargin = rawRow.recalculated_margin;
+            if (computedMargin === undefined && rawRow.sample_measured_pkg && rawRow.recalculate_profit_spec) {
+              const hc = runFastProfitHealthcheck2027({
+                ...rawRow.recalculate_profit_spec,
+                pkg: rawRow.sample_measured_pkg,
+              });
+              computedMargin = {
+                margin: hc.realized_2027_off_peak?.margin ?? null,
+                margin_pct: hc.realized_2027_off_peak?.margin_pct ?? null,
+                meets_30pct_floor: hc.realized_2027_off_peak?.meets_30pct_floor ?? null,
+                size_tier: hc.size_tier_2027?.size_tier ?? null,
+                fulfillment_usd: hc.advisory_gate1a_cap?.fulfillment_usd ?? null,
+                recalculated_at: values['as-of'] ? values['as-of'].trim() : new Date().toISOString().slice(0, 10),
+              };
+            }
+            const { recalculate_profit_spec: _ignoredSpec, ...cleanRow } = rawRow;
+            saved.push(store.upsertCalibrationTracking({
+              ...cleanRow,
+              ...(values['batch-id'] && cleanRow.batch_id === undefined ? { batch_id: values['batch-id'].trim() } : {}),
+              ...(computedMargin !== undefined ? { recalculated_margin: computedMargin } : {}),
+            }));
+          }
+        }
+        const listed = values.list === true || !inputPath
+          ? store.listCalibrationTracking({
+              batch_id: values['batch-id'] ? values['batch-id'].trim() : null,
+              form_id: values.form ? values.form.trim() : null,
+            })
+          : null;
+        const out = {
+          ok: true,
+          command,
+          ...(saved.length > 0 ? { saved_count: saved.length, saved } : {}),
+          ...(listed ? { count: listed.length, records: listed } : {}),
+        };
+        checkOperatorPayload(out);
+        const json = `${JSON.stringify(out, null, 2)}\n`;
+        if (values.output) {
+          await writeSingleFileSafe(
+            resolve(values.output),
+            Buffer.from(json, 'utf8'),
+            [...sqlitePaths(dbPath), ...(inputPath ? [inputPath] : [])],
+          );
+        }
+        streams.stdout.write(json);
+        return 0;
+      }
+
+      if (command === 'daily-batch' || command === 'single-dive' || command === 'reverse-1688') {
+        const inputPath = resolve(requireOption(values.input, 'input'));
+        const spec = await readJsonFileSafe(inputPath, `${command} 输入文件`);
+        checkOperatorPayload(spec);
+        const defaultR59ProfilePath = resolve(THIS_DIR, '..', 'docs', 'design', 'reference-profile.r59.draft.json');
+        const profilePath = values.profile ? resolve(values.profile) : defaultR59ProfilePath;
+        const profile = await readJsonFileSafe(profilePath, '评分配置文件');
+        if (values['profile-revision']) {
+          const rev = Number(values['profile-revision']);
+          if (!Number.isInteger(rev) || rev < 50) throw new Phase2CliError('--profile-revision 必须为 >= 50 的整数。');
+          profile.revision = rev;
+          if (profile.workflow?.scoring_and_ordering) profile.workflow.scoring_and_ordering.revision = rev;
+        }
+        const asOfDate = values['as-of'] ? values['as-of'].trim() : (spec.as_of_date ?? new Date().toISOString().slice(0, 10));
+
+        const hydrateWorkflowItem = rawItem => {
+          if (!rawItem || typeof rawItem !== 'object') {
+            throw new Phase2CliError(`${command} 每个候选条目必须为对象。`);
+          }
+          if ((profile.revision ?? 59) >= 59 && rawItem.disallow_pre1688_cost_guess_kill === false) {
+            throw new Phase2CliError('Revision 59 严禁启用 Gate 1A 倒推价前置砍品（disallow_pre1688_cost_guess_kill 不可为 false）。');
+          }
+          const formObj = rawItem.form && typeof rawItem.form === 'object'
+            ? rawItem.form
+            : {
+                form_id: requireOption(rawItem.form_id, 'form_id'),
+                label: rawItem.label ?? rawItem.form_id,
+                buyer_task: rawItem.buyer_task ?? rawItem.label ?? rawItem.form_id,
+                ...(rawItem.core_form ? { core_form: rawItem.core_form } : {}),
+                ...(Array.isArray(rawItem.saleable_set_composition) ? { saleable_set_composition: rawItem.saleable_set_composition } : {}),
+              };
+          let leads = Array.isArray(rawItem.leads) ? [...rawItem.leads] : [];
+          if (leads.length === 0) {
+            if (command === 'reverse-1688') {
+              leads = [{
+                lead_id: rawItem.lead_id ?? `ld-rev1688-${formObj.form_id}`,
+                source_channel: '1688_factory_cold_start',
+                source_ref: rawItem.source_ref ?? `1688://factory-cold-start/${formObj.form_id}`,
+                phrase_or_title: rawItem.phrase_or_title ?? formObj.label ?? formObj.form_id,
+                observed_at: asOfDate,
+                disposition: 'product',
+              }];
+            } else if (rawItem.asin || rawItem.post_url || rawItem.social_bridge) {
+              leads = [rawItem.social_bridge
+                ? {
+                    lead_id: rawItem.lead_id ?? `ld-dive-${formObj.form_id}`,
+                    source_channel: rawItem.source_channel ?? 'reddit',
+                    source_ref: rawItem.post_url ?? rawItem.source_ref ?? `https://example.com/${formObj.form_id}`,
+                    observed_at: asOfDate,
+                    social_bridge: rawItem.social_bridge,
+                  }
+                : {
+                    lead_id: rawItem.lead_id ?? `ld-dive-${formObj.form_id}`,
+                    source_channel: rawItem.post_url ? (rawItem.source_channel ?? 'reddit') : (rawItem.source_channel ?? 'sellersprite_supply_gap'),
+                    source_ref: rawItem.post_url ?? rawItem.source_ref ?? `https://www.amazon.com/dp/${String(rawItem.asin || '').trim().toUpperCase()}`,
+                    phrase_or_title: rawItem.phrase_or_title ?? formObj.label ?? String(rawItem.asin || formObj.form_id),
+                    observed_at: asOfDate,
+                    disposition: 'product',
+                  }];
+            }
+          }
+
+          // Pre-register form & any supplied verified 1688 quotes so runPhase2Batch reuses them cleanly.
+          const { form: upsertedForm } = store.upsertCandidateForm(formObj);
+          const quoteList = (Array.isArray(rawItem.quotes)
+            ? rawItem.quotes
+            : (rawItem.quote && typeof rawItem.quote === 'object' ? [rawItem.quote] : [])
+          ).filter(qObj => {
+            if (!qObj || typeof qObj !== 'object') return false;
+            if ((profile.revision ?? 59) >= 59 && qObj.require_ui_readback === false) {
+              throw new Phase2CliError('Revision 59 严禁关闭 1688 ui_readback 核验门禁。');
+            }
+            if (typeof qObj.quote_id === 'string' && qObj.quote_id.trim()) {
+              const existingQ = store.getQuoteById(qObj.quote_id.trim());
+              if (existingQ && existingQ.form_id === upsertedForm.form_id && existingQ.spec_version === upsertedForm.spec_version) {
+                return false;
+              }
+            }
+            return true;
+          });
+          if (quoteList.length > 0) {
+            store.recordSourcingQuotesBatch1688(quoteList.map(qObj => ({
+              ...qObj,
+              ...((profile.revision ?? 59) >= 59 ? { require_ui_readback: true } : {}),
+              form_id: upsertedForm.form_id,
+              spec_version: upsertedForm.spec_version,
+            })));
+          }
+
+          const earlyScens = Array.isArray(rawItem.early_screen_scenarios)
+            ? rawItem.early_screen_scenarios
+            : (rawItem.early_screen_scenario
+                ? [rawItem.early_screen_scenario]
+                : (Array.isArray(rawItem.gate1a_scenarios) && rawItem.gate1a_scenarios.length > 0
+                    ? buildAutoEarlyScreenScenariosFromGate1A(rawItem.gate1a_scenarios, {
+                        saleable_unit: rawItem.saleable_unit ?? formObj.label ?? '1 complete saleable set',
+                        profile_revision: profile.revision ?? 59,
+                        specific_rights_conflict: rawItem.specific_rights_conflict ?? 'unknown',
+                        strong_date_dependency: rawItem.strong_date_dependency === true ? true : false,
+                      })
+                    : null));
+          const researchPayload = rawItem.research_out ?? (rawItem.scored_batch ? { batch: rawItem.scored_batch } : null);
+          const simCaptcha = rawItem.simulate_1688_captcha === true;
+
+          return {
+            ...rawItem,
+            form: formObj,
+            leads,
+            disallow_pre1688_cost_guess_kill: true,
+            ...(earlyScens && !rawItem.early_screen_builder ? { early_screen_builder: () => earlyScens } : {}),
+            ...(simCaptcha && !rawItem.sourcing_executor
+              ? { sourcing_executor: async () => ({ status: 'captcha_triggered', reason: rawItem.captcha_reason ?? '1688 slider verification appeared' }) }
+              : {}),
+            ...(researchPayload && !rawItem.deep_research_executor
+              ? { deep_research_executor: async () => researchPayload }
+              : {}),
+          };
+        };
+
+        let reverseSolution = null;
+        if (command === 'reverse-1688') {
+          const qObj = spec.quote ?? (Array.isArray(spec.quotes) ? spec.quotes[0] : null);
+          if (!qObj || typeof qObj !== 'object') {
+            throw new Phase2CliError('reverse-1688 必须包含 1688 源头厂整套报价 quote（或 quotes[0]）。');
+          }
+          const fxVal = spec.fx_cny_per_usd ?? qObj.fx_cny_per_usd;
+          const pkgObj = spec.pkg ?? qObj.pkg ?? null;
+          if (!pkgObj || !Number.isFinite(fxVal) || fxVal <= 0) {
+            throw new Phase2CliError('reverse-1688 需要提供外箱尺寸重量 pkg 与正数汇率 fx_cny_per_usd。');
+          }
+          const orderUnits = Number.isInteger(qObj.actual_complete_sets) && qObj.actual_complete_sets > 0
+            ? qObj.actual_complete_sets
+            : 100;
+          const landedCnyPerUnit = (Number(qObj.goods_cny_total) + Number(qObj.domestic_freight_cny_total ?? 0)) / orderUnits;
+          const solved = solveMinPriceForMargin2027({
+            pkg: pkgObj,
+            landed_domestic_cny: landedCnyPerUnit,
+            headhaul_usd: spec.headhaul_usd ?? 2.20,
+            fee_category: spec.fee_category ?? 'Home and Kitchen',
+            referral_terms: spec.referral_terms ?? { referral_fraction: 0.15, minimum_referral_usd: 0.30, minimum_referral_fee_usd: 0.30, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.00 },
+            refund_fraction: spec.refund_fraction ?? 0.04,
+            physical_return_fraction: spec.physical_return_fraction ?? spec.refund_fraction ?? 0.04,
+            collection_rate: spec.collection_rate ?? 0.006,
+            fx_cny_per_usd: fxVal,
+            margin_floor: 0.30,
+            min_retail_price_usd: Math.max(29.99, spec.minimum_price_usd ?? 29.99),
+          });
+          const band = spec.mature_price_band?.mature_regular_band ?? spec.mature_price_band?.regular_band_reference ?? spec.mature_price_band?.band ?? spec.mature_price_band ?? null;
+          const minPrice = solved.feasible_min_price_usd ?? null;
+          const bandVerdict = Number.isFinite(minPrice) && Number.isFinite(band?.p25_usd) && Number.isFinite(band?.p75_usd)
+            ? (minPrice < band.p25_usd ? 'below_band_strong_headroom' : (minPrice <= band.p75_usd ? 'within_mature_band_viable' : 'above_mature_band_p75_uncompetitive'))
+            : 'forward_price_only_awaiting_us_band';
+          reverseSolution = {
+            min_retail_price_for_30pct_usd: minPrice,
+            mature_band_comparison: bandVerdict,
+            solution: solved,
+          };
+          if (!Array.isArray(spec.gate1a_scenarios) || spec.gate1a_scenarios.length === 0) {
+            const outOnly = { ok: true, command, reverse_1688: reverseSolution };
+            checkOperatorPayload(outOnly);
+            const jsonOnly = `${stringifyCliJson(outOnly)}\n`;
+            if (values.output) {
+              await writeSingleFileSafe(resolve(values.output), Buffer.from(jsonOnly, 'utf8'), [...sqlitePaths(dbPath), inputPath]);
+            }
+            streams.stdout.write(jsonOnly);
+            return 0;
+          }
+        }
+
+        const rawItems = command === 'daily-batch'
+          ? (Array.isArray(spec.items) ? spec.items : (Array.isArray(spec) ? spec : [spec]))
+          : [spec.item && typeof spec.item === 'object' ? spec.item : spec];
+        if (command !== 'daily-batch' && rawItems.length !== 1) {
+          throw new Phase2CliError(`${command} 每次仅执行单个候选深挖。`);
+        }
+        const hydratedItems = rawItems.map(hydrateWorkflowItem);
+        const discoveryPlan = command === 'daily-batch'
+          ? planDiscoveryBatch(store, {
+              max_channels: Math.max(5, hydratedItems.length),
+              task_slots: Math.max(5, hydratedItems.length),
+              enforce_80_20_mix: true,
+            })
+          : null;
+        const batchReport = await runPhase2Batch(store, {
+          items: hydratedItems,
+          profile,
+          as_of_date: asOfDate,
+          sourcing_executor: testHooks?.sourcingExecutor ?? null,
+          deep_research_executor: testHooks?.deepResearchExecutor ?? null,
+          openai_hooks: testHooks?.openaiHooks ?? null,
+          resume_skip_completed: spec.resume_skip_completed !== false,
+        });
+        const coverageAudit = command === 'daily-batch'
+          ? auditDiscoveryCoverage(store, { profile_revision: profile.revision })
+          : null;
+        const out = {
+          ok: true,
+          command,
+          ...(discoveryPlan ? { discovery_plan_80_20: discoveryPlan } : {}),
+          ...(coverageAudit ? { coverage_audit: coverageAudit } : {}),
+          ...(reverseSolution ? { reverse_1688: reverseSolution } : {}),
+          batch_report: batchReport,
+        };
+        checkOperatorPayload(out);
+        const json = `${stringifyCliJson(out)}\n`;
+        if (values.output) {
+          await writeSingleFileSafe(
+            resolve(values.output),
+            Buffer.from(json, 'utf8'),
+            [...sqlitePaths(dbPath), inputPath, profilePath],
+          );
+        }
+        streams.stdout.write(json);
         return 0;
       }
 

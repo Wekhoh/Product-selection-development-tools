@@ -22,8 +22,10 @@ import {
   computeMatchedPeerMedianPackage,
   bindSourcingQuotePricingInputs,
   solveMinPriceForMargin2027,
+  classifySizeTier2027,
   lookupFulfillmentFee2027,
   lookupBulkyFulfillmentFee2027,
+  lookupUnifiedFulfillmentFee2027,
 } from './fba-rates-2027.mjs';
 import {
   toBigRat,
@@ -1066,6 +1068,11 @@ export function runGate1AForForm(store, {
   }
   if (typeof disallow_pre1688_cost_guess_kill !== 'boolean' || typeof allow_forward_price_discovery !== 'boolean') {
     throw new TypeError('Gate 1A forward pricing options must be booleans.');
+  }
+  if ((profile_revision ?? 59) >= 59 && disallow_pre1688_cost_guess_kill === false) {
+    throw new TypeError(
+      'Revision 59 forbids pre-1688 reverse-solved procurement cap kills (disallow_pre1688_cost_guess_kill cannot be false).',
+    );
   }
   scenarios ??= allow_forward_price_discovery ? [] : null;
   if (!Array.isArray(scenarios) || (scenarios.length === 0 && !allow_forward_price_discovery)) {
@@ -4093,6 +4100,7 @@ export async function runPhase2Batch(store, {
   fee_table_snapshot = null,
   as_of_date = new Date().toISOString().slice(0, 10),
   openai_hooks = null,
+  resume_skip_completed = false,
 } = {}) {
   if (!Array.isArray(items) || items.length === 0) throw new TypeError('runPhase2Batch requires a nonempty items array.');
   if (!profile || typeof profile !== 'object') throw new TypeError('runPhase2Batch requires a profile object.');
@@ -4148,6 +4156,15 @@ export async function runPhase2Batch(store, {
   for (const item of items) {
     const formId = item.form.form_id;
     const currentForm = store.getCandidateForm(formId);
+    let priorCachedLuna = null;
+    if ((profile.revision ?? 58) >= 59 && currentForm?.gate1a_result_json && item.force_refresh_luna !== true) {
+      try {
+        const prevG1a = JSON.parse(currentForm.gate1a_result_json);
+        if (prevG1a?.spec_sha256 === currentForm.spec_sha256 && prevG1a?.luna_triage?.status === 'ready') {
+          priorCachedLuna = prevG1a.luna_triage;
+        }
+      } catch { /* ignore */ }
+    }
     const g1a = runGate1AForForm(store, {
       form_id: formId,
       scenarios: item.gate1a_scenarios,
@@ -4166,38 +4183,50 @@ export async function runPhase2Batch(store, {
     // P0-29: NEVER dispatch paid Luna triage on a form that did not pass Gate 1A (`proceed_to_gate1b === true`),
     // and keep the authoritative controller guard OUTSIDE user-overridable hook options!
     if (g1a.proceed_to_gate1b && Array.isArray(item.luna_triage_candidates) && item.luna_triage_candidates.length > 0) {
-      const lunaHookOpts = openai_hooks?.luna_triage ?? {};
-      const userLunaGuard = typeof lunaHookOpts.beforeDispatchGuard === 'function' ? lunaHookOpts.beforeDispatchGuard : null;
-      lunaTriageOut = await runOptionalStage12LunaTriage({
-        ...lunaHookOpts,
-        candidates: item.luna_triage_candidates,
-        targetSpec: item.luna_target_spec ?? { buyer_task: currentForm.buyer_task, label: currentForm.label },
-        contactSheetDataUrl: item.contact_sheet_data_url ?? null,
-        contactSheetDataUrls: item.contact_sheet_data_urls ?? null,
-        gate0Config: item.gate0_options ?? {},
-        beforeDispatchGuard: async (chunkIdx) => {
-          const checkAuthoritativeLiveForm = () => {
-            const live = store.getCandidateForm(formId);
-            if (!live || live.spec_version !== currentForm.spec_version) {
-              return { allowed: false, status: 'stale_spec_version_conflict', reason: `Form ${formId} spec changed concurrently.` };
+      if (priorCachedLuna) {
+        lunaTriageOut = { ...priorCachedLuna, reused_from_persisted_gate1a: true };
+      } else {
+        const lunaHookOpts = openai_hooks?.luna_triage ?? {};
+        const userLunaGuard = typeof lunaHookOpts.beforeDispatchGuard === 'function' ? lunaHookOpts.beforeDispatchGuard : null;
+        lunaTriageOut = await runOptionalStage12LunaTriage({
+          ...lunaHookOpts,
+          candidates: item.luna_triage_candidates,
+          targetSpec: item.luna_target_spec ?? { buyer_task: currentForm.buyer_task, label: currentForm.label },
+          contactSheetDataUrl: item.contact_sheet_data_url ?? null,
+          contactSheetDataUrls: item.contact_sheet_data_urls ?? null,
+          gate0Config: item.gate0_options ?? {},
+          beforeDispatchGuard: async (chunkIdx) => {
+            const checkAuthoritativeLiveForm = () => {
+              const live = store.getCandidateForm(formId);
+              if (!live || live.spec_version !== currentForm.spec_version) {
+                return { allowed: false, status: 'stale_spec_version_conflict', reason: `Form ${formId} spec changed concurrently.` };
+              }
+              const term = hasTerminalRejectionOrDeferralOnCurrentSpec(live);
+              if (term.blocked) {
+                return { allowed: false, status: term.status, reason: term.reason };
+              }
+              return { allowed: true };
+            };
+            const preCheck = checkAuthoritativeLiveForm();
+            if (!preCheck.allowed) return preCheck;
+            if (userLunaGuard) {
+              const userRes = await userLunaGuard(chunkIdx);
+              if (userRes && userRes.allowed === false) return userRes;
+              // P0-29: Re-verify authoritative live form state IMMEDIATELY AFTER awaiting caller guard!
+              return checkAuthoritativeLiveForm();
             }
-            const term = hasTerminalRejectionOrDeferralOnCurrentSpec(live);
-            if (term.blocked) {
-              return { allowed: false, status: term.status, reason: term.reason };
-            }
-            return { allowed: true };
-          };
-          const preCheck = checkAuthoritativeLiveForm();
-          if (!preCheck.allowed) return preCheck;
-          if (userLunaGuard) {
-            const userRes = await userLunaGuard(chunkIdx);
-            if (userRes && userRes.allowed === false) return userRes;
-            // P0-29: Re-verify authoritative live form state IMMEDIATELY AFTER awaiting caller guard!
-            return checkAuthoritativeLiveForm();
-          }
-          return preCheck;
-        },
-      });
+            return preCheck;
+          },
+        });
+      }
+      if (lunaTriageOut?.status === 'ready') {
+        const latestAfterLuna = store.getCandidateForm(formId);
+        if (latestAfterLuna && latestAfterLuna.spec_version === currentForm.spec_version) {
+          store.updateFormLifecycle(formId, latestAfterLuna.lifecycle_status, {
+            gate1a_result: { ...g1a, luna_triage: lunaTriageOut },
+          });
+        }
+      }
     }
     report.gate1a.push({
       form_id: formId,
@@ -4327,6 +4356,10 @@ export async function runPhase2Batch(store, {
       report.pause_status = 'CAPTCHA_PAUSED';
       report.pause_reason = g1b.pause_reason ?? '1688 session requires owner verification (CAPTCHA_PAUSED).';
       report.paused_form_id = formId;
+      report.completed_gate1b_form_ids = readyForGate23.map(e => e.form_id);
+      report.pending_form_ids = afterGate1A
+        .map(e => e.form_id)
+        .filter(fid => !readyForGate23.some(r => r.form_id === fid));
       report.resumable = true;
       return report;
     }
@@ -4372,6 +4405,35 @@ export async function runPhase2Batch(store, {
         attempt_ids: [],
       });
       continue;
+    }
+    if (resume_skip_completed === true && item.force_reevaluate !== true && !item.evidence_review_packet) {
+      const existingEvals = store.getEvaluationsForForm(formId).filter(ev => {
+        if (ev.profile_revision !== profile.revision) return false;
+        try {
+          const rec = ev.receipt_json ? JSON.parse(ev.receipt_json) : null;
+          return rec?.form_spec_sha256 === form.spec_sha256;
+        } catch {
+          return false;
+        }
+      });
+      if (existingEvals.length > 0) {
+        const latestBundleSha = existingEvals[existingEvals.length - 1].evidence_bundle_sha256;
+        const reusedRows = existingEvals.filter(ev => ev.evidence_bundle_sha256 === latestBundleSha);
+        for (const ev of reusedRows) report.evaluations.push(ev);
+        let parsedQual = null;
+        try { parsedQual = JSON.parse(reusedRows[0].qualification_json || 'null'); } catch { parsedQual = null; }
+        report.skipped_zero_incremental.push({ form_id: formId, stage: 'resume_completed_evaluation_reused' });
+        report.gate2_3.push({
+          form_id: formId,
+          status: 'evaluated',
+          reused_completed_evaluation: true,
+          qualification: parsedQual,
+          result_sha256: reusedRows[0].result_sha256,
+          html_sha256: reusedRows[0].html_sha256,
+          attempt_ids: [],
+        });
+        continue;
+      }
     }
     const gate1aRecord = form.gate1a_result_json ? JSON.parse(form.gate1a_result_json) : null;
 
@@ -4696,6 +4758,9 @@ export async function runPhase2Batch(store, {
         }
       }
 
+      if ((profile.revision ?? 58) >= 59 && latestForm.spec_sha256) {
+        inputCand.spec_sha256 = latestForm.spec_sha256;
+      }
       const resultBytes = Buffer.from(`${JSON.stringify(scoredResult, null, 2)}\n`, 'utf8');
       const htmlBytes = Buffer.from(
         renderReport(scoredResult, boundBatch, {
@@ -4773,10 +4838,20 @@ export async function runPhase2Batch(store, {
         store.updateFormLifecycle(formId, 'evaluated');
       });
 
+      const currentSpecReviewVerified = Boolean(
+        persistedEvidenceReview?.validated_envelope === true &&
+        persistedEvidenceReview?.status === 'ready' &&
+        (!latestForm.spec_sha256 || persistedEvidenceReview?.form_spec_sha256 === latestForm.spec_sha256),
+      );
       report.gate2_3.push({
         form_id: formId,
         status: 'evaluated',
         qualification,
+        ...((profile.revision ?? 58) >= 59 && qualification?.counts_toward_target === true ? {
+          current_spec_sha256: latestForm.spec_sha256,
+          current_spec_review_verified: currentSpecReviewVerified,
+          review_visible_state: currentSpecReviewVerified ? '已复核' : '业务入围、当前规格待复核',
+        } : {}),
         result_sha256: perCandidateSha,
         batch_result_sha256: batchResultSha,
         html_sha256: persistedHtmlSha,
@@ -4813,4 +4888,229 @@ export async function runPhase2Batch(store, {
     queue_state: store.getQueueState('gate1b_1688_queue'),
     quota_summary: store.getQuotaSummary(),
   };
+}
+
+/**
+ * Fast stateless 2027 off-peak profit healthcheck (`profit-check`):
+ * Evaluates 2027 off-peak FBA tier & merged non-SIPP fee, advisory 30%-margin landed CNY cap,
+ * exact forward breakeven retail price (when 1688 goods/freight CNY are supplied), realized
+ * 2027 off-peak pre-ad margin & unit contribution, and <= 10 mm package rescue check, keeping
+ * 2027 Q4 peak fulfillment explicitly blank ("2027 Q4 旺季费率待亚马逊公布").
+ */
+export function runFastProfitHealthcheck2027(spec = {}) {
+  if (!spec || typeof spec !== 'object' || Array.isArray(spec)) {
+    throw new TypeError('profit-check requires a JSON specification object.');
+  }
+  const pkg = spec.pkg ?? spec.package ?? null;
+  if (!pkg || typeof pkg !== 'object') {
+    throw new TypeError('profit-check requires pkg ({ length_in, width_in, height_in, weight_lb } or metric equivalents).');
+  }
+  const pricing = resolveEffectivePricing(spec);
+  const priceUsd = pricing.valid && finite(pricing.net_effective_price_usd)
+    ? pricing.net_effective_price_usd
+    : (finite(spec.price_usd) ? spec.price_usd : null);
+  const fx = finite(spec.fx_cny_per_usd) && spec.fx_cny_per_usd > 0 ? spec.fx_cny_per_usd : null;
+  const orderUnits = Number.isInteger(spec.order_units) && spec.order_units >= 1 ? spec.order_units : 100;
+  const hasGoodsCny = finite(spec.goods_cny_per_unit) || finite(spec.goods_cny_total);
+  const goodsCnyTotal = finite(spec.goods_cny_total)
+    ? spec.goods_cny_total
+    : (finite(spec.goods_cny_per_unit) ? spec.goods_cny_per_unit * orderUnits : null);
+  const domFreightCnyTotal = finite(spec.domestic_freight_cny_total)
+    ? spec.domestic_freight_cny_total
+    : (finite(spec.domestic_freight_cny_per_unit) ? spec.domestic_freight_cny_per_unit * orderUnits : 0);
+
+  const rawTierInfo = classifySizeTier2027(pkg, {
+    is_apparel: spec.is_apparel === true,
+    is_shoes: spec.is_shoes === true,
+    is_dangerous_goods: spec.is_dangerous_goods === true,
+  });
+  const tierInfo = rawTierInfo && typeof rawTierInfo === 'object'
+    ? (() => { const { rawRat: _ignoredRat, ...rest } = rawTierInfo; return rest; })()
+    : rawTierInfo;
+
+  const baseInput = {
+    ...spec,
+    pkg,
+    sales_window: spec.sales_window ?? FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
+    storage_window: spec.storage_window ?? FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
+    inbound_window: spec.inbound_window ?? FBA_2027_DEFAULT_INBOUND_WINDOW,
+    fee_category: spec.fee_category ?? 'Home and Kitchen',
+    referral_terms: spec.referral_terms ?? {
+      referral_fraction: finite(spec.referral_fraction) ? spec.referral_fraction : 0.15,
+      minimum_referral_usd: 0.30,
+      minimum_referral_fee_usd: 0.30,
+      refund_admin_fraction: 0.20,
+      refund_admin_cap_usd: 5.00,
+    },
+    refund_fraction: finite(spec.refund_fraction) ? spec.refund_fraction : 0.04,
+    physical_return_fraction: finite(spec.physical_return_fraction)
+      ? spec.physical_return_fraction
+      : (finite(spec.refund_fraction) ? spec.refund_fraction : 0.04),
+    collection_rate: finite(spec.collection_rate) ? spec.collection_rate : 0.006,
+    headhaul_usd: finite(spec.headhaul_usd) ? spec.headhaul_usd : undefined,
+    fx_cny_per_usd: fx ?? undefined,
+    profile_revision: 59,
+  };
+
+  const gate1aEstimate = priceUsd !== null
+    ? estimateGate1A2027({
+        ...baseInput,
+        price_usd: spec.price_usd ?? priceUsd,
+        margin_floor: 0.30,
+        min_landed_domestic_usd: null,
+        domestic_freight_usd: null,
+      })
+    : null;
+
+  let forwardBreakeven = null;
+  let realizedScreen = null;
+  let packagingRescue = null;
+
+  if (hasGoodsCny && fx !== null) {
+    const goodsUsdPerUnit = (goodsCnyTotal / orderUnits) / fx;
+    const domFreightUsdPerUnit = (domFreightCnyTotal / orderUnits) / fx;
+    const landedCnyPerUnit = (goodsCnyTotal + domFreightCnyTotal) / orderUnits;
+
+    forwardBreakeven = solveMinPriceForMargin2027({
+      ...baseInput,
+      landed_domestic_cny: landedCnyPerUnit,
+      margin_floor: 0.30,
+      min_retail_price_usd: 29.99,
+    });
+
+    if (priceUsd !== null && finite(baseInput.headhaul_usd)) {
+      const landedUsdPerUnit = landedCnyPerUnit / fx;
+      const g1aAtPrice = estimateGate1A2027({
+        ...baseInput,
+        price_usd: spec.price_usd ?? priceUsd,
+        margin_floor: 0.30,
+        min_landed_domestic_usd: landedUsdPerUnit,
+        domestic_freight_usd: 0,
+      });
+      if (g1aAtPrice?.status === 'verified' && finite(g1aAtPrice.net_revenue_usd) && g1aAtPrice.net_revenue_usd > 0) {
+        const contrib = Math.round((g1aAtPrice.net_revenue_usd - g1aAtPrice.non_domestic_cost_a_usd - landedUsdPerUnit) * 1e10) / 1e10;
+        const marg = Math.round((contrib / g1aAtPrice.net_revenue_usd) * 1e10) / 1e10;
+        realizedScreen = { status: 'verified', margin: marg, contribution_usd: contrib };
+      } else {
+        realizedScreen = { status: g1aAtPrice?.status ?? 'needs_calculator_verification', margin: null, contribution_usd: null };
+      }
+      const realizedMargin = realizedScreen?.margin ?? null;
+      if (finite(realizedMargin) && realizedMargin < 0.30) {
+        packagingRescue = computePackagingRedesignShortlist2027({
+          ...baseInput,
+          price_usd: spec.price_usd ?? priceUsd,
+          landed_domestic_cny_per_set: landedCnyPerUnit,
+          fx_cny_per_usd: fx,
+          headhaul_usd: baseInput.headhaul_usd,
+          collection_rate: baseInput.collection_rate,
+        });
+      }
+    }
+  }
+
+  const resolvedMargin = realizedScreen?.margin ?? null;
+  const resolvedContrib = realizedScreen?.contribution_usd ?? null;
+  return {
+    window: {
+      sales: baseInput.sales_window,
+      storage: baseInput.storage_window,
+      q4_peak_margin: null,
+      unpublished_2027_q4_peak_note: '2027 Q4 旺季费率待亚马逊公布',
+    },
+    size_tier_2027: tierInfo,
+    net_effective_price_usd: priceUsd,
+    advisory_gate1a_cap: gate1aEstimate
+      ? {
+          status: gate1aEstimate.status,
+          fulfillment_usd: gate1aEstimate.components?.fulfillment?.total_usd ?? null,
+          packaging_service_fee_usd: gate1aEstimate.components?.fulfillment?.packaging_service_fee_usd ?? null,
+          placement_usd: gate1aEstimate.components?.placement?.selected_usd ?? null,
+          storage_per_unit_usd: gate1aEstimate.components?.storage?.per_unit_usd ?? null,
+          landed_domestic_cap_usd: gate1aEstimate.landed_domestic_cap_usd ?? null,
+          landed_domestic_cap_cny: gate1aEstimate.landed_domestic_cap_cny ?? null,
+          advisory_only_never_pre_kills: true,
+        }
+      : null,
+    forward_breakeven_30pct: forwardBreakeven,
+    realized_2027_off_peak: realizedScreen
+      ? {
+          status: realizedScreen.status ?? null,
+          margin: resolvedMargin,
+          margin_pct: finite(resolvedMargin) ? Math.round(resolvedMargin * 10000) / 100 : null,
+          ad_15pct_margin: finite(resolvedMargin) ? Math.round((resolvedMargin - 0.15) * 10000) / 10000 : null,
+          contribution_usd: resolvedContrib,
+          meets_30pct_floor: finite(resolvedMargin) ? resolvedMargin >= 0.30 : null,
+        }
+      : null,
+    ...(packagingRescue ? { packaging_redesign_shortlist: packagingRescue } : {}),
+  };
+}
+
+export function buildAutoEarlyScreenScenariosFromGate1A(gate1aScenarios = [], {
+  saleable_unit = '1 complete saleable set',
+  profile_revision = 59,
+  specific_rights_conflict = 'unknown',
+  strong_date_dependency = false,
+} = {}) {
+  return (Array.isArray(gate1aScenarios) ? gate1aScenarios : []).map((rawSc, idx) => {
+    const salesWin = rawSc.sales_window ?? FBA_2027_DEFAULT_OFF_PEAK_WINDOW;
+    const storWin = rawSc.storage_window ?? FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW;
+    const inbWin = rawSc.inbound_window ?? FBA_2027_DEFAULT_INBOUND_WINDOW;
+    const est = estimateGate1A2027({
+      ...rawSc,
+      sales_window: salesWin,
+      storage_window: storWin,
+      inbound_window: inbWin,
+      margin_floor: 0.30,
+      min_landed_domestic_usd: null,
+      domestic_freight_usd: null,
+      profile_revision,
+    });
+    const refTerms = rawSc.referral_terms ?? {};
+    return {
+      ...rawSc,
+      profile_revision,
+      id: nonemptyStr(rawSc.id) ? rawSc.id.trim() : `scenario-${idx + 1}`,
+      saleable_unit: nonemptyStr(rawSc.saleable_unit) ? rawSc.saleable_unit.trim() : saleable_unit,
+      order_units: 100,
+      first_order_promotion: false,
+      goods_first_order_promotion: false,
+      headhaul: rawSc.headhaul ?? {
+        usd_per_unit: rawSc.headhaul_usd ?? est.components?.headhaul_usd ?? 2.0,
+        bond_included: true,
+      },
+      refund_fraction: rawSc.refund_fraction ?? 0.04,
+      physical_return_fraction: rawSc.physical_return_fraction ?? rawSc.refund_fraction ?? 0.04,
+      return_threshold: est.components?.returns_processing?.return_threshold ?? 0.081,
+      returns_processing_usd: est.components?.returns_processing?.expected_fee_per_shipped_unit_usd ?? 0,
+      is_apparel_or_shoes: Boolean(rawSc.is_apparel === true || rawSc.is_shoes === true),
+      referral_terms: {
+        referral_fraction: refTerms.referral_fraction ?? 0.15,
+        refund_admin_fraction: refTerms.refund_admin_fraction ?? 0.20,
+        refund_admin_cap_usd: refTerms.refund_admin_cap_usd ?? 5.00,
+        minimum_referral_usd: refTerms.minimum_referral_usd ?? refTerms.minimum_referral_fee_usd ?? 0.30,
+      },
+      fulfillment_usd: est.components?.fulfillment?.total_usd ?? null,
+      placement_usd: est.components?.placement?.selected_usd ?? null,
+      storage: {
+        cubic_feet_per_unit: est.components?.storage?.cubic_feet ?? null,
+        rate_usd_per_cuft_month: est.components?.storage?.rate_usd_per_cuft_month ?? null,
+        average_inventory_days: est.components?.storage?.average_inventory_days ?? 45,
+      },
+      operating_period: 'off_peak',
+      operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
+      fee_context: {
+        marketplace: 'US',
+        currency: 'USD',
+        package_ref: `pkg-auto-${idx + 1}`,
+        sales: salesWin,
+        storage: storWin,
+        inbound: inbWin,
+      },
+      collection_rate: rawSc.collection_rate ?? 0.006,
+      other_applicable_usd: rawSc.other_applicable_usd ?? 0,
+      specific_rights_conflict: rawSc.specific_rights_conflict ?? specific_rights_conflict,
+      strong_date_dependency: rawSc.strong_date_dependency ?? strong_date_dependency,
+    };
+  });
 }

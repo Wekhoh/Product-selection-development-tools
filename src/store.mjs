@@ -522,6 +522,29 @@ CREATE TABLE IF NOT EXISTS queue_state (
   active_lease_at TEXT,
   updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS calibration_tracking (
+  tracking_id TEXT PRIMARY KEY,
+  form_id TEXT NOT NULL,
+  spec_version INTEGER NOT NULL DEFAULT 1,
+  form_spec_sha256 TEXT,
+  batch_id TEXT,
+  system_verdict TEXT NOT NULL,
+  core_85_range_json TEXT,
+  supported_range_json TEXT,
+  pre_ad_margin_range_json TEXT,
+  owner_decision TEXT CHECK(owner_decision IS NULL OR owner_decision IN ('keep', 'drop', 'sample_check', 'hold', 'pending_owner_review')),
+  owner_reason TEXT,
+  sample_measured_pkg_json TEXT,
+  recalculated_margin_json TEXT,
+  calibration_note TEXT,
+  near_miss_spot_check_json TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(form_id, spec_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_calibration_batch ON calibration_tracking(batch_id);
 `;
 
 export function classifyBillingLane(provider, toolName = '', row = null) {
@@ -944,6 +967,29 @@ export class SelectionStore {
       ['review_notes_json', 'TEXT'],
       ['evidence_review_json', 'TEXT'],
     ]);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS calibration_tracking (
+        tracking_id TEXT PRIMARY KEY,
+        form_id TEXT NOT NULL,
+        spec_version INTEGER NOT NULL DEFAULT 1,
+        form_spec_sha256 TEXT,
+        batch_id TEXT,
+        system_verdict TEXT NOT NULL,
+        core_85_range_json TEXT,
+        supported_range_json TEXT,
+        pre_ad_margin_range_json TEXT,
+        owner_decision TEXT CHECK(owner_decision IS NULL OR owner_decision IN ('keep', 'drop', 'sample_check', 'hold', 'pending_owner_review')),
+        owner_reason TEXT,
+        sample_measured_pkg_json TEXT,
+        recalculated_margin_json TEXT,
+        calibration_note TEXT,
+        near_miss_spot_check_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(form_id, spec_version)
+      );
+      CREATE INDEX IF NOT EXISTS idx_calibration_batch ON calibration_tracking(batch_id);
+    `);
     // Lane-accurate, idempotent backfill for unresolved unknown rows with zero billed AND zero reserved units.
     // Never adds an ss_mcp reserve to an ss_web row, and never changes totals when reopening the database.
     const unreservedUnknowns = this.db.prepare(`
@@ -3414,6 +3460,186 @@ export class SelectionStore {
     return sanitizeDiagnosticText(rawPath.replace(/\\/g, '/'));
   }
 
+  _hasTable(tableName) {
+    return Boolean(
+      this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(tableName),
+    );
+  }
+
+  _deserializeCalibrationRow(row) {
+    if (!row) return null;
+    const parseOpt = s => {
+      if (!s) return null;
+      try { return JSON.parse(s); } catch { return null; }
+    };
+    return {
+      tracking_id: row.tracking_id,
+      form_id: row.form_id,
+      spec_version: row.spec_version,
+      form_spec_sha256: row.form_spec_sha256 ?? null,
+      batch_id: row.batch_id ?? null,
+      system_verdict: row.system_verdict,
+      core_85_range: parseOpt(row.core_85_range_json),
+      supported_range: parseOpt(row.supported_range_json),
+      pre_ad_margin_range: parseOpt(row.pre_ad_margin_range_json),
+      owner_decision: row.owner_decision ?? null,
+      owner_reason: row.owner_reason ?? null,
+      sample_measured_pkg: parseOpt(row.sample_measured_pkg_json),
+      recalculated_margin: parseOpt(row.recalculated_margin_json),
+      calibration_note: row.calibration_note ?? null,
+      near_miss_spot_check: parseOpt(row.near_miss_spot_check_json),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    };
+  }
+
+  /**
+   * Persist or update the 4 owner calibration tracking items per candidate form:
+   *  1) system_verdict (+ core_85_range, supported_range, pre_ad_margin_range, form_spec_sha256)
+   *  2) owner_decision ('keep' | 'drop' | 'sample_check' | 'hold' | 'pending_owner_review') + owner_reason
+   *  3) sample_measured_pkg + recalculated_margin
+   *  4) batch_id + calibration_note + near_miss_spot_check (soft-hold / near-miss & Terra-vs-Astra Keepa audit)
+   */
+  upsertCalibrationTracking(record) {
+    this._assertWritable();
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      throw new TypeError('Calibration tracking record object is required.');
+    }
+    if (containsSecretToken(record)) {
+      throw new TypeError('Calibration tracking record contains a secret or token; redact before persisting.');
+    }
+    assertNoRawPii(record, 'calibration_tracking');
+
+    const formId = nonemptyStr(record.form_id) ? record.form_id.trim() : null;
+    if (!formId) throw new TypeError('calibration_tracking requires a nonempty form_id.');
+    const existingForm = this.getCandidateForm(formId);
+    const specVersion = Number.isInteger(record.spec_version) && record.spec_version >= 1
+      ? record.spec_version
+      : (existingForm?.spec_version ?? 1);
+    const allowedDecisions = new Set(['keep', 'drop', 'sample_check', 'hold', 'pending_owner_review']);
+    const rawDecision = record.owner_decision === undefined || record.owner_decision === null
+      ? undefined
+      : String(record.owner_decision).trim();
+    if (rawDecision !== undefined && !allowedDecisions.has(rawDecision)) {
+      throw new TypeError(
+        `owner_decision must be one of [${[...allowedDecisions].join(', ')}] or null.`,
+      );
+    }
+    const now = this._now();
+
+    return this._withImmediateTx(() => {
+      const prior = this.db.prepare(
+        'SELECT * FROM calibration_tracking WHERE form_id = ? AND spec_version = ?',
+      ).get(formId, specVersion);
+
+      const trackingId = prior?.tracking_id ??
+        (nonemptyStr(record.tracking_id) ? record.tracking_id.trim() : `cal-${formId}-v${specVersion}`);
+      const systemVerdict = nonemptyStr(record.system_verdict)
+        ? record.system_verdict.trim()
+        : (prior?.system_verdict ?? null);
+      if (!systemVerdict) {
+        throw new TypeError('calibration_tracking requires a nonempty system_verdict on initial insert.');
+      }
+
+      const formSpecSha = nonemptyStr(record.form_spec_sha256)
+        ? record.form_spec_sha256.trim()
+        : (prior?.form_spec_sha256 ?? existingForm?.spec_sha256 ?? null);
+      const batchId = record.batch_id !== undefined
+        ? (nonemptyStr(record.batch_id) ? record.batch_id.trim() : null)
+        : (prior?.batch_id ?? null);
+      const core85Json = record.core_85_range !== undefined
+        ? (record.core_85_range === null ? null : canonicalJson(record.core_85_range))
+        : (prior?.core_85_range_json ?? null);
+      const suppJson = record.supported_range !== undefined
+        ? (record.supported_range === null ? null : canonicalJson(record.supported_range))
+        : (prior?.supported_range_json ?? null);
+      const marginJson = record.pre_ad_margin_range !== undefined
+        ? (record.pre_ad_margin_range === null ? null : canonicalJson(record.pre_ad_margin_range))
+        : (prior?.pre_ad_margin_range_json ?? null);
+      const ownerDecision = record.owner_decision !== undefined
+        ? (record.owner_decision === null ? null : rawDecision)
+        : (prior?.owner_decision ?? null);
+      const ownerReason = record.owner_reason !== undefined
+        ? (nonemptyStr(record.owner_reason) ? record.owner_reason.trim() : null)
+        : (prior?.owner_reason ?? null);
+      const samplePkgJson = record.sample_measured_pkg !== undefined
+        ? (record.sample_measured_pkg === null ? null : canonicalJson(record.sample_measured_pkg))
+        : (prior?.sample_measured_pkg_json ?? null);
+      const recalcMarginJson = record.recalculated_margin !== undefined
+        ? (record.recalculated_margin === null ? null : canonicalJson(record.recalculated_margin))
+        : (prior?.recalculated_margin_json ?? null);
+      const calNote = record.calibration_note !== undefined
+        ? (nonemptyStr(record.calibration_note) ? record.calibration_note.trim() : null)
+        : (prior?.calibration_note ?? null);
+      const spotCheckJson = record.near_miss_spot_check !== undefined
+        ? (record.near_miss_spot_check === null ? null : canonicalJson(record.near_miss_spot_check))
+        : (prior?.near_miss_spot_check_json ?? null);
+
+      if (prior) {
+        this.db.prepare(`
+          UPDATE calibration_tracking
+          SET form_spec_sha256 = ?,
+              batch_id = ?,
+              system_verdict = ?,
+              core_85_range_json = ?,
+              supported_range_json = ?,
+              pre_ad_margin_range_json = ?,
+              owner_decision = ?,
+              owner_reason = ?,
+              sample_measured_pkg_json = ?,
+              recalculated_margin_json = ?,
+              calibration_note = ?,
+              near_miss_spot_check_json = ?,
+              updated_at = ?
+          WHERE tracking_id = ?
+        `).run(
+          formSpecSha, batchId, systemVerdict, core85Json, suppJson, marginJson,
+          ownerDecision, ownerReason, samplePkgJson, recalcMarginJson, calNote, spotCheckJson,
+          now, trackingId,
+        );
+      } else {
+        this.db.prepare(`
+          INSERT INTO calibration_tracking (
+            tracking_id, form_id, spec_version, form_spec_sha256, batch_id,
+            system_verdict, core_85_range_json, supported_range_json, pre_ad_margin_range_json,
+            owner_decision, owner_reason, sample_measured_pkg_json, recalculated_margin_json,
+            calibration_note, near_miss_spot_check_json, created_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          trackingId, formId, specVersion, formSpecSha, batchId,
+          systemVerdict, core85Json, suppJson, marginJson,
+          ownerDecision, ownerReason, samplePkgJson, recalcMarginJson,
+          calNote, spotCheckJson, now, now,
+        );
+      }
+      const saved = this.db.prepare('SELECT * FROM calibration_tracking WHERE tracking_id = ?').get(trackingId);
+      return this._deserializeCalibrationRow(saved);
+    });
+  }
+
+  getCalibrationTrackingForForm(formId, specVersion = null) {
+    if (!this._hasTable('calibration_tracking') || !nonemptyStr(formId)) return null;
+    const row = Number.isInteger(specVersion)
+      ? this.db.prepare('SELECT * FROM calibration_tracking WHERE form_id = ? AND spec_version = ?').get(formId.trim(), specVersion)
+      : this.db.prepare('SELECT * FROM calibration_tracking WHERE form_id = ? ORDER BY spec_version DESC LIMIT 1').get(formId.trim());
+    return this._deserializeCalibrationRow(row);
+  }
+
+  listCalibrationTracking({ batch_id = null, form_id = null } = {}) {
+    if (!this._hasTable('calibration_tracking')) return [];
+    let rows;
+    if (nonemptyStr(batch_id) && nonemptyStr(form_id)) {
+      rows = this.db.prepare('SELECT * FROM calibration_tracking WHERE batch_id = ? AND form_id = ? ORDER BY updated_at DESC, form_id ASC').all(batch_id.trim(), form_id.trim());
+    } else if (nonemptyStr(batch_id)) {
+      rows = this.db.prepare('SELECT * FROM calibration_tracking WHERE batch_id = ? ORDER BY updated_at DESC, form_id ASC').all(batch_id.trim());
+    } else if (nonemptyStr(form_id)) {
+      rows = this.db.prepare('SELECT * FROM calibration_tracking WHERE form_id = ? ORDER BY spec_version DESC').all(form_id.trim());
+    } else {
+      rows = this.db.prepare('SELECT * FROM calibration_tracking ORDER BY updated_at DESC, form_id ASC').all();
+    }
+    return rows.map(r => this._deserializeCalibrationRow(r));
+  }
+
   getSummary() {
     const counts = {
       api_request_ledger: this.db.prepare('SELECT COUNT(*) AS c FROM api_request_ledger').get().c,
@@ -3423,6 +3649,9 @@ export class SelectionStore {
       sourcing_quotes_1688: this.db.prepare('SELECT COUNT(*) AS c FROM sourcing_quotes_1688').get().c,
       evaluations: this.db.prepare('SELECT COUNT(*) AS c FROM evaluations').get().c,
     };
+    const calibrationTrackingCount = this._hasTable('calibration_tracking')
+      ? this.db.prepare('SELECT COUNT(*) AS c FROM calibration_tracking').get().c
+      : 0;
     const quota = this.getQuotaSummary();
     const leadCols = this._tableColumns('raw_leads');
     const allLeads = this.db.prepare('SELECT lead_id, source_channel, entry_group' + (leadCols.has('route') ? ', route' : '') + ' FROM raw_leads').all();
@@ -3489,6 +3718,7 @@ export class SelectionStore {
       db_path: this._sanitizeDbPath(this.dbPath),
       read_only: this.readOnly,
       counts,
+      calibration_tracking_count: calibrationTrackingCount,
       quota,
       quota_by_lane: quota.by_lane,
       funnel_by_route: funnelByRoute,
