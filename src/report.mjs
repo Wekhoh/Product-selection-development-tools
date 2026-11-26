@@ -536,10 +536,19 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
   const isBareGoodsCalc = c => {
     const domLine = array(c?.lines).find(l => l?.id === 'domestic_freight');
     return Boolean(c?.cost_basis === 'bare_goods_1688' ||
+      c?.bare_goods_screening === true ||
       domLine?.bare_goods_screening === true ||
       (domLine?.status === 'not_applicable' && domLine?.amount_usd === 0));
   };
-  const isBareGoods = activeLedgers.length > 0 && activeLedgers.every(isBareGoodsCalc);
+  const bareGoodsBasisPool = activeLedgers.length > 0
+    ? activeLedgers
+    : (nonSensCoherentCalcs.length > 0
+      ? nonSensCoherentCalcs
+      : scenarios
+        .filter(s => !(s?.input?.cost_ledger?.sensitivity_only === true))
+        .map(s => s?.input?.calculation ?? s?.input?.cost_ledger)
+        .filter(Boolean));
+  const isBareGoods = bareGoodsBasisPool.length > 0 && bareGoodsBasisPool.every(isBareGoodsCalc);
   const domesticDelivered = minMaxRange(activeLedgers.map(c => {
     const proc = array(c?.lines).find(l => l.id === 'procurement')?.amount_usd;
     const dom = array(c?.lines).find(l => l.id === 'domestic_freight')?.amount_usd;
@@ -1080,7 +1089,7 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
         const cText = finite(st.contribution_usd) ? money2(st.contribution_usd) : '待补证';
         const adText = finite(st.advertising_scenario_margin) ? `${escape(numberText(st.advertising_scenario_margin * 100))}%` : '待补证';
         const capCny = finite(st.landed_domestic_cap_at_30pct_cny) ? `（约 ¥${escape(numberText(st.landed_domestic_cap_at_30pct_cny))}）` : '';
-        const capText = finite(st.landed_domestic_cap_at_30pct_usd) ? `；保30%到深含运上限 ${money2(st.landed_domestic_cap_at_30pct_usd)}${capCny}` : '';
+        const capText = finite(st.landed_domestic_cap_at_30pct_usd) ? `；${anyBareGoodsWaterfall ? '保30%裸货上限' : '保30%到深含运上限'} ${money2(st.landed_domestic_cap_at_30pct_usd)}${capCny}` : '';
         const issues = array(st.stress_issues);
         const issuesHtml = issues.length
           ? `<p class="${st.double_deduction_blocked ? 'ink-fail' : 'muted'}"><strong>压力情景核查提示：</strong>${issues.map(iss => escape(sanitizeTextPaths(string(iss?.reason ?? iss)))).join('；')}</p>`
@@ -2638,10 +2647,13 @@ function renderR58Report(result, batch = {}, reportOptions = {}) {
   ].join('');
 
   const maxPanels = Math.max(12, ...candidates.map(c => (c?.queue === 'seasonal_review' ? array(c.operating_periods).length + 2 : 4)));
-  const anyOver100Report = candidates.some(cand => {
-    const s = extractMetricsSnapshot(cand, rev);
-    return s.orderUnitsRange && s.orderUnitsRange[1] > 100;
-  });
+  const reportSnaps = candidates.map(cand => extractMetricsSnapshot(cand, rev));
+  const anyOver100Report = reportSnaps.some(s => s.orderUnitsRange && s.orderUnitsRange[1] > 100);
+  const allBareGoodsReport = reportSnaps.length > 0 && reportSnaps.every(s => s.isBareGoods);
+  const anyBareGoodsReport = reportSnaps.some(s => s.isBareGoods);
+  const mobileDomesticHeader = allBareGoodsReport
+    ? (anyOver100Report ? '1688裸货' : '1688百套裸货')
+    : (anyBareGoodsReport ? '1688货价口径' : (anyOver100Report ? '1688到深含运' : null));
   const anyAiSections = candidates.some(cand => {
     const orig = originals.get(cand?.candidate_id);
     return resolveR58EvidenceReview(cand, orig) !== null ||
@@ -2664,7 +2676,7 @@ function renderR58Report(result, batch = {}, reportOptions = {}) {
     `${Array.from({ length: maxPanels - 5 }, (_, idx) => `.card-tabs:has(input[id$="-t${idx + 6}"]:checked) .tab-p${idx + 6}`).join(',\n')}{\n  display:block;\n}`,
     targetPlinthCss,
     reservedFilterCss,
-    anyOver100Report ? '@container (width < 42.5rem){.matrix-table{--m4:"1688到深含运"}}' : '',
+    mobileDomesticHeader ? `@container (width < 42.5rem){.matrix-table{--m4:"${mobileDomesticHeader}"}}` : '',
     anyAiSections ? R58_AI_SECTIONS_CSS.trim() : '',
   ].filter(Boolean).join('\n');
 

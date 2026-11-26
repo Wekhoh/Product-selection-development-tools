@@ -42,6 +42,7 @@ import {
   isOfficial2027ScheduleWindowValid,
   lookupVerified2027PerReturnFee,
   storageMeets2027Floor,
+  isStructuredHeadhaulSpec,
   collectStructuredHeadhaulSpecs,
   computeHeadhaulWithA4Rules,
   computeAmazonCouponRedemptionFee2027,
@@ -301,7 +302,7 @@ export function calculateEconomics(input, options = {}) {
         let firstExpectedUsd = null;
         for (const rawHhSpec of rawHhSpecs) {
           const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
-          const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
+          const effUnits = input.order_units ?? procLine?.order_units ?? rawHhSpec.order_units ?? null;
           const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, {
             isR58: true,
             isR59: true,
@@ -443,6 +444,16 @@ export function calculateEconomics(input, options = {}) {
       if (!isConfirmedOversize &&
         (placeSplitOpt === 'amazon_optimized' || (hasNonOversizeEvidence && round(placeLine.amount_usd) === 0))) {
         const hhLineForPlace = map.get('headhaul');
+        const allPlacementHeadhaulObjs = [
+          ...headhaulSpecsForPlacement,
+          input.headhaul,
+          input.source_inputs?.headhaul,
+          hhLineForPlace,
+          hhLineForPlace?.fee_basis,
+          placeLine,
+          placeLine.fee_basis,
+          input,
+        ].filter(o => o && typeof o === 'object' && !Array.isArray(o));
         const placeHeadhaulScope = placeLine.headhaul_destination_scope ??
           placeLine.fee_basis?.headhaul_destination_scope ??
           input.headhaul_destination_scope ??
@@ -462,11 +473,13 @@ export function calculateEconomics(input, options = {}) {
           placeLine.fee_basis?.steady_state_replenishment ??
           input.steady_state_replenishment ??
           headhaulSpecsForPlacement[0]?.steady_state_replenishment ??
+          (input.headhaul && typeof input.headhaul === 'object' ? input.headhaul.steady_state_replenishment : undefined) ??
           true;
         const usWestBlocked = isUsWestSingleWarehouseHeadhaul({
           headhaul_destination_scope: placeHeadhaulScope,
           headhaul_rate_cny_per_kg: placeHeadhaulRate,
-        }) || headhaulSpecsForPlacement.some(spec => isUsWestSingleWarehouseHeadhaul({ headhaul: spec }));
+          extra_headhauls: allPlacementHeadhaulObjs,
+        });
         const optVerified = !usWestBlocked && isAmazonOptimizedPlacementVerified2027({
           identical_cartons_count: placeLine.identical_cartons_count ??
             placeLine.fee_basis?.identical_cartons_count ??
@@ -477,7 +490,8 @@ export function calculateEconomics(input, options = {}) {
             input.multi_destination_headhaul_verified ??
             undefined,
           steady_state_replenishment: placeSteadyState,
-          headhaul: headhaulSpecsForPlacement[0] ?? null,
+          headhaul: headhaulSpecsForPlacement[0] ?? (input.headhaul && typeof input.headhaul === 'object' ? input.headhaul : null),
+          extra_headhauls: allPlacementHeadhaulObjs,
           headhaul_rate_cny_per_kg: placeHeadhaulRate,
           headhaul_destination_scope: placeHeadhaulScope,
         });
@@ -833,23 +847,6 @@ function ratMatchesSupply(suppliedNum, exactRat) {
   return absDiff * 100000000000n <= 5n * sRat.d * exactRat.d;
 }
 
-const PER_KG_KEYS = [
-  'chargeable_kg_per_unit',
-  'rate_cny_per_kg',
-  'surcharge_cny_per_kg',
-  'bond_cny_per_kg',
-  'bond_cny_per_shipment',
-  'carton_cm',
-  'carton_count',
-  'units_per_carton',
-  'cartons',
-  'mixed_cartons',
-  'identical_cartons',
-  'uniform_cartons',
-  'actual_weight_kg_total',
-  'actual_weight_kg_per_unit',
-  'weight_per_carton_kg',
-];
 const STORAGE_CALC_KEYS = ['cubic_feet_per_unit', 'rate_usd_per_cuft_month', 'average_inventory_days'];
 
 
@@ -861,13 +858,11 @@ function parseTriState(value, fieldName) {
 
 function resolveHeadhaul(headhaul, fx, orderUnits, steadyStateReplenishment = undefined) {
   if (!headhaul || typeof headhaul !== 'object') return { amount_usd: null, cny_derivation: null, a4_applied: null };
-  const hasPerKgField = PER_KG_KEYS.some(key => Object.hasOwn(headhaul, key));
-  if (!hasPerKgField) {
+  if (!isStructuredHeadhaulSpec(headhaul)) {
     return headhaul.bond_included === true && finite(headhaul.usd_per_unit) && headhaul.usd_per_unit > 0
       ? { amount_usd: headhaul.usd_per_unit, cny_derivation: null, a4_applied: null }
       : { amount_usd: null, cny_derivation: null, a4_applied: null };
   }
-  if (Object.hasOwn(headhaul, 'usd_per_unit')) return { amount_usd: null, cny_derivation: null, a4_applied: null };
   return computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, {
     isR58: true,
     isR59: true,
@@ -1270,11 +1265,17 @@ export function evaluateEarlyScreen(input, options = {}) {
   const nestedPromoInvalid =
     (input?.source_inputs && Object.hasOwn(input.source_inputs, 'first_order_promotion') && input.source_inputs.first_order_promotion !== false) ||
     (input?.procurement && typeof input.procurement === 'object' && Object.hasOwn(input.procurement, 'first_order_promotion') && input.procurement.first_order_promotion !== false);
+  const hasExplicitDomesticInput =
+    (rawDomesticUsd !== null && rawDomesticUsd !== undefined) ||
+    (domestic_freight_cny_per_unit !== null && domestic_freight_cny_per_unit !== undefined) ||
+    (domestic_freight_cny_total !== null && domestic_freight_cny_total !== undefined);
+  const bareGoodsMode = bare_goods_screening === true || (bare_goods_screening !== false && !hasExplicitDomesticInput);
+  const freightOnlyPromoIgnored = bareGoodsMode && goods_first_order_promotion === false;
   const pricePass = price_usd >= minimum_price_usd;
   const orderUnitsValid = !skuLinesConflict && !nestedSetsInvalid && Number.isSafeInteger(order_units) && order_units >= 100 && !skuLineOrderedMismatch && (!orderPlan || order_units === orderPlan.allocated_sets);
-  const goodsPromoClear = !nestedPromoInvalid && first_order_promotion !== true && (goods_first_order_promotion === undefined
+  const goodsPromoClear = !nestedPromoInvalid && (goods_first_order_promotion === undefined
     ? first_order_promotion === false
-    : goods_first_order_promotion === false) && (!orderPlan || orderPlan.all_promo_clear);
+    : (goods_first_order_promotion === false && (freightOnlyPromoIgnored || first_order_promotion !== true))) && (!orderPlan || orderPlan.all_promo_clear);
   const freightPromoClear = !nestedPromoInvalid && first_order_promotion === false;
   let rawProc = null;
   let procCnyDerivation = null;
@@ -1340,11 +1341,6 @@ export function evaluateEarlyScreen(input, options = {}) {
     registeredIds = new Set(evidence.map(e => (typeof e === 'string' ? e : e?.id)).filter(text));
   }
 
-  const hasExplicitDomesticInput =
-    (rawDomesticUsd !== null && rawDomesticUsd !== undefined) ||
-    (domestic_freight_cny_per_unit !== null && domestic_freight_cny_per_unit !== undefined) ||
-    (domestic_freight_cny_total !== null && domestic_freight_cny_total !== undefined);
-  const bareGoodsMode = bare_goods_screening === true || (bare_goods_screening !== false && !hasExplicitDomesticInput);
   const advisoryDomesticFreightCny = finite(domestic_freight_advisory_cny_total) && domestic_freight_advisory_cny_total >= 0
     ? domestic_freight_advisory_cny_total
     : (bare_goods_screening === true && finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0
@@ -1478,6 +1474,7 @@ export function evaluateEarlyScreen(input, options = {}) {
         multi_destination_headhaul_verified: input.multi_destination_headhaul_verified ?? placement_fee_basis?.multi_destination_headhaul_verified ?? undefined,
         steady_state_replenishment: earlySteadyState,
         headhaul,
+        extra_headhauls: [placement_fee_basis, input],
         headhaul_rate_cny_per_kg: earlyHeadhaulRate,
         headhaul_destination_scope: earlyHeadhaulScope,
       });
@@ -1845,7 +1842,7 @@ export function evaluateEarlyScreen(input, options = {}) {
   if (dateState === true) reasons.push('Strong holiday/date dependency is deferred in this profile.');
   if (dateState === 'unknown') reasons.push('Strong holiday/date dependency has not been verified.');
   if (!dateCtxR58.valid) reasons.push(dateCtxR58.reason);
-  if (first_order_promotion === true || goods_first_order_promotion === true) {
+  if ((!freightOnlyPromoIgnored && first_order_promotion === true) || goods_first_order_promotion === true) {
     reasons.push('First-order promotion on goods or domestic shipping cannot support repeat-order economics.');
   } else if (!goodsPromoClear || (!bareGoodsMode && !freightPromoClear)) {
     reasons.push('Regular repeat-order status (first_order_promotion: false) must be explicitly confirmed.');
