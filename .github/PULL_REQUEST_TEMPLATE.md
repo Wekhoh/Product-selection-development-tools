@@ -19,7 +19,7 @@ Closes #<issue_number>
      - `[极简修]` — real issue with over-heavy GPT proposal -> simplest adequate fix
      - `[驳回 · 过度防御]` — extreme hypothetical in a single-person local tool -> rejected with rationale, zero defensive lines added -->
 
-- Review model & mode: `gpt-6.2-astra` (`ultrafast + max`, local subscription `$0` API spend, read-only)
+- Review model & mode: `gpt-6.2-astra` (default speed + `max`, local subscription `$0` API spend, read-only)
 - Rulings:
 
 ## Merge Danger
