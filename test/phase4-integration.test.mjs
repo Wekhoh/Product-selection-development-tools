@@ -699,6 +699,25 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
 
       const dryFile = JSON.parse(readFileSync(dryOutPath, 'utf8'));
       assert.equal(Object.hasOwn(dryFile.frozen_packet, 'execution_policy_ref'), false);
+      assert.equal(
+        dryFile.cli_args_preview.includes('service_tier="default"'),
+        true,
+        'redteam-review without --service-tier must pass -c service_tier="default" (normal/default speed, overriding host ~/.codex/config.toml)',
+      );
+
+      const optInOutPath = join(tempDir, 'review-dry-ultrafast.json');
+      const sOptIn = makeCapturingStreams();
+      const optInCode = await runPhase2Cli([
+        'redteam-review',
+        '--packet', packetPath,
+        '--output', optInOutPath,
+        '--effort', 'max',
+        '--service-tier', 'ultrafast',
+        '--dry-run',
+      ], sOptIn);
+      assert.equal(optInCode, 0, sOptIn.getErr());
+      const optInFile = JSON.parse(readFileSync(optInOutPath, 'utf8'));
+      assert.equal(optInFile.cli_args_preview.includes('service_tier="ultrafast"'), true);
 
       // 1b) P0-25 & P2-11: `--offline`, `execution_policy_ref: null`, and colliding `--output` must NEVER spawn codex!
       const sentinelPath = join(tempDir, 'must-not-spawn.txt');

@@ -57,6 +57,7 @@ import { renderReport } from './report.mjs';
 import { extractSpApiFinalistCalibration, ingestTrialSpecification, mergeKeepaPayloadsIntoPeerListings } from './raw-ingest.mjs';
 import { assertNoRawPii, containsSecretToken, sanitizeDiagnosticText } from './contracts.mjs';
 import {
+  DEFAULT_CODEX_SERVICE_TIER,
   WORKFLOW_RESPONSES_TASKS,
   OpenAiClient,
   assertAuthorizedReviewExecutionPolicy,
@@ -1779,7 +1780,7 @@ export async function runPhase2Cli(
             }
           }
         }
-        const serviceTier = values['service-tier'] ? values['service-tier'].trim() : 'ultrafast';
+        const serviceTier = values['service-tier']?.trim() || DEFAULT_CODEX_SERVICE_TIER;
         const skippedForNonQualifying = Boolean(skipNonQualifyingReason);
 
         // P2-11: Preflight and stage protected destination (including directory, special-file, PATH/shim/JS target & --codex-bin checks) BEFORE invoking Codex CLI!

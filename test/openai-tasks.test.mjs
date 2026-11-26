@@ -805,6 +805,41 @@ test('codex-runner (P0-26, P0-27, P0-28, P2-08, P2-09): mandatory guards, allowl
     });
 
     assert.equal(okCalls.length, 1);
+    assert.equal(okCalls[0].args.includes('service_tier="default"'), true, 'Default Codex execution must pass -c service_tier="default" to override any host ~/.codex/config.toml ultrafast setting');
+    assert.equal(execRes.requested_service_tier, 'default');
+    assert.equal(execRes.effective_service_tier, 'default');
+
+    // Explicit serviceTier: null inherits host config (omits CLI flag), records null effective_service_tier, and hashes distinct from explicit 'default'
+    const { spawnImpl: inheritSpawn, calls: inheritCalls } = createMockSpawn(({ args, child }) => {
+      const outPath = args[args.indexOf('-o') + 1];
+      writeFileSync(outPath, JSON.stringify({ status: 'ok_inherit' }), 'utf8');
+      child.emit('close', 0, null);
+    });
+    const inheritRes = await runCodexExecJson({
+      prompt: 'Audit synthetic packet inheriting host config tier.',
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['status'],
+        properties: { status: { type: 'string' } },
+      },
+      serviceTier: null,
+      testMode: true,
+      spawnImpl: inheritSpawn,
+    });
+    assert.equal(inheritCalls.length, 1);
+    assert.equal(inheritCalls[0].args.some(a => a.startsWith('service_tier=')), false);
+    assert.equal(inheritRes.requested_service_tier, null);
+    assert.equal(inheritRes.effective_service_tier, null);
+    assert.notEqual(inheritRes.payload_sha256, execRes.payload_sha256);
+
+    const samePacket = makeSamplePacketInput();
+    const dryDefaultTier = await runCodexEvidenceReview(samePacket, { dryRun: true, testMode: true });
+    const dryInheritTier = await runCodexEvidenceReview(samePacket, { serviceTier: null, dryRun: true, testMode: true });
+    assert.equal(dryDefaultTier.cli_args_preview.includes('service_tier="default"'), true);
+    assert.equal(dryInheritTier.cli_args_preview.some(a => a.startsWith('service_tier=')), false);
+    assert.notEqual(dryDefaultTier.payload_sha256, dryInheritTier.payload_sha256);
+
     const passedEnv = okCalls[0].options.env;
     assert.equal(passedEnv.CODEX_HOME, '/tmp/codex-sub-home');
     assert.equal(passedEnv.PATH, '/usr/bin');

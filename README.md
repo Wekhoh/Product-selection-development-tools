@@ -36,7 +36,7 @@ node src/phase2-cli.mjs status --db outputs/example-phase2.sqlite
 node src/phase2-cli.mjs openai-status --db outputs/example-phase2.sqlite
 ```
 
-OpenAI budget reconciliation, offline Batch `.jsonl` construction, and Gate-4 red-team review CLI subcommands (paid OpenAI HTTP policy remains `enabled: false` by default; `redteam-review` runs strictly offline when `--dry-run` or `--offline` is supplied, and when run live uses local subscription-backed `codex exec` on `gpt-6.2-astra` with `max` reasoning — pass `--service-tier default` for normal speed per the `2026-11-26` owner override while updating runtime `DEFAULT_CODEX_SERVICE_TIER` is tracked for follow-up/Stage 6):
+OpenAI budget reconciliation, offline Batch `.jsonl` construction, and Gate-4 red-team review CLI subcommands (paid OpenAI HTTP policy remains `enabled: false` by default; `redteam-review` runs strictly offline when `--dry-run` or `--offline` is supplied, and when run live uses local subscription-backed `codex exec` on `gpt-6.2-astra` at normal/default speed with `max` reasoning):
 
 ```sh
 node src/phase2-cli.mjs openai-reconcile --db outputs/example-phase2.sqlite --legacy-budget .local/legacy-budget.sqlite3 --monthly-limit-cents 20000
