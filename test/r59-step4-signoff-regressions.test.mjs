@@ -129,7 +129,7 @@ function extractExtraSyntheticAsins(cand) {
   return [...new Set([...s.matchAll(/\bB0[A-Z0-9]{8}\b/g)].map(m => m[0]).filter(a => a !== 'B0SYNNEW14'))];
 }
 
-test('Astra Sign-Off #3: standalone Keepa receipts merge by ASIN; undated 92-pt curve stays unsteady in Gate 1A while dated 90d flat $59 passes', async () => {
+test('Astra Sign-Off #3: standalone Keepa receipts merge by ASIN; undated compact curve stays unsteady in Gate 1A while dated 90d flat $59 passes', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'step4-reg3-'));
   try {
     const peer400d = {
@@ -142,12 +142,12 @@ test('Astra Sign-Off #3: standalone Keepa receipts merge by ASIN; undated 92-pt 
       pkg: { length_in: 12, width_in: 8, height_in: 3, unit_weight_lb: 2.0 },
     };
 
-    // Case A: Undated 92-point Keepa receipt -> keepa_90d_steady = false -> 400d veteran MUST NOT get steady pass!
+    // Case A: Undated >=90-sample compact Keepa receipt -> keepa_90d_steady = false -> 400d veteran MUST NOT get steady pass!
     const undatedKeepaPath = join(dir, 'keepa-undated.json');
     writeFileSync(undatedKeepaPath, JSON.stringify({
       asin: 'B0SYNV400D',
       series: {
-        price: [...Array(89).fill(59.00), 49.00, 49.00, 49.00],
+        price: [...Array(100).fill(59.00), ...Array(4).fill(49.00)],
       },
     }, null, 2));
 

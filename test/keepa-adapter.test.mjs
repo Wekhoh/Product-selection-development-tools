@@ -90,28 +90,26 @@ test('keepa adapter: timestamped 1-year & 90d curves preserve ts/missing calenda
   assert.equal(facts360.keepa_90d_high_usd, 59.00);
 });
 
-test('keepa adapter: undated compact curve never lets 1-point buybox overwrite 92-point price and flags 3-sample tail dip without granting steady plateau', () => {
-  // Mirrors the exact structure caught in Step 3A: 92 undated price samples ($39.99 dominant 66/92, 3 tail pts at $32.29) + 1-point undated buybox [42.99]
-  const price92 = [
-    ...Array(3).fill(42.99),
-    ...Array(17).fill(39.99),
-    ...Array(4).fill(35.99),
-    ...Array(23).fill(39.99),
-    ...Array(2).fill(35.99),
-    ...Array(6).fill(39.99),
-    ...Array(13).fill(42.99),
-    ...Array(20).fill(39.99),
-    42.99,
-    ...Array(3).fill(32.29),
+test('keepa adapter: undated compact curve never lets 1-point buybox overwrite multi-point price and flags brief tail dip without granting steady plateau', () => {
+  // Synthetic undated compact series (>= 90 samples so undated sample count cannot be mistaken for 90 calendar days):
+  // 108 price samples ($54.00 dominant 80/108, 4-sample tail dip at $44.50) + 1-point undated buybox [58.50]
+  const syntheticPrices = [
+    ...Array(10).fill(58.50),
+    ...Array(24).fill(54.00),
+    ...Array(6).fill(48.00),
+    ...Array(31).fill(54.00),
+    ...Array(8).fill(58.50),
+    ...Array(25).fill(54.00),
+    ...Array(4).fill(44.50),
   ];
-  assert.equal(price92.length, 92);
+  assert.equal(syntheticPrices.length, 108);
 
   const parsed = parseSellerSpriteKeepaPayload({
-    asin: 'B0SYNPAINT',
+    asin: 'B0SYNTCOMP',
     series: {
-      price: price92,
-      buybox: [42.99],
-      priceList: [42.99],
+      price: syntheticPrices,
+      buybox: [58.50],
+      priceList: [58.50],
     },
   });
 
@@ -119,20 +117,21 @@ test('keepa adapter: undated compact curve never lets 1-point buybox overwrite 9
   assert.equal(parsed.shape, 'undated_compact_curve');
   assert.equal(parsed.has_timestamps, false);
   assert.equal(parsed.date_window, null);
-  assert.equal(parsed.current_price_usd, 32.29, '1-point buybox must NEVER overwrite 92-point price latest value');
+  assert.equal(parsed.current_price_usd, 44.50, '1-point buybox must NEVER overwrite multi-point price latest value');
   assert.equal(parsed.current_price_source, 'price');
   assert.equal(parsed.regular_median_usd, null, 'Undated curve must not claim a dated 90d median');
-  assert.equal(parsed.undated_sample_median_usd, 39.99);
-  assert.equal(parsed.dominant_plateau_usd, 39.99);
-  assert.equal(parsed.dominant_plateau_samples, 66);
+  assert.equal(parsed.undated_sample_median_usd, 54.00);
+  assert.equal(parsed.dominant_plateau_usd, 54.00);
+  assert.equal(parsed.dominant_plateau_samples, 80);
+  assert.equal(parsed.tail_run_samples, 4);
   assert.equal(parsed.is_brief_tail_dip, true);
-  assert.equal(parsed.keepa_90d_steady, false, 'Undated 3-sample tail dip must NOT be marked keepa_90d_steady');
+  assert.equal(parsed.keepa_90d_steady, false, 'Undated tail dip must NOT be marked keepa_90d_steady');
   assert.equal(parsed.coupon_status, 'unknown_not_returned', 'Unreturned coupon series must report unknown_not_returned, never none_observed');
 
   const judgeFacts = buildKeepaPeerFactsForMarketJudge(parsed);
-  assert.equal(judgeFacts.current_price_usd, 32.29);
+  assert.equal(judgeFacts.current_price_usd, 44.50);
   assert.equal(judgeFacts.keepa_90d_median_usd, null);
-  assert.equal(judgeFacts.undated_sample_median_usd, 39.99);
+  assert.equal(judgeFacts.undated_sample_median_usd, 54.00);
   assert.equal(judgeFacts.coupon_status, 'unknown_not_returned');
 
   // Package-only snapshot must NOT throw TypeError in buildKeepaPeerFactsForMarketJudge
