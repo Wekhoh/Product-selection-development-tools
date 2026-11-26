@@ -14,7 +14,7 @@ _Avoid_: One shared keyword, five mandatory searches per card, raw keyword count
 
 **Qualifying complete card (合格完整卡)**:
 A concrete form with supported existing screening eligibility, a bounded preliminary rights assessment and all required item scores for a declared operating period. This is eligibility for owner review, not a new total-score threshold or proof of commercial success.
-_Avoid_: Rejected/pending card counted toward the ten-card target, guaranteed profitable product
+_Avoid_: Rejected/pending card counted toward the qualifying-card target, guaranteed profitable product
 
 **Discovery signal (发现线索)**:
 A sourced market observation, product record or recurring use need that gives a reason to investigate a direction. It is neither proof of an attractive opportunity nor a keyword invented without supporting evidence.
