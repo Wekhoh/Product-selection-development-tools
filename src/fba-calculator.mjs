@@ -848,6 +848,27 @@ export function resolveVerifiedFactoryKey(source) {
   return kit.distinct_factory_ids[0];
 }
 
+/**
+ * Extract ALL normalized canonical identity keys (`<field>:<normalized>`) present on a single-factory
+ * offer/quote object (e.g., `factory_id`, `supplier_id`, `seller_member_id`, `company_name`, `shop_url`)
+ * so cross-field aliases (offer 1 carrying `factory_id + seller_member_id`, offer 2 carrying only
+ * `seller_member_id`) deduplicate cleanly to the same factory without collapsing distinct factories.
+ */
+export function extractNormalizedFactoryIdentityKeys(source) {
+  if (!source || typeof source !== 'object') return [];
+  const keys = [];
+  for (const fieldName of FACTORY_IDENTITY_FIELDS) {
+    const rawVal = source[fieldName];
+    let trimmed = '';
+    if (typeof rawVal === 'string') trimmed = rawVal.trim();
+    else if (typeof rawVal === 'number' && Number.isSafeInteger(rawVal)) trimmed = String(rawVal);
+    if (!trimmed) continue;
+    const norm = fieldName === 'shop_url' ? normalizeShopUrlKey(trimmed) : trimmed.toLowerCase();
+    keys.push(`${fieldName}:${norm}`);
+  }
+  return keys;
+}
+
 export function resolveConsistentSkuLines(input, procLine) {
   const present = [input?.sku_lines, input?.source_inputs?.sku_lines, procLine?.sku_lines]
     .filter(v => v !== undefined);

@@ -753,3 +753,176 @@ test('Issue #28 Astra review regressions: Gate-0 baby-plate/ages/pins/pet-word-o
     assert.equal(outAmzCompatJson.rendered.rows[0].rendered_tile_label, '#A7', 'Amazon non-integer idx "A7" must keep "#A7" badge');
   });
 });
+
+test('Stage 3B independent audit hardening: Gate-0 bare-nursery & parent-marketing child traps, remaining adult exemptions, title patent-pending Luna clamp, 1688 metadata-only replay, cross-field dedup, same-URI multi-sheet replay, and all-choices-refused guard', () => {
+  // 1) Genuine statutory <=12y child items MUST stay hard-excluded even with bare "nursery" nouns or "for Parents/Moms" marketing copy
+  const childMustExclude = [
+    'Nursery Mat Soft Foam Crawling Pad',
+    'Nursery Supplies Starter Bundle',
+    'Nursery Cups Set of 4',
+    'Baby High Chair - Easy Clean Design for Parents',
+    'Baby Walker with Wheels, Gift for New Parents',
+    'Infant Bath Tub for Newborns, Designed for Moms',
+    'Toddler Learning Tower Step Stool for Parents Kitchen Helper',
+    'Newborn Swaddle Blanket Gift for Moms',
+  ];
+  for (const title of childMustExclude) {
+    const res = evaluateGate0CategoryBoundary({ title });
+    assert.equal(res.verdict, 'excluded_childrens_product', `Genuine child product must hard-exclude: "${title}"`);
+    assert.equal(res.hard_exclusion, true);
+    assert.equal(res.adult_exemption_applied, false);
+  }
+
+  // 2) Additional real non-child adult products MUST pass without false kill
+  const adultMustAllow = [
+    '5/8-Inch Baby Pin Wall Plate for Studio Lighting',
+    'Stainless Steel Baby Back Rib Rack for Smoker Grill',
+    'Baby Lock Serger Dust Cover',
+    'Nursery Grafting Tape 100ft',
+    'Memory Foam Adult Car Booster Seat Cushion for Short Drivers',
+    'Baby Monitor Floor Stand',
+  ];
+  for (const title of adultMustAllow) {
+    const res = evaluateGate0CategoryBoundary({ title });
+    assert.equal(res.passed, true, `Non-child adult item must pass Gate-0: "${title}" (got ${res.verdict})`);
+    assert.equal(res.hard_exclusion, false);
+    assert.equal(res.adult_exemption_applied, true);
+  }
+
+  // 3) Stage-1 Luna non-overreach: title mentioning "Patent Pending" must clamp (never auto-exclude),
+  //    powered-disabled skip must NOT be mislabeled skipped_red_ocean_default, and summary initializes gate0_skipped_red_ocean_count
+  const s1Cands = [
+    { candidate_id: 'PAT-TITLE', title: 'Magnetic Mahjong Rack Patent Pending Design', price_usd: 59.99 },
+    { candidate_id: 'PWR-DISABLED', title: 'Cordless Heated Espresso Cup Warmer', price_usd: 42.99 },
+  ];
+  const s1Res = parseStage1DecisionsResponses(s1Cands, [{
+    answers: [
+      { id: getStage1DecisionQuestionIds('PAT-TITLE').predicateId, type: 'predicate', probability: 0.92, value: true },
+      { id: getStage1DecisionQuestionIds('PAT-TITLE').choiceId, type: 'choice', value: 'exact_peer' },
+      { id: getStage1DecisionQuestionIds('PWR-DISABLED').predicateId, type: 'predicate', probability: 0.10, value: false },
+      { id: getStage1DecisionQuestionIds('PWR-DISABLED').choiceId, type: 'choice', value: 'exact_peer' },
+    ],
+  }], { gate0Config: { allow_low_risk_powered_non_3c: false, enforce_red_ocean_skip: true } });
+  const patItem = s1Res.items.find(i => i.candidate_id === 'PAT-TITLE');
+  assert.equal(patItem.gate0_status, 'allowed');
+  assert.equal(patItem.triage_disposition, 'amber_manual_review');
+  assert.equal(patItem.needs_review, true);
+  assert.equal(patItem.luna_non_overreach_clamped, true);
+  const pwrItem = s1Res.items.find(i => i.candidate_id === 'PWR-DISABLED');
+  assert.notEqual(pwrItem.triage_disposition, 'skipped_red_ocean_default', 'Powered-disabled item must NOT be mislabeled skipped_red_ocean_default');
+  assert.equal(s1Res.summary.gate0_skipped_red_ocean_count, 0, 'summary.gate0_skipped_red_ocean_count must be initialized to 0');
+
+  // 4) 1688 metadata-only mode with >40 offers carrying tile_index: 1..42 must NOT crash on parse
+  const offers42 = Array.from({ length: 42 }, (_, i) => ({
+    offer_id: `META-${i + 1}`,
+    tile_index: i + 1,
+    factory_id: `MF-${i + 1}`,
+    price_cny: 40 + i,
+    moq: 100,
+    title: 'Solid Wood Rack',
+  }));
+  const metaReqs = build1688SearchRankingDecisionsRequests({ offers: offers42, targetSpec: 'Solid Wood Rack' });
+  const metaResps = metaReqs.map(r => ({
+    answers: r.questions.map(q => q.type === 'predicate'
+      ? { id: q.id, type: 'predicate', value: true, probability: 0.85 }
+      : { id: q.id, type: 'choice', value: 'priority_complete_kit_factory' }),
+  }));
+  const metaParsed = parse1688SearchRankingDecisionsResponses(offers42, metaResps, { requests: metaReqs });
+  assert.equal(metaParsed.candidate_eliminated, false);
+  assert.equal(metaParsed.shortlist_to_open.length, 3);
+  assert.equal(metaParsed.ranked_offers[0].sheet_index, null);
+  assert.equal(metaParsed.ranked_offers[0].tile_index, null);
+
+  // 5) 1688 cross-field same-factory deduplication (offer1 has factory_id + seller_member_id, offer2 has matching seller_member_id only)
+  const crossFieldOffers = [
+    { offer_id: 'CF-1', factory_id: 'fac-A', seller_member_id: 'seller-A', price_cny: 30, moq: 100, title: 'Kit 1' },
+    { offer_id: 'CF-2', seller_member_id: 'seller-A', price_cny: 31, moq: 100, title: 'Kit 2 (same seller)' },
+    { offer_id: 'CF-3', factory_id: 'fac-B', price_cny: 35, moq: 100, title: 'Kit 3' },
+    { offer_id: 'CF-4', factory_id: 'fac-C', price_cny: 36, moq: 100, title: 'Kit 4' },
+  ];
+  const cfReqs = build1688SearchRankingDecisionsRequests({ offers: crossFieldOffers, targetSpec: 'Kit' });
+  const cfResps = cfReqs.map(r => ({
+    answers: r.questions.map(q => q.type === 'predicate'
+      ? { id: q.id, type: 'predicate', value: true, probability: 0.9 }
+      : { id: q.id, type: 'choice', value: 'priority_complete_kit_factory' }),
+  }));
+  const cfParsed = parse1688SearchRankingDecisionsResponses(crossFieldOffers, cfResps, { requests: cfReqs });
+  assert.deepEqual(
+    cfParsed.shortlist_to_open.map(o => o.offer_id),
+    ['CF-1', 'CF-3', 'CF-4'],
+    'Cross-field matching seller_member_id must deduplicate CF-2 against CF-1',
+  );
+
+  // 6) Multi-sheet JSON replay with identical image URIs must preserve distinct sheet_index 1 vs 2
+  const dupImgReqs = build1688SearchRankingDecisionsRequests({
+    sheets: [
+      { contactSheetDataUrl: TINY_PNG_DATA_URI, offers: [{ offer_id: 'S1-1', tile_index: 1, price_cny: 30, moq: 100, title: 'A' }] },
+      { contactSheetDataUrl: TINY_PNG_DATA_URI, offers: [{ offer_id: 'S2-1', tile_index: 1, price_cny: 32, moq: 100, title: 'B' }] },
+    ],
+    targetSpec: 'Kit',
+  });
+  const dupImgJson = JSON.parse(JSON.stringify(dupImgReqs));
+  const dupImgResps = dupImgJson.map(r => ({
+    answers: r.questions.map(q => q.type === 'predicate'
+      ? { id: q.id, type: 'predicate', value: true, probability: 0.9 }
+      : { id: q.id, type: 'choice', value: 'priority_complete_kit_factory' }),
+  }));
+  const dupImgParsed = parse1688SearchRankingDecisionsResponses(null, dupImgResps, { requests: dupImgJson });
+  assert.equal(dupImgParsed.ranked_offers.find(o => o.offer_id === 'S1-1').sheet_index, 1);
+  assert.equal(dupImgParsed.ranked_offers.find(o => o.offer_id === 'S2-1').sheet_index, 2);
+
+  // 7) All choice questions refused (even if predicate answered false) must NOT produce model-backed auto-shortlist
+  const partialRefOffers = [
+    { offer_id: 'PR-1', factory_id: 'pf-1', price_cny: 20, moq: 100, title: 'Bare' },
+    { offer_id: 'PR-2', factory_id: 'pf-2', price_cny: 25, moq: 100, title: 'Bare 2' },
+  ];
+  const prReqs = build1688SearchRankingDecisionsRequests({ offers: partialRefOffers, targetSpec: 'Kit' });
+  const prResps = prReqs.map(r => ({
+    answers: r.questions.map(q => q.type === 'predicate'
+      ? { id: q.id, type: 'predicate', value: false, probability: 0.02 }
+      : { id: q.id, type: 'refusal' }),
+  }));
+  const prParsed = parse1688SearchRankingDecisionsResponses(partialRefOffers, prResps, { requests: prReqs });
+  assert.equal(prParsed.candidate_eliminated, false);
+  assert.equal(prParsed.shortlist_to_open.length, 0, 'All-choice-refused responses must not emit auto-shortlist recommendations');
+  assert.equal(prParsed.next_step, 'refine_1688_search_or_manual_review');
+  assert.equal(prParsed.fallback_price_order_offers.length, 2);
+
+  // 8) prepare1688DetailVerificationHandoff must reject whitespace-only targetSpec
+  assert.throws(
+    () => prepare1688DetailVerificationHandoff({ rankingResult: cfParsed, targetSpec: '   ' }),
+    /targetSpec/i,
+  );
+
+  // 9) Python 1688 contact sheet handles long CJK titles/badges cleanly via pixel-width fitting and rejects non-finite prices
+  withTempDir(dir => {
+    const inCjk = join(dir, 'cjk-offers.json');
+    const outCjk = join(dir, 'cjk-sheet.png');
+    writeFileSync(inCjk, JSON.stringify({
+      title: '1688 搜索页中文长标题防溢出回归',
+      offers: [
+        {
+          offer_id: '795289482960',
+          price_cny: 38.5,
+          price_cny_max: 45.5,
+          moq: 100,
+          title: '实木微缩模型颜料架98孔工作台桌面收纳架带抽屉亚马逊跨境热销工厂直销批发',
+          factory_badge: '超级工厂·实力商家',
+          province: '山东菏泽曹县',
+        },
+      ],
+    }), 'utf8');
+    const cjkRes = spawnSync(process.execPath, [
+      CLI_PATH, 'contact-sheet',
+      '--input', inCjk,
+      '--output', outCjk,
+      '--mode', '1688',
+      '--offline',
+    ], { encoding: 'utf8' });
+    assert.equal(cjkRes.status, 0, `CJK 1688 contact-sheet failed: ${cjkRes.stderr}`);
+    const cjkOut = JSON.parse(cjkRes.stdout);
+    assert.equal(cjkOut.rendered.mode, '1688');
+    assert.equal(cjkOut.rendered.items_rendered, 1);
+    assert.equal(cjkOut.rendered.rows[0].rendered_price_label, '¥38.50-¥45.50');
+  });
+});

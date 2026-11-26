@@ -4459,7 +4459,7 @@ export async function runPhase2Batch(store, {
         } catch { /* ignore */ }
       }
       const hasSourcingExec = typeof (item.sourcing_executor ?? sourcing_executor) === 'function';
-      const requestFreshFactory = prevNeedMore && hasSourcingExec && !Array.isArray(item.existing_quotes) && !item.existing_quote;
+      const requestFreshFactory = (prevNeedMore || item.manual_owner_entry === true) && hasSourcingExec && !Array.isArray(item.existing_quotes) && !item.existing_quote;
       afterGate1A.push({
         item,
         form_id: formId,
@@ -4503,6 +4503,7 @@ export async function runPhase2Batch(store, {
         require_ui_readback: item.require_ui_readback,
         as_of_date,
         allow_crossing_to_gate2_3: item.allow_crossing_to_gate2_3 === true,
+        manual_owner_entry: item.manual_owner_entry === true,
         // P0-29: Dispatch 1688 vision precheck ONLY AFTER authoritative Gate-1B queue admission & exclusive lease acquisition!
         on_lease_acquired_hook: hasVisionInput
           ? async () => {

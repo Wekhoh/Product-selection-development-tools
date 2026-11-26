@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { spawnSync } from 'node:child_process';
 import { openSelectionStore } from '../src/store.mjs';
 import { scoreBatch, scoreCandidate } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
@@ -1073,5 +1075,301 @@ test('Stage 3A Astra review regressions: identity normalization, conflict/compon
     assert.equal(g1bLegacy.proceed_to_gate2_3, false);
   } finally {
     store.close();
+  }
+});
+
+test('Stage 3A independent audit hardening: evergreen Q4 peak missing kit component, embedded email PII in factory/company fields, and manual_owner_entry forwarding via runPhase2Batch & CLI gate1b', async () => {
+  // 1) Evergreen candidate with companion unpublished Q4 peak period omitting a required saleable_set_composition component must NOT unwrap or qualify
+  const rackA = {
+    component_id: 'rack', offer_id: 'off-r1', sku_id: 'sku-r1', factory_id: 'FAC-EVG-A',
+    qty_per_saleable_set: 1, pack_multiple: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: 42, regular_goods_promo_false: true,
+  };
+  const bagA = {
+    component_id: 'bag', offer_id: 'off-b1', sku_id: 'sku-b1', factory_id: 'FAC-EVG-A',
+    qty_per_saleable_set: 1, pack_multiple: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: 18, regular_goods_promo_false: true,
+  };
+  const evgMissingPeakComp = buildMultiSkuCandidate({ id: 'cand-evg-peak-missing-bag', skuLines: [rackA, bagA], seasonal: true });
+  evgMissingPeakComp.product_seasonality = 'evergreen';
+  evgMissingPeakComp.saleable_set_composition = [
+    { component_id: 'rack', qty_per_saleable_set: 1 },
+    { component_id: 'bag', qty_per_saleable_set: 1 },
+  ];
+  const peakPeriod = evgMissingPeakComp.economics.operating_periods.find(p => p.id === 'peak');
+  const peakProc = peakPeriod.scenarios[0].cost_ledger.lines.find(l => l.id === 'procurement');
+  peakProc.sku_lines = [rackA]; // Missing required 'bag' component in peak companion period!
+  peakProc.amount_usd = Number(((42 * 100) / (100 * 7.2)).toFixed(10));
+  const evgRes = scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [evgMissingPeakComp] }, r59Profile).candidates[0];
+  assert.equal(evgRes.qualification.counts_toward_target, false, 'Evergreen Q4 companion peak omitting a required kit component must NEVER unwrap or qualify');
+
+  // 2) store.mjs must block emails embedded inside factory_id, company_name, or sku_lines[].company_name
+  const store = openSelectionStore(':memory:');
+  try {
+    store.upsertCandidateForm({
+      form_id: 'form-embed-email',
+      product_family_key: 'embed-email',
+      label: 'Embedded Email PII Form',
+      buyer_task: 'Hold items',
+      saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+    });
+    const baseQuote = extra => ({
+      quote_id: `q-em-${Math.random().toString(36).slice(2, 8)}`,
+      form_id: 'form-embed-email',
+      observed_at: '2026-11-26',
+      redacted_destination: '广东深圳',
+      raw_readback_ref: 'ev-em',
+      goods_first_order_promotion: false,
+      freight_first_order_promotion: false,
+      pricing_basis: 'bare_goods_1688',
+      bare_goods_screening: true,
+      ui_readback: VALID_UI_READBACK,
+      sku_lines: [{
+        component_id: 'unit', offer_id: 'off-1', sku_id: 'sku-1', pack_multiple: 1,
+        qty_per_saleable_set: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: 35, regular_goods_promo_false: true,
+      }],
+      goods_cny_total: 3500,
+      ...extra,
+    });
+    assert.throws(
+      () => store.recordSourcingQuote1688(baseQuote({ factory_id: 'Caoxian Mill (sales@example.com)' })),
+      /email/i,
+      'Embedded email inside factory_id must be rejected',
+    );
+    assert.throws(
+      () => store.recordSourcingQuote1688(baseQuote({ company_name: 'Wood Workshop contact@factory.cn' })),
+      /email/i,
+      'Embedded email inside company_name must be rejected',
+    );
+
+    // 3) runPhase2Batch must forward manual_owner_entry: true so a gate1b_rejected 3-factory form can be reopened with a 4th manual factory via batch sourcing_executor
+    const pkg = { length_in: 12, width_in: 8, height_in: 4, unit_weight_lb: 1.5 };
+    const cuFt = Number(((pkg.length_in * pkg.width_in * pkg.height_in) / 1728).toFixed(6));
+    const baseSc = {
+      id: 'sc-batch-man',
+      price_usd: 45,
+      available_date: '2025-05-01',
+      pkg,
+      fx_cny_per_usd: 7.2,
+      refund_fraction: 0.05,
+      physical_return_fraction: 0.05,
+      fee_category: 'Home and Kitchen',
+      referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5, minimum_referral_usd: 0.3 },
+      headhaul_usd: 1.8,
+      collection_rate: 0.005,
+      other_applicable_usd: 0,
+      sales_window: { from: '2027-02-01', through: '2027-10-14' },
+      storage_window: { from: '2027-02-01', through: '2027-09-30' },
+      inbound_window: { from: '2027-01-15', through: '2027-10-14' },
+    };
+    const formSpecM = {
+      form_id: 'form-batch-man4',
+      product_family_key: 'batch-man4',
+      label: 'Batch Manual 4th Factory Form',
+      buyer_task: 'Hold items',
+      saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+    };
+    store.upsertCandidateForm(formSpecM);
+    const g1aM = runGate1AForForm(store, { form_id: 'form-batch-man4', scenarios: [baseSc] });
+    const declM = g1aM.declared_scenarios[0];
+    const mkFailQ = (qid, fid, priceCny) => ({
+      quote_id: qid,
+      form_id: 'form-batch-man4',
+      factory_id: fid,
+      spec_variant_key: 'std-v1',
+      observed_at: '2026-11-26T10:00:00Z',
+      redacted_destination: '广东深圳',
+      raw_readback_ref: `ev-${qid}`,
+      goods_first_order_promotion: false,
+      freight_first_order_promotion: false,
+      pricing_basis: 'bare_goods_1688',
+      bare_goods_screening: true,
+      fx_cny_per_usd: 7.2,
+      pkg,
+      ui_readback: VALID_UI_READBACK,
+      sku_lines: [{
+        component_id: 'unit', offer_id: `off-${qid}`, sku_id: `sku-${qid}`, factory_id: fid,
+        pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 100, ordered_qty: 100,
+        unit_price_cny: priceCny, regular_goods_promo_false: true,
+      }],
+      goods_cny_total: priceCny * 100,
+      domestic_freight_cny_total: null,
+    });
+    const esBuilderM = () => ({
+      profile_revision: 59,
+      id: declM.id,
+      saleable_unit: '1 unit',
+      price_usd: declM.price_usd,
+      fx_cny_per_usd: declM.fx_cny_per_usd,
+      pkg,
+      headhaul: { usd_per_unit: declM.headhaul_usd, bond_included: true },
+      refund_fraction: 0.05,
+      physical_return_fraction: 0.05,
+      return_threshold: 0.081,
+      returns_processing_usd: 0,
+      is_apparel_or_shoes: false,
+      referral_terms: baseSc.referral_terms,
+      fulfillment_usd: declM.fulfillment_usd,
+      placement_usd: declM.placement_range_usd[1],
+      storage: { cubic_feet_per_unit: cuFt, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+      operating_period: 'off_peak',
+      operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+      fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'p1', sales: baseSc.sales_window, storage: baseSc.storage_window, inbound: baseSc.inbound_window },
+      collection_rate: 0.005,
+      other_applicable_usd: 0,
+      specific_rights_conflict: 'unknown',
+      strong_date_dependency: false,
+    });
+    store.recordSourcingQuotesBatch1688([
+      mkFailQ('qm-1', 'fm-1', 150),
+      mkFailQ('qm-2', 'fm-2', 148),
+      mkFailQ('qm-3', 'fm-3', 145),
+    ]);
+    const rej3 = await runGate1BForForm(store, {
+      form_id: 'form-batch-man4',
+      profile_revision: 59,
+      as_of_date: '2026-11-26',
+      early_screen_builder: esBuilderM,
+    });
+    assert.equal(rej3.status, 'gate1b_rejected');
+    assert.equal(rej3.second_factory_quote_needed, false);
+
+    let batchManCalls = 0;
+    const batchOut = await runPhase2Batch(store, {
+      profile: r59Profile,
+      as_of_date: '2026-11-26',
+      items: [{
+        form: formSpecM,
+        gate1a_scenarios: [baseSc],
+        manual_owner_entry: true,
+        sourcing_executor: async () => {
+          batchManCalls += 1;
+          return {
+            status: 'quoted',
+            quote: { ...mkFailQ('qm-4-manual', 'fm-4-owner', 35), manual_owner_entry: true },
+          };
+        },
+        early_screen_builder: esBuilderM,
+      }],
+    });
+    assert.equal(batchManCalls, 1, 'runPhase2Batch must forward manual_owner_entry: true and dispatch manual 4th factory');
+    assert.equal(batchOut.gate1b[0].status, 'gate1b_passed');
+  } finally {
+    store.close();
+  }
+
+  // 4) Real CLI `phase2-cli.mjs gate1b` must forward top-level `manual_owner_entry: true` onto the 4th manual quote & reopen gate1b_rejected
+  const tmpDir = mkdtempSync(join(tmpdir(), 'stage3a-cli-man4-'));
+  try {
+    const dbPath = join(tmpDir, 'sel.sqlite');
+    const cliStore = openSelectionStore(dbPath);
+    const pkg = { length_in: 12, width_in: 8, height_in: 4, unit_weight_lb: 1.5 };
+    const cuFt = Number(((pkg.length_in * pkg.width_in * pkg.height_in) / 1728).toFixed(6));
+    const baseSc = {
+      id: 'sc-cli-man',
+      price_usd: 45,
+      available_date: '2025-05-01',
+      pkg,
+      fx_cny_per_usd: 7.2,
+      refund_fraction: 0.05,
+      physical_return_fraction: 0.05,
+      fee_category: 'Home and Kitchen',
+      referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5, minimum_referral_usd: 0.3 },
+      headhaul_usd: 1.8,
+      collection_rate: 0.005,
+      other_applicable_usd: 0,
+      sales_window: { from: '2027-02-01', through: '2027-10-14' },
+      storage_window: { from: '2027-02-01', through: '2027-09-30' },
+      inbound_window: { from: '2027-01-15', through: '2027-10-14' },
+    };
+    cliStore.upsertCandidateForm({
+      form_id: 'form-cli-man4',
+      product_family_key: 'cli-man4',
+      label: 'CLI Manual 4th Factory Form',
+      buyer_task: 'Hold items',
+      saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+    });
+    const g1aC = runGate1AForForm(cliStore, { form_id: 'form-cli-man4', scenarios: [baseSc] });
+    const declC = g1aC.declared_scenarios[0];
+    const mkCliQ = (qid, fid, priceCny) => ({
+      quote_id: qid,
+      form_id: 'form-cli-man4',
+      factory_id: fid,
+      spec_variant_key: 'std-cli',
+      observed_at: '2026-11-26T10:00:00Z',
+      redacted_destination: '广东深圳',
+      raw_readback_ref: `ev-${qid}`,
+      goods_first_order_promotion: false,
+      freight_first_order_promotion: false,
+      pricing_basis: 'bare_goods_1688',
+      bare_goods_screening: true,
+      fx_cny_per_usd: 7.2,
+      pkg,
+      ui_readback: VALID_UI_READBACK,
+      sku_lines: [{
+        component_id: 'unit', offer_id: `off-${qid}`, sku_id: `sku-${qid}`, factory_id: fid,
+        pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 100, ordered_qty: 100,
+        unit_price_cny: priceCny, regular_goods_promo_false: true,
+      }],
+      goods_cny_total: priceCny * 100,
+      domestic_freight_cny_total: null,
+    });
+    const esSc = {
+      profile_revision: 59,
+      id: declC.id,
+      saleable_unit: '1 unit',
+      price_usd: declC.price_usd,
+      fx_cny_per_usd: declC.fx_cny_per_usd,
+      pkg,
+      headhaul: { usd_per_unit: declC.headhaul_usd, bond_included: true },
+      refund_fraction: 0.05,
+      physical_return_fraction: 0.05,
+      return_threshold: 0.081,
+      returns_processing_usd: 0,
+      is_apparel_or_shoes: false,
+      referral_terms: baseSc.referral_terms,
+      fulfillment_usd: declC.fulfillment_usd,
+      placement_usd: declC.placement_range_usd[1],
+      storage: { cubic_feet_per_unit: cuFt, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+      operating_period: 'off_peak',
+      operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+      fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'p1', sales: baseSc.sales_window, storage: baseSc.storage_window, inbound: baseSc.inbound_window },
+      collection_rate: 0.005,
+      other_applicable_usd: 0,
+      specific_rights_conflict: 'unknown',
+      strong_date_dependency: false,
+    };
+    cliStore.recordSourcingQuotesBatch1688([
+      mkCliQ('qc-1', 'fc-1', 150),
+      mkCliQ('qc-2', 'fc-2', 148),
+      mkCliQ('qc-3', 'fc-3', 145),
+    ]);
+    const rejCli = await runGate1BForForm(cliStore, {
+      form_id: 'form-cli-man4',
+      profile_revision: 59,
+      as_of_date: '2026-11-26',
+      early_screen_builder: () => esSc,
+    });
+    assert.equal(rejCli.status, 'gate1b_rejected');
+    cliStore.close();
+
+    const g1bInputPath = join(tmpDir, 'g1b-man4.json');
+    writeFileSync(g1bInputPath, JSON.stringify({
+      form_id: 'form-cli-man4',
+      manual_owner_entry: true,
+      as_of_date: '2026-11-26',
+      quote: mkCliQ('qc-4-cli-man', 'fc-4-owner', 35),
+      early_screen_scenario: esSc,
+    }), 'utf8');
+    const cliRun = spawnSync(process.execPath, [
+      join(REPO_ROOT, 'src', 'phase2-cli.mjs'),
+      'gate1b',
+      '--db', dbPath,
+      '--input', g1bInputPath,
+    ], { encoding: 'utf8' });
+    assert.equal(cliRun.status, 0, `CLI gate1b manual 4th factory failed: ${cliRun.stderr}`);
+    const parsedCli = JSON.parse(cliRun.stdout);
+    assert.equal(parsedCli.ok, true);
+    assert.equal(parsedCli.result.status, 'gate1b_passed');
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
   }
 });
