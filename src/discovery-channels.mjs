@@ -681,7 +681,7 @@ export function planDiscoveryBatch(store, {
       : 'Anti-convergence planning guide (no forced category/source quotas; cooldown on one form never suspends other sources).',
     gate0_defaults: {
       exclude_childrens_products: true,
-      avoid_red_ocean: { apparel: true, consumer_electronics_3c: true, red_ocean_furniture: true },
+      avoid_red_ocean: { apparel: true, consumer_electronics_3c: true, red_ocean_furniture: false },
       allow_low_risk_powered_non_3c: true,
     },
     recommended_tracks: {

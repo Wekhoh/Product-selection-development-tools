@@ -98,7 +98,7 @@ const USAGE = [
   '  reconcile       --db <sqlite-path> --attempt <id> --status <completed|failed|permanently_locked> [--note <text>] [--sif-units <n>] [--ss-mcp-units <n>] [--ss-web-units <n>] [--exa-calls <n>] [--confirmed-zero-charge]',
   '  resume-1688     --db <sqlite-path> --login-verified --city <city> --quantity <n> --sku <sku> --validity <YYYY-MM-DD> [--form <paused-form-id>] [--as-of <YYYY-MM-DD>]',
   '  price-band         --input <listings.json> [--output <out.json>]  (无状态，执行 Gate-0 边界 + Stage-1 主流价位带去噪)',
-  '  contact-sheet      --input <items.json> --output <sheet.png> [--manifest-out <out.json>] [--title <text>] [--offline]',
+  '  contact-sheet      --input <items.json> --output <sheet.png> [--manifest-out <out.json>] [--title <text>] [--mode auto|amazon|1688] [--cols <n>] [--rows <n>] [--offline]',
   '  openai-status      --db <sqlite> [--legacy-budget <sqlite>] [--account-scope <scope>] [--month <YYYY-MM>]  (只读)',
   '  openai-reconcile   --db <sqlite> [--legacy-budget <sqlite>] [--enable --confirm-auto-recharge-off --confirm-hard-limit | --disable] [--monthly-limit-cents <0..20000>] [--same-month-pending-buffer-cents <0..2000>] [--account-scope <scope>] [--attempt <id> --status <completed|failed_known|pending_recovery> --note <text> (--usage-cost-micros <n> | --posted-billed-cents <n> | --confirmed-zero-charge)]',
   '  luna-triage        --db <sqlite> --credential-file <json> --listings <listings.json> [--contact-sheet <png>] [--detail <low|high|auto>] --output <out.json>',
@@ -846,7 +846,7 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
   return { notesByFormId, storedShortlist, storedPackagingShortlist };
 }
 
-function runPythonContactSheet({ inputPath, outputPath, manifestOut, title, offline }) {
+function runPythonContactSheet({ inputPath, outputPath, manifestOut, title, offline, mode, cols, rows }) {
   const pyArgs = [
     CONTACT_SHEET_SCRIPT,
     '--input', resolve(inputPath),
@@ -854,6 +854,9 @@ function runPythonContactSheet({ inputPath, outputPath, manifestOut, title, offl
   ];
   if (manifestOut) pyArgs.push('--manifest-out', resolve(manifestOut));
   if (title) pyArgs.push('--title', title);
+  if (mode) pyArgs.push('--mode', mode);
+  if (cols !== undefined && cols !== null) pyArgs.push('--cols', String(cols));
+  if (rows !== undefined && rows !== null) pyArgs.push('--rows', String(rows));
   if (offline) pyArgs.push('--offline');
 
   const env = { ...process.env, PYTHONUTF8: '1' };
@@ -1117,6 +1120,9 @@ export async function runPhase2Cli(
           'manifest-out': { type: 'string' },
           title: { type: 'string' },
           offline: { type: 'boolean' },
+          mode: { type: 'string' },
+          cols: { type: 'string' },
+          rows: { type: 'string' },
           budget: { type: 'string' },
           recovery: { type: 'string', multiple: true },
           ledger: { type: 'string', multiple: true },
@@ -1433,12 +1439,28 @@ export async function runPhase2Cli(
         if (pathKey(outputPath) === pathKey(inputPath) || (manifestOut && pathKey(manifestOut) === pathKey(inputPath))) {
           throw new Phase2CliError('联系表输出或清单路径不能覆盖输入文件；请选择不同的输出路径。');
         }
+        const sheetMode = values.mode ? values.mode.trim().toLowerCase() : null;
+        if (sheetMode !== null && !['auto', 'amazon', '1688'].includes(sheetMode)) {
+          throw new Phase2CliError('--mode 仅支持 auto、amazon 或 1688。');
+        }
+        const parsePositiveGridInt = (rawVal, flag) => {
+          if (rawVal === undefined) return null;
+          if (!/^\d+$/.test(String(rawVal).trim())) throw new Phase2CliError(`--${flag} 必须为正整数。`);
+          const n = Number(rawVal);
+          if (!Number.isSafeInteger(n) || n < 1) throw new Phase2CliError(`--${flag} 必须为正整数。`);
+          return n;
+        };
+        const cols = parsePositiveGridInt(values.cols, 'cols');
+        const rows = parsePositiveGridInt(values.rows, 'rows');
         const rendered = runPythonContactSheet({
           inputPath,
           outputPath,
           manifestOut,
           title: values.title ?? null,
           offline: values.offline === true,
+          mode: sheetMode,
+          cols,
+          rows,
         });
         streams.stdout.write(`${JSON.stringify({ ok: true, command, rendered }, null, 2)}\n`);
         return 0;

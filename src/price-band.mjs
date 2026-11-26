@@ -15,12 +15,32 @@ const finite = v => typeof v === 'number' && Number.isFinite(v);
 const round = (v, digits = 4) => Math.round((v + Number.EPSILON) * (10 ** digits)) / (10 ** digits);
 const isoDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
 
-const CHILDRENS_RE = /\b(baby|babies|toddler|infant|newborn|kids?|children|child's|childrens|nursery|stroller|crib|pacifier|teether|diaper|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?)|montessori|plush\s+toy|baby\s+monitor)\b|(?:婴童|母婴|婴儿|儿童|宝宝|幼儿|童装|儿童玩具|奶瓶|安全座椅)/i;
-const STRICT_CHILD_USE_ITEM_RE = /\b(toddler\s+(?:toy|bed|cup|fork|spoon|plate|bowl|seat|bike|scooter|shoes?|apparel|dress)|infant\s+toy|pacifier|teether|crib|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?|kids?|toddlers?|babies)|plush\s+toy|montessori\s+toy)\b|(?:儿童玩具|婴儿玩具|牙胶|安抚奶嘴|奶瓶|安全座椅|童装)/i;
+const CHILDRENS_RE = /\b(baby|babies|toddler|infant|newborn|kids?|children|child's|childrens|nursery|stroller|crib|pacifier|teether|diaper|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?)|musical\s+toy|montessori|plush\s+toy|baby\s+monitor|ages?\s*(?:1[0-2]|[0-9])(?!\d))\b|(?:婴童|母婴|婴儿|儿童|宝宝|幼儿|童装|儿童玩具|奶瓶|安全座椅)/i;
+const STRICT_CHILD_USE_ITEM_RE = /\b(toddler\s+(?:toy|bed|cup|fork|spoon|plate|bowl|seat|bike|scooter|shoes?|apparel|dress)|infant\s+toy|musical\s+toy|baby\s+(?:plate|bowl|spoon|fork|bib|feeding\s+set|suction\s+plate)|pacifier|teether|crib|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?|kids?|toddlers?|babies)|ages?\s*(?:1[0-2]|[0-9])(?!\d)|plush\s+toy|montessori\s+toy)\b|(?:儿童玩具|婴儿玩具|牙胶|安抚奶嘴|奶瓶|安全座椅|童装)/i;
 const HOUSEHOLD_CONTAINER_CONTENT_RE = /\b(?:pockets?|compartments?|bags?|pouches?|shelves|shelf|shelving|racks?|baskets?|hampers?|bins?|drawers?|organizers?|caddies|caddy|hooks?|sorters?|cabinets?|closets?|storage|holds?|fits?|stores?|storing)\s+(?:for\s+)?(?:storing\s+)?(?:baby|babies|infant|toddler|newborn|kids?|children(?:'s)?|nursery|linens?|bedding)\s*(?:clothes?|clothing|bedding|linens?|blankets?|towels?|wipes?|diapers?|bottles?|laundry|supplies|essentials|items?|gear)?\b/gi;
 const ADULT_CAREGIVER_EXEMPTION_RE = /\b(?:diaper\s+(?:bag|backpack|tote|caddy|organizer|pouch)|stroller\s+(?:organizer|cup\s+holder|hook|hooks|caddy|bag|phone\s+mount)|baby\s+monitor\s+(?:mount|stand|holder|shelf|shelving|bracket)|(?:newborn\s+)?nursery\s+(?:(?:adjustable|modular|heavy(?:-|\s+)duty|wall(?:-|\s+)mounted|wall|floating|hanging|wooden|metal|wire|bamboo|acrylic|corner|tiered|multi(?:-|\s+)tier|foldable|portable|rolling|closet|laundry|linen|bedding|storage|over(?:-|\s+)the(?:-|\s+)door)\s+)*(?:shelf|shelves|shelving|organizer|organizers|caddy|caddies|hamper|hampers|basket|baskets|storage|bin|bins|sorter|sorters|rack|racks|stand|mount|hook|hooks|bracket|rod|drawer|drawers|cabinet)|nursing\s+(?:cover|pillow\s+for\s+mom|bag)|breast\s+pump\s+bag|(?:for|designed\s+for|used\s+by|operated\s+by|intended\s+for|carried\s+by|worn\s+by)\s+(?:new\s+)?(?:parents?|moms?|dads?|mothers?|fathers?|caregivers?|adults?))\b|(?:妈咪包|尿布收纳包|推车挂包|推车杯架|育婴室(?:置物架|收纳架|壁挂架|脏衣篓)|父母用|家长用|成人收纳|宝妈包)/gi;
 
-const CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE = /\b(?:baby\s+(?:blue|pink|breath|greens?|spinach|corn|back\s+ribs|oil|powder\s+scent|alpaca|goat)|kid\s+(?:leather|skin|gloves?|suede)|child[- ]?(?:resistant|proof|lock\w*))\b/gi;
+const CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE = /\b(?:baby(?:'s|’s)?\s+(?:blue|pink|breath|greens?|spinach|corn|carrots?|potatoes?|back\s+ribs|oil|powder\s+scent|alpaca|goat|lock\s+sewing)|kid\s+(?:leather|skin|gloves?|suede)|child[- ]?(?:resistant|proof|lock\w*))\b/gi;
+const NON_CHILD_DOMAIN_EXEMPTION_RE = new RegExp(
+  [
+    // Musical instruments (e.g. "Baby Grand Piano Cover", "Baby Taylor Guitar")
+    String.raw`\bbaby\s+grand(?:\s+piano(?:\s+(?:cover|covers|bench|caster|cups?|lamp|mat|pad|protector|dust\s+cover))?)?\b`,
+    String.raw`\bbaby\s+taylor(?:\s+guitar)?\b`,
+    // Horticulture / plant / garden / tree nursery supplies (e.g. "Nursery Plant Pots", "Plant Nursery Trays")
+    String.raw`\b(?:(?:plant|tree|garden|greenhouse|seedling|propagat(?:ing|ion)|planting|plastic|biodegradable|peat|black|fabric|gallon|inch)\s+)*nursery\s+(?:(?:plant|seedling|grafting|planting|garden|tree)\s+)*(?:pots?|trays?|bags?|grow\s+bags?|containers?|planters?|flats?|cell\s+trays?|cups?|stakes?|labels?|tags?|mesh|mats?|greenhouses?|supplies)\b`,
+    String.raw`\b(?:plant|tree|garden|greenhouse|seedling|horticultur\w*)\s+nursery\b`,
+    // Photography / film / studio grip 5/8" baby pin/plate hardware (requires 5/8" or explicit studio/lighting/grip context so "Baby Plate" feeding dishes are NEVER exempted!)
+    String.raw`\b5\/8(?:\s*inch|")?\s+baby\s+(?:pins?|plates?|wall\s+plates?|receivers?|studs?|spigots?|adapters?|clamps?|grips?)\b`,
+    String.raw`\bbaby\s+(?:pins?|wall\s+plates?|receivers?|studs?|spigots?|c-?stands?|light\s+stands?)\s+(?:for\s+)?(?:studio|lighting|grip|camera|photo|photography|cinema|film|video|flash|softbox|strobe|monolight)\b`,
+    String.raw`\b(?:studio|lighting|grip|camera|photo|photography|cinema|film)\s+(?:(?:wall|mounting|heavy[- ]duty|metal|steel|aluminum)\s+)*baby\s+(?:pins?|plates?|wall\s+plates?|receivers?|studs?|spigots?|adapters?|clamps?|grips?)\b`,
+    // Pet / animal gear (dogs, cats, puppies, kittens, pets — supports both "booster car seat" and "car booster seat")
+    String.raw`\b(?:(?:dog|dogs|puppy|puppies|cat|cats|kitten|kittens|pet|pets|rabbit|bunny|guinea\s+pig|ferret|hamster|chicken|poultry)\s+)+(?:(?:foldable|collapsible|portable|heavy[- ]duty|outdoor|indoor|mesh|elevated|console|travel|waterproof|washable|disposable|reusable|male|female|4-?wheel|3-?wheel|double|twin|small|medium|large)\s+)*(?:(?:booster\s+)?car\s+seat|car\s+booster\s+seat|booster\s+seat|stroller|playpen|play\s+pen|diaper|diapers|crib|bib|bibs|carrier|wagon)\b`,
+    String.raw`\b(?:(?:booster\s+)?car\s+seat|car\s+booster\s+seat|booster\s+seat|stroller|playpen|play\s+pen|diaper|diapers)\s+for\s+(?:(?:small|medium|large|extra[- ]large)\s+)?(?:dogs?|pupp(?:y|ies)|cats?|kittens?|pets?|animals?)\b`,
+    // Adult automotive car seat accessories (never child/infant safety car seats)
+    String.raw`\b(?:(?:leather|neoprene|waterproof|heated|cooling|cooled|ventilated|universal|front|rear|back|bucket|bench|automotive|auto|truck|suv|sedan|van|mesh|linen|memory\s+foam|orthopedic|lumbar)\s+)*car\s+seat\s+(?:cover|covers|protector|protectors|gap\s+filler|gap\s+fillers|gap\s+organizer|organizer|organizers|cushion|cushions|pad|pads|mat|mats|headrest|pillow|hook|hooks|storage|pocket|caddy|back\s+organizer|kick\s+mat|belt\s+cover|belt\s+pad|heater|warmer|cooler|massager)\b`,
+  ].join('|'),
+  'gi',
+);
 const CHILDRENS_NEGATION_OR_WARNING_RE = /\b(?:not\s+(?:for|intended\s+for|suitable\s+for|designed\s+for|a\s+toy\s+for)|keep\s+(?:away\s+from|out\s+of\s+(?:the\s+)?reach\s+of)|out\s+of\s+(?:the\s+)?reach\s+of|for\s+adults?\s+only[^.;,|]*not\s+for)\s+(?:all\s+|young\s+|small\s+)?(?:children|kids?|babies|infants?|toddlers?|minors?)(?:\s+and\s+(?:pets?|animals?|children|kids?))?\b|(?:非儿童(?:用品|玩具|产品)?|不适合儿童|勿让儿童(?:接触|触碰|玩耍)?|请勿让儿童(?:接触|触碰|使用)?|儿童勿[用近触碰]|远离儿童|放在儿童接触不到的地方|仅供成人)/gi;
 
 function assertActiveRevision59(rev, fnName) {
@@ -29,44 +49,61 @@ function assertActiveRevision59(rev, fnName) {
   }
 }
 
-function matchesChildrensStatutoryBoundary(item, textBlob, { profileRevision = 59 } = {}) {
+function evaluateChildrensStatutoryBoundary(item, textBlob, { profileRevision = 59 } = {}) {
   assertActiveRevision59(profileRevision, 'evaluateGate0CategoryBoundary');
   if (item?.is_childrens_product === true || item?.is_children_product === true || item?.cpc_required === true) {
-    return true;
+    return { isChildrens: true, adultExemptionApplied: false, exemptionReason: null };
   }
   const ageGroup = String(item?.age_group || '').trim().toLowerCase();
   if (['kids', 'child', 'children', 'baby', 'toddler', 'infant'].includes(ageGroup)) {
-    return true;
+    return { isChildrens: true, adultExemptionApplied: false, exemptionReason: null };
   }
-  if ((profileRevision ?? 59) >= 59 && ['adult', 'adults', 'parent', 'parents', 'caregiver'].includes(ageGroup)) {
-    return false;
+  if (['adult', 'adults', 'parent', 'parents', 'caregiver'].includes(ageGroup)) {
+    return { isChildrens: false, adultExemptionApplied: true, exemptionReason: 'explicit_adult_metadata' };
   }
   // US CPSC / CPC statutory boundary: <= 12 years of age.
   if (finite(item?.max_target_age_years) && item.max_target_age_years > 0 && item.max_target_age_years <= BUSINESS_THRESHOLDS.children_statutory_max_age_years) {
-    return true;
+    return { isChildrens: true, adultExemptionApplied: false, exemptionReason: null };
   }
   if (item?.is_childrens_product === false && item?.cpc_required === false) {
-    return false;
+    return { isChildrens: false, adultExemptionApplied: true, exemptionReason: 'explicit_non_child_flags' };
   }
-  if (finite(item?.min_age_years) && item.min_age_years > 12) {
-    return false;
+  if (finite(item?.min_age_years) && item.min_age_years > BUSINESS_THRESHOLDS.children_statutory_max_age_years) {
+    return { isChildrens: false, adultExemptionApplied: true, exemptionReason: 'explicit_age_gt_12' };
   }
-  if (!textBlob) return false;
-  if ((profileRevision ?? 59) < 59) {
-    return CHILDRENS_RE.test(textBlob);
+  if (!textBlob) {
+    return { isChildrens: false, adultExemptionApplied: false, exemptionReason: null };
   }
+  const rawMatchedChildToken = CHILDRENS_RE.test(textBlob) || STRICT_CHILD_USE_ITEM_RE.test(textBlob);
   let scrubbed = textBlob
     .replace(CHILDRENS_NEGATION_OR_WARNING_RE, ' ')
-    .replace(CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE, ' ');
+    .replace(CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE, ' ')
+    .replace(NON_CHILD_DOMAIN_EXEMPTION_RE, ' ');
+  const domainOrBenignScrubbed = scrubbed !== textBlob;
+  let caregiverScrubbed = false;
   if (!STRICT_CHILD_USE_ITEM_RE.test(scrubbed)) {
     const beforeCaregiver = scrubbed;
     scrubbed = scrubbed.replace(ADULT_CAREGIVER_EXEMPTION_RE, ' ');
     if (scrubbed !== beforeCaregiver) {
+      caregiverScrubbed = true;
       scrubbed = scrubbed.replace(/\b(?:baby|babies|toddler|infant|newborn|diaper|stroller|nursery)\b/gi, ' ');
     }
+    const beforeContainer = scrubbed;
     scrubbed = scrubbed.replace(HOUSEHOLD_CONTAINER_CONTENT_RE, ' ');
+    if (scrubbed !== beforeContainer) caregiverScrubbed = true;
   }
-  return CHILDRENS_RE.test(scrubbed);
+  const stillChildrens = CHILDRENS_RE.test(scrubbed) || STRICT_CHILD_USE_ITEM_RE.test(scrubbed);
+  return {
+    isChildrens: stillChildrens,
+    adultExemptionApplied: !stillChildrens && (domainOrBenignScrubbed || caregiverScrubbed || rawMatchedChildToken),
+    exemptionReason: !stillChildrens
+      ? (domainOrBenignScrubbed ? 'non_child_domain_or_benign_phrase' : (caregiverScrubbed ? 'adult_caregiver_or_storage' : null))
+      : null,
+  };
+}
+
+function matchesChildrensStatutoryBoundary(item, textBlob, options = {}) {
+  return evaluateChildrensStatutoryBoundary(item, textBlob, options).isChildrens;
 }
 
 const RED_OCEAN_RULES = Object.freeze({
@@ -99,7 +136,7 @@ const DEFAULT_GATE0_CONFIG = Object.freeze({
   avoid_red_ocean: Object.freeze({
     apparel: true,
     consumer_electronics_3c: true,
-    red_ocean_furniture: true,
+    red_ocean_furniture: false,
     fda_ingestible_topical: false,
   }),
   allow_low_risk_powered_non_3c: true,
@@ -130,9 +167,9 @@ function matchesCategoryRoot(item, roots) {
 }
 
 /**
- * Cross-category Gate-0 boundary filter (DECISIONS.md 2026-11-19):
- * - Hard-excludes children's products (CPC / safety liability).
- * - Applies configurable quota-saving avoid defaults for red-ocean apparel, 3C electronics, and furniture.
+ * Cross-category Gate-0 boundary filter (`docs/SPEC.md`):
+ * - Hard-excludes statutory <=12y US CPSC/CPC children's products (preserving adult/horticulture/musical/studio/pet/automotive exemptions).
+ * - Applies configurable discovery-intake skip defaults for confirmed ordinary apparel & commodity 3C phone-case/cable leads (furniture is NOT blocked by default).
  * - Explicitly permits low-risk powered non-3C items with required compliance/battery/freight cost disclosures.
  */
 export function evaluateGate0CategoryBoundary(item, config = {}) {
@@ -144,12 +181,13 @@ export function evaluateGate0CategoryBoundary(item, config = {}) {
   const allowPoweredNon3c = config.allow_low_risk_powered_non_3c ?? DEFAULT_GATE0_CONFIG.allow_low_risk_powered_non_3c;
   const textBlob = gatherSearchText(item);
 
-  const isKids = matchesChildrensStatutoryBoundary(item, textBlob, { profileRevision: config.profile_revision ?? 59 });
-  if (isKids) {
+  const childEval = evaluateChildrensStatutoryBoundary(item, textBlob, { profileRevision: config.profile_revision ?? 59 });
+  if (childEval.isChildrens) {
     return {
       passed: false,
       verdict: 'excluded_childrens_product',
       hard_exclusion: true,
+      adult_exemption_applied: false,
       reasons: ['Excluded under fixed Gate-0 US CPSC/CPC statutory children/baby boundary (<=12 years, non-overridable).'],
       powered_non_3c: false,
       required_cost_and_compliance_items: [],
@@ -174,6 +212,8 @@ export function evaluateGate0CategoryBoundary(item, config = {}) {
       verdict: 'skipped_red_ocean_default',
       hard_exclusion: false,
       configurable_skip: true,
+      adult_exemption_applied: childEval.adultExemptionApplied,
+      ...(childEval.exemptionReason ? { adult_exemption_reason: childEval.exemptionReason } : {}),
       matched_filters: redOceanHits,
       reasons: [`Skipped by configurable Gate-0 red-ocean filter (${redOceanHits.join(', ')}); owner may disable filter to inspect.`],
       powered_non_3c: false,
@@ -194,6 +234,8 @@ export function evaluateGate0CategoryBoundary(item, config = {}) {
       verdict: 'skipped_powered_disabled',
       hard_exclusion: false,
       configurable_skip: true,
+      adult_exemption_applied: childEval.adultExemptionApplied,
+      ...(childEval.exemptionReason ? { adult_exemption_reason: childEval.exemptionReason } : {}),
       reasons: ['Powered products disabled by caller Gate-0 configuration.'],
       powered_non_3c: true,
       required_cost_and_compliance_items: [],
@@ -213,6 +255,8 @@ export function evaluateGate0CategoryBoundary(item, config = {}) {
     passed: true,
     verdict: isPowered ? 'allowed_powered_non_3c' : 'allowed',
     hard_exclusion: false,
+    adult_exemption_applied: childEval.adultExemptionApplied,
+    ...(childEval.exemptionReason ? { adult_exemption_reason: childEval.exemptionReason } : {}),
     reasons: isPowered
       ? ['Low-risk powered non-3C item permitted under Gate-0; explicitly include certification, battery, and freight costs in Gate 1A/1B.']
       : ['Passed cross-category Gate-0 boundary.'],
