@@ -304,4 +304,170 @@ test('missing vine flag on purchased:false, non-vine origin text, and failed MCP
     },
   });
   assert.equal(combinedExt.display_zh, '来源汇总 Vine 6 · VP 75%。抽查 1 篇文字评：Vine 0 · VP 1 · 直评 0');
+  // Round-tripping the cached combined breakdown preserves BOTH summary totals and sample scope
+  const combinedRoundtrip = breakdown({ review_origin_breakdown: combinedExt });
+  assert.equal(combinedRoundtrip.display_zh, '来源汇总 Vine 6 · VP 75%。抽查 1 篇文字评：Vine 0 · VP 1 · 直评 0');
+  assert.equal(combinedRoundtrip.vine_count, 6);
+  assert.equal(combinedRoundtrip.vp_share, 0.75);
+
+  // Empty badge string must not shadow origin: 'Vine Voice'
+  const emptyBadgeVine = breakdown({
+    reviews: [{ title: 'T', content: 'Body', badge: '', origin: 'Vine Voice' }],
+  });
+  assert.deepEqual(emptyBadgeVine.sample, { size: 1, vine_count: 1, vp_count: 0, direct_count: 0, unknown_count: 0 });
+  assert.equal(emptyBadgeVine.display_zh, '抽查 1 篇文字评：Vine 1 · VP 0 · 直评 0');
+
+  // Fresh summary-only reviews_raw must NEVER resurrect stale cached sample or fall through to stale reviews_list
+  const freshSummaryOverStale = breakdown({
+    review_origin_breakdown: {
+      vine_count: 5,
+      sample: { size: 5, vine_count: 5, vp_count: 0, direct_count: 0, unknown_count: 0 },
+      display_zh: '抽查 5 篇文字评：Vine 5 · VP 0 · 直评 0',
+    },
+    reviews_list: [{ title: 'Stale', content: 'Old Vine.', vine: true, purchased: false }],
+    reviews_raw: { vp_count: 0 },
+  });
+  assert.equal(freshSummaryOverStale.sample, undefined);
+  assert.equal(freshSummaryOverStale.display_zh, 'VP 0');
+
+  // Independent total equal to sample count keeps 来源汇总 prefix; pure sample cache without display_zh does not invent 来源汇总
+  const equalSummaryAndSample = breakdown({
+    vp_count: 1,
+    review_origin_breakdown: {
+      vine_count: 0,
+      vp_count: 1,
+      direct_count: 0,
+      sample: { size: 1, vine_count: 0, vp_count: 1, direct_count: 0, unknown_count: 0 },
+      display_zh: '抽查 1 篇文字评：Vine 0 · VP 1 · 直评 0',
+    },
+  });
+  assert.equal(equalSummaryAndSample.display_zh, '来源汇总 VP 1。抽查 1 篇文字评：Vine 0 · VP 1 · 直评 0');
+  const pureSampleNoDisplay = breakdown({
+    review_origin_breakdown: {
+      vine_count: 0,
+      vp_count: 1,
+      direct_count: 0,
+      sample: { size: 1, vine_count: 0, vp_count: 1, direct_count: 0, unknown_count: 0 },
+    },
+  });
+  assert.equal(pureSampleNoDisplay.display_zh, '抽查 1 篇文字评：Vine 0 · VP 1 · 直评 0');
+
+  // MCP envelope with structuredContent reviews AND RATE_LIMIT in content[] is rejected as failed
+  assert.equal(breakdown({
+    structuredContent: { reviews: [{ title: 'T', content: 'Body', vine: false, purchased: true }] },
+    content: [{ type: 'text', text: JSON.stringify({ code: 'RATE_LIMIT' }) }],
+  }), null);
+});
+
+test('combined external summary+reviews survives raw-ingest -> report HTML, summary-only source clears stale sample, case-insensitive ASIN matches, and raw author/body never leak into result.json from ingest or direct scoreBatch', () => {
+  const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
+  const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
+
+  // 1. Combined external q31_review_sources (summary + reviews[]) survives raw-ingest -> scoreBatch -> renderReport HTML
+  const candCombined = structuredClone(fixture.candidates[0]);
+  const c0 = candCombined.newcomer_cohort.members[0];
+  const c1 = candCombined.newcomer_cohort.members[1];
+  c1.review_origin_breakdown = {
+    vine_count: 5,
+    sample: { size: 5, vine_count: 5, vp_count: 0, direct_count: 0, unknown_count: 0 },
+    display_zh: '抽查 5 篇文字评：Vine 5 · VP 0 · 直评 0',
+  };
+  const ingestedCombined = ingestTrialSpecification({
+    profile_revision: 59,
+    allow_synthetic_without_receipts: true,
+    evidence: fixture.evidence,
+    candidates: [{
+      candidate: candCombined,
+      q31_review_sources: {
+        // Use lowercase key to verify case-insensitive ASIN lookup
+        [c0.asin.toLowerCase()]: {
+          asin: c0.asin,
+          vine_count: 6,
+          vp_share: 0.75,
+          reviews: [{ author: 'Combined Raw Author', title: 'VP row', content: 'Combined raw body.', vine: false, purchased: true }],
+        },
+        // Summary-only replacement must clear stale cached sample (size 5 Vine)
+        [c1.asin]: { vp_count: 0 },
+      },
+    }],
+  }, profile);
+
+  const scoredCombined = scoreBatch(ingestedCombined.batch, profile);
+  const combinedHtml = renderReport(scoredCombined, ingestedCombined.batch);
+  assert.match(combinedHtml, /代表新品评论构成：来源汇总 Vine 6 · VP 75%。抽查 1 篇文字评：Vine 0 · VP 1 · 直评 0/u);
+  assert.match(combinedHtml, /代表新品评论构成：VP 0<\/p>/u);
+  assert.equal(combinedHtml.includes('抽查 5 篇文字评'), false);
+  assert.equal(JSON.stringify(scoredCombined).includes('Combined Raw Author'), false);
+  assert.equal(JSON.stringify(scoredCombined).includes('Combined raw body.'), false);
+
+  // 2. Member inline reviews_list stripped on raw-ingest AND on direct scoreBatch without mutating caller input
+  const candInlineList = structuredClone(fixture.candidates[0]);
+  candInlineList.newcomer_cohort.members[0].reviews_list = [
+    { author: 'Inline List Author', title: 'Nice', content: 'Inline list secret body.', vine: false, purchased: true },
+  ];
+  const ingestedInline = ingestTrialSpecification({
+    profile_revision: 59,
+    allow_synthetic_without_receipts: true,
+    evidence: fixture.evidence,
+    candidates: [{ candidate: candInlineList }],
+  }, profile);
+  assert.equal(JSON.stringify(ingestedInline.batch).includes('Inline List Author'), false);
+  assert.equal(JSON.stringify(ingestedInline.batch).includes('Inline list secret body.'), false);
+  assert.equal(
+    ingestedInline.batch.candidates[0].newcomer_cohort.members[0].review_origin_breakdown.display_zh,
+    '抽查 1 篇文字评：Vine 0 · VP 1 · 直评 0',
+  );
+
+  // Direct scoreBatch (CLI offline path) strips raw review payloads (including nested data.data.reviews and array data)
+  // from result.json while preserving scalar reviews/content fields, caller batch, and HTML output
+  const directBatch = { schema_version: 1, profile_revision: 59, candidates: [structuredClone(fixture.candidates[0])] };
+  const dm = directBatch.candidates[0].newcomer_cohort.members[0];
+  const dm1 = directBatch.candidates[0].newcomer_cohort.members[1];
+  dm.reviews_raw = {
+    asin: dm.asin,
+    reviews: [{ author: 'Direct Batch Author', title: 'T', content: 'Direct batch raw body.', vine: true, purchased: false }],
+  };
+  dm.data = {
+    data: {
+      reviews: [{ author: 'Nested Data Author', title: 'Old', content: 'Nested data raw body.', vine: false, purchased: true }],
+    },
+  };
+  dm1.reviews = 84;
+  dm1.content = 'plain diagnostic note';
+  dm1.data = { content: 'plain data note' };
+  const directScored = scoreBatch(directBatch, profile);
+  const directResultJson = JSON.stringify(directScored);
+  assert.equal(directResultJson.includes('Direct Batch Author'), false);
+  assert.equal(directResultJson.includes('Direct batch raw body.'), false);
+  assert.equal(directResultJson.includes('Nested Data Author'), false);
+  assert.equal(directResultJson.includes('Nested data raw body.'), false);
+  // Scalar diagnostic fields on members without raw review arrays are preserved verbatim
+  const scoredDm1 = directScored.candidates[0].diagnostics.newcomers.members[1];
+  assert.equal(scoredDm1.reviews, 84);
+  assert.equal(scoredDm1.content, 'plain diagnostic note');
+  assert.equal(scoredDm1.data.content, 'plain data note');
+  // Caller's input batch was NOT mutated
+  assert.equal(Array.isArray(dm.reviews_raw.reviews), true);
+  assert.equal(Array.isArray(dm.data.data.reviews), true);
+  // Report still renders the exact derived breakdown from result.json
+  const directHtml = renderReport(directScored, directBatch);
+  assert.match(directHtml, /代表新品评论构成：抽查 1 篇文字评：Vine 1 · VP 0 · 直评 0/u);
+
+  // Flat candidate entry with q31_review_sources strips q31_review_sources from ingested batch JSON
+  const flatCand = structuredClone(fixture.candidates[0]);
+  const fm = flatCand.newcomer_cohort.members[0];
+  flatCand.q31_review_sources = {
+    [fm.asin]: {
+      asin: fm.asin,
+      reviews: [{ author: 'Flat Entry Author', title: 'T', content: 'Flat entry raw body.', vine: false, purchased: true }],
+    },
+  };
+  const flatIngested = ingestTrialSpecification({
+    profile_revision: 59,
+    allow_synthetic_without_receipts: true,
+    evidence: fixture.evidence,
+    candidates: [flatCand],
+  }, profile);
+  assert.equal(flatIngested.batch.candidates[0].q31_review_sources, undefined);
+  assert.equal(JSON.stringify(flatIngested.batch).includes('Flat Entry Author'), false);
 });

@@ -1,5 +1,5 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
-import { validEvidenceDate as validDate } from './observations.mjs';
+import { validEvidenceDate as validDate, sanitizeNewcomerMemberReviews } from './observations.mjs';
 import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS, resolveSharedLedgerPackage } from './economics.mjs';
 import { resolveEffectivePricing, resolveUniquePackageByRef, hasProhibited2026PeakExtrapolation } from './fba-calculator.mjs';
@@ -812,7 +812,10 @@ function scoreNatural(member, ctx, profile, cohortPeriod = null, cohortGrain = n
 }
 
 function scoreNewcomers(cohort, ctx, profile, defs) {
-  return scoreNewcomersR58(cohort, ctx, profile, defs);
+  const sanitizedCohort = cohort && typeof cohort === 'object' && Array.isArray(cohort.members)
+    ? { ...cohort, members: cohort.members.map(sanitizeNewcomerMemberReviews) }
+    : cohort;
+  return scoreNewcomersR58(sanitizedCohort, ctx, profile, defs);
 }
 
 function evalExampleRat(ratingsVal, unitsVal, tEffRat, profile) {
