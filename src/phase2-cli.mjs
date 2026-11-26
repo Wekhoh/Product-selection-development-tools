@@ -2454,6 +2454,7 @@ export async function runPhase2Cli(
             }
             return {
               ...qObj,
+              ...(spec.manual_owner_entry === true && qObj?.manual_owner_entry !== false ? { manual_owner_entry: true } : {}),
               ...(g1bProfileRev >= 59 ? { require_ui_readback: true } : {}),
               form_id: formId,
               spec_version: form.spec_version,
@@ -2465,6 +2466,7 @@ export async function runPhase2Cli(
           }
           store.recordSourcingQuote1688({
             ...spec.quote,
+            ...(spec.manual_owner_entry === true && spec.quote.manual_owner_entry !== false ? { manual_owner_entry: true } : {}),
             ...(g1bProfileRev >= 59 ? { require_ui_readback: true } : {}),
             form_id: formId,
             spec_version: form.spec_version,
@@ -2476,6 +2478,10 @@ export async function runPhase2Cli(
         const scenarios = Array.isArray(spec.early_screen_scenarios)
           ? spec.early_screen_scenarios
           : (spec.early_screen_scenario ? [spec.early_screen_scenario] : null);
+        const manualEntryFlag =
+          spec.manual_owner_entry === true ||
+          spec.quote?.manual_owner_entry === true ||
+          (Array.isArray(spec.quotes) && spec.quotes.some(q => q?.manual_owner_entry === true));
         const result = await runGate1BForForm(store, {
           form_id: formId,
           existing_quote: existingQuotes[0] ?? null,
@@ -2484,6 +2490,7 @@ export async function runPhase2Cli(
           early_screen_builder: scenarios ? () => scenarios : undefined,
           as_of_date: values['as-of'] ? values['as-of'].trim() : (spec.as_of_date ?? new Date().toISOString().slice(0, 10)),
           allow_crossing_to_gate2_3: spec.allow_crossing_to_gate2_3 === true,
+          manual_owner_entry: manualEntryFlag,
         });
         streams.stdout.write(`${JSON.stringify({ ok: true, command, result }, null, 2)}\n`);
         return 0;

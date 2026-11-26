@@ -19,7 +19,10 @@ import {
   validateSocialBridgeOutput,
   validateSpecMatcherOutput,
 } from '../contracts.mjs';
-import { resolveVerifiedFactoryKey } from '../fba-calculator.mjs';
+import {
+  extractNormalizedFactoryIdentityKeys,
+  resolveVerifiedFactoryKey,
+} from '../fba-calculator.mjs';
 import { validEvidenceDate } from '../observations.mjs';
 import { evaluateGate0CategoryBoundary } from '../price-band.mjs';
 import { sha256Hex } from '../store.mjs';
@@ -1348,6 +1351,7 @@ export function parseStage1DecisionsResponses(candidates, responses, {
     needs_zoom_count: 0,
     gate0_allowed_count: 0,
     gate0_prohibited_count: 0,
+    gate0_skipped_red_ocean_count: 0,
     gate0_unknown_count: 0,
     luna_non_overreach_clamped_count: 0,
     refusal_count: 0,
@@ -1449,19 +1453,26 @@ export function parseStage1DecisionsResponses(candidates, responses, {
     // and strict date/holiday-dependent disposables. Powered/electronic items, suspected patents/IP,
     // uncertain niches / unclear_needs_zoom, adult-exempted phrases, and soft-avoid categories are NEVER auto-excluded,
     // and items carrying powered / patent-suspect / uncertain-niche / zoom-needed signals ALWAYS retain needs_review: true.
-    const isConfigurableRedOceanSkip = !detGate0.passed && detGate0.hard_exclusion !== true;
+    const isConfigurableRedOceanSkip = detGate0.verdict === 'skipped_red_ocean_default';
     const isRedOceanSoftWatch = isConfigurableRedOceanSkip && gate0Config?.enforce_red_ocean_skip !== true;
     const isDiscoveryIntakeSkip = isConfigurableRedOceanSkip && gate0Config?.enforce_red_ocean_skip === true;
     const isDeclaredHolidayDisposable = rawCand?.strict_holiday_disposable === true || rawCand?.strong_date_dependency === true;
     const isPoweredRisk = detGate0.powered_non_3c === true || rawCand?.is_powered === true || rawCand?.has_battery === true;
     const rawIpStatus = String(rawCand?.ip_risk ?? rawCand?.patent_status ?? '').trim().toLowerCase();
-    const rawRiskNote = [rawCand?.notes, rawCand?.risk_note, rawCand?.triage_note].filter(v => typeof v === 'string').join(' ');
+    const rawRiskNote = [
+      rawCand?.title,
+      rawCand?.description,
+      rawCand?.notes,
+      rawCand?.risk_note,
+      rawCand?.triage_note,
+      ...(Array.isArray(rawCand?.tags) ? rawCand.tags : []),
+    ].filter(v => typeof v === 'string').join(' ');
     const isSuspectedPatentRisk = Boolean(
       rawCand?.suspected_patent === true ||
       rawCand?.suspected_ip_risk === true ||
       rawCand?.patent_suspect === true ||
       ['suspected', 'needs_review', 'unverified', 'pending'].includes(rawIpStatus) ||
-      /\b(?:patent\s+pending|suspected\s+patent|design\s+patent\s+risk|possible\s+ip)\b|疑似专利|专利风险/i.test(rawRiskNote),
+      /\b(?:patent\s+pending|patented|suspected\s+patent|design\s+patent(?:\s+risk)?|utility\s+patent|possible\s+ip|US\s*D?\d{6,8}[A-Z]\d?)\b|疑似专利|专利风险/i.test(rawRiskNote),
     );
     const isUncertainOrZoom = Boolean(
       visualCluster === 'unclear_needs_zoom' ||
@@ -2442,8 +2453,8 @@ function extract1688RequestsMetadata(requests) {
   const recoveredOffers = [];
   const recoveredBindings = new Map();
   const perRequestQuestionIds = [];
-  const seenImageUrls = new Map();
   let nextSheetNumber = 0;
+  let tilesOnCurrentSheet = new Set();
 
   for (let rIdx = 0; rIdx < requests.length; rIdx++) {
     const req = requests[rIdx];
@@ -2453,21 +2464,29 @@ function extract1688RequestsMetadata(requests) {
     const content = req.input?.[0]?.content;
     const imgPart = Array.isArray(content) ? content.find(p => p?.type === 'input_image') : null;
     const hasImage = Boolean(imgPart && typeof imgPart.image_url === 'string' && imgPart.image_url.trim());
+    const jsonPart = Array.isArray(content) ? content.find(p => p?.type === 'input_json') : null;
+    const reqOffers = Array.isArray(jsonPart?.data?.offers) ? jsonPart.data.offers : null;
     let sheetIdx = null;
     if (hasImage) {
-      // Distinguish sheets cleanly; if same sheet URL was split by 256 KiB cap, reuse its sheet index.
+      // Distinguish sheets cleanly; reuse current sheet ONLY when a single sheet was split by the 256 KiB cap
+      // (same image URL AND strictly disjoint tile_index values compared to earlier chunks on that sheet).
       const prevUrl = rIdx > 0 ? requests[rIdx - 1]?.input?.[0]?.content?.find(p => p?.type === 'input_image')?.image_url : null;
-      if (rIdx > 0 && prevUrl === imgPart.image_url && nextSheetNumber > 0) {
+      const chunkTileSet = new Set(
+        (reqOffers ?? [])
+          .map(o => o?.tile_index)
+          .filter(t => Number.isInteger(t)),
+      );
+      const overlapsCurrentSheetTiles = [...chunkTileSet].some(t => tilesOnCurrentSheet.has(t));
+      if (rIdx > 0 && prevUrl === imgPart.image_url && nextSheetNumber > 0 && !overlapsCurrentSheetTiles) {
         sheetIdx = nextSheetNumber;
       } else {
         nextSheetNumber += 1;
         sheetIdx = nextSheetNumber;
+        tilesOnCurrentSheet = new Set();
       }
-      seenImageUrls.set(rIdx, sheetIdx);
+      for (const t of chunkTileSet) tilesOnCurrentSheet.add(t);
     }
 
-    const jsonPart = Array.isArray(content) ? content.find(p => p?.type === 'input_json') : null;
-    const reqOffers = Array.isArray(jsonPart?.data?.offers) ? jsonPart.data.offers : null;
     if (reqOffers) {
       for (const o of reqOffers) {
         recoveredOffers.push(o);
@@ -2561,12 +2580,12 @@ export function parse1688SearchRankingDecisionsResponses(offers, responses, {
     const defaultSheetIndex = useSheetPaging ? Math.floor(idx / MAX_1688_SEARCH_SHEET_TILES) + 1 : null;
     const defaultTileIndex = useSheetPaging ? (idx % MAX_1688_SEARCH_SHEET_TILES) + 1 : null;
     const hasRequestBinding = Boolean(requestBindingsMap && rawOffer && typeof rawOffer === 'object' && requestBindingsMap.has(String(rawOffer.offer_id ?? rawOffer.id ?? '')));
-    const offerForNorm = (!useSheetPaging && !tileBindings && !hasRequestBinding && rawOffer && typeof rawOffer === 'object' && !Array.isArray(rawOffer))
+    const offerForNorm = (requestIsMetadataOnly || (!useSheetPaging && !tileBindings && !hasRequestBinding)) && rawOffer && typeof rawOffer === 'object' && !Array.isArray(rawOffer)
       ? { ...rawOffer, tile_index: null }
       : rawOffer;
     const normOffer = normalize1688SearchOffer(offerForNorm, idx, {
       defaultTileIndex,
-      sheetMode: useSheetPaging || hasRequestBinding,
+      sheetMode: !requestIsMetadataOnly && (useSheetPaging || hasRequestBinding),
     });
     if (seenOfferIds.has(normOffer.offer_id)) {
       throw new TypeError(`Duplicate 1688 offer_id "${normOffer.offer_id}" at index ${idx}.`);
@@ -2725,13 +2744,15 @@ export function parse1688SearchRankingDecisionsResponses(offers, responses, {
     }
 
     const canonicalFactoryKey = resolveVerifiedFactoryKey(normOffer);
+    const factoryIdentityKeys = extractNormalizedFactoryIdentityKeys(normOffer);
     return {
       offer_id: normOffer.offer_id,
       factory_id: normOffer.factory_id ?? null,
       supplier_id: normOffer.supplier_id ?? null,
       seller_member_id: normOffer.seller_member_id ?? null,
       canonical_factory_key: canonicalFactoryKey,
-      factory_identity_known: Boolean(canonicalFactoryKey),
+      factory_identity_keys: factoryIdentityKeys,
+      factory_identity_known: factoryIdentityKeys.length > 0,
       title: normOffer.title,
       price_cny: normOffer.price_cny,
       moq: normOffer.moq,
@@ -2773,15 +2794,21 @@ export function parse1688SearchRankingDecisionsResponses(offers, responses, {
     }));
 
   const allRefused = refusalCount === evaluated.length * 2;
+  const allChoicesRefused = evaluated.length > 0 && evaluated.every(o => o.choice_refused);
+  const noModelRankingAvailable = allRefused || allChoicesRefused;
   const shortlistToOpen = [];
-  const seenShortlistFactories = new Set();
-  if (!allRefused) {
+  const seenShortlistFactoryKeys = new Set();
+  let confirmedDistinctFactoriesShortlisted = 0;
+  if (!noModelRankingAvailable) {
     for (const offer of rankedOffers) {
       if (offer.demoted) continue;
       if (shortlistToOpen.length >= maxFactoriesToOpen) break;
-      const facKey = offer.canonical_factory_key;
-      if (facKey && seenShortlistFactories.has(facKey)) continue;
-      if (facKey) seenShortlistFactories.add(facKey);
+      const idKeys = Array.isArray(offer.factory_identity_keys) ? offer.factory_identity_keys : [];
+      if (idKeys.length > 0 && idKeys.some(k => seenShortlistFactoryKeys.has(k))) continue;
+      if (idKeys.length > 0) {
+        for (const k of idKeys) seenShortlistFactoryKeys.add(k);
+        confirmedDistinctFactoriesShortlisted += 1;
+      }
       shortlistToOpen.push({ ...offer, action: 'open_for_terra_hd_verification' });
     }
   }
@@ -2790,7 +2817,7 @@ export function parse1688SearchRankingDecisionsResponses(offers, responses, {
     if (shortlistIds.has(offer.offer_id)) offer.action = 'open_for_terra_hd_verification';
   }
   const demotedOffers = rankedOffers.filter(o => o.demoted);
-  const fallbackPriceOrderOffers = allRefused
+  const fallbackPriceOrderOffers = noModelRankingAvailable
     ? [...rankedOffers].sort((a, b) => (a.price_cny - b.price_cny) || (a.moq - b.moq) || a.offer_id.localeCompare(b.offer_id))
     : [];
 
@@ -2802,24 +2829,25 @@ export function parse1688SearchRankingDecisionsResponses(offers, responses, {
     next_step: shortlistToOpen.length > 0
       ? 'open_detail_pages_for_terra_hd_verification'
       : 'refine_1688_search_or_manual_review',
-    sourcing_advisory: allRefused
-      ? 'All 1688 ranking questions were refused by Luna; candidate product is RETAINED with zero auto-shortlist — review fallback_price_order_offers manually or retry with cleaner thumbnails.'
+    sourcing_advisory: noModelRankingAvailable
+      ? 'All 1688 ranking choices were refused by Luna; candidate product is RETAINED with zero auto-shortlist — review fallback_price_order_offers manually or retry with cleaner thumbnails.'
       : (shortlistToOpen.length > 0
-        ? `Shortlisted ${shortlistToOpen.length} 1688 offer(s) (${seenShortlistFactories.size} confirmed distinct factory ID(s)) to inspect sequentially with Terra HD vision (open #1 first; stop immediately if Gate 1B clears >= 30%).`
+        ? `Shortlisted ${shortlistToOpen.length} 1688 offer(s) (${confirmedDistinctFactoriesShortlisted} confirmed distinct factory ID(s)) to inspect sequentially with Terra HD vision (open #1 first; stop immediately if Gate 1B clears >= 30%).`
         : 'No search-page offer cleared auto-shortlist; candidate product is RETAINED — refine 1688 image/keyword search or review offers manually (Luna never eliminates products).'),
     ranked_offers: rankedOffers,
     shortlist_to_open: shortlistToOpen,
     demoted_offers: demotedOffers,
-    ...(allRefused ? { fallback_price_order_offers: fallbackPriceOrderOffers } : {}),
+    ...(noModelRankingAvailable ? { fallback_price_order_offers: fallbackPriceOrderOffers } : {}),
     summary: {
       total_offers: rankedOffers.length,
       priority_count: rankedOffers.filter(o => o.rank_tier === 'priority_complete_kit_factory').length,
       plausible_count: rankedOffers.filter(o => o.rank_tier === 'plausible_needs_detail_check').length,
       demoted_count: demotedOffers.length,
       shortlist_count: shortlistToOpen.length,
-      confirmed_distinct_factories_shortlisted: seenShortlistFactories.size,
+      confirmed_distinct_factories_shortlisted: confirmedDistinctFactoriesShortlisted,
       refusal_count: refusalCount,
       all_refused: allRefused,
+      all_choices_refused: allChoicesRefused,
       candidate_eliminated: false,
     },
   };
@@ -2848,7 +2876,7 @@ export function prepare1688DetailVerificationHandoff({
   if (!['high', 'original'].includes(imageDetail)) {
     throw new TypeError('prepare1688DetailVerificationHandoff requires imageDetail "high" or "original" for Terra HD spec inspection.');
   }
-  if (!targetSpec) {
+  if (targetSpec === null || targetSpec === undefined || (typeof targetSpec === 'string' && !targetSpec.trim())) {
     throw new TypeError('targetSpec is required for 1688 Terra detail verification handoff.');
   }
   assertPlainObject(openedDetailsByOfferId, 'openedDetailsByOfferId');

@@ -13,6 +13,7 @@ import hashlib
 import io
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -119,13 +120,13 @@ def safe_text(value: Any, fallback: str = "-") -> str:
 
 
 def fmt_money(value: Any) -> str:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
         return f"${value:.2f}"
     return "-"
 
 
 def fmt_cny(value: Any) -> str:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
         return f"¥{value:.2f}"
     return "-"
 
@@ -170,7 +171,7 @@ def detect_sheet_mode(raw: Any, items: list[dict[str, Any]], explicit_mode: str 
 
 
 def fmt_int(value: Any) -> str:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
         return f"{int(round(value)):,}"
     return "-"
 
@@ -180,6 +181,58 @@ def truncate(text: str, limit: int) -> str:
     if len(clean) <= limit:
         return clean
     return clean[: max(1, limit - 1)].rstrip() + "..."
+
+
+def truncate_to_width(draw: ImageDraw.ImageDraw, text: str, font: Any, max_width_px: int) -> str:
+    clean = " ".join(text.split())
+    if not clean or max_width_px <= 0:
+        return ""
+    if draw.textlength(clean, font=font) <= max_width_px:
+        return clean
+    ellipsis = "..."
+    ell_w = draw.textlength(ellipsis, font=font)
+    budget = max(0.0, max_width_px - ell_w)
+    lo, hi = 0, len(clean)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if draw.textlength(clean[:mid], font=font) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (clean[:lo].rstrip() + ellipsis) if lo > 0 else ellipsis
+
+
+def wrap_to_width(draw: ImageDraw.ImageDraw, text: str, font: Any, max_width_px: int, max_lines: int = 2) -> list[str]:
+    clean = " ".join(text.split())
+    if not clean or max_width_px <= 0 or max_lines < 1:
+        return []
+    lines: list[str] = []
+    remaining = clean
+    for line_idx in range(max_lines):
+        if not remaining:
+            break
+        if draw.textlength(remaining, font=font) <= max_width_px:
+            lines.append(remaining)
+            remaining = ""
+            break
+        if line_idx == max_lines - 1:
+            lines.append(truncate_to_width(draw, remaining, font, max_width_px))
+            remaining = ""
+            break
+        lo, hi = 1, len(remaining)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if draw.textlength(remaining[:mid], font=font) <= max_width_px:
+                lo = mid
+            else:
+                hi = mid - 1
+        chunk = remaining[:lo].rstrip()
+        if not chunk:
+            chunk = remaining[:1]
+            lo = 1
+        lines.append(chunk)
+        remaining = remaining[lo:].lstrip()
+    return lines
 
 
 def fetch_image(item: dict[str, Any], base_dir: Path, offline: bool, timeout: float) -> tuple[Image.Image | None, str]:
@@ -274,7 +327,7 @@ def render_contact_sheet(
     font_small = load_font(12, bold=False)
 
     # Crisp header bar with 1px hairline rule
-    draw.text((pad, 14), truncate(resolved_title, 96), fill=(17, 17, 17), font=font_title)
+    draw.text((pad, 14), truncate_to_width(draw, resolved_title, font_title, canvas_w - pad * 2), fill=(17, 17, 17), font=font_title)
     unit_label = "1688 offers" if resolved_mode == "1688" else "peers"
     subtitle = f"Showing {len(selected)} of {len(items)} {unit_label} | Grid {cols}x{actual_rows} | Mode: {'offline' if offline else 'online+local'}"
     draw.text((pad, 41), subtitle, fill=(102, 102, 102), font=font_sub)
@@ -342,21 +395,32 @@ def render_contact_sheet(
                 "",
             )
             if factory_badge:
-                badge_text = truncate(factory_badge, 12)
-                badge_w = max(56, len(badge_text) * 10 + 16)
-                badge_w = min(badge_w, cell_width - 74)
-                draw.rectangle([x1 - badge_w - 8, y0 + 8, x1 - 8, y0 + 32], fill=(242, 244, 247), outline=(180, 188, 198), width=1)
-                draw.text((x1 - badge_w, y0 + 12), badge_text, fill=(25, 45, 70), font=font_small)
+                max_badge_box_w = max(56, cell_width - 74)
+                badge_text = truncate_to_width(draw, factory_badge, font_small, max_badge_box_w - 16)
+                badge_text_w = int(math.ceil(draw.textlength(badge_text, font=font_small)))
+                badge_w = min(max_badge_box_w, max(48, badge_text_w + 16))
+                badge_x0 = x1 - badge_w - 8
+                draw.rectangle([badge_x0, y0 + 8, x1 - 8, y0 + 32], fill=(242, 244, 247), outline=(180, 188, 198), width=1)
+                draw.text((badge_x0 + 8, y0 + 12), badge_text, fill=(25, 45, 70), font=font_small)
 
             offer_id = scrub_pii_label(item.get("offer_id") or item.get("id"), f"OFFER-{i + 1}")
             raw_price_cny = item.get("price_cny", item.get("unit_price_cny", item.get("price")))
-            price_cny = float(raw_price_cny) if isinstance(raw_price_cny, (int, float)) and not isinstance(raw_price_cny, bool) and raw_price_cny > 0 else None
+            price_cny = (
+                float(raw_price_cny)
+                if isinstance(raw_price_cny, (int, float)) and not isinstance(raw_price_cny, bool) and math.isfinite(raw_price_cny) and raw_price_cny > 0
+                else None
+            )
             raw_price_cny_max = item.get("price_cny_max", item.get("max_price_cny"))
-            price_cny_max = float(raw_price_cny_max) if isinstance(raw_price_cny_max, (int, float)) and not isinstance(raw_price_cny_max, bool) and raw_price_cny_max > 0 else None
+            price_cny_max = (
+                float(raw_price_cny_max)
+                if isinstance(raw_price_cny_max, (int, float)) and not isinstance(raw_price_cny_max, bool) and math.isfinite(raw_price_cny_max) and raw_price_cny_max > 0
+                else None
+            )
             raw_moq = item.get("moq", item.get("moq_qty", item.get("min_order_qty")))
             moq = int(raw_moq) if isinstance(raw_moq, int) and not isinstance(raw_moq, bool) and raw_moq >= 1 else None
             province = scrub_pii_label(item.get("province") or item.get("location_province") or item.get("city"), "")
-            item_title = truncate(scrub_pii_label(item.get("title") or item.get("offer_title"), ""), 34)
+            clean_full_title = scrub_pii_label(item.get("title") or item.get("offer_title"), "")
+            item_title = truncate(clean_full_title, 48)
             raw_factory_id = item.get("factory_id")
             safe_factory_id = scrub_pii_label(raw_factory_id, "") if raw_factory_id is not None else ""
             if safe_factory_id == "[REDACTED]":
@@ -366,12 +430,15 @@ def render_contact_sheet(
             if price_cny is not None and price_cny_max is not None and price_cny_max > price_cny + 0.005:
                 price_str = f"{fmt_cny(price_cny)}-{fmt_cny(price_cny_max)}"
 
+            text_max_w = max(80, cell_width - 20)
             line1 = f"{price_str} | MOQ {fmt_int(moq)}"
             line2 = f"ID {truncate(offer_id, 20)}" + (f" | {truncate(province, 10)}" if province else "")
-            draw.text((x0 + 10, fy + 8), truncate(line1, 34), fill=(17, 17, 17), font=font_meta)
-            draw.text((x0 + 10, fy + 30), truncate(line2, 36), fill=(55, 55, 55), font=font_small)
-            if item_title:
-                draw.text((x0 + 10, fy + 52), item_title, fill=(102, 102, 102), font=font_small)
+            draw.text((x0 + 10, fy + 8), truncate_to_width(draw, line1, font_meta, text_max_w), fill=(17, 17, 17), font=font_meta)
+            draw.text((x0 + 10, fy + 29), truncate_to_width(draw, line2, font_small, text_max_w), fill=(55, 55, 55), font=font_small)
+            if clean_full_title:
+                title_lines = wrap_to_width(draw, clean_full_title, font_small, text_max_w, max_lines=2)
+                for t_idx, t_line in enumerate(title_lines):
+                    draw.text((x0 + 10, fy + 50 + t_idx * 18), t_line, fill=(102, 102, 102), font=font_small)
 
             manifest_rows.append(
                 {
@@ -434,11 +501,12 @@ def render_contact_sheet(
         line2 = f"Sales {fmt_int(sales)}/mo | Rev {fmt_int(reviews)} ({rating_str})"
         line3 = f"{fba_str}" + (f" | {truncate(pkg, 28)}" if pkg else "")
 
-        draw.text((x0 + 10, fy + 8), truncate(line1, 44), fill=(17, 17, 17), font=font_meta)
-        draw.text((x0 + 10, fy + 30), truncate(line2, 44), fill=(55, 55, 55), font=font_small)
-        draw.text((x0 + 10, fy + 50), truncate(line3, 44), fill=(90, 90, 90), font=font_small)
+        text_max_w = max(80, cell_width - 20)
+        draw.text((x0 + 10, fy + 8), truncate_to_width(draw, line1, font_meta, text_max_w), fill=(17, 17, 17), font=font_meta)
+        draw.text((x0 + 10, fy + 30), truncate_to_width(draw, line2, font_small, text_max_w), fill=(55, 55, 55), font=font_small)
+        draw.text((x0 + 10, fy + 50), truncate_to_width(draw, line3, font_small, text_max_w), fill=(90, 90, 90), font=font_small)
         if item_title:
-            draw.text((x0 + 10, fy + 72), item_title, fill=(102, 102, 102), font=font_small)
+            draw.text((x0 + 10, fy + 72), truncate_to_width(draw, item_title, font_small, text_max_w), fill=(102, 102, 102), font=font_small)
 
         effective_price = net_price if isinstance(net_price, (int, float)) else list_price
         manifest_rows.append(

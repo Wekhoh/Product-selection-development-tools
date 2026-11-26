@@ -2748,13 +2748,17 @@ export class SelectionStore {
       ? quote.spec_variant_key.trim()
       : null;
     const resolvedFactoryId = kitCheck.resolved_factory_id;
-    const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const emailRe = /[^\s@]+@[^\s@]+\.[^\s@]+/;
     const factoryCandidatesForEmailCheck = [
       resolvedFactoryId,
       quote.factory_id,
       quote.supplier_id,
       quote.seller_member_id,
-      ...(Array.isArray(quote.sku_lines) ? quote.sku_lines.flatMap(l => [l?.factory_id, l?.supplier_id, l?.seller_member_id]) : []),
+      quote.company_name,
+      quote.shop_url,
+      ...(Array.isArray(quote.sku_lines)
+        ? quote.sku_lines.flatMap(l => [l?.factory_id, l?.supplier_id, l?.seller_member_id, l?.company_name, l?.shop_url])
+        : []),
     ];
     if (factoryCandidatesForEmailCheck.some(v => typeof v === 'string' && emailRe.test(v.trim()))) {
       throw new TypeError('sourcing_quote_1688 factory/seller identifier must not contain a raw email address; redact or use a non-PII factory_id before persisting.');

@@ -2671,7 +2671,7 @@ function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
     if (!(ledger.sensitivity_only === undefined || ledger.sensitivity_only === false)) return 'ledger is sensitivity-only';
     if (sc?.input?.coherent !== true) return 'scenario is not coherent';
     if (sc.price_anchor_supported === false) return 'price anchor is not supported';
-    const peakKitCheck = evaluateSingleFactoryCompleteKit({
+    const peakKitCheck = sc?.single_factory_complete_kit ?? evaluateSingleFactoryCompleteKit({
       scenario: sc?.input,
       cost_ledger: ledger,
     });
@@ -3622,8 +3622,12 @@ export function scoreCandidate(candidate, profile, internal = null) {
         const ledger = sc?.input?.cost_ledger;
         const lines = ledger?.lines ?? ledger?.costs ?? [];
         const ful = Array.isArray(lines) ? lines.find(x => x?.id === 'fulfillment') : null;
-        return hasProhibited2026PeakExtrapolation(ful, ledger) ||
-          evaluateSingleFactoryCompleteKit({ scenario: sc?.input, cost_ledger: ledger }).is_cross_factory_or_incomplete;
+        const peakKit = sc?.single_factory_complete_kit ?? evaluateSingleFactoryCompleteKit({
+          scenario: sc?.input,
+          cost_ledger: ledger,
+          expected_components: candidate?.saleable_set_composition ?? candidate?.expected_components ?? null,
+        });
+        return hasProhibited2026PeakExtrapolation(ful, ledger) || peakKit.is_cross_factory_or_incomplete;
       });
     };
     const otherPeriodsAreUnpublishedPeak = Boolean(

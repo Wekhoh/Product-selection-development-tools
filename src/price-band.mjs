@@ -16,28 +16,35 @@ const round = (v, digits = 4) => Math.round((v + Number.EPSILON) * (10 ** digits
 const isoDate = v => typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
 
 const CHILDRENS_RE = /\b(baby|babies|toddler|infant|newborn|kids?|children|child's|childrens|nursery|stroller|crib|pacifier|teether|diaper|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?)|musical\s+toy|montessori|plush\s+toy|baby\s+monitor|ages?\s*(?:1[0-2]|[0-9])(?!\d))\b|(?:婴童|母婴|婴儿|儿童|宝宝|幼儿|童装|儿童玩具|奶瓶|安全座椅)/i;
-const STRICT_CHILD_USE_ITEM_RE = /\b(toddler\s+(?:toy|bed|cup|fork|spoon|plate|bowl|seat|bike|scooter|shoes?|apparel|dress)|infant\s+toy|musical\s+toy|baby\s+(?:plate|bowl|spoon|fork|bib|feeding\s+set|suction\s+plate)|pacifier|teether|crib|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?|kids?|toddlers?|babies)|ages?\s*(?:1[0-2]|[0-9])(?!\d)|plush\s+toy|montessori\s+toy)\b|(?:儿童玩具|婴儿玩具|牙胶|安抚奶嘴|奶瓶|安全座椅|童装)/i;
+const STRICT_CHILD_USE_ITEM_RE = /\b(toddler\s+(?:toy|bed|cup|fork|spoon|plate|bowl|seat|bike|scooter|shoes?|apparel|dress|learning\s+tower|step\s+stool)|infant\s+(?:toy|bath\s+tub|bathtub|lounger|carrier|swaddle)|newborn\s+(?:swaddle|bath\s+tub|bathtub|lounger|clothes?)|musical\s+toy|baby\s+(?:plate|bowl|spoon|fork|bib|feeding\s+set|suction\s+plate|high\s*chair|walker|bouncer|swing|bath\s+tub|bathtub|play\s*mat|crawling\s+mat|lounger|swaddle)|bassinet|pacifier|teether|crib|onesie|playpen|sippy|car\s+seat|booster\s+seat|toys?\s+for\s+(?:ages?|boys?|girls?|kids?|toddlers?|babies)|ages?\s*(?:1[0-2]|[0-9])(?!\d)|plush\s+toy|montessori\s+toy)\b|(?:儿童玩具|婴儿玩具|牙胶|安抚奶嘴|奶瓶|安全座椅|童装)/i;
 const HOUSEHOLD_CONTAINER_CONTENT_RE = /\b(?:pockets?|compartments?|bags?|pouches?|shelves|shelf|shelving|racks?|baskets?|hampers?|bins?|drawers?|organizers?|caddies|caddy|hooks?|sorters?|cabinets?|closets?|storage|holds?|fits?|stores?|storing)\s+(?:for\s+)?(?:storing\s+)?(?:baby|babies|infant|toddler|newborn|kids?|children(?:'s)?|nursery|linens?|bedding)\s*(?:clothes?|clothing|bedding|linens?|blankets?|towels?|wipes?|diapers?|bottles?|laundry|supplies|essentials|items?|gear)?\b/gi;
-const ADULT_CAREGIVER_EXEMPTION_RE = /\b(?:diaper\s+(?:bag|backpack|tote|caddy|organizer|pouch)|stroller\s+(?:organizer|cup\s+holder|hook|hooks|caddy|bag|phone\s+mount)|baby\s+monitor\s+(?:mount|stand|holder|shelf|shelving|bracket)|(?:newborn\s+)?nursery\s+(?:(?:adjustable|modular|heavy(?:-|\s+)duty|wall(?:-|\s+)mounted|wall|floating|hanging|wooden|metal|wire|bamboo|acrylic|corner|tiered|multi(?:-|\s+)tier|foldable|portable|rolling|closet|laundry|linen|bedding|storage|over(?:-|\s+)the(?:-|\s+)door)\s+)*(?:shelf|shelves|shelving|organizer|organizers|caddy|caddies|hamper|hampers|basket|baskets|storage|bin|bins|sorter|sorters|rack|racks|stand|mount|hook|hooks|bracket|rod|drawer|drawers|cabinet)|nursing\s+(?:cover|pillow\s+for\s+mom|bag)|breast\s+pump\s+bag|(?:for|designed\s+for|used\s+by|operated\s+by|intended\s+for|carried\s+by|worn\s+by)\s+(?:new\s+)?(?:parents?|moms?|dads?|mothers?|fathers?|caregivers?|adults?))\b|(?:妈咪包|尿布收纳包|推车挂包|推车杯架|育婴室(?:置物架|收纳架|壁挂架|脏衣篓)|父母用|家长用|成人收纳|宝妈包)/gi;
+const ADULT_CAREGIVER_PRODUCT_RE = /\b(?:diaper\s+(?:bag|backpack|tote|caddy|organizer|pouch)|stroller\s+(?:organizer|cup\s+holder|hook|hooks|caddy|bag|phone\s+mount)|baby\s+monitor\s+(?:(?:wall|floor|crib|table|shelf|clamp|clip|flexible|gooseneck|universal|adjustable)\s+)*(?:mount|stand|holder|shelf|shelving|bracket)|(?:newborn\s+)?nursery\s+(?:(?:adjustable|modular|heavy(?:-|\s+)duty|wall(?:-|\s+)mounted|wall|floating|hanging|wooden|metal|wire|bamboo|acrylic|corner|tiered|multi(?:-|\s+)tier|foldable|portable|rolling|closet|laundry|linen|bedding|storage|over(?:-|\s+)the(?:-|\s+)door)\s+)*(?:shelf|shelves|shelving|organizer|organizers|caddy|caddies|hamper|hampers|basket|baskets|storage|bin|bins|sorter|sorters|rack|racks|stand|mount|hook|hooks|bracket|rod|drawer|drawers|cabinet)|nursing\s+(?:cover|pillow\s+for\s+mom|bag)|breast\s+pump\s+bag)\b|(?:妈咪包|尿布收纳包|推车挂包|推车杯架|育婴室(?:置物架|收纳架|壁挂架|脏衣篓)|宝妈包)/gi;
+const ADULT_AUDIENCE_PHRASE_RE = /\b(?:for|designed\s+for|used\s+by|operated\s+by|intended\s+for|carried\s+by|worn\s+by)\s+(?:new\s+)?(?:parents?|moms?|dads?|mothers?|fathers?|caregivers?|adults?)\b|(?:父母用|家长用|成人收纳)/gi;
 
-const CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE = /\b(?:baby(?:'s|’s)?\s+(?:blue|pink|breath|greens?|spinach|corn|carrots?|potatoes?|back\s+ribs|oil|powder\s+scent|alpaca|goat|lock\s+sewing)|kid\s+(?:leather|skin|gloves?|suede)|child[- ]?(?:resistant|proof|lock\w*))\b/gi;
+const CHILDRENS_BENIGN_COLOR_OR_MATERIAL_RE = /\b(?:baby(?:'s|’s)?\s+(?:blue|pink|breath|greens?|spinach|corn|carrots?|potatoes?|back\s+ribs?|oil|powder\s+scent|alpaca|goat|lock\s+(?:sewing|serger|overlock|embroidery|quilting))|kid\s+(?:leather|skin|gloves?|suede)|child[- ]?(?:resistant|proof|lock\w*))\b/gi;
 const NON_CHILD_DOMAIN_EXEMPTION_RE = new RegExp(
   [
     // Musical instruments (e.g. "Baby Grand Piano Cover", "Baby Taylor Guitar")
     String.raw`\bbaby\s+grand(?:\s+piano(?:\s+(?:cover|covers|bench|caster|cups?|lamp|mat|pad|protector|dust\s+cover))?)?\b`,
     String.raw`\bbaby\s+taylor(?:\s+guitar)?\b`,
-    // Horticulture / plant / garden / tree nursery supplies (e.g. "Nursery Plant Pots", "Plant Nursery Trays")
-    String.raw`\b(?:(?:plant|tree|garden|greenhouse|seedling|propagat(?:ing|ion)|planting|plastic|biodegradable|peat|black|fabric|gallon|inch)\s+)*nursery\s+(?:(?:plant|seedling|grafting|planting|garden|tree)\s+)*(?:pots?|trays?|bags?|grow\s+bags?|containers?|planters?|flats?|cell\s+trays?|cups?|stakes?|labels?|tags?|mesh|mats?|greenhouses?|supplies)\b`,
+    // Horticulture / plant / garden / tree nursery supplies:
+    // (a) Unambiguously horticultural nursery nouns ("Nursery Pots", "Nursery Grow Bags", "Nursery Planters", "Nursery Grafting Tape")
+    String.raw`\b(?:(?:plant|tree|garden|greenhouse|seedling|propagat(?:ing|ion)|planting|plastic|biodegradable|peat|black|fabric|gallon|inch|potting|flower|herb|succulent)\s+)*nursery\s+(?:(?:plant|seedling|grafting|planting|garden|tree)\s+)*(?:pots?|grow\s+bags?|planters?|flats?|cell\s+trays?|stakes?|greenhouses?|grafting\s+(?:tape|wax|clips?|knives?|tools?|supplies))\b`,
+    // (b) Generic nouns ("mats", "cups", "supplies", "bags", "trays", etc.) REQUIRE an explicit horticulture modifier before or after "nursery"
+    String.raw`\b(?:plant|tree|garden|greenhouse|seedling|propagat(?:ing|ion)|planting|peat|biodegradable|gallon|grafting|horticultur\w*|potting|flower|herb|succulent)\s+(?:(?:plastic|black|fabric|inch|heavy[- ]duty)\s+)*nursery\s+(?:(?:plant|seedling|grafting|planting|garden|tree)\s+)*(?:trays?|bags?|containers?|cups?|labels?|tags?|mesh|mats?|supplies|tape)\b`,
+    String.raw`\bnursery\s+(?:plant|seedling|grafting|planting|garden|tree)\s+(?:trays?|bags?|containers?|cups?|labels?|tags?|mesh|mats?|supplies|tape)\b`,
     String.raw`\b(?:plant|tree|garden|greenhouse|seedling|horticultur\w*)\s+nursery\b`,
     // Photography / film / studio grip 5/8" baby pin/plate hardware (requires 5/8" or explicit studio/lighting/grip context so "Baby Plate" feeding dishes are NEVER exempted!)
-    String.raw`\b5\/8(?:\s*inch|")?\s+baby\s+(?:pins?|plates?|wall\s+plates?|receivers?|studs?|spigots?|adapters?|clamps?|grips?)\b`,
+    String.raw`\b5\/8(?:\s*-?\s*inch|")?\s+baby\s+(?:pins?|plates?|wall\s+plates?|receivers?|studs?|spigots?|adapters?|clamps?|grips?)\b`,
     String.raw`\bbaby\s+(?:pins?|wall\s+plates?|receivers?|studs?|spigots?|c-?stands?|light\s+stands?)\s+(?:for\s+)?(?:studio|lighting|grip|camera|photo|photography|cinema|film|video|flash|softbox|strobe|monolight)\b`,
     String.raw`\b(?:studio|lighting|grip|camera|photo|photography|cinema|film)\s+(?:(?:wall|mounting|heavy[- ]duty|metal|steel|aluminum)\s+)*baby\s+(?:pins?|plates?|wall\s+plates?|receivers?|studs?|spigots?|adapters?|clamps?|grips?)\b`,
     // Pet / animal gear (dogs, cats, puppies, kittens, pets — supports both "booster car seat" and "car booster seat")
     String.raw`\b(?:(?:dog|dogs|puppy|puppies|cat|cats|kitten|kittens|pet|pets|rabbit|bunny|guinea\s+pig|ferret|hamster|chicken|poultry)\s+)+(?:(?:foldable|collapsible|portable|heavy[- ]duty|outdoor|indoor|mesh|elevated|console|travel|waterproof|washable|disposable|reusable|male|female|4-?wheel|3-?wheel|double|twin|small|medium|large)\s+)*(?:(?:booster\s+)?car\s+seat|car\s+booster\s+seat|booster\s+seat|stroller|playpen|play\s+pen|diaper|diapers|crib|bib|bibs|carrier|wagon)\b`,
     String.raw`\b(?:(?:booster\s+)?car\s+seat|car\s+booster\s+seat|booster\s+seat|stroller|playpen|play\s+pen|diaper|diapers)\s+for\s+(?:(?:small|medium|large|extra[- ]large)\s+)?(?:dogs?|pupp(?:y|ies)|cats?|kittens?|pets?|animals?)\b`,
-    // Adult automotive car seat accessories (never child/infant safety car seats)
+    // Adult automotive car seat accessories & explicit adult driving/office booster cushions (never child/infant safety car seats)
     String.raw`\b(?:(?:leather|neoprene|waterproof|heated|cooling|cooled|ventilated|universal|front|rear|back|bucket|bench|automotive|auto|truck|suv|sedan|van|mesh|linen|memory\s+foam|orthopedic|lumbar)\s+)*car\s+seat\s+(?:cover|covers|protector|protectors|gap\s+filler|gap\s+fillers|gap\s+organizer|organizer|organizers|cushion|cushions|pad|pads|mat|mats|headrest|pillow|hook|hooks|storage|pocket|caddy|back\s+organizer|kick\s+mat|belt\s+cover|belt\s+pad|heater|warmer|cooler|massager)\b`,
+    String.raw`\badult\s+(?:car\s+)?booster\s+seat\s+(?:cushion|cushions|pad|pads|pillow|mat)\b`,
+    String.raw`\b(?:car\s+)?booster\s+seat\s+(?:cushion|cushions|pad|pads|pillow)\s+for\s+(?:short\s+drivers?|adults?|driving|office\s+chairs?|car\s+seats?)\b`,
   ].join('|'),
   'gi',
 );
@@ -83,7 +90,7 @@ function evaluateChildrensStatutoryBoundary(item, textBlob, { profileRevision = 
   let caregiverScrubbed = false;
   if (!STRICT_CHILD_USE_ITEM_RE.test(scrubbed)) {
     const beforeCaregiver = scrubbed;
-    scrubbed = scrubbed.replace(ADULT_CAREGIVER_EXEMPTION_RE, ' ');
+    scrubbed = scrubbed.replace(ADULT_CAREGIVER_PRODUCT_RE, ' ');
     if (scrubbed !== beforeCaregiver) {
       caregiverScrubbed = true;
       scrubbed = scrubbed.replace(/\b(?:baby|babies|toddler|infant|newborn|diaper|stroller|nursery)\b/gi, ' ');
@@ -91,6 +98,7 @@ function evaluateChildrensStatutoryBoundary(item, textBlob, { profileRevision = 
     const beforeContainer = scrubbed;
     scrubbed = scrubbed.replace(HOUSEHOLD_CONTAINER_CONTENT_RE, ' ');
     if (scrubbed !== beforeContainer) caregiverScrubbed = true;
+    scrubbed = scrubbed.replace(ADULT_AUDIENCE_PHRASE_RE, ' ');
   }
   const stillChildrens = CHILDRENS_RE.test(scrubbed) || STRICT_CHILD_USE_ITEM_RE.test(scrubbed);
   return {
