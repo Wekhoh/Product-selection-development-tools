@@ -53,7 +53,7 @@ For a fresh selection run, `node src/phase2-cli.mjs --help` lists all operator c
 - `calibration-track` records and summarizes 4-item post-card calibration outcomes (`ip_clearance`, `factory_quote_accuracy`, `package_tier_match`, `owner_verdict`) across real cards in SQLite.
 - `sp-api-calibrate` extracts read-only SP-API `catalogItems`, `productFees`, and `listingsRestrictions` calibration before finalist profit evaluation (distinguishing peer brand-gating from white-label category restrictions).
 - `dedupe-forms` checks proposed titles, keywords, buyer tasks and identifiers against persisted leads and forms. `luna-triage` screens up to 200 metadata rows or a 16-tile `4x4` PNG contact sheet via `/v1/decisions`.
-- `solve-min-price` solves exact cent-rounded 2027 breakeven retail prices for a target margin floor given a 1688 quote or landed domestic cost.
+- `solve-min-price` (*"按 1688 成本算保底定价"*) solves exact cent-rounded 2027 breakeven US selling prices for the `30%` steady-state margin floor given a 1688 `100`-set regular bare-goods quote (with explicit bare-goods domestic-freight disclosure).
 - `openai-task` runs one validated Terra `xhigh` workflow task with resumable background polling (`--progress-file`) and `DELETE + 404` cleanup; `openai-cancel --attempt` cancels a bound background request.
 - `funnel-ledger --since` reports realized OpenAI costs, four provider quota lanes (`ss_mcp`, `ss_web`, `sif`, `exa`), and funnel conversion.
 - `ingest-trial --input <spec.json> --profile docs/design/reference-profile.r59.draft.json --output <out.batch.json>` verifies raw-receipt ASIN provenance, normalizes SellerSprite/SIF/SP-API/Keepa receipts (`src/adapters/`), auto-builds 3-tier progressive bids, and constructs evergreen `2027-02-01..2027-10-14` off-peak + blank Q4 peak operating periods.
@@ -62,6 +62,8 @@ For a fresh selection run, `node src/phase2-cli.mjs --help` lists all operator c
 
 | Start here | Purpose |
 | --- | --- |
+| [Active specification](docs/SPEC.md) | Single active business & workflow specification, model boundaries, and permanent Non-Goals |
+| [Architecture decisions](docs/adr/0001-decouple-steady-state-freight-from-100-set-sourcing.md) | Concise records of hard-to-reverse architectural and business-boundary tradeoffs (`ADR-0001..0004`) |
 | [Current state](docs/STATE.md) | Single current outcome, evidence, blockers, and next step |
 | [Context router](docs/CONTEXT-ROUTER.md) | Causal history, code/test map, and private source routing |
 | [Product requirements](docs/PRODUCT.md) and [decisions](docs/design/DECISIONS.md) | Confirmed business rules, 4 hard kill lines, 2027 FBA rules, and history |
