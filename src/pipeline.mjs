@@ -1,4 +1,8 @@
-import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
+import {
+  BARE_GOODS_DISCLOSURE_ZH,
+  BUSINESS_THRESHOLDS,
+  CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+} from './business-thresholds.mjs';
 /**
  * Phase 2 single-controller resumable selection pipeline:
  *  Stage 0: Multi-source lead ingestion & form registration (raw_leads + lead_form_links + candidate_forms)
@@ -25,6 +29,7 @@ import {
   bindSourcingQuotePricingInputs,
   solveMinPriceForMargin2027,
   classifySizeTier2027,
+  isAmazonOptimizedPlacementVerified2027,
   lookupFulfillmentFee2027,
   lookupBulkyFulfillmentFee2027,
   lookupUnifiedFulfillmentFee2027,
@@ -100,8 +105,9 @@ const PRICE_WATCH_REASONS = [
   'multi_pack_or_bundle_variant',
 ];
 const FORWARD_FEE_INPUTS = [
-  'pkg', 'fx_cny_per_usd', 'refund_fraction', 'physical_return_fraction',
-  'fee_category', 'return_threshold', 'referral_terms', 'headhaul_usd',
+  'pkg', 'fx_cny_per_usd', 'order_units', 'refund_fraction', 'physical_return_fraction',
+  'fee_category', 'return_threshold', 'referral_terms', 'headhaul_usd', 'headhaul',
+  'headhaul_rate_cny_per_kg', 'headhaul_destination_scope', 'steady_state_replenishment',
   'collection_rate', 'other_applicable_usd', 'other_payee', 'sales_window',
   'storage_window', 'inbound_window', 'average_inventory_days', 'placement_usd',
   'placement_split_option', 'carton_count', 'identical_cartons_count', 'multi_destination_headhaul_verified',
@@ -121,13 +127,24 @@ const ALLOWED_GATE1B_ENTRY_STATUSES = new Set([
   'evaluated',
 ]);
 
+function isQuoteBareGoods(quote) {
+  return Boolean(
+    quote?.pricing_basis === 'bare_goods_1688' ||
+    quote?.bare_goods_screening === true ||
+    quote?.domestic_freight_cny_total === null ||
+    quote?.domestic_freight_cny_total === undefined,
+  );
+}
+
 function isQuoteUsableForForm(quote, form, asOfDay) {
   if (!quote || quote.quote_status !== 'verified') return false;
   if (quote.form_id !== form.form_id) return false;
   if (quote.spec_version !== form.spec_version) return false;
-  if (quote.goods_first_order_promotion !== 0 || quote.freight_first_order_promotion !== 0) return false;
+  const bareGoods = isQuoteBareGoods(quote);
+  if (quote.goods_first_order_promotion !== 0 || (!bareGoods && quote.freight_first_order_promotion !== 0)) return false;
   if (!finite(quote.goods_cny_total) || quote.goods_cny_total <= 0) return false;
-  if (!finite(quote.domestic_freight_cny_total) || quote.domestic_freight_cny_total < 0) return false;
+  if (quote.domestic_freight_cny_total !== null && quote.domestic_freight_cny_total !== undefined &&
+    (!finite(quote.domestic_freight_cny_total) || quote.domestic_freight_cny_total < 0)) return false;
   if (quote.expires_at && quote.expires_at.slice(0, 10) < asOfDay) return false;
   return true;
 }
@@ -333,6 +350,12 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
   }
 
   const resolvedRev = Math.max(59, Number.isInteger(effectiveProfileRevision) ? effectiveProfileRevision : 59);
+  const bareGoodsQuote = isQuoteBareGoods(persistedQuote);
+  const advisoryDomFreightCny = bareGoodsQuote
+    ? (finite(persistedQuote.domestic_freight_advisory_cny_total)
+      ? persistedQuote.domestic_freight_advisory_cny_total
+      : (finite(persistedQuote.domestic_freight_cny_total) ? persistedQuote.domestic_freight_cny_total : null))
+    : null;
 
   if (skuLines.length > 0) {
     return {
@@ -344,11 +367,19 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
       sku_lines: skuLines,
       goods_cny_per_unit: null,
       procurement_usd: null,
-      domestic_freight_cny_total: persistedQuote.domestic_freight_cny_total,
+      ...(bareGoodsQuote ? {
+        bare_goods_screening: true,
+        domestic_freight_cny_total: null,
+        ...(advisoryDomFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomFreightCny } : {}),
+      } : {
+        domestic_freight_cny_total: persistedQuote.domestic_freight_cny_total,
+      }),
       domestic_freight_cny_per_unit: null,
       domestic_freight_usd: null,
       goods_first_order_promotion: Boolean(persistedQuote.goods_first_order_promotion),
-      first_order_promotion: Boolean(persistedQuote.freight_first_order_promotion),
+      first_order_promotion: bareGoodsQuote
+        ? Boolean(persistedQuote.goods_first_order_promotion)
+        : Boolean(persistedQuote.freight_first_order_promotion),
     };
   }
 
@@ -361,11 +392,19 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
     sku_lines: null,
     goods_cny_per_unit: goodsCnyPerUnit,
     procurement_usd: null,
-    domestic_freight_cny_total: persistedQuote.domestic_freight_cny_total,
+    ...(bareGoodsQuote ? {
+      bare_goods_screening: true,
+      domestic_freight_cny_total: null,
+      ...(advisoryDomFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomFreightCny } : {}),
+    } : {
+      domestic_freight_cny_total: persistedQuote.domestic_freight_cny_total,
+    }),
     domestic_freight_cny_per_unit: null,
     domestic_freight_usd: null,
     goods_first_order_promotion: Boolean(persistedQuote.goods_first_order_promotion),
-    first_order_promotion: Boolean(persistedQuote.freight_first_order_promotion),
+    first_order_promotion: bareGoodsQuote
+      ? Boolean(persistedQuote.goods_first_order_promotion)
+      : Boolean(persistedQuote.freight_first_order_promotion),
   };
 }
 
@@ -701,19 +740,27 @@ function verifyStage3ContainerBindings({
         }
       }
       if (domLine && domLine.status !== 'pending' && domLine.status !== 'deferred' && finite(domLine.amount_usd)) {
-        if (domLine.order_units !== undefined && domLine.order_units !== activeQuote.actual_sets) {
-          throw new TypeError(
-            `Stage 3 ${containerLabel}scenario "${sc.id}" domestic_freight.order_units (${domLine.order_units}) conflicts with persisted 1688 quote actual_sets (${activeQuote.actual_sets}).`,
-          );
-        }
-        if (effectiveFx === null) {
-          throw new TypeError(`Stage 3 ${containerLabel}scenario "${sc.id}" requires fx_cny_per_usd to verify domestic_freight parity against persisted CNY 1688 quote.`);
-        }
-        const expectedDomUsd = (activeQuote.domestic_freight_cny_total / activeQuote.actual_sets) / effectiveFx;
-        if (Math.abs(domLine.amount_usd - expectedDomUsd) > PARITY_TOLERANCE_USD) {
-          throw new TypeError(
-            `Stage 3 ${containerLabel}scenario "${sc.id}" domestic_freight ($${domLine.amount_usd}) disagrees with persisted 1688 quote "${activeQuote.quote_id}" ($${expectedDomUsd.toFixed(4)} at accepted FX ${effectiveFx}).`,
-          );
+        if (isQuoteBareGoods(activeQuote)) {
+          if (Math.abs(domLine.amount_usd) > PARITY_TOLERANCE_USD) {
+            throw new TypeError(
+              `Stage 3 ${containerLabel}scenario "${sc.id}" domestic_freight ($${domLine.amount_usd}) conflicts with bare-goods 1688 quote "${activeQuote.quote_id}" (pricing_basis: bare_goods_1688).`,
+            );
+          }
+        } else {
+          if (domLine.order_units !== undefined && domLine.order_units !== activeQuote.actual_sets) {
+            throw new TypeError(
+              `Stage 3 ${containerLabel}scenario "${sc.id}" domestic_freight.order_units (${domLine.order_units}) conflicts with persisted 1688 quote actual_sets (${activeQuote.actual_sets}).`,
+            );
+          }
+          if (effectiveFx === null) {
+            throw new TypeError(`Stage 3 ${containerLabel}scenario "${sc.id}" requires fx_cny_per_usd to verify domestic_freight parity against persisted CNY 1688 quote.`);
+          }
+          const expectedDomUsd = (activeQuote.domestic_freight_cny_total / activeQuote.actual_sets) / effectiveFx;
+          if (Math.abs(domLine.amount_usd - expectedDomUsd) > PARITY_TOLERANCE_USD) {
+            throw new TypeError(
+              `Stage 3 ${containerLabel}scenario "${sc.id}" domestic_freight ($${domLine.amount_usd}) disagrees with persisted 1688 quote "${activeQuote.quote_id}" ($${expectedDomUsd.toFixed(4)} at accepted FX ${effectiveFx}).`,
+            );
+          }
         }
       }
     }
@@ -767,15 +814,30 @@ function verifyStage3ContainerBindings({
       ) {
         const [lo, hi] = matchedDecl.placement_range_usd;
         const isOversizeDecl = /oversize/i.test(String(matchedDecl.size_tier ?? plcLine.fee_basis?.size_tier ?? ''));
-        const optCartons = plcLine.fee_basis?.identical_cartons_count ?? ledger.identical_cartons_count ?? ledger.carton_count ?? null;
-        const optMultiDestVerified = plcLine.fee_basis?.multi_destination_headhaul_verified === true ||
-          ledger.multi_destination_headhaul_verified === true;
+        const hhLine = lines.find(l => l?.id === 'headhaul');
+        const hhSpec = ledger.headhaul ?? ledger.source_inputs?.headhaul ?? hhLine?.cny_derivation ?? null;
+        const optVerified = isAmazonOptimizedPlacementVerified2027({
+          identical_cartons_count: plcLine.fee_basis?.identical_cartons_count ?? ledger.identical_cartons_count ?? ledger.carton_count ?? null,
+          multi_destination_headhaul_verified: plcLine.fee_basis?.multi_destination_headhaul_verified ??
+            ledger.multi_destination_headhaul_verified ??
+            undefined,
+          steady_state_replenishment: plcLine.fee_basis?.steady_state_replenishment ?? ledger.steady_state_replenishment ?? hhSpec?.steady_state_replenishment ?? true,
+          headhaul: hhSpec,
+          extra_headhauls: [ledger.headhaul, ledger.source_inputs?.headhaul, hhLine?.cny_derivation],
+          headhaul_rate_cny_per_kg: plcLine.fee_basis?.headhaul_rate_cny_per_kg ?? ledger.headhaul_rate_cny_per_kg ?? hhSpec?.rate_cny_per_kg ?? null,
+          headhaul_destination_scope: plcLine.fee_basis?.headhaul_destination_scope ?? ledger.headhaul_destination_scope ?? hhSpec?.destination_scope ?? null,
+        });
+        if (!isOversizeDecl && plcLine.amount_usd === 0 && !optVerified) {
+          throw new TypeError(
+            `Stage 3 ${containerLabel}scenario "${sc.id}" placement ($0) is not eligible for Standard/Bulky amazon_optimized placement (requires steady-state nationwide multi-warehouse headhaul >= ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg or multi_destination_headhaul_verified: true, never pure US-West single-warehouse headhaul).`,
+          );
+        }
         const allowZeroOpt = plcLine.amount_usd === 0 &&
           (plcLine.split_option === 'amazon_optimized' || plcLine.fee_basis?.split_option === 'amazon_optimized') &&
-          (isOversizeDecl || (finite(optCartons) && optCartons >= 5 && optMultiDestVerified));
+          (isOversizeDecl || optVerified);
         if (!allowZeroOpt && finite(lo) && finite(hi) && (plcLine.amount_usd < lo - PARITY_TOLERANCE_USD || plcLine.amount_usd > hi + PARITY_TOLERANCE_USD)) {
           throw new TypeError(
-            `Stage 3 ${containerLabel}scenario "${sc.id}" placement ($${plcLine.amount_usd}) falls outside Gate 1A verified placement range [$${lo}, $${hi}] (Standard/Bulky amazon_optimized requires >=5 identical cartons and multi_destination_headhaul_verified: true).`,
+            `Stage 3 ${containerLabel}scenario "${sc.id}" placement ($${plcLine.amount_usd}) falls outside Gate 1A verified placement range [$${lo}, $${hi}] (Standard/Bulky amazon_optimized requires steady-state nationwide multi-warehouse headhaul >= ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg or multi_destination_headhaul_verified: true, never pure US-West single-warehouse headhaul).`,
           );
         }
       }
@@ -1046,8 +1108,13 @@ function computeGate1BForwardPricing(gate1a, quote) {
   });
   const sharedMinimum = quoteBasisIssues.length === 0 && sharedBandMinima.length > 0 ? Math.min(...sharedBandMinima) : null;
   const hasProvenInfeasibleScenario = results.some(({ solution }) => solution.status === 'infeasible');
+  const isBareGoodsForward = isQuoteBareGoods(quote) ||
+    results.some(({ solution }) => solution?.cost_basis === 'bare_goods_1688');
   return {
     status: sharedMinimum !== null ? 'verified' : (quoteBasisIssues.length === 0 && hasProvenInfeasibleScenario ? 'infeasible' : 'needs_calculator_verification'),
+    calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+    cost_basis: isBareGoodsForward ? 'bare_goods_1688' : 'landed_domestic_explicit',
+    ...(isBareGoodsForward ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
     advisory_only: true,
     quote_id: quote.quote_id,
     actual_sets: quote.actual_sets,
@@ -1061,6 +1128,9 @@ function computeGate1BForwardPricing(gate1a, quote) {
       id: declared.id,
       operating_period_id: declared.operating_period_id,
       status: solution.status,
+      calculator_name_zh: solution.calculator_name_zh ?? CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+      ...(solution.cost_basis ? { cost_basis: solution.cost_basis } : {}),
+      ...(solution.bare_goods_disclosure ? { bare_goods_disclosure: solution.bare_goods_disclosure } : {}),
       feasible_min_price_usd: solution.feasible_min_price_usd ?? null,
       min_retail_price_for_30pct_usd: solution.feasible_min_price_usd ?? null,
       landed_domestic_cny_per_set: solution.landed_domestic_cny ?? null,
@@ -2596,7 +2666,8 @@ export async function runGate1BForForm(store, {
         }
 
         let candPkgRescue = ev.packaging_redesign_shortlist ?? null;
-        if (!candPkgRescue && rawScenarios[i]?.pkg && met && finite(met.procurement_usd) && finite(met.domestic_freight_usd) &&
+        const rescueDomUsd = finite(met?.domestic_freight_usd) ? met.domestic_freight_usd : 0;
+        if (!candPkgRescue && rawScenarios[i]?.pkg && met && finite(met.procurement_usd) &&
           finite(met.headhaul_usd) && finite(fallbackFx) && fallbackFx > 0 && finite(rawScenarios[i].refund_fraction)) {
           candPkgRescue = computePackagingRedesignShortlist2027({
             pkg: rawScenarios[i].pkg,
@@ -2615,8 +2686,12 @@ export async function runGate1BForForm(store, {
             carton_count: rawScenarios[i].carton_count,
             identical_cartons_count: rawScenarios[i].identical_cartons_count ?? rawScenarios[i].placement_fee_basis?.identical_cartons_count,
             multi_destination_headhaul_verified: rawScenarios[i].multi_destination_headhaul_verified ?? rawScenarios[i].placement_fee_basis?.multi_destination_headhaul_verified,
+            headhaul: rawScenarios[i].headhaul ?? null,
+            headhaul_rate_cny_per_kg: rawScenarios[i].headhaul_rate_cny_per_kg ?? rawScenarios[i].placement_fee_basis?.headhaul_rate_cny_per_kg ?? null,
+            headhaul_destination_scope: rawScenarios[i].headhaul_destination_scope ?? rawScenarios[i].placement_fee_basis?.headhaul_destination_scope ?? null,
+            steady_state_replenishment: rawScenarios[i].steady_state_replenishment ?? rawScenarios[i].placement_fee_basis?.steady_state_replenishment ?? true,
             fx_cny_per_usd: fallbackFx,
-            landed_domestic_usd: met.procurement_usd + met.domestic_freight_usd,
+            landed_domestic_usd: met.procurement_usd + rescueDomUsd,
             refund_fraction: rawScenarios[i].refund_fraction,
             physical_return_fraction: rawScenarios[i].physical_return_fraction ?? null,
             fee_category: rawScenarios[i].fee_category ?? null,
@@ -2655,7 +2730,7 @@ export async function runGate1BForForm(store, {
       const rows = store.getQuotesForForm(form_id).filter(
         q => q.spec_version === expectedSpecVersion &&
           q.goods_first_order_promotion === 0 &&
-          q.freight_first_order_promotion === 0 &&
+          (isQuoteBareGoods(q) || q.freight_first_order_promotion === 0) &&
           (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
       );
       return new Set(rows.map(resolveQuoteVerifiedFactoryKey).filter(Boolean)).size;
@@ -5134,6 +5209,7 @@ export function runFastProfitHealthcheck2027(spec = {}) {
     : undefined;
   let resolvedHeadhaulUsd;
   let headhaulCheckReason = null;
+  let headhaulAdvisoryNote = null;
   const hasStructuredHeadhaul = Boolean(
     spec.headhaul && typeof spec.headhaul === 'object' && !Array.isArray(spec.headhaul) &&
     !finite(spec.headhaul.usd_per_unit) &&
@@ -5149,8 +5225,19 @@ export function runFastProfitHealthcheck2027(spec = {}) {
       const a4 = computeHeadhaulWithA4Rules(spec.headhaul, fx, orderUnits, {
         isR58: true,
         isR59: true,
+        steadyStateReplenishment: spec.steady_state_replenishment,
       });
-      if (a4?.weight_conflict) {
+      if (a4?.advisory_replenishment_note || a4?.a4_applied?.advisory_replenishment_note) {
+        headhaulAdvisoryNote = a4.advisory_replenishment_note ?? a4.a4_applied.advisory_replenishment_note;
+      }
+      const innerRate = finite(spec.headhaul.rate_cny_per_kg) ? spec.headhaul.rate_cny_per_kg : a4?.cny_derivation?.rate_cny_per_kg;
+      const innerScope = String(spec.headhaul.destination_scope ?? spec.headhaul.headhaul_destination_scope ?? '').trim().toLowerCase();
+      const outerScope = String(spec.headhaul_destination_scope ?? '').trim().toLowerCase();
+      if (finite(spec.headhaul_rate_cny_per_kg) && finite(innerRate) && Math.abs(spec.headhaul_rate_cny_per_kg - innerRate) > 1e-6) {
+        headhaulCheckReason = `Conflicting outer headhaul_rate_cny_per_kg (${spec.headhaul_rate_cny_per_kg}) vs headhaul.rate_cny_per_kg (${innerRate}).`;
+      } else if (outerScope && innerScope && outerScope !== innerScope) {
+        headhaulCheckReason = `Conflicting outer headhaul_destination_scope (${outerScope}) vs headhaul.destination_scope (${innerScope}).`;
+      } else if (a4?.weight_conflict) {
         headhaulCheckReason = a4.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.';
       } else if (a4?.missing_surcharge_quote) {
         headhaulCheckReason = `Headhaul Freight A4 requires ${a4.a4_applied?.missing_surcharge_quote ?? 'surcharge quote'}.`;
@@ -5184,6 +5271,14 @@ export function runFastProfitHealthcheck2027(spec = {}) {
     pkg,
     order_units: orderUnits,
     headhaul: finite(resolvedHeadhaulUsd) ? undefined : spec.headhaul,
+    headhaul_rate_cny_per_kg: (spec.headhaul && typeof spec.headhaul === 'object' && finite(spec.headhaul.rate_cny_per_kg))
+      ? spec.headhaul.rate_cny_per_kg
+      : spec.headhaul_rate_cny_per_kg,
+    headhaul_destination_scope: (spec.headhaul && typeof spec.headhaul === 'object' && (spec.headhaul.destination_scope ?? spec.headhaul.headhaul_destination_scope))
+      ? (spec.headhaul.destination_scope ?? spec.headhaul.headhaul_destination_scope)
+      : spec.headhaul_destination_scope,
+    steady_state_replenishment: spec.steady_state_replenishment ??
+      (spec.headhaul && typeof spec.headhaul === 'object' ? spec.headhaul.steady_state_replenishment : undefined),
     sales_window: spec.sales_window ?? FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
     storage_window: spec.storage_window ?? FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
     inbound_window: spec.inbound_window ?? FBA_2027_DEFAULT_INBOUND_WINDOW,
@@ -5218,39 +5313,63 @@ export function runFastProfitHealthcheck2027(spec = {}) {
   let forwardBreakeven = null;
   let realizedScreen = null;
   let packagingRescue = null;
+  const bareGoodsScreening = spec.bare_goods_screening === true || (!hasDomFreightCny && spec.bare_goods_screening !== false);
+  const advisoryDomFreightCny = finite(spec.domestic_freight_advisory_cny_total) && spec.domestic_freight_advisory_cny_total >= 0
+    ? spec.domestic_freight_advisory_cny_total
+    : (bareGoodsScreening && hasDomFreightCny ? domFreightCnyTotal : null);
+  const explicitLandedMissingFreight = spec.bare_goods_screening === false && !hasDomFreightCny;
+  const batchTotalBelow100Sets = !finite(spec.goods_cny_per_unit) && finite(spec.goods_cny_total) && orderUnits < 100;
+  const promoOrInvalidBatchQuote = spec.goods_first_order_promotion === true ||
+    spec.goods_first_order_promotion === 1 ||
+    (!bareGoodsScreening && (spec.freight_first_order_promotion === true || spec.freight_first_order_promotion === 1));
 
   if (hasGoodsCny && fx !== null) {
-    if (!hasDomFreightCny) {
-      const pendingReason = 'Missing domestic_freight_cny_total / domestic_freight_cny_per_unit to 广东深圳; domestic freight is never assumed ¥0.';
+    if (explicitLandedMissingFreight || batchTotalBelow100Sets || promoOrInvalidBatchQuote) {
+      const invalidReason = explicitLandedMissingFreight
+        ? 'Explicit landed-freight screening (bare_goods_screening: false) requires domestic_freight_cny_total or domestic_freight_cny_per_unit.'
+        : (batchTotalBelow100Sets
+          ? `Full batch goods_cny_total screening requires at least 100 complete sets (received ${orderUnits}); use goods_cny_per_unit for quick per-unit trials.`
+          : 'Promotional quote (first_order_promotion: true) cannot produce a verified repeat-order screening.');
+      const invalidStatus = explicitLandedMissingFreight ? 'pending_domestic_freight' : 'needs_calculator_verification';
       forwardBreakeven = {
-        status: 'pending_domestic_freight',
-        reason: pendingReason,
+        status: invalidStatus,
+        calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+        cost_basis: bareGoodsScreening ? 'bare_goods_1688' : 'landed_domestic_explicit',
+        ...(bareGoodsScreening ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
+        reason: invalidReason,
         feasible_min_price_usd: null,
       };
       realizedScreen = {
-        status: 'pending_domestic_freight',
-        reason: pendingReason,
+        status: invalidStatus,
+        reason: invalidReason,
         margin: null,
         contribution_usd: null,
       };
     } else {
-      const landedCnyPerUnit = (goodsCnyTotal + domFreightCnyTotal) / orderUnits;
+      const costCnyPerUnit = bareGoodsScreening
+        ? goodsCnyTotal / orderUnits
+        : (goodsCnyTotal + domFreightCnyTotal) / orderUnits;
 
-      forwardBreakeven = finite(baseInput.headhaul_usd)
+      forwardBreakeven = finite(baseInput.headhaul_usd) && headhaulCheckReason === null
         ? solveMinPriceForMargin2027({
             ...baseInput,
-            landed_domestic_cny: landedCnyPerUnit,
+            ...(bareGoodsScreening
+              ? { bare_goods_cny: costCnyPerUnit, bare_goods_screening: true, domestic_freight_advisory_cny_total: advisoryDomFreightCny }
+              : { landed_domestic_cny: costCnyPerUnit }),
             margin_floor: 0.30,
             min_retail_price_usd: 29.99,
           })
         : {
             status: 'needs_calculator_verification',
+            calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+            cost_basis: bareGoodsScreening ? 'bare_goods_1688' : 'landed_domestic_explicit',
+            ...(bareGoodsScreening ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
             reason: headhaulCheckReason ?? 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
             feasible_min_price_usd: null,
           };
 
       if (priceUsd !== null) {
-        if (!finite(baseInput.headhaul_usd)) {
+        if (!finite(baseInput.headhaul_usd) || headhaulCheckReason !== null) {
           realizedScreen = {
             status: 'needs_calculator_verification',
             reason: headhaulCheckReason ?? 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
@@ -5258,16 +5377,16 @@ export function runFastProfitHealthcheck2027(spec = {}) {
             contribution_usd: null,
           };
         } else {
-          const landedUsdPerUnit = landedCnyPerUnit / fx;
+          const costUsdPerUnit = costCnyPerUnit / fx;
           const g1aAtPrice = estimateGate1A2027({
             ...baseInput,
             price_usd: spec.price_usd ?? priceUsd,
             margin_floor: 0.30,
-            min_landed_domestic_usd: landedUsdPerUnit,
+            min_landed_domestic_usd: costUsdPerUnit,
             domestic_freight_usd: 0,
           });
           if (g1aAtPrice?.status === 'verified' && finite(g1aAtPrice.net_revenue_usd) && g1aAtPrice.net_revenue_usd > 0) {
-            const contrib = Math.round((g1aAtPrice.net_revenue_usd - g1aAtPrice.non_domestic_cost_a_usd - landedUsdPerUnit) * 1e10) / 1e10;
+            const contrib = Math.round((g1aAtPrice.net_revenue_usd - g1aAtPrice.non_domestic_cost_a_usd - costUsdPerUnit) * 1e10) / 1e10;
             const marg = Math.round((contrib / g1aAtPrice.net_revenue_usd) * 1e10) / 1e10;
             realizedScreen = { status: 'verified', margin: marg, contribution_usd: contrib };
           } else {
@@ -5278,7 +5397,7 @@ export function runFastProfitHealthcheck2027(spec = {}) {
             packagingRescue = computePackagingRedesignShortlist2027({
               ...baseInput,
               price_usd: spec.price_usd ?? priceUsd,
-              landed_domestic_cny_per_set: landedCnyPerUnit,
+              landed_domestic_cny: costCnyPerUnit,
               fx_cny_per_usd: fx,
               headhaul_usd: baseInput.headhaul_usd,
               collection_rate: baseInput.collection_rate,
@@ -5292,6 +5411,11 @@ export function runFastProfitHealthcheck2027(spec = {}) {
   const resolvedMargin = realizedScreen?.margin ?? null;
   const resolvedContrib = realizedScreen?.contribution_usd ?? null;
   return {
+    calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+    cost_basis: bareGoodsScreening ? 'bare_goods_1688' : 'landed_domestic_explicit',
+    ...(bareGoodsScreening ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
+    ...(advisoryDomFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomFreightCny } : {}),
+    ...(headhaulAdvisoryNote ? { advisory_replenishment_note: headhaulAdvisoryNote } : {}),
     window: {
       sales: baseInput.sales_window,
       storage: baseInput.storage_window,

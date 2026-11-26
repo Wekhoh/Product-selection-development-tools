@@ -1,5 +1,5 @@
 // Self-contained, script-free Chinese Curatorial Studio (01 视觉策展室) report renderer (Revision 59+).
-import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
+import { BARE_GOODS_DISCLOSURE_ZH, BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import { sanitizeDiagnosticText } from './contracts.mjs';
 import { ledgerMeetsMarginFloor } from './economics.mjs';
 import { extractNewcomerReviewOriginBreakdown } from './observations.mjs';
@@ -533,6 +533,13 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
   const prices = minMaxRange(activeLedgers.map(c => c?.price_usd)) ??
     (bareGoodsBounds ? minMaxRange(nonSensCoherentCalcs.map(c => c?.price_usd)) : null) ??
     validatedRefPrice;
+  const isBareGoodsCalc = c => {
+    const domLine = array(c?.lines).find(l => l?.id === 'domestic_freight');
+    return Boolean(c?.cost_basis === 'bare_goods_1688' ||
+      domLine?.bare_goods_screening === true ||
+      (domLine?.status === 'not_applicable' && domLine?.amount_usd === 0));
+  };
+  const isBareGoods = activeLedgers.length > 0 && activeLedgers.every(isBareGoodsCalc);
   const domesticDelivered = minMaxRange(activeLedgers.map(c => {
     const proc = array(c?.lines).find(l => l.id === 'procurement')?.amount_usd;
     const dom = array(c?.lines).find(l => l.id === 'domestic_freight')?.amount_usd;
@@ -572,6 +579,7 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
   );
   const cnyTotals = minMaxRange(activeLedgers.map(c => {
     const si = sInputs(scenarios, c);
+    if (isBareGoodsCalc(c) && finite(si?.procurement_cny)) return si.procurement_cny;
     return finite(si?.procurement_cny) && finite(si?.domestic_per_unit_cny) ? si.procurement_cny + si.domestic_per_unit_cny : null;
   }));
   const orderUnitsRange = rev >= 58
@@ -673,6 +681,7 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
   return {
     target,
     prices,
+    isBareGoods,
     domesticDelivered,
     cnyTotals,
     orderUnitsRange,
@@ -912,6 +921,10 @@ function r57RevenueAllocationStrip(scenarios, rev = 57) {
     const found = lines.find(l => l.id === id);
     return found && !array(calc.deferred_lines).includes(id) && finite(found.amount_usd) ? found.amount_usd : 0;
   };
+  const domLineAlloc = lines.find(l => l.id === 'domestic_freight');
+  const isBareGoodsAlloc = Boolean(calc?.cost_basis === 'bare_goods_1688' ||
+    domLineAlloc?.bare_goods_screening === true ||
+    (domLineAlloc?.status === 'not_applicable' && domLineAlloc?.amount_usd === 0));
   const supplyUsd = amt('procurement') + amt('domestic_freight') + amt('headhaul');
   const platformUsd = Math.max(0, calc.net_cost_usd - supplyUsd);
   const netRev = calc.net_revenue_usd;
@@ -935,7 +948,7 @@ function r57RevenueAllocationStrip(scenarios, rev = 57) {
       <span class="alloc-tick" title="30% 广告前净毛利红线（净成本 ≤ 70%）"></span>
     </div>
     <div class="alloc-legend">
-      <span><i class="swatch swatch-supply" aria-hidden="true"></i>采购＋国内运＋头程 <strong>${money(supplyUsd)}</strong>（${escape(numberText((supplyUsd / netRev) * 100))}%）</span>
+      <span><i class="swatch swatch-supply" aria-hidden="true"></i>${isBareGoodsAlloc ? '裸货采购＋头程' : '采购＋国内运＋头程'} <strong>${money(supplyUsd)}</strong>（${escape(numberText((supplyUsd / netRev) * 100))}%）</span>
       <span><i class="swatch swatch-platform" aria-hidden="true"></i>佣金＋FBA配送入仓仓储 <strong>${money(platformUsd)}</strong>（${escape(numberText((platformUsd / netRev) * 100))}%）</span>
       <span><i class="swatch ${pass ? 'swatch-pass' : 'swatch-fail'}" aria-hidden="true"></i>广告前留存 <strong>${money(contribUsd)}</strong>（<strong class="${pass ? 'ink-pass' : 'ink-fail'}">${finite(calc.margin) ? `${escape(numberText(calc.margin * 100))}%` : `${escape(numberText((posContrib / netRev) * 100))}%`}</strong>）</span>
     </div>
@@ -955,19 +968,27 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
   const stressScenarios = r58 ? array(diagnostics.stress_scenarios) : [];
   const expectedPrimary = r58 && Array.isArray(diagnostics.expected_primary_scenarios) ? diagnostics.expected_primary_scenarios : [];
 
+  const isBareGoodsLedger = ledger => {
+    const domLine = array(ledger?.lines).find(l => l?.id === 'domestic_freight');
+    return Boolean(ledger?.cost_basis === 'bare_goods_1688' ||
+      domLine?.bare_goods_screening === true ||
+      (domLine?.status === 'not_applicable' && domLine?.amount_usd === 0));
+  };
+  const anyBareGoodsWaterfall = scenarios.some(sc => isBareGoodsLedger(sc?.input?.calculation));
   const cellAmount = (ledger, lineId) => {
     if (!ledger) return '未知';
     const pending = array(ledger.pending_lines);
     const deferred = array(ledger.deferred_lines);
     const line = array(ledger.lines).find(l => l.id === lineId);
     if (!line) return r58 ? '–' : '—';
+    if (lineId === 'domestic_freight' && isBareGoodsLedger(ledger)) return '未计入（裸货口径）';
     if (deferred.includes(lineId)) return pending.includes(lineId) ? '待补证' : '成对暂缓';
     if (pending.includes(lineId) || line.amount_usd === null) return '待补证';
     return money2(line.amount_usd);
   };
 
   const r58ExtraRows = r58 ? `
-          <tr><th scope="row">保 30% 毛利对应到深含运采购上限<span class="th-note">含采购＋国内运（(0.70×R − A)×FX）；与上方裸货采购上限区分</span></th>${scenarios.map(sc => {
+          <tr><th scope="row">${anyBareGoodsWaterfall ? '保 30% 毛利对应 1688 裸货上限' : '保 30% 毛利对应到深含运采购上限'}<span class="th-note">${anyBareGoodsWaterfall ? '按 1688 裸货初筛口径（(0.70×R − A)×FX），不含国内到深圳运费' : '含采购＋国内运（(0.70×R − A)×FX）；与上方裸货采购上限区分'}</span></th>${scenarios.map(sc => {
             const c = sc.input?.calculation;
             const si = sc.input?.cost_ledger?.source_inputs;
             const fxVal = finite(si?.fx_cny_per_usd) ? si.fx_cny_per_usd : si?.fx_usdcny;
@@ -980,7 +1001,7 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
               ? `<td class="num-col">${money2(c.landed_domestic_cap_at_30pct_usd)}${finite(cnyCap) ? `<span class="th-note">约 ¥${escape(numberText(cnyCap))}</span>` : ''}</td>`
               : '<td class="num-col ink-muted">待补证</td>';
           }).join('')}</tr>${rev >= 59 ? `
-          <tr><th scope="row">单件落地本金（采购 + 国内运费 + 头程）<span class="th-note">仅作资金门槛参考，不算强制周转月数</span></th>${scenarios.map(sc => {
+          <tr><th scope="row">${anyBareGoodsWaterfall ? '单件参考本金（1688 裸货 + 头程）' : '单件落地本金（采购 + 国内运费 + 头程）'}<span class="th-note">仅作资金门槛参考，不算强制周转月数</span></th>${scenarios.map(sc => {
             const c = sc.input?.calculation;
             const cl = sc.input?.cost_ledger;
             const si = cl?.source_inputs;
@@ -989,8 +1010,9 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
             const fxVal = [si?.fx_cny_per_usd, si?.fx_usdcny, cl?.fx_cny_per_usd, procLineRaw?.fx_cny_per_usd, domLineRaw?.fx_cny_per_usd]
               .find(v => finite(v) && v > 0) ?? null;
             const pendingSet = new Set(array(c?.pending_lines));
+            const bareSc = isBareGoodsLedger(c);
             const procUsd = pendingSet.has('procurement') ? null : array(c?.lines).find(l => l?.id === 'procurement')?.amount_usd;
-            const domUsd = pendingSet.has('domestic_freight') ? null : array(c?.lines).find(l => l?.id === 'domestic_freight')?.amount_usd;
+            const domUsd = bareSc ? 0 : (pendingSet.has('domestic_freight') ? null : array(c?.lines).find(l => l?.id === 'domestic_freight')?.amount_usd);
             const headUsd = pendingSet.has('headhaul') ? null : array(c?.lines).find(l => l?.id === 'headhaul')?.amount_usd;
             if (!finite(procUsd) || !finite(domUsd) || !finite(headUsd)) {
               return '<td class="num-col ink-muted">待补证</td>';
@@ -1005,7 +1027,33 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
             }
             const batch100UsdFmt = new Intl.NumberFormat('en-US').format(Math.round(unitUsd * 100));
             return `<td class="num-col">≈ $${escape(usdFmt)}<span class="th-note">按 100 套试算参考本金 ≈ $${escape(batch100UsdFmt)}</span></td>`;
-          }).join('')}</tr>${(() => {
+          }).join('')}</tr>${anyBareGoodsWaterfall ? (() => {
+            const advisoryRefs = [...new Set(scenarios.flatMap(sc => {
+              const cl = sc?.input?.cost_ledger;
+              const si = cl?.source_inputs;
+              const domLineRaw = array(cl?.lines).find(l => l?.id === 'domestic_freight');
+              const refs = [];
+              if (typeof si?.domestic_freight_advisory_note === 'string' && si.domestic_freight_advisory_note.trim()) {
+                refs.push(sanitizeTextPaths(si.domestic_freight_advisory_note.trim()));
+              }
+              if (finite(domLineRaw?.domestic_freight_advisory_cny_total)) {
+                refs.push(`页面展示国内运费参考 ¥${numberText(domLineRaw.domestic_freight_advisory_cny_total)}（仅备注，不卡 30% 红线）`);
+              }
+              return refs;
+            }))];
+            const advisorySuffix = advisoryRefs.length ? `（参考备注：${advisoryRefs.join('；')}）` : '';
+            return `
+          <tr><th scope="row">裸货口径说明<span class="th-note">1688 常规 100 套初筛标准披露</span></th><td colspan="${scenarios.length}">${escape(BARE_GOODS_DISCLOSURE_ZH)}${escape(advisorySuffix)}</td></tr>`;
+          })() : ''}${(() => {
+            const replNotes = [...new Set(scenarios.map(sc =>
+              sc?.input?.calculation?.advisory_replenishment_note ??
+              sc?.input?.calculation?.headhaul_a4_applied?.advisory_replenishment_note ??
+              null,
+            ).filter(n => typeof n === 'string' && n.trim()))];
+            if (!replNotes.length) return '';
+            return `
+          <tr><th scope="row">稳态补货门槛提示<span class="th-note">海卡单仓 ≥50 kg 参考，不拖累主毛利</span></th><td colspan="${scenarios.length}">${escape(replNotes.join('；'))}</td></tr>`;
+          })()}${(() => {
             const rawLabNote = original?.one_time_lab_fee_note ?? original?.compliance_lab_fee_note ?? original?.presentation?.one_time_lab_fee_note ?? null;
             const rawLabUsd = original?.one_time_compliance_fee_usd ?? original?.one_time_lab_fee_usd ?? null;
             if (!rawLabNote && !finite(rawLabUsd)) return '';
@@ -1291,7 +1339,12 @@ function renderComparisonMatrix(candidates, originals, rev = 57) {
   if (!candidates.length) return '';
   const snaps = candidates.map(cand => extractMetricsSnapshot(cand, rev));
   const anyOver100 = rev >= 58 && snaps.some(s => s.orderUnitsRange && s.orderUnitsRange[1] > 100);
-  const domesticColHeader = anyOver100 ? '1688到深含运' : '1688百套含运';
+  const allBareGoodsMatrix = snaps.length > 0 && snaps.every(s => s.isBareGoods);
+  const anyBareGoodsMatrix = snaps.some(s => s.isBareGoods);
+  const mixedBareGoodsMatrix = anyBareGoodsMatrix && !allBareGoodsMatrix;
+  const domesticColHeader = allBareGoodsMatrix
+    ? (anyOver100 ? '1688裸货' : '1688百套裸货')
+    : (mixedBareGoodsMatrix ? '1688货价口径' : (anyOver100 ? '1688到深含运' : '1688百套含运'));
   return `<section id="overview" class="matrix-block" aria-labelledby="matrix-heading">
     <div class="section-head">
       <h2 id="matrix-heading">横向对比总览</h2>
@@ -1335,11 +1388,14 @@ function renderComparisonMatrix(candidates, originals, rev = 57) {
               : (snap.margins ? (snap.margins[0] >= 0.3 ? 'ink-pass' : snap.margins[1] < 0.3 ? 'ink-fail' : '') : 'ink-muted');
             const unitsSuffix = anyOver100 && snap.orderUnitsRange && snap.orderUnitsRange[1] > 100
               ? `（${escape(rangeText(snap.orderUnitsRange))}套）` : '';
+            const basisSuffix = mixedBareGoodsMatrix
+              ? (snap.isBareGoods ? '<span class="th-note">裸货口径</span>' : '<span class="th-note">含运口径</span>')
+              : '';
             return `<tr data-eligible="${eligible ? 'true' : 'false'}"${bucketAttr}>
               <th scope="row"><a class="row-jump" href="#candidate-${idx + 1}"><span class="mono-idx">${String(idx + 1).padStart(2, '0')}</span>${escape(cand.label ?? cand.candidate_id)}</a></th>
               <td>${renderDotStatus(cand, snap, rev)}</td>
               <td class="num-col">${usdRangeText(snap.prices)}</td>
-              <td class="num-col">${snap.cnyTotals ? `${escape(rangeText(snap.cnyTotals))} 元` : usdRangeText(snap.domesticDelivered)}${unitsSuffix}</td>
+              <td class="num-col">${snap.cnyTotals ? `${escape(rangeText(snap.cnyTotals))} 元` : usdRangeText(snap.domesticDelivered)}${unitsSuffix}${basisSuffix}</td>
               <td class="num-col ${mCls}"><strong>${pctRangeText(snap.margins)}</strong></td>
               <td class="num-col">${pctRangeText(snap.adMargins)}</td>
               <td class="num-col">${usdRangeText(snap.contributions)}</td>
@@ -1583,9 +1639,13 @@ function renderR58SculpturalLedger(snapshot, queueLabel) {
   const domesticSub = snapshot.cnyTotals && snapshot.domesticDelivered
     ? `（${usdRangeText(snapshot.domesticDelivered)}）`
     : '';
-  const domesticLabel = snapshot.orderUnitsRange && snapshot.orderUnitsRange[1] > 100
-    ? `1688到深含运（${escape(rangeText(snapshot.orderUnitsRange))}套）`
-    : '1688百套含运';
+  const domesticLabel = snapshot.isBareGoods
+    ? (snapshot.orderUnitsRange && snapshot.orderUnitsRange[1] > 100
+      ? `1688裸货（${escape(rangeText(snapshot.orderUnitsRange))}套）`
+      : '1688百套裸货')
+    : (snapshot.orderUnitsRange && snapshot.orderUnitsRange[1] > 100
+      ? `1688到深含运（${escape(rangeText(snapshot.orderUnitsRange))}套）`
+      : '1688百套含运');
   const hasSamplePending = Array.isArray(snapshot.sampleCheckItems) && snapshot.sampleCheckItems.length > 0;
   const scoreMain = snapshot.totalRange
     ? `${escape(rangeText(snapshot.totalRange))} / 100`
@@ -1606,7 +1666,7 @@ function renderR58SculpturalLedger(snapshot, queueLabel) {
       </div>
       <div class="sm-side-pair">
         <div class="sm-side-item">
-          <span>保 30% 到深封顶</span>
+          <span>${snapshot.isBareGoods ? '保 30% 裸货封顶' : '保 30% 到深封顶'}</span>
           <strong class="num">${capDisplay}</strong>
         </div>
         <div class="sm-side-item">
@@ -1616,6 +1676,7 @@ function renderR58SculpturalLedger(snapshot, queueLabel) {
       </div>
     </div>
     <p class="hero-stat-sub">${deltaHtml}</p>
+    ${snapshot.isBareGoods ? `<p class="hero-stat-sub muted">${escape(BARE_GOODS_DISCLOSURE_ZH)}</p>` : ''}
   </div>
   <dl class="side-ledger">
     <div><dt>美站参照价</dt><dd>${usdRangeText(snapshot.prices)}</dd></div>

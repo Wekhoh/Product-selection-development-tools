@@ -1,6 +1,6 @@
 // Offline trial calculations, with revision-50 replay. Importing performs no I/O.
 import { validEvidenceDate as validDate, sanitizeNewcomerMemberReviews } from './observations.mjs';
-import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
+import { BARE_GOODS_DISCLOSURE_ZH, BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS, resolveSharedLedgerPackage } from './economics.mjs';
 import { resolveEffectivePricing, resolveUniquePackageByRef, hasProhibited2026PeakExtrapolation } from './fba-calculator.mjs';
 import { lookupUnifiedFulfillmentFee2027, priceBand2027 } from './fba-calculator.mjs';
@@ -3237,9 +3237,15 @@ function buildOperationalDisclosuresR58(candidate, scenarios = []) {
         : (procurementQuotePending ? null : 0));
   const leadTimeDays = [ops.lead_time_days, ops.production_lead_time_days, ops.quote?.lead_time_days, si.lead_time_days]
     .find(v => number(v) && v >= 0) ?? null;
-  const perUnitCashUsd = [procLine?.amount_usd, domLine?.amount_usd, hhLine?.amount_usd]
+  const isBareGoodsLedger = Boolean(
+    firstLedger?.cost_basis === 'bare_goods_1688' ||
+    firstLedger?.bare_goods_screening === true ||
+    (domLine && domLine.status === 'not_applicable' && domLine.amount_usd === 0),
+  );
+  const effDomUsd = isBareGoodsLedger ? 0 : domLine?.amount_usd;
+  const perUnitCashUsd = [procLine?.amount_usd, effDomUsd, hhLine?.amount_usd]
     .every(v => number(v) && v >= 0)
-    ? (procLine.amount_usd + domLine.amount_usd + hhLine.amount_usd)
+    ? (procLine.amount_usd + effDomUsd + hhLine.amount_usd)
     : null;
   const effectiveSetsForCash = actualCompleteSets ?? (procurementQuotePending && perUnitCashUsd === null ? null : orderUnits);
   // Purchase-to-set lineage: purchased pieces / declared purchase SKUs beyond the saleable-set count reveal a
@@ -3294,10 +3300,12 @@ function buildOperationalDisclosuresR58(candidate, scenarios = []) {
   const moqCapitalAlert = (effectiveSetsForCash !== null && effectiveSetsForCash >= 300) || (orderUnits !== null && orderUnits >= 300);
   const cashStatus = moqCapitalAlert || (number(remainderUnits) && remainderUnits > 0) ? 'alert'
     : ((!procurementQuotePending && orderUnits !== null) || actualCompleteSets !== null || batchCashUsd !== null || leadTimeDays !== null) ? 'disclosed' : 'unverified';
+  const bareGoodsSuffix = isBareGoodsLedger ? ` ${BARE_GOODS_DISCLOSURE_ZH}。` : '';
   const batchCashDisclosure = {
     id: 'batch_cash_and_moq',
     label: '首批占资、交期与齐套余料',
     status: cashStatus,
+    ...(isBareGoodsLedger ? { cost_basis: 'bare_goods_1688', bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
     order_units: orderUnits,
     actual_complete_sets: actualCompleteSets,
     sku_line_count: skuLines.length,
@@ -3309,11 +3317,11 @@ function buildOperationalDisclosuresR58(candidate, scenarios = []) {
     batch_cash_tie_up_usd: batchCashUsd,
     batch_cash_tie_up_cny: batchCashCny,
     moq_capital_alert: moqCapitalAlert,
-    note: moqCapitalAlert
-      ? `起订批次数 ${effectiveSetsForCash ?? orderUnits} 齐套（≥300 套 MOQ 占资预警）${purchaseLineageNote}${batchCashCny !== null ? `，首批货款+头程占资约 ¥${batchCashCny}` : ''}${batchCashUsd !== null ? `（US$ ${batchCashUsd}）` : ''}${leadTimeDays !== null ? `，交期 ${leadTimeDays} 天` : ''}${number(remainderUnits) && remainderUnits > 0 ? `，齐套后余料 ${remainderUnits} 件` : ''}。`
+    note: (moqCapitalAlert
+      ? `起订批次数 ${effectiveSetsForCash ?? orderUnits} 齐套（≥300 套 MOQ 占资预警）${purchaseLineageNote}${batchCashCny !== null ? `，首批${isBareGoodsLedger ? '裸货' : '货款'}+头程占资约 ¥${batchCashCny}` : ''}${batchCashUsd !== null ? `（US$ ${batchCashUsd}）` : ''}${leadTimeDays !== null ? `，交期 ${leadTimeDays} 天` : ''}${number(remainderUnits) && remainderUnits > 0 ? `，齐套后余料 ${remainderUnits} 件` : ''}。`
       : effectiveSetsForCash !== null
-        ? `首批 ${actualCompleteSets ?? effectiveSetsForCash} 齐套${orderUnits !== null && actualCompleteSets !== null && orderUnits !== actualCompleteSets ? `（分摊口径 ${orderUnits} 套）` : ''}${purchaseLineageNote}${batchCashCny !== null ? `，货款+头程占资约 ¥${batchCashCny}` : ''}${batchCashUsd !== null ? `（US$ ${batchCashUsd}）` : ''}${leadTimeDays !== null ? `，交期 ${leadTimeDays} 天` : ''}${number(remainderUnits) && remainderUnits > 0 ? `；存在齐套余料 ${remainderUnits} 件` : remainderUnits === 0 ? '；完全齐套无余料' : ''}。`
-        : '尚缺完整的首批套数、交期或占资明细（不影响主分，下单前核实）。',
+        ? `首批 ${actualCompleteSets ?? effectiveSetsForCash} 齐套${orderUnits !== null && actualCompleteSets !== null && orderUnits !== actualCompleteSets ? `（分摊口径 ${orderUnits} 套）` : ''}${purchaseLineageNote}${batchCashCny !== null ? `，${isBareGoodsLedger ? '裸货' : '货款'}+头程占资约 ¥${batchCashCny}` : ''}${batchCashUsd !== null ? `（US$ ${batchCashUsd}）` : ''}${leadTimeDays !== null ? `，交期 ${leadTimeDays} 天` : ''}${number(remainderUnits) && remainderUnits > 0 ? `；存在齐套余料 ${remainderUnits} 件` : remainderUnits === 0 ? '；完全齐套无余料' : ''}。`
+        : '尚缺完整的首批套数、交期或占资明细（不影响主分，下单前核实）。') + bareGoodsSuffix,
   };
 
   // (2) Offer-bound Amazon 1P presence

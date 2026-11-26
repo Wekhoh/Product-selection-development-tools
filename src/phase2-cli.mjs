@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
+import { BARE_GOODS_DISCLOSURE_ZH, CALCULATOR_1688_FLOOR_PRICE_NAME_ZH } from './business-thresholds.mjs';
 import { canonicalJson, computeEvidenceBundleHash, openSelectionStore, sha256Hex } from './store.mjs';
 import {
   buildOutOfTableLookupDirective,
@@ -102,7 +103,7 @@ const USAGE = [
   '  luna-triage        --db <sqlite> --credential-file <json> --listings <listings.json> [--contact-sheet <png>] [--detail <low|high|auto>] --output <out.json>',
   '  openai-task        --db <sqlite> --credential-file <json> --task <social-bridge|spec-matcher|1688-vision|review-judge|rights-prescreen> --input <task.json> --output <out.json> [--background] [--progress-file <progress.json>] [--max-tool-calls <n>] [--delete-after]',
   '  openai-cancel      --db <sqlite> --credential-file <json> --attempt <id> [--output <out.json>]',
-  '  solve-min-price    --input <spec.json> [--output <out.json>]',
+  '  solve-min-price    --input <spec.json> [--output <out.json>]  (无状态，按 1688 成本算保底定价：求解美亚 30% 毛利最低零售价)',
   '  dedupe-forms       --db <sqlite> --input <leads-or-forms.json> [--output <out.json>]',
   '  funnel-ledger      --db <sqlite> [--since <ISO-timestamp>] [--output <out.json>]',
   '  openai-batch-build --task <social-bridge|spec-matcher|1688-vision|review-judge|rights-prescreen> --input <items.json> --output <batch.jsonl> [--max-tool-calls <n>]',
@@ -112,7 +113,7 @@ const USAGE = [
   '  redteam-review     --packet <packet.json> --output <review.json> [--effort <xhigh|max>] [--image <file>...] [--dry-run | --offline]  (未传 --dry-run/--offline 时调用本地订阅 codex exec)',
   '  daily-batch        --db <sqlite> --input <daily-batch.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (日常 80% 站内 + 20% 站外 + 1688 源头厂小批入口，支持滑块暂停续跑)',
   '  single-product     --db <sqlite> --input <asin-or-post.json> [--profile <profile.json>] [--report-dir <dir>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (单品种子登记、Gate1A/1B/21项评分与 V4 报告导出；兼容别名 single-dive)',
-  '  reverse-1688       --db <sqlite> --input <1688-spec.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (1688 源头厂反向测美亚 30% 保底零售价与深挖)',
+  '  reverse-1688       --db <sqlite> --input <1688-spec.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (按 1688 成本算保底定价：1688 源头厂裸货价测美亚 30% 保底零售价与深挖)',
   '  profit-check       --input <profit-spec.json> [--output <out.json>]  (无状态，快速 2027 淡季利润体检 + 非 SIPP 合并费 + <=10mm 改盒可救检测)',
   '  openai-recover     --db <sqlite> --credential-file <json> --attempt <id> [--output <out.json>]  (零重复 POST 读取 GET /v1/responses/{id} 断点恢复并补记新用量)',
   '  openai-batch-poll  --db <sqlite> --credential-file <json> (--batch-id <id> | --submit-jsonl <batch.jsonl>) [--attempt <id>] [--download-output] [--output <out.json>]  (Batch API 提交/轮询)',
@@ -1359,8 +1360,16 @@ export async function runPhase2Cli(
         const comparable = Number.isFinite(price) && Number.isFinite(band?.p25_usd) &&
           Number.isFinite(band?.p75_usd) && band.p25_usd > 0 && band.p25_usd <= band.p75_usd;
         const comparison = comparable ? (price < band.p25_usd ? 'below_band' : price > band.p75_usd ? 'above_band' : 'within_band') : null;
-        const out = { ok: true, command, solution, min_retail_price_for_30pct_usd: solution.margin_floor === 0.30 ? price : null,
-          mature_band_comparison: comparison };
+        const out = {
+          ok: true,
+          command,
+          calculator_name_zh: solution.calculator_name_zh ?? CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+          ...(solution.cost_basis ? { cost_basis: solution.cost_basis } : {}),
+          ...(solution.bare_goods_disclosure ? { bare_goods_disclosure: solution.bare_goods_disclosure } : {}),
+          solution,
+          min_retail_price_for_30pct_usd: solution.margin_floor === 0.30 ? price : null,
+          mature_band_comparison: comparison,
+        };
         const json = JSON.stringify(out, null, 2) + '\n';
         if (values.output) await writeSingleFileSafe(values.output, Buffer.from(json), [inputPath]);
         streams.stdout.write(json);
@@ -2861,12 +2870,24 @@ export async function runPhase2Cli(
           );
           let resolvedRevHeadhaulUsd;
           let revHeadhaulErrorReason = null;
+          let revHeadhaulAdvisoryNote = null;
           if (hasStructuredRevHeadhaul) {
             const a4Rev = computeHeadhaulWithA4Rules(rawRevHeadhaulObj, fxVal, orderUnits, {
               isR58: true,
               isR59: true,
+              steadyStateReplenishment: spec.steady_state_replenishment,
             });
-            if (a4Rev?.weight_conflict) {
+            if (a4Rev?.advisory_replenishment_note || a4Rev?.a4_applied?.advisory_replenishment_note) {
+              revHeadhaulAdvisoryNote = a4Rev.advisory_replenishment_note ?? a4Rev.a4_applied.advisory_replenishment_note;
+            }
+            const innerRevRate = Number.isFinite(rawRevHeadhaulObj.rate_cny_per_kg) ? rawRevHeadhaulObj.rate_cny_per_kg : a4Rev?.cny_derivation?.rate_cny_per_kg;
+            const innerRevScope = String(rawRevHeadhaulObj.destination_scope ?? rawRevHeadhaulObj.headhaul_destination_scope ?? '').trim().toLowerCase();
+            const outerRevScope = String(spec.headhaul_destination_scope ?? '').trim().toLowerCase();
+            if (Number.isFinite(spec.headhaul_rate_cny_per_kg) && Number.isFinite(innerRevRate) && Math.abs(spec.headhaul_rate_cny_per_kg - innerRevRate) > 1e-6) {
+              revHeadhaulErrorReason = `Conflicting outer headhaul_rate_cny_per_kg (${spec.headhaul_rate_cny_per_kg}) vs headhaul.rate_cny_per_kg (${innerRevRate}).`;
+            } else if (outerRevScope && innerRevScope && outerRevScope !== innerRevScope) {
+              revHeadhaulErrorReason = `Conflicting outer headhaul_destination_scope (${outerRevScope}) vs headhaul.destination_scope (${innerRevScope}).`;
+            } else if (a4Rev?.weight_conflict) {
               revHeadhaulErrorReason = a4Rev.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.';
             } else if (a4Rev?.missing_surcharge_quote) {
               revHeadhaulErrorReason = `Headhaul Freight A4 requires ${a4Rev.a4_applied?.missing_surcharge_quote ?? 'surcharge quote'}.`;
@@ -2888,28 +2909,70 @@ export async function runPhase2Cli(
               resolvedRevHeadhaulUsd = rawRevHeadhaulObj.usd_per_unit + (rawRevHeadhaulObj.bond_included === true ? 0 : rawRevHeadhaulObj.bond_usd_per_unit);
             }
           }
-          if (!hasGoodsTotal || !hasDomFreight || !Number.isFinite(resolvedRevHeadhaulUsd)) {
+          const bareGoodsScreening = spec.bare_goods_screening === true ||
+            qObj.bare_goods_screening === true ||
+            qObj.pricing_basis === 'bare_goods_1688' ||
+            (!hasDomFreight && spec.bare_goods_screening !== false && qObj.bare_goods_screening !== false);
+          const advisoryDomFreightCny = Number.isFinite(qObj.domestic_freight_advisory_cny_total) && qObj.domestic_freight_advisory_cny_total >= 0
+            ? qObj.domestic_freight_advisory_cny_total
+            : (bareGoodsScreening && hasDomFreight ? Number(qObj.domestic_freight_cny_total) : null);
+          const revExplicitLandedMissingFreight = !bareGoodsScreening && !hasDomFreight;
+          const revInvalidSets = !Number.isSafeInteger(orderUnits) || orderUnits < 100;
+          const revPromoOrRejected = qObj.goods_first_order_promotion === true ||
+            qObj.goods_first_order_promotion === 1 ||
+            (!bareGoodsScreening && (qObj.freight_first_order_promotion === true || qObj.freight_first_order_promotion === 1)) ||
+            (typeof qObj.quote_status === 'string' && qObj.quote_status !== 'verified' && qObj.quote_status !== 'superseded_uncompetitive');
+          if (!hasGoodsTotal || !Number.isFinite(resolvedRevHeadhaulUsd) || revHeadhaulErrorReason !== null ||
+            revExplicitLandedMissingFreight || revInvalidSets || revPromoOrRejected) {
             const pendingReason = !hasGoodsTotal
               ? 'Missing goods_cny_total on 1688 quote.'
-              : (!hasDomFreight
-                ? 'Missing domestic_freight_cny_total to 广东深圳; domestic freight is never assumed ¥0.'
-                : (revHeadhaulErrorReason ?? 'Missing verified headhaul_usd or complete structured A4 headhaul inputs; headhaul is never assumed $2.20.'));
+              : revExplicitLandedMissingFreight
+                ? 'Explicit landed-freight reverse-1688 (bare_goods_screening: false) requires domestic_freight_cny_total.'
+                : revInvalidSets
+                  ? `1688 quote must cover at least 100 complete sets (received ${orderUnits}).`
+                  : revPromoOrRejected
+                    ? 'Promotional, rejected, expired, or incomplete 1688 quote cannot produce a verified repeat-order floor price.'
+                    : (revHeadhaulErrorReason ?? 'Missing verified headhaul_usd or complete structured A4 headhaul inputs; headhaul is never assumed $2.20.');
             reverseSolution = {
+              calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+              cost_basis: bareGoodsScreening ? 'bare_goods_1688' : 'landed_domestic_explicit',
+              ...(bareGoodsScreening ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
+              ...(advisoryDomFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomFreightCny } : {}),
+              ...(revHeadhaulAdvisoryNote ? { advisory_replenishment_note: revHeadhaulAdvisoryNote } : {}),
               actual_complete_sets_used: orderUnits,
               min_retail_price_for_30pct_usd: null,
               mature_band_comparison: 'pending_freight_or_headhaul_verification',
               solution: {
-                status: !hasDomFreight ? 'pending_domestic_freight' : 'needs_calculator_verification',
+                status: revExplicitLandedMissingFreight ? 'pending_domestic_freight' : 'needs_calculator_verification',
+                calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+                cost_basis: bareGoodsScreening ? 'bare_goods_1688' : 'landed_domestic_explicit',
+                ...(bareGoodsScreening ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
                 reason: pendingReason,
                 feasible_min_price_usd: null,
               },
             };
           } else {
-            const landedCnyPerUnit = (Number(qObj.goods_cny_total) + Number(qObj.domestic_freight_cny_total)) / orderUnits;
+            const costCnyPerUnit = bareGoodsScreening
+              ? Number(qObj.goods_cny_total) / orderUnits
+              : (Number(qObj.goods_cny_total) + Number(qObj.domestic_freight_cny_total)) / orderUnits;
             const solved = solveMinPriceForMargin2027({
               pkg: pkgObj,
-              landed_domestic_cny: landedCnyPerUnit,
+              order_units: orderUnits,
+              ...(bareGoodsScreening
+                ? { bare_goods_cny: costCnyPerUnit, bare_goods_screening: true, domestic_freight_advisory_cny_total: advisoryDomFreightCny }
+                : { landed_domestic_cny: costCnyPerUnit }),
               headhaul_usd: resolvedRevHeadhaulUsd,
+              headhaul_rate_cny_per_kg: (rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object' && Number.isFinite(rawRevHeadhaulObj.rate_cny_per_kg))
+                ? rawRevHeadhaulObj.rate_cny_per_kg
+                : (spec.headhaul_rate_cny_per_kg ?? null),
+              headhaul_destination_scope: (rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object' && (rawRevHeadhaulObj.destination_scope ?? rawRevHeadhaulObj.headhaul_destination_scope))
+                ? (rawRevHeadhaulObj.destination_scope ?? rawRevHeadhaulObj.headhaul_destination_scope)
+                : (spec.headhaul_destination_scope ?? null),
+              steady_state_replenishment: spec.steady_state_replenishment ??
+                (rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object' ? rawRevHeadhaulObj.steady_state_replenishment : undefined),
+              placement_split_option: spec.placement_split_option,
+              identical_cartons_count: spec.identical_cartons_count,
+              multi_destination_headhaul_verified: spec.multi_destination_headhaul_verified,
               fee_category: spec.fee_category ?? 'Home and Kitchen',
               referral_terms: spec.referral_terms ?? { referral_fraction: 0.15, minimum_referral_usd: 0.30, minimum_referral_fee_usd: 0.30, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.00 },
               refund_fraction: spec.refund_fraction ?? 0.04,
@@ -2925,6 +2988,11 @@ export async function runPhase2Cli(
               ? (minPrice < band.p25_usd ? 'below_band_strong_headroom' : (minPrice <= band.p75_usd ? 'within_mature_band_viable' : 'above_mature_band_p75_uncompetitive'))
               : 'forward_price_only_awaiting_us_band';
             reverseSolution = {
+              calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+              cost_basis: bareGoodsScreening ? 'bare_goods_1688' : 'landed_domestic_explicit',
+              ...(bareGoodsScreening ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
+              ...(advisoryDomFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomFreightCny } : {}),
+              ...(revHeadhaulAdvisoryNote ? { advisory_replenishment_note: revHeadhaulAdvisoryNote } : {}),
               actual_complete_sets_used: orderUnits,
               min_retail_price_for_30pct_usd: minPrice,
               mature_band_comparison: bandVerdict,

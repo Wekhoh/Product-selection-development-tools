@@ -797,7 +797,7 @@ test('Step 1.4: second-order counterexamples (explicit $0 placement, early-scree
       ...baseWin, pkg: stdPkg, profile_revision: 59, price_usd: 45, fx_cny_per_usd: 7.2,
       refund_fraction: 0.04, physical_return_fraction: 0.04, collection_rate: 0.006, headhaul_usd: 1.8,
       referral_terms: refTerms, fee_category: 'Home and Kitchen', placement_split_option: 'amazon_optimized',
-      carton_count: 5, multi_destination_headhaul_verified: true,
+      steady_state_replenishment: false, carton_count: 5, multi_destination_headhaul_verified: true,
     }).status, 'sensitivity_only');
     const badFormalCand = structuredClone(synthBatch.candidates[0]);
     const badPlaceLine = badFormalCand.economics.scenarios[0].cost_ledger.lines.find(l => l.id === 'placement');
