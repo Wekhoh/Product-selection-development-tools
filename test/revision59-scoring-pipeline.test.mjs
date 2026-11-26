@@ -524,7 +524,8 @@ test('Slice 2D: 1688 Stage-1 pack_multiple=1 default, strict UI readback guards,
       }),
     });
     assert.equal(g1bMulti.margin_interval_verdict, 'crosses_30pct');
-    assert.equal(g1bMulti.proceed_to_gate2_3, true, 'r59 crossing-30% multi-quote must auto-proceed to Gate 2/3');
+    assert.equal(g1bMulti.owner_crossing_override, false, 'r59 crossing-30% multi-quote must NEVER auto-set owner_crossing_override: true');
+    assert.equal(g1bMulti.proceed_to_gate2_3, false, 'r59 crossing-30% multi-quote requires explicit allow_crossing_to_gate2_3: true before Gate 2/3 spend');
     assert.equal(g1bMulti.negotiation_shortlist, null, 'Crossing-30% form must never enter negotiation_shortlist');
     assert.deepEqual(g1bMulti.passing_quote_ids, ['quote-factory-pass']);
     assert.deepEqual(g1bMulti.failing_quote_ids, ['quote-factory-high']);
@@ -1058,6 +1059,7 @@ test('Astra Round-1 Regressions (Scoring & Pipeline): BLOCKER 3 multi-quote Stag
           strong_date_dependency: false,
         };
       };
+      item.allow_crossing_to_gate2_3 = true;
       return item;
     };
 
@@ -1707,6 +1709,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
             domestic_freight_cny_total: 360,
           },
         }),
+        allow_crossing_to_gate2_3: true,
         early_screen_builder: ({ form: f }) => {
           const d = JSON.parse(store.getCandidateForm(f.form_id).gate1a_result_json).declared_scenarios[0];
           return {
@@ -1823,6 +1826,7 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
           { id: 'sc-55', price_usd: 55, available_date: '2025-05-01', pkg, fx_cny_per_usd: 7.2, refund_fraction: 0.05, physical_return_fraction: 0.05, fee_category: 'Home and Kitchen', referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 }, headhaul_usd: 1.5, collection_rate: 0.005, sales_window: { from: '2027-02-01', through: '2027-09-30' }, storage_window: { from: '2027-02-01', through: '2027-09-30' }, inbound_window: { from: '2027-01-15', through: '2027-01-15' } },
         ],
         existing_quotes: [qEvalCross],
+        allow_crossing_to_gate2_3: true,
         early_screen_builder: ({ form: f }) => JSON.parse(store.getCandidateForm(f.form_id).gate1a_result_json).declared_scenarios.map(d => ({
           profile_revision: 59, id: d.id, saleable_unit: '1 unit', price_usd: d.price_usd, fx_cny_per_usd: 7.2, pkg,
           headhaul: { usd_per_unit: d.headhaul_usd, bond_included: true }, refund_fraction: 0.05, physical_return_fraction: 0.05, return_threshold: 0.081, returns_processing_usd: 0,

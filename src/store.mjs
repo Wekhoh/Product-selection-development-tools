@@ -31,7 +31,12 @@ import {
   resolveChannelMeta,
 } from './discovery-channels.mjs';
 import { canonicalizeConnectorToolName, validateProviderCall } from './provider-guards.mjs';
-import { bindSourcingQuotePricingInputs } from './fba-calculator.mjs';
+import {
+  bindSourcingQuotePricingInputs,
+  evaluateSingleFactoryCompleteKit,
+  INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH,
+  resolveVerifiedFactoryKey,
+} from './fba-calculator.mjs';
 import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -707,6 +712,9 @@ function sourcingQuoteFromRow(row) {
       }
       if (parsedPlan?.domestic_freight_advisory_cny_total !== undefined) {
         quote.domestic_freight_advisory_cny_total = parsedPlan.domestic_freight_advisory_cny_total;
+      }
+      if (parsedPlan?.manual_owner_entry === true) {
+        quote.manual_owner_entry = true;
       }
     } catch { /* ignore */ }
   }
@@ -2725,50 +2733,44 @@ export class SelectionStore {
           ? [composition]
           : null));
 
-    const rawLinesForFactoryCheck = Array.isArray(quote.sku_lines) ? quote.sku_lines : [];
-    const distinctFactoryIds = new Set(
-      rawLinesForFactoryCheck
-        .map(l => String(l?.supplier_id ?? l?.factory_id ?? '').trim())
-        .filter(Boolean),
-    );
-    const isCrossFactoryOrBarePart = Boolean(
-      quote.single_factory_complete_kit === false ||
-      quote.requires_cross_factory_packaging === true ||
-      quote.bare_parts_incomplete === true ||
-      distinctFactoryIds.size > 1,
-    );
+    const kitCheck = evaluateSingleFactoryCompleteKit(quote);
+    const isCrossFactoryOrBarePart = kitCheck.is_cross_factory_or_incomplete;
 
-    const quoteStatus = isCrossFactoryOrBarePart
-      ? 'incomplete_cross_factory_kit'
-      : (quote.quote_status ?? 'verified');
+    const quoteStatus = quote.quote_status === 'rejected_spec'
+      ? 'rejected_spec'
+      : (isCrossFactoryOrBarePart ? 'incomplete_cross_factory_kit' : (quote.quote_status ?? 'verified'));
     const kitNote = nonemptyStr(quote.kit_note)
       ? sanitizeDiagnosticText(quote.kit_note.trim())
       : (quoteStatus === 'incomplete_cross_factory_kit'
-        ? '初筛仅认单一工厂一站齐套；只卖裸件或需跨两家厂另配标准袋/盒暂置归档'
+        ? INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH
         : null);
     const specVariantKey = nonemptyStr(quote.spec_variant_key)
       ? quote.spec_variant_key.trim()
       : null;
-    const resolvedFactoryId = nonemptyStr(quote.factory_id)
-      ? quote.factory_id.trim()
-      : (nonemptyStr(quote.supplier_id)
-        ? quote.supplier_id.trim()
-        : (nonemptyStr(quote.seller_member_id)
-          ? quote.seller_member_id.trim()
-          : (nonemptyStr(quote.company_name)
-            ? quote.company_name.trim()
-            : (nonemptyStr(quote.shop_url)
-              ? quote.shop_url.trim()
-              : (distinctFactoryIds.size === 1 ? [...distinctFactoryIds][0] : null)))));
+    const resolvedFactoryId = kitCheck.resolved_factory_id;
+    const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const factoryCandidatesForEmailCheck = [
+      resolvedFactoryId,
+      quote.factory_id,
+      quote.supplier_id,
+      quote.seller_member_id,
+      ...(Array.isArray(quote.sku_lines) ? quote.sku_lines.flatMap(l => [l?.factory_id, l?.supplier_id, l?.seller_member_id]) : []),
+    ];
+    if (factoryCandidatesForEmailCheck.some(v => typeof v === 'string' && emailRe.test(v.trim()))) {
+      throw new TypeError('sourcing_quote_1688 factory/seller identifier must not contain a raw email address; redact or use a non-PII factory_id before persisting.');
+    }
+    const isManualOwnerEntry = quote.manual_owner_entry === true;
 
     const prospectiveIsBareGoods = quote.pricing_basis === 'bare_goods_1688' ||
       quote.bare_goods_screening === true ||
       quote.domestic_freight_cny_total == null;
+    const normalizedFactoryKey = resolveVerifiedFactoryKey(quote);
     if (
+      !isManualOwnerEntry &&
       quoteStatus === 'verified' &&
       quote.goods_first_order_promotion !== true &&
       (prospectiveIsBareGoods || quote.freight_first_order_promotion !== true) &&
-      resolvedFactoryId
+      normalizedFactoryKey
     ) {
       const maxFactoriesCap = BUSINESS_THRESHOLDS.max_1688_factories_to_check;
       const prospectiveQuoteId = nonemptyStr(quote.quote_id) ? quote.quote_id.trim() : null;
@@ -2780,24 +2782,10 @@ export class SelectionStore {
           (eq.pricing_basis === 'bare_goods_1688' || eq.domestic_freight_cny_total == null || eq.freight_first_order_promotion === 0) &&
           (eq.quote_status === 'verified' || eq.quote_status === 'superseded_uncompetitive'),
       );
-      const extractRowFac = eq => {
-        for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
-          if (nonemptyStr(eq?.[k])) return eq[k].trim().toLowerCase();
-        }
-        if (Array.isArray(eq?.sku_lines)) {
-          for (const sl of eq.sku_lines) {
-            for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
-              if (nonemptyStr(sl?.[k])) return sl[k].trim().toLowerCase();
-            }
-          }
-        }
-        return null;
-      };
-      const seenFacs = new Set(existingNonPromo.map(extractRowFac).filter(Boolean));
-      seenFacs.add(resolvedFactoryId.toLowerCase());
-      if (seenFacs.size > maxFactoriesCap) {
+      const existingFacs = new Set(existingNonPromo.map(resolveVerifiedFactoryKey).filter(Boolean));
+      if (!existingFacs.has(normalizedFactoryKey) && existingFacs.size + 1 > maxFactoriesCap) {
         throw new TypeError(
-          `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesCap} per form (would reach ${seenFacs.size} on ${form.form_id}).`,
+          `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesCap} per form (would reach ${existingFacs.size + 1} on ${form.form_id}; pass manual_owner_entry: true for owner-entered 4th+ factories).`,
         );
       }
     }
@@ -2812,7 +2800,9 @@ export class SelectionStore {
       contract: 'SourcingVerifier1688',
       stage: quote.stage ?? null,
       allow_default_pack_multiple: quote.allow_default_pack_multiple ?? false,
-      require_ui_readback: quote.require_ui_readback ?? false,
+      require_ui_readback: (isManualOwnerEntry && quoteStatus === 'verified')
+        ? true
+        : (quote.require_ui_readback ?? false),
       status: contractStatus,
       observed_at: quote.observed_at,
       expires_at: explicitExpiresAt,
@@ -2848,6 +2838,9 @@ export class SelectionStore {
       orderPlan.pricing_basis = verified.pricing_basis ?? (prospectiveIsBareGoods ? 'bare_goods_1688' : 'landed_domestic_explicit');
       if (verified.domestic_freight_advisory_cny_total !== null && verified.domestic_freight_advisory_cny_total !== undefined) {
         orderPlan.domestic_freight_advisory_cny_total = verified.domestic_freight_advisory_cny_total;
+      }
+      if (isManualOwnerEntry) {
+        orderPlan.manual_owner_entry = true;
       }
     }
     const ui = quote.ui_readback;
@@ -2975,49 +2968,54 @@ export class SelectionStore {
       throw new TypeError('quotes must be a nonempty array.');
     }
     const maxFactoriesCap = BUSINESS_THRESHOLDS.max_1688_factories_to_check;
-    if (quotes.length > maxFactoriesCap) {
-      throw new TypeError(
-        `Revision 59 1688 stop rule caps checked quotes/factories at ${maxFactoriesCap} per form (received ${quotes.length} quotes in batch).`,
-      );
-    }
-    const extractVerifiedFactoryKey = qObj => {
-      if (!qObj || typeof qObj !== 'object') return null;
-      for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
-        if (nonemptyStr(qObj[k])) return `${k}:${qObj[k].trim().toLowerCase()}`;
-      }
-      if (Array.isArray(qObj.sku_lines)) {
-        for (const sl of qObj.sku_lines) {
-          for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name', 'shop_url']) {
-            if (nonemptyStr(sl?.[k])) return `${k}:${sl[k].trim().toLowerCase()}`;
-          }
-        }
-      }
-      return null;
+    const isAiAutoCompleteKitQuote = qObj => {
+      if (!qObj || typeof qObj !== 'object') return false;
+      if (qObj.manual_owner_entry === true) return false;
+      const kit = evaluateSingleFactoryCompleteKit(qObj);
+      if (kit.is_cross_factory_or_incomplete) return false;
+      const st = qObj.quote_status ?? 'verified';
+      if (st !== 'verified') return false;
+      const bare = qObj.pricing_basis === 'bare_goods_1688' || qObj.bare_goods_screening === true || qObj.domestic_freight_cny_total == null;
+      return qObj.goods_first_order_promotion !== true && (bare || qObj.freight_first_order_promotion !== true);
     };
+    const aiAutoQuotes = quotes.filter(isAiAutoCompleteKitQuote);
     return this._withImmediateTx(() => {
-      const factoriesByFormSpec = new Map();
-      for (const qObj of quotes) {
-        if (!qObj || typeof qObj !== 'object' || !nonemptyStr(qObj.form_id)) continue;
+      const stateByFormSpec = new Map();
+      for (const qObj of aiAutoQuotes) {
+        if (!nonemptyStr(qObj.form_id)) continue;
         const fId = qObj.form_id.trim();
         const formRow = this.getCandidateForm(fId);
         const sVer = Number.isInteger(qObj.spec_version) ? qObj.spec_version : (formRow?.spec_version ?? 1);
         const mapKey = `${fId}::${sVer}`;
-        let set = factoriesByFormSpec.get(mapKey);
-        if (!set) {
+        let state = stateByFormSpec.get(mapKey);
+        if (!state) {
           const existing = this.getQuotesForForm(fId).filter(
             eq => eq.spec_version === sVer &&
               eq.goods_first_order_promotion === 0 &&
-              eq.freight_first_order_promotion === 0 &&
+              (eq.pricing_basis === 'bare_goods_1688' || eq.domestic_freight_cny_total == null || eq.freight_first_order_promotion === 0) &&
               (eq.quote_status === 'verified' || eq.quote_status === 'superseded_uncompetitive'),
           );
-          set = new Set(existing.map(extractVerifiedFactoryKey).filter(Boolean));
-          factoriesByFormSpec.set(mapKey, set);
+          state = {
+            existingFacs: new Set(existing.map(resolveVerifiedFactoryKey).filter(Boolean)),
+            addedFacs: new Set(),
+            unattributedCount: 0,
+          };
+          stateByFormSpec.set(mapKey, state);
         }
-        const fk = extractVerifiedFactoryKey(qObj);
-        if (fk) set.add(fk);
-        if (set.size > maxFactoriesCap) {
+        const fk = resolveVerifiedFactoryKey(qObj);
+        if (fk) {
+          if (!state.existingFacs.has(fk)) state.addedFacs.add(fk);
+        } else {
+          state.unattributedCount += 1;
+        }
+        if (state.unattributedCount > maxFactoriesCap) {
           throw new TypeError(
-            `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesCap} per form (would reach ${set.size} on ${fId}).`,
+            `Revision 59 1688 stop rule caps unattributed automated quotes at ${maxFactoriesCap} per form batch (received ${state.unattributedCount} on ${fId}; supply factory_id or pass manual_owner_entry: true for owner-entered 4th+ factories).`,
+          );
+        }
+        if (state.addedFacs.size > 0 && state.existingFacs.size + state.addedFacs.size > maxFactoriesCap) {
+          throw new TypeError(
+            `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesCap} per form (would reach ${state.existingFacs.size + state.addedFacs.size} on ${fId}; pass manual_owner_entry: true for owner-entered 4th+ factories).`,
           );
         }
       }

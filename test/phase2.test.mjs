@@ -1275,7 +1275,8 @@ test('Round-1 Codex Regressions #7, #8, #9, #10, #11, #12: Gate 1A/1B hard gates
   assert.equal(multiRes.status, 'gate1b_pending');
   assert.equal(multiRes.margin_interval_verdict, 'crosses_30pct');
   assert.equal(multiRes.second_factory_quote_needed, true);
-  assert.equal(multiRes.proceed_to_gate2_3, true);
+  assert.equal(multiRes.owner_crossing_override, false);
+  assert.equal(multiRes.proceed_to_gate2_3, false);
   assert.deepEqual(multiRes.passing_prices_usd, [60]);
   assert.deepEqual(multiRes.failing_prices_usd, [40]);
 

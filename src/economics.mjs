@@ -29,6 +29,7 @@ import {
 import {
   validateFeeBasis,
   validateSkuLinesR58,
+  evaluateSingleFactoryCompleteKit,
   resolveConsistentNumeric,
   resolveConsistentText,
   resolveConsistentFeeCategory,
@@ -237,6 +238,7 @@ export function calculateEconomics(input, options = {}) {
 
   let r58ReturnsInvalid = false;
   let r58ProcInvalid = false;
+  let r59KitCheck = null;
   let r58HeadhaulInvalid = false;
   let headhaulConflictReason = null;
   let headhaulA4Applied = null;
@@ -253,8 +255,18 @@ export function calculateEconomics(input, options = {}) {
     }
     return { present: true, valid: true, value: present[0] };
   };
+  const procLineAny = map.get('procurement');
+  const kitCheckAny = evaluateSingleFactoryCompleteKit({
+    cost_ledger: input,
+    procLine: procLineAny,
+    expected_components: input.expected_components ?? input.saleable_set_composition ?? null,
+  });
+  if (kitCheckAny.is_cross_factory_or_incomplete) {
+    r58ProcInvalid = true;
+  }
+  r59KitCheck = isR59Plus || kitCheckAny.is_cross_factory_or_incomplete ? kitCheckAny : null;
   if (isR58Plus) {
-    const procLine = map.get('procurement');
+    const procLine = procLineAny;
     const skuRes = resolveConsistentSkuLines(input, procLine);
     if (skuRes.conflict) {
       r58ProcInvalid = true;
@@ -814,6 +826,7 @@ export function calculateEconomics(input, options = {}) {
         bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH,
       } : {}),
     } : {}),
+    ...(r59KitCheck ? { single_factory_complete_kit: r59KitCheck } : {}),
     expected_refund_usd: round(p * r), net_revenue_usd: round(net),
     known_cost_usd: round(known), pending_lines: pending, deferred_lines: deferred,
     net_cost_usd: complete ? round(cost) : null,
@@ -1820,9 +1833,17 @@ export function evaluateEarlyScreen(input, options = {}) {
         recovery_credit_usd === 0 ? 'not_applicable' : 'estimated'),
   ];
 
+  const earlyKitCheck = evaluateSingleFactoryCompleteKit({
+    ...input,
+    ...(activeSkuLines ? { sku_lines: activeSkuLines } : {}),
+  });
+  const earlyKitIncomplete = earlyKitCheck.is_cross_factory_or_incomplete;
   const ledger = calculateEconomics(
     {
       id, saleable_unit, price_usd, refund_fraction,
+      ...(earlyKitIncomplete
+        ? { single_factory_complete_kit: false }
+        : (earlyKitCheck.resolved_factory_id ? { factory_id: earlyKitCheck.resolved_factory_id } : {})),
       ...(requiredCouponFeeUsd > 0 ? {
         coupon_redemption_fee_usd: requiredCouponFeeUsd,
         coupon_fee_already_in_other: true,
@@ -1833,6 +1854,9 @@ export function evaluateEarlyScreen(input, options = {}) {
     },
     { profileRevision: rev },
   );
+  if (earlyKitIncomplete) {
+    ledger.single_factory_complete_kit = earlyKitCheck;
+  }
   const marginComplete = ledger.margin !== null && dateCtxR58.valid;
   const marginPass = marginComplete && ledgerMeetsMarginFloor(ledger, margin_floor);
 
@@ -1854,6 +1878,9 @@ export function evaluateEarlyScreen(input, options = {}) {
   if (headhaulRes.weight_conflict && headhaulRes.conflict_reason) {
     reasons.push(headhaulRes.conflict_reason);
   }
+  if (earlyKitIncomplete || ledger.single_factory_complete_kit?.is_cross_factory_or_incomplete) {
+    reasons.push((earlyKitIncomplete ? earlyKitCheck : ledger.single_factory_complete_kit).kit_note);
+  }
   if (!marginComplete) {
     reasons.push(`Complete margin pending (${ledger.pending_lines.join(', ')}).`);
   } else if (!marginPass) {
@@ -1862,7 +1889,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     const pctDisplay = Number(pct2) >= margin_floor * 100 ? (ledger.margin * 100).toFixed(6) : pct2;
     reasons.push(`Pre-ad net margin ${pctDisplay}% is below the ${floorPct}% floor.`);
   }
-  if (rightsState === 'unknown' && pricePass && dateState === false && domesticQuoteValid && marginPass) {
+  if (rightsState === 'unknown' && pricePass && dateState === false && domesticQuoteValid && marginPass && !earlyKitIncomplete) {
     reasons.push('Economic checks passed; specific-design rights remain unsearched (eligible to advance to Gate 2 rights check).');
   }
 
@@ -1871,7 +1898,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     gateStatus = 'fail';
   } else if (dateState === true) {
     gateStatus = 'deferred';
-  } else if (!domesticQuoteValid || !marginComplete || dateState === 'unknown') {
+  } else if (!domesticQuoteValid || !marginComplete || dateState === 'unknown' || earlyKitIncomplete) {
     gateStatus = 'pending';
   } else if (rightsState === 'unknown') {
     gateStatus = 'economic_pass_rights_unsearched';

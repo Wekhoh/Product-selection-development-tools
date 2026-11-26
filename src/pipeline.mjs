@@ -22,7 +22,8 @@ import {
   computeOrderPlan,
   estimateGate1A2027,
   evaluatePriceCliff2027,
-  computeNegotiationShortlist,
+  evaluateSingleFactoryCompleteKit,
+  resolveVerifiedFactoryKey,
   computePackagingRedesignShortlist2027,
   computeMatchedPeerMedianPackage,
   isStructuredHeadhaulSpec,
@@ -147,6 +148,7 @@ function isQuoteUsableForForm(quote, form, asOfDay) {
   if (quote.domestic_freight_cny_total !== null && quote.domestic_freight_cny_total !== undefined &&
     (!finite(quote.domestic_freight_cny_total) || quote.domestic_freight_cny_total < 0)) return false;
   if (quote.expires_at && quote.expires_at.slice(0, 10) < asOfDay) return false;
+  if (evaluateSingleFactoryCompleteKit(quote).is_cross_factory_or_incomplete) return false;
   return true;
 }
 
@@ -205,27 +207,6 @@ function hasTerminalRejectionOrDeferralOnCurrentSpec(form) {
     };
   }
   return { blocked: false, status: null, preserve_rights_conflict: false, reason: null };
-}
-
-function resolveQuoteVerifiedFactoryKey(q) {
-  for (const k of ['factory_id', 'supplier_id', 'seller_member_id', 'company_name']) {
-    if (nonemptyStr(q?.[k])) return `fac:${q[k].trim()}`;
-  }
-  let lines = Array.isArray(q?.sku_lines) ? q.sku_lines : null;
-  if (!lines && nonemptyStr(q?.sku_lines_json)) {
-    try {
-      const parsed = JSON.parse(q.sku_lines_json);
-      if (Array.isArray(parsed)) lines = parsed;
-    } catch { /* ignore */ }
-  }
-  const lineFactories = Array.isArray(lines)
-    ? [...new Set(lines.map(l => {
-      const fk = l?.factory_id ?? l?.supplier_id ?? l?.seller_member_id ?? l?.company_name ?? null;
-      return nonemptyStr(fk) ? fk.trim() : null;
-    }).filter(Boolean))].sort()
-    : [];
-  if (lineFactories.length > 0) return `fac:${lineFactories.join('+')}`;
-  return null;
 }
 
 function resolveScreenHeadhaulUsd(sc) {
@@ -340,8 +321,13 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
   const sanitizedRaw = { ...rawInput };
   if (persistedQuote.pkg != null) sanitizedRaw.pkg = pricingInputs.pkg;
   if (persistedQuote.fx_cny_per_usd != null) sanitizedRaw.fx_cny_per_usd = pricingInputs.fx_cny_per_usd;
-  // Strip any caller-injected nested procurement or conflicting source_inputs.sku_lines/order_units.
+  // Strip any caller-injected nested procurement, conflicting factory identity, or conflicting source_inputs.sku_lines/order_units.
   delete sanitizedRaw.procurement;
+  delete sanitizedRaw.factory_id;
+  delete sanitizedRaw.supplier_id;
+  delete sanitizedRaw.seller_member_id;
+  delete sanitizedRaw.company_name;
+  delete sanitizedRaw.shop_url;
   if (sanitizedRaw.source_inputs && typeof sanitizedRaw.source_inputs === 'object') {
     const si = { ...sanitizedRaw.source_inputs };
     delete si.sku_lines;
@@ -357,10 +343,14 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
       ? persistedQuote.domestic_freight_advisory_cny_total
       : (finite(persistedQuote.domestic_freight_cny_total) ? persistedQuote.domestic_freight_cny_total : null))
     : null;
+  const authoritativeFactory = nonemptyStr(persistedQuote.factory_id)
+    ? { factory_id: persistedQuote.factory_id.trim() }
+    : {};
 
   if (skuLines.length > 0) {
     return {
       ...sanitizedRaw,
+      ...authoritativeFactory,
       profile_revision: resolvedRev,
       order_units: persistedQuote.actual_sets,
       target_sets: persistedQuote.actual_sets,
@@ -388,6 +378,7 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
   const goodsCnyPerUnit = roundBigRat(goodsPerSetRat.n, goodsPerSetRat.d, 10);
   return {
     ...sanitizedRaw,
+    ...authoritativeFactory,
     profile_revision: resolvedRev,
     order_units: persistedQuote.actual_sets,
     sku_lines: null,
@@ -1045,12 +1036,6 @@ export function attachGate1APriceCliffStress(inputCand, gate1aRecord) {
   econ.stress_scenarios = existingStress;
 }
 
-function getNegotiationDiscountFraction(neg) {
-  if (!neg || typeof neg !== 'object') return Infinity;
-  const val = neg.required_discount_fraction ?? neg.required_reduction_fraction;
-  return finite(val) ? val : Infinity;
-}
-
 function projectForwardPricingInputs(scenario) {
   const inputs = Object.fromEntries(
     FORWARD_FEE_INPUTS.filter(key => Object.hasOwn(scenario, key)).map(key => [key, scenario[key]]),
@@ -1593,48 +1578,11 @@ export function runGate1AForForm(store, {
     return payload;
   }
 
-  // Require Stage-2 visual cluster tightening whenever a Stage-1 mainstream band triggers a width alarm
-  // OR lacks sufficient mainstream peer breadth (low_peer_count)!
-  const hasValidTightenedClusters = Boolean(
-    resolvedClusterBands?.all_clusters_tightened === true &&
-    Array.isArray(resolvedClusterBands?.clusters) &&
-    resolvedClusterBands.clusters.length > 0,
-  );
   const priceDiscoveryOnly = allow_forward_price_discovery && (
     eligiblePriceScenarios.length === 0 || resolvedPriceBand?.guardrail?.low_peer_count === true
   );
   if (resolvedPriceBand?.guardrail) {
     baseMeta.price_band_guardrail = resolvedPriceBand.guardrail;
-  }
-  if (!isR59Gate1A && resolvedPriceBand?.guardrail?.low_peer_count === true && !priceDiscoveryOnly) {
-    const payload = {
-      ...baseMeta,
-      gate_status: 'gate1a_needs_verification',
-      gate0,
-      price_band_guardrail: resolvedPriceBand.guardrail,
-      cluster_bands: resolvedClusterBands,
-      reason: 'Stage-1 mainstream price band has insufficient peer breadth (<2 mainstream listings after denoising); collect additional comparable peers before Gate 1B.',
-      proceed_to_gate1b: false,
-      proceed_to_gate2_3: false,
-      scenarios: scenarioResults,
-    };
-    store.updateFormLifecycle(form_id, 'gate1a_needs_verification', { gate1a_result: payload, landed_domestic_cap_cny: null });
-    return payload;
-  }
-  if (!isR59Gate1A && resolvedPriceBand?.guardrail?.width_alarm === true && !hasValidTightenedClusters && !priceDiscoveryOnly) {
-    const payload = {
-      ...baseMeta,
-      gate_status: 'gate1a_needs_verification',
-      gate0,
-      price_band_guardrail: resolvedPriceBand.guardrail,
-      cluster_bands: resolvedClusterBands,
-      reason: 'Stage-1 mainstream price band triggered width alarm; Stage-2 visual clustering and tightened sub-cluster bands are required before Gate 1B.',
-      proceed_to_gate1b: false,
-      proceed_to_gate2_3: false,
-      scenarios: scenarioResults,
-    };
-    store.updateFormLifecycle(form_id, 'gate1a_needs_verification', { gate1a_result: payload, landed_domestic_cap_cny: null });
-    return payload;
   }
 
   const unverified = regularScenarios.filter(s => !s.price_below_floor && s.estimate.status !== 'verified');
@@ -1767,6 +1715,7 @@ export async function runGate1BForForm(store, {
   as_of_date = new Date().toISOString().slice(0, 10),
   lease_owner = 'gate1b',
   allow_crossing_to_gate2_3 = false,
+  manual_owner_entry = false,
   on_lease_acquired_hook = null,
 } = {}) {
   const form = store.getCandidateForm(form_id);
@@ -1786,15 +1735,37 @@ export async function runGate1BForForm(store, {
     gate1aRecord.proceed_to_gate1b === true &&
     !hasProvenRightsConflictOnCurrentSpec(form);
 
+  const isManualOwnerQuoteRow = q => {
+    if (!q || !isQuoteUsableForForm(q, form, as_of_date)) return false;
+    const op = deriveOrderPlanFromPersistedQuote(q);
+    return op?.manual_owner_entry === true || q.manual_owner_entry === true;
+  };
+  const suppliedListForRetry = Array.isArray(existing_quotes) && existing_quotes.length > 0
+    ? existing_quotes
+    : (existing_quote && typeof existing_quote === 'object' ? [existing_quote] : []);
+  const hasManualOwnerQuoteForCurrentSpec =
+    manual_owner_entry === true ||
+    suppliedListForRetry.some(cand => {
+      if (!cand || typeof cand !== 'object') return false;
+      const stored = nonemptyStr(cand.quote_id) ? store.getQuoteById(cand.quote_id) : null;
+      return stored ? isManualOwnerQuoteRow(stored) : false;
+    }) ||
+    store.getQuotesForForm(form_id).some(isManualOwnerQuoteRow);
+
   const canRetrySecondFactoryR59 = isR59 &&
     form.lifecycle_status === 'gate1b_rejected' &&
-    (typeof sourcing_executor === 'function' || existing_quote !== null || (Array.isArray(existing_quotes) && existing_quotes.length > 0)) &&
+    !hasProvenRightsConflictOnCurrentSpec(form) &&
     (() => {
       try {
         const prev = form.gate1b_result_json ? JSON.parse(form.gate1b_result_json) : null;
-        return Boolean(prev && prev.second_factory_quote_needed === true && prev.specific_rights_conflict_proven !== true);
+        if (prev?.specific_rights_conflict_proven === true) return false;
+        if (hasManualOwnerQuoteForCurrentSpec) return true;
+        return Boolean(
+          (typeof sourcing_executor === 'function' || existing_quote !== null || (Array.isArray(existing_quotes) && existing_quotes.length > 0)) &&
+          prev && prev.second_factory_quote_needed === true,
+        );
       } catch {
-        return false;
+        return hasManualOwnerQuoteForCurrentSpec;
       }
     })();
 
@@ -1847,11 +1818,22 @@ export async function runGate1BForForm(store, {
       }
     } catch { /* ignore */ }
   }
+  const maxFactoriesCapR59 = BUSINESS_THRESHOLDS.max_1688_factories_to_check;
+  const existingNonPromoSpecRows = store.getQuotesForForm(form_id).filter(
+    q => q.spec_version === expectedSpecVersion &&
+      q.goods_first_order_promotion === 0 &&
+      (isQuoteBareGoods(q) || q.freight_first_order_promotion === 0) &&
+      (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
+  );
+  const existingDistinctFactoryCount = new Set(existingNonPromoSpecRows.map(resolveVerifiedFactoryKey).filter(Boolean)).size;
   const allUsableStoreQuotes = store.getQuotesForForm(form_id).filter(q => isQuoteUsableForForm(q, form, as_of_date));
   const shouldReuseWithoutNewSourcing = isR59 && allUsableStoreQuotes.length > 0 && (
     persistedQuotes.length > 0 ||
     typeof sourcing_executor !== 'function' ||
-    prevG1bOnCurrentSpec?.second_factory_quote_needed === false
+    (manual_owner_entry !== true && (
+      prevG1bOnCurrentSpec?.second_factory_quote_needed === false ||
+      existingDistinctFactoryCount >= maxFactoriesCapR59
+    ))
   );
   if (shouldReuseWithoutNewSourcing) {
     for (const sq of allUsableStoreQuotes) {
@@ -1888,6 +1870,16 @@ export async function runGate1BForForm(store, {
     }
     if (typeof sourcing_executor !== 'function') {
       const g1bRes = { status: 'gate1b_pending', reason: 'No usable verified quote and no sourcing_executor supplied.' };
+      store.updateFormLifecycle(form_id, 'gate1b_pending', { gate1b_result: g1bRes });
+      return { form_id, ...g1bRes, proceed_to_gate2_3: false };
+    }
+    if (manual_owner_entry !== true && existingDistinctFactoryCount >= maxFactoriesCapR59) {
+      const g1bRes = {
+        status: 'gate1b_pending',
+        checked_factory_quotes_count: existingDistinctFactoryCount,
+        second_factory_quote_needed: false,
+        reason: `Revision 59 1688 stop rule already reached ${existingDistinctFactoryCount}/${maxFactoriesCapR59} distinct verified factories on ${form_id}; skipping automated sourcing_executor (pass manual_owner_entry: true for owner-entered 4th+ factories).`,
+      };
       store.updateFormLifecycle(form_id, 'gate1b_pending', { gate1b_result: g1bRes });
       return { form_id, ...g1bRes, proceed_to_gate2_3: false };
     }
@@ -2130,48 +2122,70 @@ export async function runGate1BForForm(store, {
     const existingSpecRows = store.getQuotesForForm(form_id).filter(
       q => q.spec_version === expectedSpecVersion &&
         q.goods_first_order_promotion === 0 &&
-        q.freight_first_order_promotion === 0 &&
+        (isQuoteBareGoods(q) || q.freight_first_order_promotion === 0) &&
         (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
     );
-    const seenVerifiedFactories = new Set(existingSpecRows.map(resolveQuoteVerifiedFactoryKey).filter(Boolean));
+    const seenVerifiedFactories = new Set(existingSpecRows.map(resolveVerifiedFactoryKey).filter(Boolean));
     let submittedQuoteBatches = 0;
 
     const validateAndRecordBatch = (quotesArr) => {
       const cleanArr = quotesArr.filter(qObj => qObj && typeof qObj === 'object');
-      if (isR59 && cleanArr.length > maxFactoriesToCheck) {
-        return {
-          rejectedOverCap: true,
-          reason: `Revision 59 1688 stop rule caps checked factories at ${maxFactoriesToCheck} per form (received ${cleanArr.length} quotes at once); submit per-factory quotes sequentially.`,
-        };
-      }
-      const prospectiveFactories = new Set(seenVerifiedFactories);
       for (const qObj of cleanArr) {
-        if (isR59 && qObj.require_ui_readback === false) {
+        if (qObj.require_ui_readback === false) {
           throw new TypeError('Revision 59 prohibits disabling require_ui_readback on verified 1688 quotes.');
         }
-        const fk = resolveQuoteVerifiedFactoryKey(qObj);
-        if (fk) prospectiveFactories.add(fk);
       }
-      if (isR59 && prospectiveFactories.size > maxFactoriesToCheck) {
-        return {
-          rejectedOverCap: true,
-          reason: `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesToCheck} per form (would reach ${prospectiveFactories.size}).`,
-        };
+      const aiAutoCompleteArr = cleanArr.filter(qObj => {
+        if (qObj.manual_owner_entry === true) return false;
+        const kit = evaluateSingleFactoryCompleteKit(qObj);
+        if (kit.is_cross_factory_or_incomplete) return false;
+        const st = qObj.quote_status ?? 'verified';
+        if (st !== 'verified') return false;
+        return qObj.goods_first_order_promotion !== true && (isQuoteBareGoods(qObj) || qObj.freight_first_order_promotion !== true);
+      });
+      if (aiAutoCompleteArr.length > 0) {
+        const addedAutoFactories = new Set();
+        let unattributedAutoCount = 0;
+        for (const qObj of aiAutoCompleteArr) {
+          const fk = resolveVerifiedFactoryKey(qObj);
+          if (fk) {
+            if (!seenVerifiedFactories.has(fk)) addedAutoFactories.add(fk);
+          } else {
+            unattributedAutoCount += 1;
+          }
+        }
+        if (unattributedAutoCount > maxFactoriesToCheck) {
+          return {
+            rejectedOverCap: true,
+            reason: `Revision 59 1688 stop rule caps unattributed automated quotes at ${maxFactoriesToCheck} per form batch (received ${unattributedAutoCount}; supply factory_id or pass manual_owner_entry: true for owner-entered 4th+ factories).`,
+          };
+        }
+        if (addedAutoFactories.size > 0 && seenVerifiedFactories.size + addedAutoFactories.size > maxFactoriesToCheck) {
+          return {
+            rejectedOverCap: true,
+            reason: `Revision 59 1688 stop rule caps distinct verified factories at ${maxFactoriesToCheck} per form (would reach ${seenVerifiedFactories.size + addedAutoFactories.size}; pass manual_owner_entry: true for owner-entered 4th+ factories).`,
+          };
+        }
       }
       const batchOut = store.recordSourcingQuotesBatch1688(
         cleanArr.map(qObj => ({
           ...qObj,
-          ...(isR59 ? { require_ui_readback: true } : {}),
+          require_ui_readback: true,
           form_id,
           spec_version: expectedSpecVersion,
         })),
       );
-      for (const fk of prospectiveFactories) seenVerifiedFactories.add(fk);
+      for (const rec of batchOut) {
+        const fk = resolveVerifiedFactoryKey(rec.quote);
+        if (fk && (rec.quote.quote_status === 'verified' || rec.quote.quote_status === 'superseded_uncompetitive')) {
+          seenVerifiedFactories.add(fk);
+        }
+      }
       submittedQuoteBatches += 1;
-      const clearedInterval = cleanArr.length === 1 && batchOut.some(rec => {
-        const freshCheck = store.getQuoteById(rec.quote.quote_id) ?? rec.quote;
-        return isR59 && isQuoteUsableForForm(freshCheck, latestAfterSource, as_of_date) && doesQuoteClearEntireInterval(freshCheck);
-      });
+      const usableFromBatch = batchOut
+        .map(rec => store.getQuoteById(rec.quote.quote_id) ?? rec.quote)
+        .filter(q => isQuoteUsableForForm(q, latestAfterSource, as_of_date));
+      const clearedInterval = usableFromBatch.length > 0 && usableFromBatch.every(q => doesQuoteClearEntireInterval(q));
       return { rejectedOverCap: false, recordedIds: batchOut, clearedInterval };
     };
 
@@ -2189,13 +2203,16 @@ export async function runGate1BForForm(store, {
     }
     const recordedBatch = [...seqRes.recordedIds];
 
-    // Support iterative per-factory sourcing_executor when `has_more_factories === true` and prior factory did not clear >= 30%
+    // Support iterative per-factory sourcing_executor when `has_more_factories === true` and prior factory did not clear >= 30%.
+    // Mismatched (`rejected_spec`) and cross-factory/incomplete quotes do not consume the 3-factory quota,
+    // while `maxFactoriesToCheck * 4` prevents runaway loops from a broken executor.
+    const maxSourcingLoopAttempts = maxFactoriesToCheck * 4;
     while (
       isR59 &&
       !seqRes.clearedInterval &&
       sourcingOutcome.has_more_factories === true &&
       seenVerifiedFactories.size < maxFactoriesToCheck &&
-      submittedQuoteBatches < maxFactoriesToCheck
+      submittedQuoteBatches < maxSourcingLoopAttempts
     ) {
       const preIterCheck = checkConcurrentSourcingAbort();
       if (preIterCheck.aborted) return preIterCheck.aborted;
@@ -2629,8 +2646,17 @@ export async function runGate1BForForm(store, {
     } catch { /* ignore */ }
   }
 
+  const countDistinctCheckedFactories = () => {
+    const rows = store.getQuotesForForm(form_id).filter(
+      q => q.spec_version === expectedSpecVersion &&
+        q.goods_first_order_promotion === 0 &&
+        (isQuoteBareGoods(q) || q.freight_first_order_promotion === 0) &&
+        (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
+    );
+    return new Set(rows.map(resolveVerifiedFactoryKey).filter(Boolean)).size;
+  };
+
   if (anyRightsHardFail || (allSuppliedFail && interiorPassPrices.length === 0)) {
-    let bestNegotiation = null;
     let bestPackagingRedesign = null;
     let maxTargetGoodsCnyFor30Pct = null;
     if (!anyRightsHardFail) {
@@ -2649,20 +2675,6 @@ export async function runGate1BForForm(store, {
           const candTargetGoodsCny = Math.max(0, Number((led.landed_domestic_cap_at_30pct_cny - domCny).toFixed(2)));
           if (maxTargetGoodsCnyFor30Pct === null || candTargetGoodsCny > maxTargetGoodsCnyFor30Pct) {
             maxTargetGoodsCnyFor30Pct = candTargetGoodsCny;
-          }
-        }
-        if (effectiveRevForEval < 59) {
-          let candNeg = ev.negotiation_shortlist ?? null;
-          if (!candNeg && led && met && finite(led.net_revenue_usd) && finite(led.contribution_usd) && finite(met.procurement_usd) && met.procurement_usd > 0) {
-            candNeg = computeNegotiationShortlist({
-              net_revenue_usd: led.net_revenue_usd,
-              contribution_usd: led.contribution_usd,
-              negotiable_cost_usd: met.procurement_usd,
-              margin_floor: 0.30,
-            });
-          }
-          if (candNeg && (!bestNegotiation || getNegotiationDiscountFraction(candNeg) < getNegotiationDiscountFraction(bestNegotiation))) {
-            bestNegotiation = candNeg;
           }
         }
 
@@ -2727,18 +2739,7 @@ export async function runGate1BForForm(store, {
         }
       }
     }
-    const countDistinctCheckedFactories = () => {
-      const rows = store.getQuotesForForm(form_id).filter(
-        q => q.spec_version === expectedSpecVersion &&
-          q.goods_first_order_promotion === 0 &&
-          (isQuoteBareGoods(q) || q.freight_first_order_promotion === 0) &&
-          (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
-      );
-      return new Set(rows.map(resolveQuoteVerifiedFactoryKey).filter(Boolean)).size;
-    };
-    const checkedFactoryQuotesCount = effectiveRevForEval >= 59
-      ? countDistinctCheckedFactories()
-      : quotesToEvaluate.length;
+    const checkedFactoryQuotesCount = countDistinctCheckedFactories();
     const g1bRes = {
       status: 'gate1b_rejected',
       margin_interval_verdict: anyRightsHardFail ? 'rights_conflict' : 'all_below_30pct',
@@ -2748,30 +2749,30 @@ export async function runGate1BForForm(store, {
       ...quotePricing,
       scenarios_checked: evaluations.length,
       evaluated_scenarios: evaluatedScenarioSummary,
-      ...(effectiveRevForEval >= 59 ? { checked_factory_quotes_count: checkedFactoryQuotesCount } : {}),
-      ...(effectiveRevForEval >= 59 && maxTargetGoodsCnyFor30Pct !== null ? { target_goods_cny_for_30pct: maxTargetGoodsCnyFor30Pct } : {}),
-      ...(effectiveRevForEval >= 59 && !anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < BUSINESS_THRESHOLDS.max_1688_factories_to_check } : {}),
+      checked_factory_quotes_count: checkedFactoryQuotesCount,
+      ...(maxTargetGoodsCnyFor30Pct !== null ? { target_goods_cny_for_30pct: maxTargetGoodsCnyFor30Pct } : {}),
+      ...(!anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < BUSINESS_THRESHOLDS.max_1688_factories_to_check } : {}),
       ...(bestPackagingRedesign ? { packaging_redesign_shortlist: bestPackagingRedesign } : {}),
       reasons: evaluations.flatMap(e => e.reasons || []).map(sanitizeDiagnosticText),
     };
     store.updateFormLifecycle(form_id, 'gate1b_rejected', {
       gate1b_result: g1bRes,
-      negotiation_shortlist: bestNegotiation,
+      negotiation_shortlist: null,
       packaging_redesign_shortlist: bestPackagingRedesign,
     });
     return {
       form_id,
       status: 'gate1b_rejected',
       margin_interval_verdict: g1bRes.margin_interval_verdict,
-      ...(effectiveRevForEval >= 59 ? { checked_factory_quotes_count: checkedFactoryQuotesCount } : {}),
-      ...(effectiveRevForEval >= 59 && maxTargetGoodsCnyFor30Pct !== null ? { target_goods_cny_for_30pct: maxTargetGoodsCnyFor30Pct } : {}),
-      ...(effectiveRevForEval >= 59 && !anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < BUSINESS_THRESHOLDS.max_1688_factories_to_check } : {}),
+      checked_factory_quotes_count: checkedFactoryQuotesCount,
+      ...(maxTargetGoodsCnyFor30Pct !== null ? { target_goods_cny_for_30pct: maxTargetGoodsCnyFor30Pct } : {}),
+      ...(!anyRightsHardFail ? { second_factory_quote_needed: checkedFactoryQuotesCount < BUSINESS_THRESHOLDS.max_1688_factories_to_check } : {}),
       ...(sampleWarningTag ? { sample_warning_tag: sampleWarningTag } : {}),
       ...quotePricing,
       quote: persistedQuote,
       order_plan: orderPlan,
       early_screen: evaluations.length === 1 ? evaluations[0] : evaluations,
-      negotiation_shortlist: bestNegotiation,
+      negotiation_shortlist: null,
       packaging_redesign_shortlist: bestPackagingRedesign,
       proceed_to_gate2_3: false,
     };
@@ -2805,7 +2806,7 @@ export async function runGate1BForForm(store, {
     const g1bRes = {
       status: 'gate1b_passed',
       margin_interval_verdict: 'all_ge_30pct',
-      ...(effectiveRevForEval >= 59 ? { second_factory_quote_needed: secondFactoryQuoteNeeded } : {}),
+      second_factory_quote_needed: secondFactoryQuoteNeeded,
       spec_sha256: latest.spec_sha256,
       ...(sampleWarningTag ? { sample_warning_tag: sampleWarningTag } : {}),
       ...quotePricing,
@@ -2823,7 +2824,7 @@ export async function runGate1BForForm(store, {
       form_id,
       status: 'gate1b_passed',
       margin_interval_verdict: 'all_ge_30pct',
-      ...(effectiveRevForEval >= 59 ? { second_factory_quote_needed: secondFactoryQuoteNeeded } : {}),
+      second_factory_quote_needed: secondFactoryQuoteNeeded,
       ...(sampleWarningTag ? { sample_warning_tag: sampleWarningTag } : {}),
       ...quotePricing,
       quote: persistedQuote,
@@ -2849,42 +2850,16 @@ export async function runGate1BForForm(store, {
       }
     }
     const marginRange = margins.length > 0 ? [Math.min(...margins), Math.max(...margins)] : null;
-    const latest = store.getCandidateForm(form_id) ?? form;
-    const canProceed = (allow_crossing_to_gate2_3 === true || isR59) && missingDeclared.length === 0 && (anyPass || interiorPassPrices.length > 0);
-    const checkedFactoryQuotesCountCross = effectiveRevForEval >= 59
-      ? (() => {
-          const rows = store.getQuotesForForm(form_id).filter(
-            q => q.spec_version === expectedSpecVersion &&
-              q.goods_first_order_promotion === 0 &&
-              q.freight_first_order_promotion === 0 &&
-              (q.quote_status === 'verified' || q.quote_status === 'superseded_uncompetitive'),
-          );
-          return new Set(rows.map(q => {
-            if (nonemptyStr(q?.factory_id)) return `fac:${q.factory_id.trim()}`;
-            let lines = Array.isArray(q?.sku_lines) ? q.sku_lines : null;
-            if (!lines && nonemptyStr(q?.sku_lines_json)) {
-              try {
-                const parsed = JSON.parse(q.sku_lines_json);
-                if (Array.isArray(parsed)) lines = parsed;
-              } catch { /* ignore */ }
-            }
-            const offerIds = Array.isArray(lines)
-              ? [...new Set(lines.map(l => (nonemptyStr(l?.offer_id) ? l.offer_id.trim() : null)).filter(Boolean))].sort()
-              : [];
-            if (offerIds.length > 0) return `off:${offerIds.join('+')}`;
-            return `qid:${q?.quote_id ?? 'unknown'}`;
-          })).size;
-        })()
-      : quotesToEvaluate.length;
+    const anyPendingEval = evaluations.some(ev => ev.gate_status === 'pending' || ev.gate_status === 'deferred');
+    const canProceed = allow_crossing_to_gate2_3 === true && missingDeclared.length === 0 && !anyPendingEval && (anyPass || interiorPassPrices.length > 0);
+    const checkedFactoryQuotesCountCross = countDistinctCheckedFactories();
     const g1bRes = {
       status: 'gate1b_pending',
       margin_interval_verdict: 'crosses_30pct',
       spec_sha256: form.spec_sha256,
-      ...(effectiveRevForEval >= 59 ? {
-        checked_factory_quotes_count: checkedFactoryQuotesCountCross,
-        second_factory_quote_needed: checkedFactoryQuotesCountCross < BUSINESS_THRESHOLDS.max_1688_factories_to_check,
-      } : {}),
-      owner_review_required: !isR59 || hasInteriorCliffCrossing,
+      checked_factory_quotes_count: checkedFactoryQuotesCountCross,
+      second_factory_quote_needed: checkedFactoryQuotesCountCross < BUSINESS_THRESHOLDS.max_1688_factories_to_check,
+      owner_review_required: !canProceed || hasInteriorCliffCrossing,
       owner_crossing_override: canProceed,
       ...quotePricing,
       spec_version: expectedSpecVersion,
@@ -2904,9 +2879,11 @@ export async function runGate1BForForm(store, {
         ? `Forward solver found a >=30% feasible interior cliff price ($${interiorPassPrices.join(', $')}) inside the evaluated interval [$${minEvaluatedPrice}, $${maxEvaluatedPrice}]; add the interior cliff price scenario rather than rejecting as all_below_30pct.`
         : (allSuppliedPass && interiorFailPrices.length > 0
           ? `Interior FBA tier cliff ($${interiorFailPrices.join(', $')}) dips below 30% inside [$${minEvaluatedPrice}, $${maxEvaluatedPrice}]; treat as crosses_30pct rather than all_ge_30pct.`
-          : (isR59
-            ? 'Gate 1B scenarios cross the 30% pre-ad margin floor across verified quotes/prices; r59 auto-admits to Gate 2/3 to score [min_total, max_total] without inflating strict qualifying counts.'
-            : 'Gate 1B margin interval crosses the 30% pre-ad margin floor across feasible scenarios; requires owner review or price-band tightening rather than collapsing to pass or reject.')),
+          : (canProceed
+            ? 'Gate 1B scenarios cross the 30% pre-ad margin floor across verified quotes/prices; advancing to Gate 2/3 under explicit owner allow_crossing_to_gate2_3 authorization to score [min_total, max_total] without inflating strict qualifying counts.'
+            : (anyPendingEval
+              ? 'Gate 1B scenarios cross the 30% floor, but one or more active scenarios/quotes remain pending; resolve pending cost inputs before owner crossing override can advance to Gate 2/3.'
+              : 'Gate 1B margin interval crosses the 30% pre-ad margin floor across feasible scenarios; retained for owner review (requires explicit allow_crossing_to_gate2_3: true before Gate 2/3 deep spend or a cheaper complete-kit factory quote).'))),
     };
     store.updateFormLifecycle(form_id, 'gate1b_pending', {
       gate1b_result: g1bRes,
@@ -2917,10 +2894,8 @@ export async function runGate1BForForm(store, {
       form_id,
       status: 'gate1b_pending',
       margin_interval_verdict: 'crosses_30pct',
-      ...(effectiveRevForEval >= 59 ? {
-        checked_factory_quotes_count: checkedFactoryQuotesCountCross,
-        second_factory_quote_needed: checkedFactoryQuotesCountCross < BUSINESS_THRESHOLDS.max_1688_factories_to_check,
-      } : {}),
+      checked_factory_quotes_count: checkedFactoryQuotesCountCross,
+      second_factory_quote_needed: checkedFactoryQuotesCountCross < BUSINESS_THRESHOLDS.max_1688_factories_to_check,
       owner_review_required: g1bRes.owner_review_required,
       owner_crossing_override: canProceed,
       ...(sampleWarningTag ? { sample_warning_tag: sampleWarningTag } : {}),

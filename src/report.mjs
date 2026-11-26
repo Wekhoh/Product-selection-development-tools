@@ -2,6 +2,10 @@
 import { BARE_GOODS_DISCLOSURE_ZH, BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import { sanitizeDiagnosticText } from './contracts.mjs';
 import { ledgerMeetsMarginFloor } from './economics.mjs';
+import {
+  evaluateSingleFactoryCompleteKit,
+  INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH,
+} from './fba-calculator.mjs';
 import { extractNewcomerReviewOriginBreakdown } from './observations.mjs';
 import { R58_FONT_FACE_CSS } from './report-fonts.mjs';
 import { R58_STUDIO_CSS, R58_AI_SECTIONS_CSS } from './report-studio-css.mjs';
@@ -371,6 +375,7 @@ const FEE_ISSUES = {
   returns_processing_required: '实物退货率高于类目阈值且无官方豁免，必须计入额外退货处理费。',
   invalid_return_rate: '实物退货率超出有效范围 [0, 1)。',
   missing_carrier_bond: '修订58要求正头程报价在 headhaul.components 中明确包含适用 carrier_bond（或提供有据豁免声明），不能默认已含。',
+  incomplete_cross_factory_kit: INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH,
 };
 
 function inputSummary(item, rev = 0) {
@@ -1112,9 +1117,11 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
             ${scenarios.map(sc => {
               const calc = sc.input?.calculation;
               const cond = calc?.status === 'sensitivity_only';
+              const kit = sc.single_factory_complete_kit ?? calc?.single_factory_complete_kit ?? evaluateSingleFactoryCompleteKit({ scenario: sc.input, cost_ledger: sc.input?.cost_ledger });
               const rawLabel = string(sc.input?.label, sc.id ?? '未命名情景');
               const dispLabel = r58 ? sanitizeTextPaths(rawLabel) : rawLabel;
-              return `<th scope="col" class="num-col">${escape(dispLabel)}${cond ? '<span class="th-note">条件试算·不计分</span>' : ''}</th>`;
+              const kitNote = kit?.is_cross_factory_or_incomplete ? '<span class="th-note">跨厂拼套·不计入围</span>' : '';
+              return `<th scope="col" class="num-col">${escape(dispLabel)}${cond ? '<span class="th-note">条件试算·不计分</span>' : ''}${kitNote}</th>`;
             }).join('')}
           </tr>
         </thead>
@@ -1185,8 +1192,12 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
         ? `退货费口径：退款率 r_refund=${escape(numberText(retComp.r_refund * 100))}%，实物退货率 r_physical=${escape(numberText(retComp.r_physical * 100))}%${retComp.return_threshold !== null ? `，类目阈值 ${escape(numberText(retComp.return_threshold * 100))}%` : ''}，超阈费 US$ ${escape(numberText(retComp.expected_fee_per_shipped_unit_usd))}。`
         : '';
       const foldTitle = r58 ? sanitizeTextPaths(string(scenario.input?.label, scenario.id ?? '未命名情景')) : string(scenario.input?.label, scenario.id ?? '未命名情景');
+      const kit = scenario.single_factory_complete_kit ?? calculation?.single_factory_complete_kit ?? evaluateSingleFactoryCompleteKit({ scenario: scenario.input, cost_ledger: scenario.input?.cost_ledger });
+      const kitFoldNote = kit?.is_cross_factory_or_incomplete
+        ? `<p class="ink-fail"><strong>单厂齐套核查未通过（保留采购情景供复核，不计入入围）：</strong>${escape(kit.kit_note ?? INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH)}${kit.distinct_factory_count > 1 ? `（检测到 ${escape(String(kit.distinct_factory_count))} 家不同工厂拼套）` : ''}。</p>`
+        : '';
       const winSep = r58 ? '·' : '—';
-      return `<details class="quiet-fold"><summary>${escape(foldTitle)} · ${escape(explanation)}</summary><div class="fold-body">${calculation ? `<p class="muted">适用窗口 ${winSep} 销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。费率核验：${validation.status === 'validated' ? '通过' : '存在待补证项'}。</p>` : ''}${adNote ? `<p class="muted">${adNote}</p>` : ''}${retNote ? `<p class="muted">${retNote}</p>` : ''}${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(issue.code === 'domestic_quote_required' ? (r58 ? '修订58要求提供整数 order_units >= 100 的非首单常规复购货款与国内运费报价（且须与 source_inputs/sku_lines 口径一致，first_order_promotion: false）。' : '需要100采购单位的非首单常规复购货款与国内运费报价（须明确order_units: 100及first_order_promotion: false），不能沿用旧暂缓规则或首单促销减免。') : (FEE_ISSUES[issue.code] ?? (r58 ? sanitizeTextPaths(string(issue.reason)) : issue.reason)))}</li>`).join('')}</ul>` : ''}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(r58 ? readableSanitized(value) : readable(value))}</li>`).join('')}</ul>` : ''}</div></details>`;
+      return `<details class="quiet-fold"><summary>${escape(foldTitle)} · ${escape(explanation)}</summary><div class="fold-body">${kitFoldNote}${calculation ? `<p class="muted">适用窗口 ${winSep} 销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。费率核验：${validation.status === 'validated' ? '通过' : '存在待补证项'}。</p>` : ''}${adNote ? `<p class="muted">${adNote}</p>` : ''}${retNote ? `<p class="muted">${retNote}</p>` : ''}${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(issue.code === 'domestic_quote_required' ? (r58 ? '修订58要求提供整数 order_units >= 100 的非首单常规复购货款与国内运费报价（且须与 source_inputs/sku_lines 口径一致，first_order_promotion: false）。' : '需要100采购单位的非首单常规复购货款与国内运费报价（须明确order_units: 100及first_order_promotion: false），不能沿用旧暂缓规则或首单促销减免。') : (FEE_ISSUES[issue.code] ?? (r58 ? sanitizeTextPaths(string(issue.reason)) : issue.reason)))}</li>`).join('')}</ul>` : ''}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(r58 ? readableSanitized(value) : readable(value))}</li>`).join('')}</ul>` : ''}</div></details>`;
     }).join('')}</div>
   </section>`;
 }
