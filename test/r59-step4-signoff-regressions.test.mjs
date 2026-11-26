@@ -818,6 +818,7 @@ test('Astra Sign-Off #13 & #14: Codex startup banner ultrafast fallback, NTFS ha
     const tierSeen = [];
     const fallbackOut = await runCodexExecMarkdown({
       prompt: 'Synthetic fallback test.',
+      serviceTier: 'ultrafast',
       testMode: true,
       cwd: dir,
       receiptDir: join(dir, 'codex-fb-receipts'),
@@ -851,6 +852,7 @@ test('Astra Sign-Off #13 & #14: Codex startup banner ultrafast fallback, NTFS ha
     await assert.rejects(async () => {
       await runCodexExecMarkdown({
         prompt: 'Synthetic post-generation error.',
+        serviceTier: 'ultrafast',
         testMode: true,
         cwd: dir,
         receiptDir: join(dir, 'codex-noblock-receipts'),
@@ -1421,6 +1423,7 @@ test('Astra Round-2 Counterexamples B: $0 placement proof in calculateEconomics/
     let longAttempts = 0;
     const longFallback = await runCodexExecMarkdown({
       prompt: 'Short caller prompt while mock uses full 6.8KB receipt prefix.',
+      serviceTier: 'ultrafast',
       testMode: true,
       cwd: dir,
       receiptDir: join(dir, 'codex-long-fb'),

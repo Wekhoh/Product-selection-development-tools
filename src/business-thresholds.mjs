@@ -353,10 +353,10 @@ export const BUSINESS_THRESHOLD_AUDIT_REGISTRY = deepFreeze({
     provenance: 'AGENTS.md Luna [0.50, 0.70) amber_manual_review band',
   },
   codex_default_service_tier: {
-    value: 'ultrafast',
+    value: 'default',
     unit: 'service_tier',
-    confirmed_at: '2026-11-25',
-    provenance: 'Owner 2026-11-25 explicit override: use ultrafast (+ max reasoning, with standard/default fallback) across all GPT-6.2 Astra runs',
+    confirmed_at: '2026-11-26',
+    provenance: 'Owner 2026-11-26 21:12 +08:00 explicit override: pass -c service_tier="default" (+ max reasoning) so normal speed explicitly overrides any host ~/.codex/config.toml ultrafast setting unless explicitly opted in',
   },
   codex_default_reasoning_effort: {
     value: 'max',

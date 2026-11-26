@@ -6,6 +6,7 @@ import {
   BUSINESS_THRESHOLD_AUDIT_REGISTRY,
 } from '../src/business-thresholds.mjs';
 import { MAX_MONTHLY_LIMIT_CENTS } from '../src/openai/budget-ledger.mjs';
+import { DEFAULT_CODEX_SERVICE_TIER } from '../src/openai/codex-runner.mjs';
 import {
   FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
   FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
@@ -47,7 +48,7 @@ test('business-thresholds: every registered cutoff is deep-frozen with verified 
   }
 });
 
-test('business-thresholds: locked 4 hard kill lines, 21-item 100-pt rubric, 15-pt USD CPC anchors, 2027 windows, and ultrafast Codex default match active runtime', () => {
+test('business-thresholds: locked 4 hard kill lines, 21-item 100-pt rubric, 15-pt USD CPC anchors, 2027 windows, and normal-speed Codex default match active runtime', () => {
   // 4 hard kill lines
   assert.equal(BUSINESS_THRESHOLDS.minimum_reference_price_usd, 29.99);
   assert.equal(BUSINESS_THRESHOLDS.pre_ad_margin_floor, 0.30);
@@ -96,7 +97,8 @@ test('business-thresholds: locked 4 hard kill lines, 21-item 100-pt rubric, 15-p
   assert.deepEqual(FBA_2027_DEFAULT_OFF_PEAK_WINDOW, BUSINESS_THRESHOLDS.fba_2027_off_peak_sales_window);
   assert.deepEqual(FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW, BUSINESS_THRESHOLDS.fba_2027_off_peak_storage_window);
   assert.deepEqual(FBA_2027_UNPUBLISHED_PEAK_WINDOW, BUSINESS_THRESHOLDS.fba_2027_unpublished_q4_peak_window);
-  assert.equal(BUSINESS_THRESHOLDS.codex_default_service_tier, 'ultrafast');
+  assert.equal(BUSINESS_THRESHOLDS.codex_default_service_tier, 'default');
+  assert.equal(DEFAULT_CODEX_SERVICE_TIER, 'default');
   assert.equal(BUSINESS_THRESHOLDS.codex_default_reasoning_effort, 'max');
 });
 

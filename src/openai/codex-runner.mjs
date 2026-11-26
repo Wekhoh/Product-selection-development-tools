@@ -2371,7 +2371,7 @@ export async function runCodexExecJson({
     model: explicitModel ?? 'inherited_config',
     reasoning_effort: reasoningEffort ?? 'inherited_config',
     web_search: webSearch ?? 'live',
-    requested_service_tier: serviceTier ?? 'default',
+    requested_service_tier: serviceTier ?? 'inherited_config',
     prompt_sha256: sha256Hex(prompt),
     schema_sha256: sha256Hex(schemaJson),
     image_sha256s: attachmentSha256s,
@@ -2457,7 +2457,7 @@ export async function runCodexExecJson({
     };
 
     let tierFallbackUsed = false;
-    let effectiveServiceTier = serviceTier ?? 'standard';
+    let effectiveServiceTier = serviceTier ?? null;
     const firstRun = await runAttempt(1, serviceTier);
     let attempt = firstRun;
     let firstAttemptDiagnostics = null;
@@ -3129,7 +3129,7 @@ export async function runCodexEvidenceReview(packetInput, {
     model: explicitGateModel ?? 'inherited_config',
     reasoning_effort: reasoningEffort ?? 'inherited_config',
     web_search: webSearch,
-    requested_service_tier: serviceTier ?? 'default',
+    requested_service_tier: serviceTier ?? 'inherited_config',
     prompt_sha256: sha256Hex(prompt),
     schema_sha256: sha256Hex(canonicalJson(EVIDENCE_REVIEW_JSON_SCHEMA)),
     image_sha256s: attachmentSha256s,
@@ -3408,7 +3408,7 @@ export async function runCodexEvidenceReview(packetInput, {
         reviewer_label: verifiedOnDisk.reviewer_label,
         model: verifiedOnDisk.model,
         reasoning_effort: verifiedOnDisk.reasoning_effort,
-        effective_service_tier: existingClaim.envelope.effective_service_tier ?? (serviceTier ?? 'standard'),
+        effective_service_tier: existingClaim.envelope.effective_service_tier ?? (serviceTier ?? null),
         tier_fallback_used: Boolean(existingClaim.envelope.tier_fallback_used),
         duration_ms: existingClaim.envelope.duration_ms ?? 0,
         disposition_counts: revalidated.disposition_counts,
