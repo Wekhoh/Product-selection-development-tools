@@ -199,3 +199,39 @@ _Avoid_: Silent substitution as a literal product query, locking novel cold-star
 **Target-child sales grain (目标子体销量口径 / `target_child_units`)**:
 A Revision 59 observation grain measuring latest-30-day unit sales for the matched specification child variant (using exact single-variant parent units, multi-variant `bought_in_past_month` badge bounds, or median same-spec pure-color variant units) rather than pooling unrelated multi-size parent totals or treating unbadged active sub-50/month variants as zero sales.
 _Avoid_: Attributing an entire multi-size parent's sales to one SKU, treating `<50/month` unbadged active children as dormant zeros
+
+**Steady-state multi-warehouse fulfillment basis (后期稳态多仓发货口径)**:
+The unit-economics shipping assumption modeling mature replenishment (`>= 5` identical cartons qualifying for `$0` Amazon-optimized inbound placement) paired with a nationwide multi-warehouse sea-truck base rate (`¥10.0/kg` before bond and material surcharges), independent of the `100`-set wholesale quote quantity.
+_Avoid_: Coupling `100`-set test-order carton counts to `$0` placement eligibility, pairing `$0` placement with a pure US-West single-warehouse ocean rate
+
+**Bare-goods sourcing cost (1688 裸货价口径)**:
+The `100`-set regular repeat-order unit wholesale price on 1688 excluding domestic China delivery to the Shenzhen consolidation warehouse, used for initial screening with explicit disclosure rather than gating on volatile 1688 page express templates.
+_Avoid_: Domestic freight as international headhaul, invented per-kilogram domestic freight caps
+
+**1688-cost breakeven floor price (按 1688 成本算保底定价)**:
+The minimum US selling price calculated forward from an observed 1688 factory quote to achieve the `30%` steady-state pre-ad margin floor. Distinct from — and never used as — a competitor-price-derived procurement cap.
+_Avoid_: Competitor-price reverse procurement cap, pre-sourcing price-cap elimination
+
+**Boutique multi-product storefront (优质精铺店铺)**:
+A focused Amazon US seller storefront carrying roughly `5–50` parent listings with at least half actively selling and strong whole-store revenue, contrasted with thousands-SKU mass-listing shops and single-SKU accidental accounts.
+_Avoid_: Mass-listing drop/arbitrage storefront, whole-store revenue confused with single-ASIN sales
+
+**Strict date-dependent item (强时效／日期依赖品)**:
+A product whose utility expires after a fixed calendar date, year, or one-time holiday (such as a dated calendar or single-holiday decoration), excluded under the evergreen-first scope.
+_Avoid_: Ordinary year-round evergreen products with mild seasonal demand swings
+
+**Non-overreach triage (宁放过不误杀初筛)**:
+Lightweight fast-model screening restricted solely to undisputed statutory `<= 12y` children's items, strict date-dependent disposables, discovery-channel red-ocean skips (with logged reasons, never a 5th global hard kill line), and 1688 search-page offer prioritization, passing all uncertain, powered, or patent-suspect items forward for full verification.
+_Avoid_: Allowing a non-reasoning triage model to judge complex patents, electrical compliance, or reject whole product candidates on a 1688 search page
+
+**Review-sample origin coverage (评论抽样来源覆盖)**:
+The explicit count of inspected written text reviews (excluding star-only ratings) classified on complete provider records strictly into three origins — Vine, Verified Purchase (`VP`), and unverified direct (`直评`, neither Vine nor VP) — kept separate from the listing's total star-rating count, with missing-origin labels (`来源字段缺失`) reserved solely for upstream payloads omitting origin flags.
+_Avoid_: Reporting partial identified review counts as a complete listing-wide origin breakdown, misclassifying normal unverified direct reviews as unknown origin, silently hiding unclassified sample rows
+
+**Sample-pending qualifying card (拿样待核入围卡 / `sample_pending_qualifying`)**:
+A Revision 59 qualifying card (`counts_toward_target: true`) whose 14-item objective core (`85` points) clears the `>= 30%` single-factory complete-kit margin floor and whose public IP/compliance pre-screens show zero proven conflict, while post-sample or factory-inquiry items (`15` points) remain honestly `null` until physical sampling or factory confirmation.
+_Avoid_: Scaling earned points up to 100, treating deferred post-sample items as zero scores, qualifying a card with a proven IP conflict or bare-part quote
+
+**85-point objective core vs. 100-point full score (85 分客观核心排位与 100 分满分)**:
+The Revision 59 ranking separation where full card score always remains `100` points across all 21 items, while qualifying cards (`complete`, `seasonal_eligible`, and `sample_pending_qualifying`) are ranked fairly on their shared 14-item `85`-point objective core (`core_85_range`) so strong sample-pending cards are not penalized below weaker cards that already have post-sample items filled.
+_Avoid_: Changing total profile budget from 100 to 85, dropping the 15 post-sample points from the scoring profile
