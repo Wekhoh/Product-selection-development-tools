@@ -72,7 +72,7 @@ Original external handoff locations requested by the owner are preserved in the 
 
 ## Planning and choices still open
 
-Discovery studies contain reusable ideas, not an all-channels-per-card requirement or new scoring bonuses. FIRST-RELEASE defines the full target; STATE names actual acceptance. Useful throughput, multi-category calibration, unattended startup/recovery, final workspace interaction and owner-decision writeback remain separate subjects.
+Discovery studies contain reusable ideas, not an all-channels-per-card requirement or new scoring bonuses. [SPEC](SPEC.md) defines the active business and workflow target (superseding archived [FIRST-RELEASE](archive/design/FIRST-RELEASE.draft.md)); [STATE](STATE.md) names actual acceptance. Useful throughput, multi-category calibration, unattended startup/recovery, final workspace interaction and owner-decision writeback remain separate subjects.
 
 For an API or `Codex CLI` change, read [API-MIGRATION](API-MIGRATION.md) (plus archived provenance in [EVIDENCE-REVIEW-CONTRACT](archive/api/EVIDENCE-REVIEW-CONTRACT.draft.md) and [OFFICIAL-OPENAI-OPTIONS](archive/api/OFFICIAL-OPENAI-OPTIONS.2026-11-14.md)). Paid HTTP API remains `enabled: false` by default in offline/CI runs, while local subscription `Codex CLI` (`gpt-6.2-astra`, `ultrafast` + `max` reasoning with automatic `standard`/`default` fallback) runs at `$0` API spend.
 

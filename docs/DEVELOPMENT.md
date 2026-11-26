@@ -101,7 +101,7 @@ The installed v1.3.2 package was checked directly. Its user-invoked main flow in
 | `code-review` / `pr` | Fixed-scope standards/spec review, resolved findings and relevant acceptance evidence | Code adoption, offline operation, native integration, real-card usefulness and visual acceptance stay distinct |
 | `retro` | Evidence-based improvements to checks, navigation or engineering conventions | Improvements address observed problems; they do not automatically install tooling or create more process |
 
-Keep STATE as the single maintained task/recovery record. Use existing repository documents and issue conventions; do not mechanically reproduce a skill's sample tracker structure. Write a real spec once its scope is understandable, rather than creating a complete-looking document from unsettled assumptions. The owner-authorized bounded discovery-to-card slice in FIRST-RELEASE is implemented and undergoing real-data trials; broader application interaction and deployment remain open. Historical clarification-only checkpoints do not block this adopted slice.
+Keep STATE as the single maintained task/recovery record. Use existing repository documents and issue conventions; do not mechanically reproduce a skill's sample tracker structure. Write a real spec once its scope is understandable, rather than creating a complete-looking document from unsettled assumptions. The initial bounded discovery-to-card slice (originating in archived [FIRST-RELEASE](archive/design/FIRST-RELEASE.draft.md) and now governed by [SPEC.md](SPEC.md)) is implemented and undergoing real-data trials; broader application interaction and deployment remain open. Historical clarification-only checkpoints do not block this adopted slice.
 
 | Skill | Applicable work |
 | --- | --- |
