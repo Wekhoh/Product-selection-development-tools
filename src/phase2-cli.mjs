@@ -2843,27 +2843,49 @@ export async function runPhase2Cli(
           const hasDomFreight = Number.isFinite(qObj.domestic_freight_cny_total) && qObj.domestic_freight_cny_total >= 0;
           const missingTopRevBond = (spec.bond_included === false || qObj.bond_included === false) &&
             !Number.isFinite(spec.bond_usd_per_unit ?? qObj.bond_usd_per_unit);
-          let resolvedRevHeadhaulUsd = !missingTopRevBond && Number.isFinite(spec.headhaul_usd) && spec.headhaul_usd >= 0
+          const scalarRevHeadhaulUsd = !missingTopRevBond && Number.isFinite(spec.headhaul_usd) && spec.headhaul_usd >= 0
             ? spec.headhaul_usd + (spec.bond_included === false ? Number(spec.bond_usd_per_unit ?? qObj.bond_usd_per_unit) : 0)
             : (!missingTopRevBond && Number.isFinite(qObj.headhaul_usd) && qObj.headhaul_usd >= 0
               ? qObj.headhaul_usd + (qObj.bond_included === false ? Number(qObj.bond_usd_per_unit ?? spec.bond_usd_per_unit) : 0)
               : undefined);
           const rawRevHeadhaulObj = spec.headhaul ?? qObj.headhaul ?? null;
-          if (resolvedRevHeadhaulUsd === undefined && rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object') {
+          const hasStructuredRevHeadhaul = Boolean(
+            rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object' && !Array.isArray(rawRevHeadhaulObj) &&
+            !Number.isFinite(rawRevHeadhaulObj.usd_per_unit) &&
+            (rawRevHeadhaulObj.rate_cny_per_kg !== undefined ||
+              rawRevHeadhaulObj.weight_per_carton_kg !== undefined ||
+              rawRevHeadhaulObj.actual_weight_kg_total !== undefined ||
+              rawRevHeadhaulObj.actual_weight_kg_per_unit !== undefined ||
+              rawRevHeadhaulObj.carton_cm !== undefined ||
+              rawRevHeadhaulObj.cartons !== undefined),
+          );
+          let resolvedRevHeadhaulUsd;
+          let revHeadhaulErrorReason = null;
+          if (hasStructuredRevHeadhaul) {
+            const a4Rev = computeHeadhaulWithA4Rules(rawRevHeadhaulObj, fxVal, orderUnits, {
+              isR58: true,
+              isR59: true,
+            });
+            if (a4Rev?.weight_conflict) {
+              revHeadhaulErrorReason = a4Rev.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.';
+            } else if (a4Rev?.missing_surcharge_quote) {
+              revHeadhaulErrorReason = `Headhaul Freight A4 requires ${a4Rev.a4_applied?.missing_surcharge_quote ?? 'surcharge quote'}.`;
+            } else if (Number.isFinite(a4Rev?.amount_usd)) {
+              if (scalarRevHeadhaulUsd !== undefined && Math.abs(scalarRevHeadhaulUsd - a4Rev.amount_usd) > 0.005) {
+                revHeadhaulErrorReason = `Supplied headhaul_usd ($${scalarRevHeadhaulUsd}) conflicts with recomputed structured headhaul ($${a4Rev.amount_usd}).`;
+              } else {
+                resolvedRevHeadhaulUsd = a4Rev.amount_usd;
+              }
+            }
+          } else if (scalarRevHeadhaulUsd !== undefined) {
+            resolvedRevHeadhaulUsd = scalarRevHeadhaulUsd;
+          } else if (rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object') {
             if (
               Number.isFinite(rawRevHeadhaulObj.usd_per_unit) &&
               rawRevHeadhaulObj.usd_per_unit >= 0 &&
               (rawRevHeadhaulObj.bond_included === true || Number.isFinite(rawRevHeadhaulObj.bond_usd_per_unit))
             ) {
               resolvedRevHeadhaulUsd = rawRevHeadhaulObj.usd_per_unit + (rawRevHeadhaulObj.bond_included === true ? 0 : rawRevHeadhaulObj.bond_usd_per_unit);
-            } else if (!Number.isFinite(rawRevHeadhaulObj.usd_per_unit)) {
-              const a4Rev = computeHeadhaulWithA4Rules(rawRevHeadhaulObj, fxVal, orderUnits, {
-                isR58: true,
-                isR59: true,
-              });
-              if (!a4Rev?.missing_surcharge_quote && Number.isFinite(a4Rev?.amount_usd)) {
-                resolvedRevHeadhaulUsd = a4Rev.amount_usd;
-              }
             }
           }
           if (!hasGoodsTotal || !hasDomFreight || !Number.isFinite(resolvedRevHeadhaulUsd)) {
@@ -2871,7 +2893,7 @@ export async function runPhase2Cli(
               ? 'Missing goods_cny_total on 1688 quote.'
               : (!hasDomFreight
                 ? 'Missing domestic_freight_cny_total to 广东深圳; domestic freight is never assumed ¥0.'
-                : 'Missing verified headhaul_usd or complete structured A4 headhaul inputs; headhaul is never assumed $2.20.');
+                : (revHeadhaulErrorReason ?? 'Missing verified headhaul_usd or complete structured A4 headhaul inputs; headhaul is never assumed $2.20.'));
             reverseSolution = {
               actual_complete_sets_used: orderUnits,
               min_retail_price_for_30pct_usd: null,

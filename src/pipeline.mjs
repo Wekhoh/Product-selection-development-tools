@@ -5129,20 +5129,44 @@ export function runFastProfitHealthcheck2027(spec = {}) {
     : (finite(spec.domestic_freight_cny_per_unit) ? spec.domestic_freight_cny_per_unit * orderUnits : null);
 
   const missingTopLevelBond = spec.bond_included === false && !finite(spec.bond_usd_per_unit);
-  let resolvedHeadhaulUsd = !missingTopLevelBond && finite(spec.headhaul_usd)
+  const scalarHeadhaulUsd = !missingTopLevelBond && finite(spec.headhaul_usd)
     ? spec.headhaul_usd + (spec.bond_included === false ? spec.bond_usd_per_unit : 0)
     : undefined;
-  if (resolvedHeadhaulUsd === undefined && spec.headhaul && typeof spec.headhaul === 'object') {
-    if (finite(spec.headhaul.usd_per_unit) && (spec.headhaul.bond_included === true || finite(spec.headhaul.bond_usd_per_unit))) {
-      resolvedHeadhaulUsd = spec.headhaul.usd_per_unit + (spec.headhaul.bond_included === true ? 0 : spec.headhaul.bond_usd_per_unit);
-    } else if (!finite(spec.headhaul.usd_per_unit) && fx !== null) {
+  let resolvedHeadhaulUsd;
+  let headhaulCheckReason = null;
+  const hasStructuredHeadhaul = Boolean(
+    spec.headhaul && typeof spec.headhaul === 'object' && !Array.isArray(spec.headhaul) &&
+    !finite(spec.headhaul.usd_per_unit) &&
+    (spec.headhaul.rate_cny_per_kg !== undefined ||
+      spec.headhaul.weight_per_carton_kg !== undefined ||
+      spec.headhaul.actual_weight_kg_total !== undefined ||
+      spec.headhaul.actual_weight_kg_per_unit !== undefined ||
+      spec.headhaul.carton_cm !== undefined ||
+      spec.headhaul.cartons !== undefined),
+  );
+  if (hasStructuredHeadhaul) {
+    if (fx !== null) {
       const a4 = computeHeadhaulWithA4Rules(spec.headhaul, fx, orderUnits, {
         isR58: true,
         isR59: true,
       });
-      if (!a4?.missing_surcharge_quote && finite(a4?.amount_usd)) {
-        resolvedHeadhaulUsd = a4.amount_usd;
+      if (a4?.weight_conflict) {
+        headhaulCheckReason = a4.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.';
+      } else if (a4?.missing_surcharge_quote) {
+        headhaulCheckReason = `Headhaul Freight A4 requires ${a4.a4_applied?.missing_surcharge_quote ?? 'surcharge quote'}.`;
+      } else if (finite(a4?.amount_usd)) {
+        if (scalarHeadhaulUsd !== undefined && Math.abs(scalarHeadhaulUsd - a4.amount_usd) > 0.005) {
+          headhaulCheckReason = `Supplied headhaul_usd ($${scalarHeadhaulUsd}) conflicts with recomputed structured headhaul ($${a4.amount_usd}).`;
+        } else {
+          resolvedHeadhaulUsd = a4.amount_usd;
+        }
       }
+    }
+  } else if (scalarHeadhaulUsd !== undefined) {
+    resolvedHeadhaulUsd = scalarHeadhaulUsd;
+  } else if (spec.headhaul && typeof spec.headhaul === 'object') {
+    if (finite(spec.headhaul.usd_per_unit) && (spec.headhaul.bond_included === true || finite(spec.headhaul.bond_usd_per_unit))) {
+      resolvedHeadhaulUsd = spec.headhaul.usd_per_unit + (spec.headhaul.bond_included === true ? 0 : spec.headhaul.bond_usd_per_unit);
     }
   }
 
@@ -5176,7 +5200,7 @@ export function runFastProfitHealthcheck2027(spec = {}) {
       ? spec.physical_return_fraction
       : (finite(spec.refund_fraction) ? spec.refund_fraction : 0.04),
     collection_rate: finite(spec.collection_rate) ? spec.collection_rate : 0.006,
-    headhaul_usd: resolvedHeadhaulUsd,
+    headhaul_usd: headhaulCheckReason !== null ? scalarHeadhaulUsd : resolvedHeadhaulUsd,
     fx_cny_per_usd: fx ?? undefined,
     profile_revision: 59,
   };
@@ -5221,7 +5245,7 @@ export function runFastProfitHealthcheck2027(spec = {}) {
           })
         : {
             status: 'needs_calculator_verification',
-            reason: 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
+            reason: headhaulCheckReason ?? 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
             feasible_min_price_usd: null,
           };
 
@@ -5229,7 +5253,7 @@ export function runFastProfitHealthcheck2027(spec = {}) {
         if (!finite(baseInput.headhaul_usd)) {
           realizedScreen = {
             status: 'needs_calculator_verification',
-            reason: 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
+            reason: headhaulCheckReason ?? 'Missing verified headhaul_usd or complete structured A4 headhaul inputs.',
             margin: null,
             contribution_usd: null,
           };

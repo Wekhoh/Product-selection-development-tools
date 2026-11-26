@@ -42,6 +42,7 @@ import {
   isOfficial2027ScheduleWindowValid,
   lookupVerified2027PerReturnFee,
   storageMeets2027Floor,
+  collectStructuredHeadhaulSpecs,
   computeHeadhaulWithA4Rules,
   computeAmazonCouponRedemptionFee2027,
   classifySizeTier2027,
@@ -223,6 +224,8 @@ export function calculateEconomics(input, options = {}) {
   let r58ReturnsInvalid = false;
   let r58ProcInvalid = false;
   let r58HeadhaulInvalid = false;
+  let headhaulConflictReason = null;
+  let headhaulA4Applied = null;
   let r58StorageInvalid = false;
   let r58FulfillmentInvalid = false;
   let r59PlacementInvalid = false;
@@ -258,6 +261,7 @@ export function calculateEconomics(input, options = {}) {
     }
     if (!options.requireFeeBasis) {
       for (const [lineId, deriv] of cnyDerivations.entries()) {
+        if (lineId === 'headhaul' && isR59Plus) continue;
         const targetLine = map.get(lineId);
         if (!targetLine || targetLine.status === 'pending' || VERIFIED_LINE_RATIONALS.has(targetLine)) continue;
         const derivedRat = deriveExactCnyLineRat(lineId, deriv, isR59Plus);
@@ -267,29 +271,49 @@ export function calculateEconomics(input, options = {}) {
           VERIFIED_LINE_RATIONALS.set(targetLine, derivedRat);
         }
       }
-    } else if (isR59Plus) {
-      // H11: In formal r59 scoring (`requireFeeBasis: true`), recompute/cross-check A4 headhaul when tariff inputs exist!
+    }
+    if (isR59Plus) {
+      // H11 + Issue #5: Check ALL supplied structured headhaul specs consistently across strict and non-strict modes.
       const hhLine = map.get('headhaul');
-      const rawHhSpec = cnyDerivations.get('headhaul')
-        ?? (input.headhaul && typeof input.headhaul === 'object' ? input.headhaul : null)
-        ?? (input.source_inputs?.headhaul && typeof input.source_inputs.headhaul === 'object' ? input.source_inputs.headhaul : null);
-      if (hhLine && hhLine.status !== 'pending' && rawHhSpec && typeof rawHhSpec === 'object' && rawHhSpec.rate_cny_per_kg !== undefined) {
-        const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
-        const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
-        const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
-        if (hhCalc.missing_surcharge_quote || !hhCalc.exact_usd_rational) {
-          r58HeadhaulInvalid = true;
-        } else {
+      const rawHhSpecs = collectStructuredHeadhaulSpecs(
+        cnyDerivations.get('headhaul'),
+        input.headhaul,
+        input.source_inputs?.headhaul,
+      );
+      if (hhLine && hhLine.status !== 'pending' && rawHhSpecs.length > 0) {
+        let firstCalc = null;
+        let firstExpectedUsd = null;
+        for (const rawHhSpec of rawHhSpecs) {
+          const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
+          const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
+          const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
+          if (hhCalc.weight_conflict || hhCalc.missing_surcharge_quote || !hhCalc.exact_usd_rational) {
+            r58HeadhaulInvalid = true;
+            if (hhCalc.weight_conflict && hhCalc.conflict_reason) headhaulConflictReason = hhCalc.conflict_reason;
+            if (hhCalc.a4_applied) headhaulA4Applied = hhCalc.a4_applied;
+            break;
+          }
           const expectedHhUsd = roundBigRat(hhCalc.exact_usd_rational.n, hhCalc.exact_usd_rational.d, 10);
-          if (finite(hhLine.amount_usd) && Math.abs(hhLine.amount_usd - expectedHhUsd) > 0.005) {
+          if (firstExpectedUsd !== null && Math.abs(firstExpectedUsd - expectedHhUsd) > 0.005) {
+            r58HeadhaulInvalid = true;
+            headhaulConflictReason = `Conflicting structured headhaul specs compute different per-unit costs ($${firstExpectedUsd} vs $${expectedHhUsd}).`;
+            break;
+          }
+          if (!firstCalc) {
+            firstCalc = hhCalc;
+            firstExpectedUsd = expectedHhUsd;
+          }
+        }
+        if (!r58HeadhaulInvalid && firstCalc) {
+          if (options.requireFeeBasis && finite(hhLine.amount_usd) && Math.abs(hhLine.amount_usd - firstExpectedUsd) > 0.005) {
             r58HeadhaulInvalid = true;
           } else {
-            hhLine.amount_usd = expectedHhUsd;
+            hhLine.amount_usd = firstExpectedUsd;
             hhLine.exact_usd_rational = {
-              num: hhCalc.exact_usd_rational.n.toString(),
-              den: hhCalc.exact_usd_rational.d.toString(),
+              num: firstCalc.exact_usd_rational.n.toString(),
+              den: firstCalc.exact_usd_rational.d.toString(),
             };
-            VERIFIED_LINE_RATIONALS.set(hhLine, hhCalc.exact_usd_rational);
+            VERIFIED_LINE_RATIONALS.set(hhLine, firstCalc.exact_usd_rational);
           }
         }
       }
@@ -715,6 +739,8 @@ export function calculateEconomics(input, options = {}) {
       returns_processing_components: returnsComponents,
       landed_domestic_cap_at_30pct_usd: landedDomesticCap,
       ...(landedDomesticCapCny !== null ? { landed_domestic_cap_at_30pct_cny: landedDomesticCapCny } : {}),
+      ...(headhaulConflictReason ? { headhaul_conflict_reason: headhaulConflictReason } : {}),
+      ...(headhaulA4Applied ? { headhaul_a4_applied: headhaulA4Applied } : {}),
     } : {}),
     expected_refund_usd: round(p * r), net_revenue_usd: round(net),
     known_cost_usd: round(known), pending_lines: pending, deferred_lines: deferred,
@@ -757,6 +783,11 @@ const PER_KG_KEYS = [
   'bond_cny_per_shipment',
   'carton_cm',
   'carton_count',
+  'units_per_carton',
+  'cartons',
+  'mixed_cartons',
+  'identical_cartons',
+  'uniform_cartons',
   'actual_weight_kg_total',
   'actual_weight_kg_per_unit',
   'weight_per_carton_kg',
@@ -1805,6 +1836,9 @@ export function evaluateEarlyScreen(input, options = {}) {
       : `Regular domestic quote must use 100 complete saleable units (received ${order_units}).`);
   } else if (procurementUsd === null || domesticUsd === null) {
     reasons.push('Regular goods or domestic freight quote is missing.');
+  }
+  if (headhaulRes.weight_conflict && headhaulRes.conflict_reason) {
+    reasons.push(headhaulRes.conflict_reason);
   }
   if (!marginComplete) {
     reasons.push(`Complete margin pending (${ledger.pending_lines.join(', ')}).`);
