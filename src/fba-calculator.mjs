@@ -466,104 +466,97 @@ export function isOfficial2027ScheduleWindowValid(lineId, basis, isApparel = fal
   return true;
 }
 
-const SMALL_STD_RETURN_FEE_OZ = Object.freeze([
-  { max_oz: 2, fee: 1.78 }, { max_oz: 4, fee: 1.84 }, { max_oz: 6, fee: 1.90 }, { max_oz: 8, fee: 1.96 },
-  { max_oz: 10, fee: 2.02 }, { max_oz: 12, fee: 2.08 }, { max_oz: 14, fee: 2.14 }, { max_oz: 16, fee: 2.21 },
-]);
-
-const LARGE_STD_RETURN_FEE_LB = Object.freeze([
-  { max_lb: 0.25, fee: 2.36 }, { max_lb: 0.50, fee: 2.70 }, { max_lb: 0.75, fee: 3.05 }, { max_lb: 1.00, fee: 3.39 },
-  { max_lb: 1.25, fee: 3.70 }, { max_lb: 1.50, fee: 4.01 }, { max_lb: 1.75, fee: 4.32 }, { max_lb: 2.00, fee: 4.63 },
-  { max_lb: 2.25, fee: 4.66 }, { max_lb: 2.50, fee: 4.68 }, { max_lb: 2.75, fee: 4.71 }, { max_lb: 3.00, fee: 4.73 },
-]);
-
-const SMALL_STD_APPAREL_RETURN_FEE_OZ = Object.freeze([
-  { max_oz: 4, fee: 1.65 }, { max_oz: 8, fee: 1.75 }, { max_oz: 12, fee: 1.85 }, { max_oz: 16, fee: 1.95 },
-]);
-
-const LARGE_STD_APPAREL_RETURN_FEE_LB = Object.freeze([
-  { max_lb: 0.25, fee: 2.04 }, { max_lb: 0.50, fee: 2.12 }, { max_lb: 0.75, fee: 2.19 }, { max_lb: 1.00, fee: 2.27 },
-  { max_lb: 1.50, fee: 2.62 }, { max_lb: 2.00, fee: 2.98 }, { max_lb: 2.50, fee: 3.33 }, { max_lb: 3.00, fee: 3.69 },
-]);
+/**
+ * Single source of truth for 2027 US FBA per-return processing fees across Standard (Non-Apparel & Apparel/Shoes),
+ * Bulky (4 tiers), and Oversize (6 tiers). Reads exclusively from canonical annual tables in `src/rates/fba-2027-tables.mjs`.
+ */
+function resolve2027PerReturnFeeFromTier(cls, { isApparelOrShoes = false, allowAll2027Tiers = true } = {}) {
+  if (!cls || cls.status !== 'verified' || !cls.rawRat) {
+    return { per_return_fee_usd: null, extra_lb_steps: 0, reason: 'Unclassified package.' };
+  }
+  if (cls.size_tier === 'small_standard') {
+    if (isApparelOrShoes) {
+      if (!allowAll2027Tiers) return { per_return_fee_usd: null, extra_lb_steps: 0, reason: 'Apparel returns require unified 2027 schedule.' };
+      const fee = APPAREL_SHOES_STANDARD_RETURNS_2027.small_standard_oz.find(
+        r => ratCmp(cls.rawRat.ozRat, toBigRat(r.max_oz)) <= 0,
+      )?.return_fee ?? null;
+      return { per_return_fee_usd: fee, extra_lb_steps: 0, reason: fee === null ? 'Unlisted returns-processing weight bracket.' : null };
+    }
+    const fee = SMALL_STANDARD_2027_OZ.find(
+      r => ratCmp(cls.rawRat.ozRat, toBigRat(r.max_oz)) <= 0,
+    )?.return_fee ?? null;
+    return { per_return_fee_usd: fee, extra_lb_steps: 0, reason: fee === null ? 'Unlisted returns-processing weight bracket.' : null };
+  }
+  if (cls.size_tier === 'large_standard') {
+    const lbRat = cls.rawRat.shipLbRat;
+    if (isApparelOrShoes) {
+      if (!allowAll2027Tiers) return { per_return_fee_usd: null, extra_lb_steps: 0, reason: 'Apparel returns require unified 2027 schedule.' };
+      if (ratCmp(lbRat, { n: 3n, d: 1n }) <= 0) {
+        const fee = APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_lb.find(
+          r => ratCmp(lbRat, toBigRat(r.max_lb)) <= 0,
+        )?.return_fee ?? null;
+        return { per_return_fee_usd: fee, extra_lb_steps: 0, reason: fee === null ? 'Unlisted returns-processing weight bracket.' : null };
+      }
+      const extraHalfLbs = extraHalfLbStepsRat(lbRat);
+      const over = APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_over_3lb;
+      return {
+        per_return_fee_usd: round(over.return_base_usd + extraHalfLbs * over.return_step_usd_per_half_lb),
+        extra_lb_steps: extraHalfLbs,
+        reason: null,
+      };
+    }
+    if (ratCmp(lbRat, { n: 3n, d: 1n }) <= 0) {
+      const fee = LARGE_STANDARD_2027_LB.find(
+        r => ratCmp(lbRat, toBigRat(r.max_lb)) <= 0,
+      )?.return_fee ?? null;
+      return { per_return_fee_usd: fee, extra_lb_steps: 0, reason: fee === null ? 'Unlisted returns-processing weight bracket.' : null };
+    }
+    const extraQuarterLbs = extraQuarterLbStepsRat(lbRat);
+    return {
+      per_return_fee_usd: round(LARGE_STANDARD_OVER_3LB.return_base_usd + extraQuarterLbs * LARGE_STANDARD_OVER_3LB.return_step_usd),
+      extra_lb_steps: extraQuarterLbs,
+      reason: null,
+    };
+  }
+  if (!allowAll2027Tiers) {
+    return { per_return_fee_usd: null, extra_lb_steps: 0, reason: 'Bulky/Oversize returns require unified 2027 schedule.' };
+  }
+  if (cls.size_tier.endsWith('_bulky')) {
+    const shipLbRat = cls.rawRat.shipLbRat;
+    const excessLbNum = shipLbRat.n - 1n * shipLbRat.d;
+    const extraWholeLbs = excessLbNum > 0n ? Number(ceilDivBig(excessLbNum, shipLbRat.d)) : 0;
+    return {
+      per_return_fee_usd: round(
+        BULKY_RETURNS_2027_RULE.base_first_lb_usd + extraWholeLbs * BULKY_RETURNS_2027_RULE.step_usd_per_lb_over_1,
+      ),
+      extra_lb_steps: extraWholeLbs,
+      reason: null,
+    };
+  }
+  if (cls.tier_family === 'oversize') {
+    const retRule = OVERSIZE_RETURNS_2027_TIERS[cls.size_tier];
+    if (!retRule) {
+      return { per_return_fee_usd: null, extra_lb_steps: 0, reason: `Unlisted Oversize returns-processing tier: ${cls.size_tier}` };
+    }
+    const billableRat = retRule.unit_weight_only ? cls.rawRat.wtLbRat : cls.rawRat.shipLbRat;
+    const threshBig = BigInt(retRule.base_threshold_lb);
+    const excessLbNum = billableRat.n - threshBig * billableRat.d;
+    const extraWholeLbs = excessLbNum > 0n ? Number(ceilDivBig(excessLbNum, billableRat.d)) : 0;
+    return {
+      per_return_fee_usd: round(retRule.base_usd + extraWholeLbs * retRule.step_usd_per_lb),
+      extra_lb_steps: extraWholeLbs,
+      reason: null,
+    };
+  }
+  return { per_return_fee_usd: null, extra_lb_steps: 0, reason: 'Unlisted returns-processing weight bracket.' };
+}
 
 export function lookupVerified2027PerReturnFee(pkg, { isApparelOrShoes = false, allowAll2027Tiers = false } = {}) {
-  const dims = resolvePackageDimsRat(pkg);
-  if (!dims || !dims.wtLbRat || !dims.shipLbRat) return null;
-  const { s1Rat, s2Rat, s3Rat, wtLbRat, ozRat, shipLbRat } = dims;
-  const isSmall = ratCmp(wtLbRat, { n: 1n, d: 1n }) <= 0 &&
-    ratCmp(s1Rat, { n: 15n, d: 1n }) <= 0 &&
-    ratCmp(s2Rat, { n: 12n, d: 1n }) <= 0 &&
-    ratCmp(s3Rat, { n: 3n, d: 4n }) <= 0;
-  if (isSmall) {
-    if (isApparelOrShoes) {
-      return allowAll2027Tiers
-        ? (SMALL_STD_APPAREL_RETURN_FEE_OZ.find(r => ratCmp(ozRat, toBigRat(r.max_oz)) <= 0)?.fee ?? null)
-        : null;
-    }
-    return SMALL_STD_RETURN_FEE_OZ.find(r => ratCmp(ozRat, toBigRat(r.max_oz)) <= 0)?.fee ?? null;
-  }
-  const isLarge = ratCmp(wtLbRat, { n: 20n, d: 1n }) <= 0 &&
-    ratCmp(shipLbRat, { n: 20n, d: 1n }) <= 0 &&
-    ratCmp(s1Rat, { n: 18n, d: 1n }) <= 0 &&
-    ratCmp(s2Rat, { n: 14n, d: 1n }) <= 0 &&
-    ratCmp(s3Rat, { n: 8n, d: 1n }) <= 0;
-  if (isLarge) {
-    if (isApparelOrShoes) {
-      if (!allowAll2027Tiers) return null;
-      if (ratCmp(shipLbRat, { n: 3n, d: 1n }) <= 0) {
-        return LARGE_STD_APPAREL_RETURN_FEE_LB.find(r => ratCmp(shipLbRat, toBigRat(r.max_lb)) <= 0)?.fee ?? null;
-      }
-      const num2 = 2n * (shipLbRat.n - 3n * shipLbRat.d);
-      const halfSteps = num2 <= 0n ? 0 : Number((num2 + shipLbRat.d - 1n) / shipLbRat.d);
-      return Math.round((3.89 + halfSteps * 0.10 + Number.EPSILON) * 100) / 100;
-    }
-    if (ratCmp(shipLbRat, { n: 3n, d: 1n }) <= 0) {
-      return LARGE_STD_RETURN_FEE_LB.find(r => ratCmp(shipLbRat, toBigRat(r.max_lb)) <= 0)?.fee ?? null;
-    }
-    const num4 = 4n * (shipLbRat.n - 3n * shipLbRat.d);
-    const steps = num4 <= 0n ? 0 : Number((num4 + shipLbRat.d - 1n) / shipLbRat.d);
-    return Math.round((5.00 + steps * 0.05 + Number.EPSILON) * 100) / 100;
-  }
-  if (!allowAll2027Tiers) return null;
-
-  const bulkyS2Rat = ratCmp(s2Rat, { n: 2n, d: 1n }) >= 0 ? s2Rat : { n: 2n, d: 1n };
-  const bulkyS3Rat = ratCmp(s3Rat, { n: 2n, d: 1n }) >= 0 ? s3Rat : { n: 2n, d: 1n };
-  const bulkyCubicInRat = mulBigRat(mulBigRat(s1Rat, bulkyS2Rat), bulkyS3Rat);
-  const bulkyDimLbRat = divBigRat(bulkyCubicInRat, { n: 139n, d: 1n });
-  const bulkyShipLbRat = ratCmp(bulkyDimLbRat, wtLbRat) >= 0 ? bulkyDimLbRat : wtLbRat;
-  const girthPlusLenRat = addBigRat(s1Rat, mulBigRat({ n: 2n, d: 1n }, addBigRat(s2Rat, s3Rat)));
-  const ceilWholeExcess = (r, baseLb) => {
-    const excess = r.n - BigInt(baseLb) * r.d;
-    return excess > 0n ? Number((excess + r.d - 1n) / r.d) : 0;
-  };
-
-  // Official 2027 Bulky 4 tiers (<= 59 x 33 x 33 in, L+G <= 130 in, unit & shipping weight <= 50 lb): $6.74 + $0.32/lb over 1 lb
-  const fitsAnyBulky =
-    ratCmp(wtLbRat, { n: 50n, d: 1n }) <= 0 &&
-    ratCmp(bulkyShipLbRat, { n: 50n, d: 1n }) <= 0 &&
-    ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0 && (
-      (ratCmp(s1Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 24n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 20n, d: 1n }) <= 0) ||
-      (ratCmp(s1Rat, { n: 37n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 20n, d: 1n }) <= 0) ||
-      (ratCmp(s1Rat, { n: 52n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 28n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 28n, d: 1n }) <= 0) ||
-      (ratCmp(s1Rat, { n: 59n, d: 1n }) <= 0 && ratCmp(s2Rat, { n: 33n, d: 1n }) <= 0 && ratCmp(s3Rat, { n: 33n, d: 1n }) <= 0)
-    );
-  if (fitsAnyBulky) {
-    return Math.round((6.74 + ceilWholeExcess(bulkyShipLbRat, 1) * 0.32 + Number.EPSILON) * 100) / 100;
-  }
-
-  // Official 2027 Oversize 6 tiers returns processing (GZGEQLTM3RZXUV6T)
-  if (ratCmp(wtLbRat, { n: 50n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 50n, d: 1n }) <= 0 &&
-    ratCmp(s1Rat, { n: 72n, d: 1n }) <= 0 && ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0) {
-    return Math.round((26.33 + ceilWholeExcess(bulkyShipLbRat, 1) * 0.38 + Number.EPSILON) * 100) / 100;
-  }
-  if (ratCmp(wtLbRat, { n: 70n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 70n, d: 1n }) <= 0 &&
-    ratCmp(s1Rat, { n: 78n, d: 1n }) <= 0 && ratCmp(girthPlusLenRat, { n: 130n, d: 1n }) <= 0) {
-    return Math.round((40.12 + ceilWholeExcess(bulkyShipLbRat, 51) * 0.75 + Number.EPSILON) * 100) / 100;
-  }
-  if (ratCmp(wtLbRat, { n: 150n, d: 1n }) <= 0 && ratCmp(bulkyShipLbRat, { n: 150n, d: 1n }) <= 0) {
-    return Math.round((52.45 + ceilWholeExcess(bulkyShipLbRat, 71) * 0.75 + Number.EPSILON) * 100) / 100;
-  }
-  return Math.round((157.35 + ceilWholeExcess(wtLbRat, 151) * 0.19 + Number.EPSILON) * 100) / 100;
+  const dims = parsePackage(pkg);
+  if (!dims) return null;
+  const cls = classifyPhysicalSizeTier2027(dims);
+  if (cls.status !== 'verified') return null;
+  return resolve2027PerReturnFeeFromTier(cls, { isApparelOrShoes, allowAll2027Tiers }).per_return_fee_usd;
 }
 
 function canonicalValue(val) {
@@ -1527,6 +1520,10 @@ export function classifySizeTier2027(pkg, { is_apparel, is_shoes, is_apparel_or_
       reason: 'Valid positive packaged length, width, height, and unit weight are required.',
     };
   }
+  return classifyPhysicalSizeTier2027(dims);
+}
+
+function classifyPhysicalSizeTier2027(dims) {
   const { s1Rat, s2Rat, s3Rat, wtLbRat, ozRat, dimLbRat, shipLbRat } = dims.rawRat;
 
   // 1) Small Standard: unit weight <= 16 oz, longest <= 15 in, median <= 12 in, shortest <= 0.75 in
@@ -2354,50 +2351,11 @@ export function lookupBulkyReturnsProcessing2027({
     }
   }
 
-  let perReturnFee = null;
-  let extraWholeLbs = 0;
-  if (cls.size_tier === 'small_standard') {
-    if (isApparelOrShoes) {
-      perReturnFee = APPAREL_SHOES_STANDARD_RETURNS_2027.small_standard_oz.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.return_fee ?? null;
-    } else {
-      perReturnFee = SMALL_STANDARD_2027_OZ.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.return_fee ?? null;
-    }
-  } else if (cls.size_tier === 'large_standard') {
-    const lbRat = cls.rawRat.shipLbRat;
-    if (isApparelOrShoes) {
-      if (ratCmp(lbRat, toRat(3)) <= 0) {
-        perReturnFee = APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_lb.find(r => ratCmp(lbRat, toRat(r.max_lb)) <= 0)?.return_fee ?? null;
-      } else {
-        extraWholeLbs = extraHalfLbStepsRat(lbRat);
-        perReturnFee = round(
-          APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_over_3lb.return_base_usd +
-          extraWholeLbs * APPAREL_SHOES_STANDARD_RETURNS_2027.large_standard_over_3lb.return_step_usd_per_half_lb,
-        );
-      }
-    } else if (ratCmp(lbRat, toRat(3)) <= 0) {
-      perReturnFee = LARGE_STANDARD_2027_LB.find(r => ratCmp(lbRat, toRat(r.max_lb)) <= 0)?.return_fee ?? null;
-    } else {
-      extraWholeLbs = extraQuarterLbStepsRat(lbRat);
-      perReturnFee = round(LARGE_STANDARD_OVER_3LB.return_base_usd + extraWholeLbs * LARGE_STANDARD_OVER_3LB.return_step_usd);
-    }
-  } else if (cls.size_tier.endsWith('_bulky')) {
-    const shipLbRat = cls.rawRat.shipLbRat;
-    const excessLbNum = shipLbRat.n - 1n * shipLbRat.d;
-    extraWholeLbs = excessLbNum > 0n ? Number(ceilDivBig(excessLbNum, shipLbRat.d)) : 0;
-    perReturnFee = round(BULKY_RETURNS_2027_RULE.base_first_lb_usd + extraWholeLbs * BULKY_RETURNS_2027_RULE.step_usd_per_lb_over_1);
-  } else if (cls.tier_family === 'oversize') {
-    const retRule = OVERSIZE_RETURNS_2027_TIERS[cls.size_tier];
-    if (!retRule) {
-      return { status: 'needs_calculator_verification', reason: `Unlisted Oversize returns-processing tier: ${cls.size_tier}` };
-    }
-    const billableRat = retRule.unit_weight_only ? cls.rawRat.wtLbRat : cls.rawRat.shipLbRat;
-    const threshBig = BigInt(retRule.base_threshold_lb);
-    const excessLbNum = billableRat.n - threshBig * billableRat.d;
-    extraWholeLbs = excessLbNum > 0n ? Number(ceilDivBig(excessLbNum, billableRat.d)) : 0;
-    perReturnFee = round(retRule.base_usd + extraWholeLbs * retRule.step_usd_per_lb);
-  }
+  const feeLookup = resolve2027PerReturnFeeFromTier(cls, { isApparelOrShoes, allowAll2027Tiers: true });
+  const perReturnFee = feeLookup.per_return_fee_usd;
+  const extraWholeLbs = feeLookup.extra_lb_steps;
   if (perReturnFee === null) {
-    return { status: 'needs_calculator_verification', reason: 'Unlisted returns-processing weight bracket.' };
+    return { status: 'needs_calculator_verification', reason: feeLookup.reason ?? 'Unlisted returns-processing weight bracket.' };
   }
   const excessFraction = isApparelOrShoes ? physical_return_fraction : Math.max(0, round(physical_return_fraction - threshold));
   const expectedPerShippedUnit = round(excessFraction * perReturnFee);
@@ -2994,19 +2952,9 @@ export function lookupReturnsProcessing2027({
     }
     return cls;
   }
-  let perReturnFee = null;
-  if (cls.size_tier === 'small_standard') {
-    perReturnFee = SMALL_STANDARD_2027_OZ.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.return_fee ?? null;
-  } else {
-    const lbRat = cls.rawRat.shipLbRat;
-    if (ratCmp(lbRat, toRat(3)) <= 0) {
-      perReturnFee = LARGE_STANDARD_2027_LB.find(r => ratCmp(lbRat, toRat(r.max_lb)) <= 0)?.return_fee ?? null;
-    } else {
-      const steps = extraQuarterLbStepsRat(lbRat);
-      perReturnFee = round(LARGE_STANDARD_OVER_3LB.return_base_usd + steps * LARGE_STANDARD_OVER_3LB.return_step_usd);
-    }
-  }
-  if (perReturnFee === null) return { status: 'needs_calculator_verification', reason: 'Unlisted returns-processing weight bracket.' };
+  const feeLookup = resolve2027PerReturnFeeFromTier(cls, { isApparelOrShoes: false, allowAll2027Tiers: false });
+  const perReturnFee = feeLookup.per_return_fee_usd;
+  if (perReturnFee === null) return { status: 'needs_calculator_verification', reason: feeLookup.reason ?? 'Unlisted returns-processing weight bracket.' };
   const excess = Math.max(0, round(physical_return_fraction - threshold));
   const expectedPerShippedUnit = round(excess * perReturnFee);
   return {
