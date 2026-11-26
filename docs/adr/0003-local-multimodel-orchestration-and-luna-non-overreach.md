@@ -16,4 +16,4 @@ Keep all orchestration local inside this Node.js 24 ESM repository (`src/openai/
 
 - `Luna` may only hard-exclude undisputed statutory `<= 12y` children's items (preserving adult-storage exemptions) and strict date/holiday-dependent disposables (ordinary apparel and generic phone-case/cable leads may be skipped at discovery intake with explicit skip reasons rather than treated as a 5th global hard kill line); all powered, uncertain, or patent-suspect items pass through as `needs_review` to web-enabled `gpt-6.1-terra`.
 - On 1688 search pages, `Luna` only ranks and demotes individual mismatched/bare offers to cut wasted clicks and sliders; it never eliminates the candidate product.
-- Local subscription `gpt-6.2-astra` (`ultrafast + max`, `$0` API spend) owns both pre-implementation blueprint/workflow audits and post-implementation Standards + Spec dual-axis reviews.
+- Local subscription `gpt-6.2-astra` (normal/default speed + `max` reasoning, `$0` API spend, per `2026-11-26 21:12 +08:00` owner override omitting `ultrafast` unless re-enabled later) owns both pre-implementation blueprint/workflow audits and post-implementation Standards + Spec dual-axis reviews.

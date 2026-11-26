@@ -8,6 +8,7 @@ import {
   deduplicateParentSalesRows,
   extractNewcomerReviewOriginBreakdown,
   resolveCategoryReturnWithFallback,
+  sanitizeNewcomerMemberReviews,
 } from './observations.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { calculateEconomics, netReferral } from './economics.mjs';
@@ -1995,56 +1996,58 @@ export function ingestTrialSpecification(spec, profile, {
         }
         return null;
       };
-      for (const member of cand.newcomer_cohort.members) {
-        if (!member || typeof member !== 'object') continue;
+      const reviewSourceByAsin = new Map();
+      if (entry.q31_review_sources && typeof entry.q31_review_sources === 'object') {
+        for (const [k, v] of Object.entries(entry.q31_review_sources)) {
+          const normKey = typeof k === 'string' && k.trim().length > 0 ? k.trim().toUpperCase() : null;
+          if (normKey && v !== undefined && v !== null) reviewSourceByAsin.set(normKey, v);
+        }
+      }
+      cand.newcomer_cohort.members = cand.newcomer_cohort.members.map(member => {
+        if (!member || typeof member !== 'object') return member;
         const memberAsin = typeof member.asin === 'string' && member.asin.trim().length > 0
           ? member.asin.trim().toUpperCase()
           : null;
-        const reviewSource = entry.q31_review_sources?.[member.asin];
+        const rawMappedSource = entry.q31_review_sources?.[member.asin];
+        const reviewSource = rawMappedSource !== undefined && rawMappedSource !== null
+          ? rawMappedSource
+          : (memberAsin ? reviewSourceByAsin.get(memberAsin) : undefined);
         const hasExternalReviewSource = reviewSource !== undefined && reviewSource !== null;
-        const activeRawBundle = hasExternalReviewSource
-          ? reviewSource
-          : (member.reviews_raw ?? member.data);
-        const sourceAsin = extractBundleAsin(activeRawBundle);
-        if (memberAsin && sourceAsin && sourceAsin !== memberAsin) {
-          throw new TypeError(
-            `Candidate "${cand.id}" Q31 review source ASIN (${sourceAsin}) does not match newcomer member ASIN (${memberAsin}).`,
-          );
+        const inlineEnvelope = (member.structuredContent || Array.isArray(member.content))
+          ? { structuredContent: member.structuredContent, content: member.content }
+          : null;
+        const bundlesToCheck = hasExternalReviewSource
+          ? [reviewSource]
+          : [member.reviews_raw, member.data, inlineEnvelope].filter(Boolean);
+        for (const bundle of bundlesToCheck) {
+          const sourceAsin = extractBundleAsin(bundle);
+          if (memberAsin && sourceAsin && sourceAsin !== memberAsin) {
+            throw new TypeError(
+              `Candidate "${cand.id}" Q31 review source ASIN (${sourceAsin}) does not match newcomer member ASIN (${memberAsin}).`,
+            );
+          }
         }
         const reviewInput = hasExternalReviewSource
           ? {
-            ...member,
+            ...sanitizeNewcomerMemberReviews(member),
             reviews_raw: reviewSource,
-            reviews_list: undefined,
-            reviews: undefined,
-            ...(member.data && typeof member.data === 'object'
-              ? { data: { ...member.data, reviews: undefined, reviews_list: undefined } }
-              : {}),
+            review_origin_breakdown: undefined,
           }
           : member;
-        const originBreakdown = extractNewcomerReviewOriginBreakdown(reviewInput);
-        if (originBreakdown) {
-          member.review_origin_breakdown = originBreakdown;
-        } else {
-          delete member.review_origin_breakdown;
+        const outMember = sanitizeNewcomerMemberReviews(reviewInput);
+        if (!outMember.review_origin_breakdown) {
+          const fallbackBreakdown = extractNewcomerReviewOriginBreakdown(outMember);
+          if (fallbackBreakdown) outMember.review_origin_breakdown = fallbackBreakdown;
         }
-        if (hasExternalReviewSource || member.reviews_raw !== undefined || member.reviews !== undefined || member.data?.reviews !== undefined) {
-          // Strip raw review payloads (author names / review bodies) and superseded arrays after deriving the sanitized summary.
-          delete member.reviews_raw;
-          delete member.reviews;
-          if (hasExternalReviewSource) delete member.reviews_list;
-          if (member.data && typeof member.data === 'object') {
-            delete member.data.reviews;
-            delete member.data.reviews_list;
-          }
-        }
-        const nat = member.natural_visibility ?? member.natural;
-        if (nat && typeof nat === 'object' && !nat.keyword_counts && entry.q31_keyword_sources?.[member.asin]) {
-          const kc = extractQ31DualSourceKeywordCounts(entry.q31_keyword_sources[member.asin]);
+        const nat = outMember.natural_visibility ?? outMember.natural;
+        if (nat && typeof nat === 'object' && !nat.keyword_counts && entry.q31_keyword_sources?.[outMember.asin]) {
+          const kc = extractQ31DualSourceKeywordCounts(entry.q31_keyword_sources[outMember.asin]);
           if (kc) nat.keyword_counts = kc;
         }
-      }
+        return outMember;
+      });
     }
+    delete cand.q31_review_sources;
 
     if (entry.qualitative_inputs) {
       const qual = resolveStage1QualitativeJudgments({
