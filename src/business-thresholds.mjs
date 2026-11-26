@@ -165,6 +165,12 @@ export const BUSINESS_THRESHOLD_AUDIT_REGISTRY = deepFreeze({
     confirmed_at: '2026-11-20',
     provenance: 'Audited Kaiqi US West A4 tariff: volumetric weight = L_cm * W_cm * H_cm / 6000',
   },
+  kaiqi_nationwide_sea_truck_base_cny_per_kg: {
+    value: 10.0,
+    unit: 'CNY_per_kg',
+    confirmed_at: '2026-11-26',
+    provenance: 'Owner 2026-11-26 confirmed (docs/SPEC.md §3.1, ADR-0001): Kaiqi 2026-10-19 SVIP Guangdong 50KG+ tax-included nationwide multi-warehouse sea-truck base rate before +¥1/kg bond & material surcharge, paired with steady-state >= 5 cartons $0 amazon_optimized placement',
+  },
 
   // ---------------------------------------------------------------------------
   // 4. 3-Tier Listing-Age Priority, Price-Band Denoising & Market Callouts
@@ -371,3 +377,8 @@ export const BUSINESS_THRESHOLDS = deepFreeze(
     Object.entries(BUSINESS_THRESHOLD_AUDIT_REGISTRY).map(([k, entry]) => [k, entry.value]),
   ),
 );
+
+export const BARE_GOODS_DISCLOSURE_ZH =
+  '当前按 1688 裸货价算，未含国内到深圳运费（常规约占 0.5%～1.5%，超大超重抛货拿样下单前实询）';
+
+export const CALCULATOR_1688_FLOOR_PRICE_NAME_ZH = '按 1688 成本算保底定价';

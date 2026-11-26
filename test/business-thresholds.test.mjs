@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
+  BARE_GOODS_DISCLOSURE_ZH,
   BUSINESS_THRESHOLDS,
   BUSINESS_THRESHOLD_AUDIT_REGISTRY,
 } from '../src/business-thresholds.mjs';
@@ -100,6 +101,12 @@ test('business-thresholds: locked 4 hard kill lines, 21-item 100-pt rubric, 15-p
   assert.equal(BUSINESS_THRESHOLDS.codex_default_service_tier, 'default');
   assert.equal(DEFAULT_CODEX_SERVICE_TIER, 'default');
   assert.equal(BUSINESS_THRESHOLDS.codex_default_reasoning_effort, 'max');
+  assert.equal(BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg, 10.0);
+  assert.equal(BUSINESS_THRESHOLD_AUDIT_REGISTRY.kaiqi_nationwide_sea_truck_base_cny_per_kg.confirmed_at, '2026-11-26');
+  assert.equal(
+    BARE_GOODS_DISCLOSURE_ZH,
+    '当前按 1688 裸货价算，未含国内到深圳运费（常规约占 0.5%～1.5%，超大超重抛货拿样下单前实询）',
+  );
 });
 
 test('business-thresholds: guard check blocks re-introduction of purged AI-invented cutoffs in src/', () => {
@@ -107,6 +114,14 @@ test('business-thresholds: guard check blocks re-introduction of purged AI-inven
   const wtSrc = readFileSync(new URL('../src/openai/workflow-tasks.mjs', import.meta.url), 'utf8');
   const discSrc = readFileSync(new URL('../src/discovery-channels.mjs', import.meta.url), 'utf8');
   const keepaSrc = readFileSync(new URL('../src/adapters/keepa.mjs', import.meta.url), 'utf8');
+  const fbaSrc = readFileSync(new URL('../src/fba-calculator.mjs', import.meta.url), 'utf8');
+  const econSrc = readFileSync(new URL('../src/economics.mjs', import.meta.url), 'utf8');
+
+  assert.equal(
+    /domestic_freight_rate_cny_per_kg|DOMESTIC_LTL_TABLE|domestic_freight_cap_cny_per_kg\s*=\s*(?:2\.5|3(?:\.0)?)\b/i.test(`${fbaSrc}\n${econSrc}`),
+    false,
+    'ADR-0002 forbids inventing a China domestic LTL rate table or ¥2.5/¥3/kg domestic-freight cutoffs in src/.',
+  );
 
   assert.equal(
     /observed_count\s*>=\s*1[45]|latestRun\.count\s*>=\s*1[45]|regularMedianUsd\s*\*\s*0\.92|1\.12/.test(keepaSrc),

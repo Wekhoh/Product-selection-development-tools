@@ -1412,21 +1412,33 @@ function enforceCandidateContainerMatrixAndDbParity(cand, {
           }
         }
         if (hasSourcedDom) {
-          if (domLine.order_units !== undefined && domLine.order_units !== activeQuote.actual_sets) {
-            throw new TypeError(
-              `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" domestic_freight.order_units (${domLine.order_units}) conflicts with persisted SQLite quote "${activeQuote.quote_id}" actual_sets (${activeQuote.actual_sets}).`,
-            );
-          }
-          if (effectiveFx === null) {
-            throw new TypeError(
-              `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" requires fx_cny_per_usd to verify domestic_freight parity against SQLite quote "${activeQuote.quote_id}".`,
-            );
-          }
-          const expectedDomUsd = (activeQuote.domestic_freight_cny_total / activeQuote.actual_sets) / effectiveFx;
-          if (Math.abs(domLine.amount_usd - expectedDomUsd) > 0.005) {
-            throw new TypeError(
-              `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" domestic_freight ($${domLine.amount_usd}) disagrees with persisted SQLite 1688 quote "${activeQuote.quote_id}" ($${expectedDomUsd.toFixed(4)} at FX ${effectiveFx}).`,
-            );
+          const activeQuoteIsBareGoods = activeQuote.pricing_basis === 'bare_goods_1688' ||
+            activeQuote.bare_goods_screening === true ||
+            activeQuote.domestic_freight_cny_total === null ||
+            activeQuote.domestic_freight_cny_total === undefined;
+          if (activeQuoteIsBareGoods) {
+            if (Math.abs(domLine.amount_usd) > 0.005) {
+              throw new TypeError(
+                `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" domestic_freight ($${domLine.amount_usd}) conflicts with bare-goods SQLite 1688 quote "${activeQuote.quote_id}" (pricing_basis: bare_goods_1688).`,
+              );
+            }
+          } else {
+            if (domLine.order_units !== undefined && domLine.order_units !== activeQuote.actual_sets) {
+              throw new TypeError(
+                `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" domestic_freight.order_units (${domLine.order_units}) conflicts with persisted SQLite quote "${activeQuote.quote_id}" actual_sets (${activeQuote.actual_sets}).`,
+              );
+            }
+            if (effectiveFx === null) {
+              throw new TypeError(
+                `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" requires fx_cny_per_usd to verify domestic_freight parity against SQLite quote "${activeQuote.quote_id}".`,
+              );
+            }
+            const expectedDomUsd = (activeQuote.domestic_freight_cny_total / activeQuote.actual_sets) / effectiveFx;
+            if (Math.abs(domLine.amount_usd - expectedDomUsd) > 0.005) {
+              throw new TypeError(
+                `Candidate "${cand.id}" scenario "${sc?.id ?? 'unknown'}" domestic_freight ($${domLine.amount_usd}) disagrees with persisted SQLite 1688 quote "${activeQuote.quote_id}" ($${expectedDomUsd.toFixed(4)} at FX ${effectiveFx}).`,
+              );
+            }
           }
         }
       }

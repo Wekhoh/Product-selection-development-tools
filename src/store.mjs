@@ -462,7 +462,7 @@ CREATE TABLE IF NOT EXISTS sourcing_quotes_1688 (
   actual_sets INTEGER NOT NULL CHECK(actual_sets >= 1),
   actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
   goods_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
-  domestic_freight_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
+  domestic_freight_cny_total REAL CHECK(domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0),
   pkg_json TEXT,
   fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
   factory_id TEXT,
@@ -702,7 +702,19 @@ function sourcingQuoteFromRow(row) {
       } else if (parsedPlan?.ui_readback_verified === false) {
         quote.ui_readback_verified = false;
       }
+      if (parsedPlan?.pricing_basis === 'bare_goods_1688' || parsedPlan?.pricing_basis === 'landed_domestic_explicit') {
+        quote.pricing_basis = parsedPlan.pricing_basis;
+      }
+      if (parsedPlan?.domestic_freight_advisory_cny_total !== undefined) {
+        quote.domestic_freight_advisory_cny_total = parsedPlan.domestic_freight_advisory_cny_total;
+      }
     } catch { /* ignore */ }
+  }
+  if (!quote.pricing_basis) {
+    quote.pricing_basis = quote.domestic_freight_cny_total == null ? 'bare_goods_1688' : 'landed_domestic_explicit';
+  }
+  if (quote.domestic_freight_advisory_cny_total === undefined) {
+    quote.domestic_freight_advisory_cny_total = null;
   }
   return quote;
 }
@@ -859,7 +871,10 @@ export class SelectionStore {
     const master = this.db.prepare(
       "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sourcing_quotes_1688'",
     ).get();
-    if (!master?.sql || master.sql.includes("'superseded_uncompetitive'")) return;
+    if (!master?.sql) return;
+    const hadNotNullFreightConstraint = master.sql.includes('domestic_freight_cny_total IS NOT NULL');
+    const needsRebuild = !master.sql.includes("'superseded_uncompetitive'") || hadNotNullFreightConstraint;
+    if (!needsRebuild) return;
     this.db.exec('PRAGMA foreign_keys = OFF;');
     try {
       this._withImmediateTx(() => {
@@ -867,6 +882,7 @@ export class SelectionStore {
         for (const [colName, colDef] of [
           ['pkg_json', 'TEXT'],
           ['fx_cny_per_usd', 'REAL CHECK(fx_cny_per_usd > 0)'],
+          ['factory_id', 'TEXT'],
           ['spec_variant_key', 'TEXT'],
           ['kit_note', 'TEXT'],
         ]) {
@@ -878,7 +894,7 @@ export class SelectionStore {
           'quote_id', 'form_id', 'spec_version', 'sku_lines_json', 'order_plan_json',
           'pack_multiple', 'moq_sets', 'actual_sets', 'actual_complete_sets',
           'goods_cny_total', 'domestic_freight_cny_total', 'pkg_json', 'fx_cny_per_usd',
-          'spec_variant_key', 'kit_note',
+          'factory_id', 'spec_variant_key', 'kit_note',
           'goods_first_order_promotion', 'freight_first_order_promotion', 'lead_time_days',
           'sensitive_freebie_flags_json', 'redacted_destination', 'redacted_screenshot_path',
           'redacted_webp_sha256', 'raw_readback_ref', 'observed_at', 'expires_at', 'quote_status', 'created_at',
@@ -896,9 +912,10 @@ export class SelectionStore {
             actual_sets INTEGER NOT NULL CHECK(actual_sets >= 1),
             actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
             goods_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
-            domestic_freight_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
+            domestic_freight_cny_total REAL CHECK(domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0),
             pkg_json TEXT,
             fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
+            factory_id TEXT,
             spec_variant_key TEXT,
             kit_note TEXT,
             goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
@@ -919,10 +936,54 @@ export class SelectionStore {
           ALTER TABLE sourcing_quotes_1688_v2 RENAME TO sourcing_quotes_1688;
           CREATE INDEX IF NOT EXISTS idx_quotes_form ON sourcing_quotes_1688(form_id, quote_status);
         `);
+        if (hadNotNullFreightConstraint) {
+          // ADR-0002 migration: re-rank existing non-promo same-spec ('verified', 'superseded_uncompetitive') groups
+          // strictly by bare-goods unit price so legacy freight-distorted winners do not stay inverted.
+          const legacyForms = this.db.prepare(
+            "SELECT DISTINCT form_id FROM sourcing_quotes_1688 WHERE quote_status = 'superseded_uncompetitive'",
+          ).all();
+          for (const row of legacyForms) {
+            this._rerankSameSpecBareGoodsLocked(row.form_id);
+          }
+        }
       });
     } finally {
       this.db.exec('PRAGMA foreign_keys = ON;');
     }
+  }
+
+  _rerankSameSpecBareGoodsLocked(formId, { spec_version = null, spec_variant_key = undefined } = {}) {
+    const candidates = this.db.prepare(`
+      SELECT * FROM sourcing_quotes_1688
+      WHERE form_id = ? AND quote_status IN ('verified', 'superseded_uncompetitive') AND goods_first_order_promotion = 0 AND goods_cny_total > 0
+      ORDER BY created_at ASC
+    `).all(formId);
+    const byGroup = new Map();
+    for (const row of candidates) {
+      if (spec_version !== null && row.spec_version !== spec_version) continue;
+      if (spec_variant_key !== undefined && (row.spec_variant_key ?? null) !== (spec_variant_key ?? null)) continue;
+      const key = `${row.spec_version}::${row.spec_variant_key ?? ''}`;
+      if (!byGroup.has(key)) byGroup.set(key, []);
+      byGroup.get(key).push(row);
+    }
+    const supersededIds = [];
+    for (const rows of byGroup.values()) {
+      if (rows.length < 2) continue;
+      let minUnit = Number.POSITIVE_INFINITY;
+      for (const r of rows) {
+        const u = (r.goods_cny_total ?? 0) / Math.max(1, r.actual_sets || 100);
+        if (u < minUnit) minUnit = u;
+      }
+      for (const r of rows) {
+        const u = (r.goods_cny_total ?? 0) / Math.max(1, r.actual_sets || 100);
+        const desiredStatus = u > minUnit + 1e-6 ? 'superseded_uncompetitive' : 'verified';
+        if (r.quote_status !== desiredStatus) {
+          this.db.prepare('UPDATE sourcing_quotes_1688 SET quote_status = ? WHERE quote_id = ?').run(desiredStatus, r.quote_id);
+        }
+        if (desiredStatus === 'superseded_uncompetitive') supersededIds.push(r.quote_id);
+      }
+    }
+    return supersededIds;
   }
 
   _migrateSchema() {
@@ -2696,10 +2757,13 @@ export class SelectionStore {
               ? quote.shop_url.trim()
               : (distinctFactoryIds.size === 1 ? [...distinctFactoryIds][0] : null)))));
 
+    const prospectiveIsBareGoods = quote.pricing_basis === 'bare_goods_1688' ||
+      quote.bare_goods_screening === true ||
+      quote.domestic_freight_cny_total == null;
     if (
       quoteStatus === 'verified' &&
       quote.goods_first_order_promotion !== true &&
-      quote.freight_first_order_promotion !== true &&
+      (prospectiveIsBareGoods || quote.freight_first_order_promotion !== true) &&
       resolvedFactoryId
     ) {
       const maxFactoriesCap = BUSINESS_THRESHOLDS.max_1688_factories_to_check;
@@ -2709,7 +2773,7 @@ export class SelectionStore {
         eq => eq.spec_version === prospectiveSpecVer &&
           eq.quote_id !== prospectiveQuoteId &&
           eq.goods_first_order_promotion === 0 &&
-          eq.freight_first_order_promotion === 0 &&
+          (eq.pricing_basis === 'bare_goods_1688' || eq.domestic_freight_cny_total == null || eq.freight_first_order_promotion === 0) &&
           (eq.quote_status === 'verified' || eq.quote_status === 'superseded_uncompetitive'),
       );
       const extractRowFac = eq => {
@@ -2754,7 +2818,10 @@ export class SelectionStore {
       sensitive_freebie_flags: quote.sensitive_freebie_flags ?? {},
       lead_time_days: quote.lead_time_days ?? null,
       goods_first_order_promotion: quote.goods_first_order_promotion,
-      freight_first_order_promotion: quote.freight_first_order_promotion,
+      freight_first_order_promotion: quote.freight_first_order_promotion ?? (prospectiveIsBareGoods ? false : quote.freight_first_order_promotion),
+      pricing_basis: quote.pricing_basis ?? null,
+      bare_goods_screening: quote.bare_goods_screening ?? false,
+      domestic_freight_advisory_cny_total: quote.domestic_freight_advisory_cny_total ?? null,
       includes_platform_subsidy_in_freight: quote.includes_platform_subsidy_in_freight ?? false,
       ui_readback: quote.ui_readback ?? undefined,
       sku_lines: quote.sku_lines,
@@ -2773,6 +2840,12 @@ export class SelectionStore {
     const pricingInputs = bindSourcingQuotePricingInputs(quote);
     if (pricingInputs.issue) throw new TypeError(pricingInputs.issue);
     const orderPlan = verified.order_plan ? { ...verified.order_plan } : null;
+    if (orderPlan) {
+      orderPlan.pricing_basis = verified.pricing_basis ?? (prospectiveIsBareGoods ? 'bare_goods_1688' : 'landed_domestic_explicit');
+      if (verified.domestic_freight_advisory_cny_total !== null && verified.domestic_freight_advisory_cny_total !== undefined) {
+        orderPlan.domestic_freight_advisory_cny_total = verified.domestic_freight_advisory_cny_total;
+      }
+    }
     const ui = quote.ui_readback;
     if (orderPlan && ui && typeof ui === 'object') {
       const normalizedUi = {
@@ -2824,8 +2897,8 @@ export class SelectionStore {
       resolvedFactoryId,
       specVariantKey,
       kitNote,
-      quote.goods_first_order_promotion ? 1 : 0,
-      quote.freight_first_order_promotion ? 1 : 0,
+      verified.goods_first_order_promotion ? 1 : 0,
+      verified.freight_first_order_promotion ? 1 : 0,
       quote.lead_time_days ?? null,
       canonicalJson(verified.sensitive_freebie_flags),
       verified.redacted_destination,
@@ -2847,8 +2920,9 @@ export class SelectionStore {
       (specVariantKey !== null || quote.supersede_same_spec === true || quote.supersede_expensive_same_spec === true),
     );
     if (shouldAutoSupersedeSameSpec) {
-      const newUnitLandedCny = ((quote.goods_cny_total ?? 0) + (quote.domestic_freight_cny_total ?? 0)) / actualSets;
-      if (Number.isFinite(newUnitLandedCny) && newUnitLandedCny > 0) {
+      // ADR-0002: Rank same-spec quotes strictly by regular bare-goods unit price (`裸货价`), never domestic freight.
+      const newUnitBareGoodsCny = (quote.goods_cny_total ?? 0) / actualSets;
+      if (Number.isFinite(newUnitBareGoodsCny) && newUnitBareGoodsCny > 0) {
         const existingVerified = this.db.prepare(`
           SELECT quote_id, actual_sets, goods_cny_total, domestic_freight_cny_total, spec_variant_key
           FROM sourcing_quotes_1688
@@ -2858,14 +2932,14 @@ export class SelectionStore {
           const prevSpecKey = prev.spec_variant_key ?? null;
           if (specVariantKey !== null && prevSpecKey !== null && prevSpecKey !== specVariantKey) continue;
           if (specVariantKey !== null && prevSpecKey === null && quote.supersede_same_spec !== true) continue;
-          const prevUnitLanded = ((prev.goods_cny_total ?? 0) + (prev.domestic_freight_cny_total ?? 0)) / Math.max(1, prev.actual_sets || 100);
-          if (prevUnitLanded > newUnitLandedCny + 1e-6) {
+          const prevUnitBareGoods = (prev.goods_cny_total ?? 0) / Math.max(1, prev.actual_sets || 100);
+          if (prevUnitBareGoods > newUnitBareGoodsCny + 1e-6) {
             this.db.prepare(`
               UPDATE sourcing_quotes_1688
               SET quote_status = 'superseded_uncompetitive'
               WHERE quote_id = ?
             `).run(prev.quote_id);
-          } else if ((quote.supersede_same_spec === true || quote.supersede_expensive_same_spec === true || specVariantKey !== null) && newUnitLandedCny > prevUnitLanded + 1e-6) {
+          } else if ((quote.supersede_same_spec === true || quote.supersede_expensive_same_spec === true || specVariantKey !== null) && newUnitBareGoodsCny > prevUnitBareGoods + 1e-6) {
             this.db.prepare(`
               UPDATE sourcing_quotes_1688
               SET quote_status = 'superseded_uncompetitive'
@@ -2884,36 +2958,7 @@ export class SelectionStore {
 
   supersedeUncompetitiveQuotesForForm(formId, { spec_version = null, spec_variant_key = undefined } = {}) {
     this._assertWritable();
-    const allVerified = this.db.prepare(`
-      SELECT * FROM sourcing_quotes_1688
-      WHERE form_id = ? AND quote_status = 'verified'
-      ORDER BY created_at ASC
-    `).all(formId);
-    const byGroup = new Map();
-    for (const row of allVerified) {
-      if (spec_version !== null && row.spec_version !== spec_version) continue;
-      if (spec_variant_key !== undefined && (row.spec_variant_key ?? null) !== (spec_variant_key ?? null)) continue;
-      const key = `${row.spec_version}::${row.spec_variant_key ?? ''}`;
-      if (!byGroup.has(key)) byGroup.set(key, []);
-      byGroup.get(key).push(row);
-    }
-    const supersededIds = [];
-    for (const rows of byGroup.values()) {
-      if (rows.length < 2) continue;
-      let minUnit = Number.POSITIVE_INFINITY;
-      for (const r of rows) {
-        const u = ((r.goods_cny_total ?? 0) + (r.domestic_freight_cny_total ?? 0)) / Math.max(1, r.actual_sets || 100);
-        if (u < minUnit) minUnit = u;
-      }
-      for (const r of rows) {
-        const u = ((r.goods_cny_total ?? 0) + (r.domestic_freight_cny_total ?? 0)) / Math.max(1, r.actual_sets || 100);
-        if (u > minUnit + 1e-6) {
-          this.db.prepare("UPDATE sourcing_quotes_1688 SET quote_status = 'superseded_uncompetitive' WHERE quote_id = ?").run(r.quote_id);
-          supersededIds.push(r.quote_id);
-        }
-      }
-    }
-    return supersededIds;
+    return this._rerankSameSpecBareGoodsLocked(formId, { spec_version, spec_variant_key });
   }
 
   recordSourcingQuotesBatch1688(quotes) {

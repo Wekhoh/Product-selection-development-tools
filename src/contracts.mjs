@@ -4,6 +4,7 @@
  * quantities, sets, component coverage, SKU-level review provenance, and PII boundaries.
  */
 import { crc32, inflateSync } from 'node:zlib';
+import { BARE_GOODS_DISCLOSURE_ZH } from './business-thresholds.mjs';
 import { validEvidenceDate } from './observations.mjs';
 import { computeOrderPlan } from './fba-calculator.mjs';
 import { toBigRat, addBigRat, mulBigRat, roundBigRat, ratCmp } from './fba-calculator.mjs';
@@ -672,12 +673,22 @@ export function validateSourcingVerifier1688Output(output, { expected_components
     }
   }
 
+  const hasDomesticFreight = output.domestic_freight_cny_total !== undefined && output.domestic_freight_cny_total !== null;
+  const hasAdvisoryDomesticFreight = output.domestic_freight_advisory_cny_total !== undefined && output.domestic_freight_advisory_cny_total !== null;
+  if (hasAdvisoryDomesticFreight && (!finite(output.domestic_freight_advisory_cny_total) || output.domestic_freight_advisory_cny_total < 0)) {
+    throw new TypeError('domestic_freight_advisory_cny_total must be a nonnegative finite number or null.');
+  }
+  const isBareGoodsQuote = output.pricing_basis === 'bare_goods_1688' ||
+    output.bare_goods_screening === true ||
+    !hasDomesticFreight;
   const goodsPromo = assertBoolean(output.goods_first_order_promotion, 'goods_first_order_promotion');
-  const freightPromo = assertBoolean(output.freight_first_order_promotion, 'freight_first_order_promotion');
+  const freightPromo = (isBareGoodsQuote && (output.freight_first_order_promotion === undefined || output.freight_first_order_promotion === null))
+    ? false
+    : assertBoolean(output.freight_first_order_promotion, 'freight_first_order_promotion');
   const isStage1Initial = output.stage === 'stage1_initial' || output.allow_default_pack_multiple === true;
 
   if (output.status === 'verified') {
-    if (output.includes_platform_subsidy_in_freight === true) {
+    if (!isBareGoodsQuote && output.includes_platform_subsidy_in_freight === true) {
       throw new TypeError('Verified regular 1688 quote cannot deduct temporary platform_subsidy (可再减) from domestic_freight_cny_total; record full regular Shenzhen freight.');
     }
     const requiresUiReadback = output.require_ui_readback === true || isStage1Initial;
@@ -820,8 +831,8 @@ export function validateSourcingVerifier1688Output(output, { expected_components
   if (!finite(output.goods_cny_total) || output.goods_cny_total <= 0) {
     throw new TypeError('goods_cny_total must be a positive finite number.');
   }
-  if (!finite(output.domestic_freight_cny_total) || output.domestic_freight_cny_total < 0) {
-    throw new TypeError('domestic_freight_cny_total must be a nonnegative finite number.');
+  if (hasDomesticFreight && (!finite(output.domestic_freight_cny_total) || output.domestic_freight_cny_total < 0)) {
+    throw new TypeError('domestic_freight_cny_total must be a nonnegative finite number or null.');
   }
 
   // Exact BigInt parity: must equal either exact sum OR standard 2-dp rounded sum (rejects 199.99 when exact sum is 200.00).
@@ -838,8 +849,8 @@ export function validateSourcingVerifier1688Output(output, { expected_components
   }
 
   if (output.status === 'verified') {
-    if (goodsPromo !== false || freightPromo !== false) {
-      throw new TypeError('Verified regular 1688 quote requires both goods_first_order_promotion: false and freight_first_order_promotion: false.');
+    if (goodsPromo !== false || (!isBareGoodsQuote && freightPromo !== false)) {
+      throw new TypeError('Verified regular 1688 quote requires goods_first_order_promotion: false (and freight_first_order_promotion: false for explicit landed-freight quotes).');
     }
     if (orderPlan.allocated_sets < 100 || orderPlan.actual_complete_sets < 100) {
       throw new TypeError('Verified quote must cover at least 100 complete saleable sets.');
@@ -850,6 +861,11 @@ export function validateSourcingVerifier1688Output(output, { expected_components
     valid: true,
     contract: 'SourcingVerifier1688',
     status: output.status,
+    pricing_basis: isBareGoodsQuote ? 'bare_goods_1688' : 'landed_domestic_explicit',
+    ...(isBareGoodsQuote ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
+    domestic_freight_advisory_cny_total: isBareGoodsQuote
+      ? (hasAdvisoryDomesticFreight ? output.domestic_freight_advisory_cny_total : (hasDomesticFreight ? output.domestic_freight_cny_total : null))
+      : null,
     redacted_destination: redactedDestination,
     sensitive_freebie_flags: normalizedFlags,
     order_plan: orderPlan,

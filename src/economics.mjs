@@ -2,7 +2,7 @@
  * Layer 3: Unified unit-economics cost ledger and deterministic Gate-1 early screener.
  * Imports ONLY src/utils/, src/business-thresholds.mjs, src/rates/index.mjs, and src/fba-calculator.mjs.
  */
-import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
+import { BARE_GOODS_DISCLOSURE_ZH, BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import {
   gcdBig,
   toBigRat,
@@ -47,9 +47,9 @@ import {
   computeAmazonCouponRedemptionFee2027,
   classifySizeTier2027,
   computeOrderPlan,
-  computeNegotiationShortlist,
   computePackagingRedesignShortlist2027,
   isAmazonOptimizedPlacementVerified2027,
+  isUsWestSingleWarehouseHeadhaul,
   lookupUnifiedFulfillmentFee2027,
   priceBand2027,
 } from './fba-calculator.mjs';
@@ -218,6 +218,19 @@ export function calculateEconomics(input, options = {}) {
     if (line.status === 'not_applicable' && line.amount_usd !== 0) throw new TypeError(`Not-applicable cost must be explicit zero: ${line.id}`);
     map.set(line.id, line);
   }
+  // ADR-0002 (P1-5): Explicit bare-goods ledgers (`cost_basis: 'bare_goods_1688'` / `bare_goods_screening: true`)
+  // may omit the `domestic_freight` line without turning margin pending or dropping the card.
+  if (isR59Plus && !map.has('domestic_freight') && (input.cost_basis === 'bare_goods_1688' || input.bare_goods_screening === true)) {
+    const bareDomLine = {
+      id: 'domestic_freight',
+      amount_usd: 0,
+      status: 'not_applicable',
+      bare_goods_screening: true,
+      basis: BARE_GOODS_DISCLOSURE_ZH,
+    };
+    lines.push(bareDomLine);
+    map.set('domestic_freight', bareDomLine);
+  }
   let refundComponents = null, payoutComponents = null, returnsComponents = null;
   const amazonDeductions = ['referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'returns_disposal'];
 
@@ -226,6 +239,7 @@ export function calculateEconomics(input, options = {}) {
   let r58HeadhaulInvalid = false;
   let headhaulConflictReason = null;
   let headhaulA4Applied = null;
+  let headhaulAdvisoryReplenishmentNote = null;
   let r58StorageInvalid = false;
   let r58FulfillmentInvalid = false;
   let r59PlacementInvalid = false;
@@ -272,6 +286,7 @@ export function calculateEconomics(input, options = {}) {
         }
       }
     }
+    let headhaulSpecsForPlacement = [];
     if (isR59Plus) {
       // H11 + Issue #5: Check ALL supplied structured headhaul specs consistently across strict and non-strict modes.
       const hhLine = map.get('headhaul');
@@ -280,13 +295,18 @@ export function calculateEconomics(input, options = {}) {
         input.headhaul,
         input.source_inputs?.headhaul,
       );
+      headhaulSpecsForPlacement = rawHhSpecs;
       if (hhLine && hhLine.status !== 'pending' && rawHhSpecs.length > 0) {
         let firstCalc = null;
         let firstExpectedUsd = null;
         for (const rawHhSpec of rawHhSpecs) {
           const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
           const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
-          const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
+          const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, {
+            isR58: true,
+            isR59: true,
+            steadyStateReplenishment: input.steady_state_replenishment,
+          });
           if (hhCalc.weight_conflict || hhCalc.missing_surcharge_quote || !hhCalc.exact_usd_rational) {
             r58HeadhaulInvalid = true;
             if (hhCalc.weight_conflict && hhCalc.conflict_reason) headhaulConflictReason = hhCalc.conflict_reason;
@@ -305,6 +325,8 @@ export function calculateEconomics(input, options = {}) {
           }
         }
         if (!r58HeadhaulInvalid && firstCalc) {
+          if (firstCalc.a4_applied) headhaulA4Applied = firstCalc.a4_applied;
+          if (firstCalc.advisory_replenishment_note) headhaulAdvisoryReplenishmentNote = firstCalc.advisory_replenishment_note;
           if (options.requireFeeBasis && finite(hhLine.amount_usd) && Math.abs(hhLine.amount_usd - firstExpectedUsd) > 0.005) {
             r58HeadhaulInvalid = true;
           } else {
@@ -420,7 +442,32 @@ export function calculateEconomics(input, options = {}) {
         (declaredPlaceTier.length > 0 && !declaredPlaceTier.includes('oversize'));
       if (!isConfirmedOversize &&
         (placeSplitOpt === 'amazon_optimized' || (hasNonOversizeEvidence && round(placeLine.amount_usd) === 0))) {
-        const optVerified = isAmazonOptimizedPlacementVerified2027({
+        const hhLineForPlace = map.get('headhaul');
+        const placeHeadhaulScope = placeLine.headhaul_destination_scope ??
+          placeLine.fee_basis?.headhaul_destination_scope ??
+          input.headhaul_destination_scope ??
+          hhLineForPlace?.destination_scope ??
+          hhLineForPlace?.fee_basis?.destination_scope ??
+          null;
+        const placeHeadhaulRate = finite(placeLine.headhaul_rate_cny_per_kg)
+          ? placeLine.headhaul_rate_cny_per_kg
+          : finite(placeLine.fee_basis?.headhaul_rate_cny_per_kg)
+            ? placeLine.fee_basis.headhaul_rate_cny_per_kg
+            : finite(input.headhaul_rate_cny_per_kg)
+              ? input.headhaul_rate_cny_per_kg
+              : finite(hhLineForPlace?.rate_cny_per_kg)
+                ? hhLineForPlace.rate_cny_per_kg
+                : null;
+        const placeSteadyState = placeLine.steady_state_replenishment ??
+          placeLine.fee_basis?.steady_state_replenishment ??
+          input.steady_state_replenishment ??
+          headhaulSpecsForPlacement[0]?.steady_state_replenishment ??
+          true;
+        const usWestBlocked = isUsWestSingleWarehouseHeadhaul({
+          headhaul_destination_scope: placeHeadhaulScope,
+          headhaul_rate_cny_per_kg: placeHeadhaulRate,
+        }) || headhaulSpecsForPlacement.some(spec => isUsWestSingleWarehouseHeadhaul({ headhaul: spec }));
+        const optVerified = !usWestBlocked && isAmazonOptimizedPlacementVerified2027({
           identical_cartons_count: placeLine.identical_cartons_count ??
             placeLine.fee_basis?.identical_cartons_count ??
             input.identical_cartons_count ??
@@ -428,7 +475,11 @@ export function calculateEconomics(input, options = {}) {
           multi_destination_headhaul_verified: placeLine.multi_destination_headhaul_verified ??
             placeLine.fee_basis?.multi_destination_headhaul_verified ??
             input.multi_destination_headhaul_verified ??
-            false,
+            undefined,
+          steady_state_replenishment: placeSteadyState,
+          headhaul: headhaulSpecsForPlacement[0] ?? null,
+          headhaul_rate_cny_per_kg: placeHeadhaulRate,
+          headhaul_destination_scope: placeHeadhaulScope,
         });
         if (!optVerified) {
           r59PlacementInvalid = true;
@@ -674,7 +725,7 @@ export function calculateEconomics(input, options = {}) {
     validation.issues.push({
       line: 'placement',
       code: 'unverified_amazon_optimized_placement',
-      reason: 'Standard/Bulky $0 placement (amazon_optimized) requires identical_cartons_count >= 5 AND multi_destination_headhaul_verified === true.',
+      reason: `Standard/Bulky $0 placement (amazon_optimized) requires steady-state nationwide multi-warehouse headhaul (>= ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg or multi_destination_headhaul_verified === true) and prohibits pure US-West single-warehouse headhaul; coupled small-batch checks additionally require identical_cartons_count >= 5.`,
     });
   }
   const invalid = new Set(validation?.issues.map(issue => issue.line) ?? []);
@@ -722,6 +773,8 @@ export function calculateEconomics(input, options = {}) {
       }
     }
   }
+  const domLineFinal = map.get('domestic_freight');
+  const isBareGoodsLedger = Boolean(isR59Plus && domLineFinal && domLineFinal.status === 'not_applicable' && domLineFinal.amount_usd === 0);
   const hasPricingDetails = Boolean(isR58Plus && pricing && (
     pricing.has_ongoing_discount ||
     input.list_price_usd !== undefined ||
@@ -741,6 +794,11 @@ export function calculateEconomics(input, options = {}) {
       ...(landedDomesticCapCny !== null ? { landed_domestic_cap_at_30pct_cny: landedDomesticCapCny } : {}),
       ...(headhaulConflictReason ? { headhaul_conflict_reason: headhaulConflictReason } : {}),
       ...(headhaulA4Applied ? { headhaul_a4_applied: headhaulA4Applied } : {}),
+      ...(headhaulAdvisoryReplenishmentNote ? { advisory_replenishment_note: headhaulAdvisoryReplenishmentNote } : {}),
+      ...(isBareGoodsLedger ? {
+        cost_basis: 'bare_goods_1688',
+        bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH,
+      } : {}),
     } : {}),
     expected_refund_usd: round(p * r), net_revenue_usd: round(net),
     known_cost_usd: round(known), pending_lines: pending, deferred_lines: deferred,
@@ -801,19 +859,23 @@ function parseTriState(value, fieldName) {
   throw new TypeError(`${fieldName} must be boolean true, false, or 'unknown' under revision 58.`);
 }
 
-function resolveHeadhaul(headhaul, fx, orderUnits, isR58 = false, isR59 = false) {
+function resolveHeadhaul(headhaul, fx, orderUnits, steadyStateReplenishment = undefined) {
   if (!headhaul || typeof headhaul !== 'object') return { amount_usd: null, cny_derivation: null, a4_applied: null };
   const hasPerKgField = PER_KG_KEYS.some(key => Object.hasOwn(headhaul, key));
   if (!hasPerKgField) {
     return headhaul.bond_included === true && finite(headhaul.usd_per_unit) && headhaul.usd_per_unit > 0
-      ? { amount_usd: isR58 ? headhaul.usd_per_unit : round(headhaul.usd_per_unit), cny_derivation: null, a4_applied: null }
+      ? { amount_usd: headhaul.usd_per_unit, cny_derivation: null, a4_applied: null }
       : { amount_usd: null, cny_derivation: null, a4_applied: null };
   }
   if (Object.hasOwn(headhaul, 'usd_per_unit')) return { amount_usd: null, cny_derivation: null, a4_applied: null };
-  return computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58, isR59 });
+  return computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, {
+    isR58: true,
+    isR59: true,
+    steadyStateReplenishment,
+  });
 }
 
-function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58, isR59 = false, feeContext = null) {
+function resolveRequiredMonths(operatingPeriod, operatingMonths, feeContext = null) {
   let months = null;
   if (operatingMonths !== undefined) {
     if (!Array.isArray(operatingMonths) || !operatingMonths.length ||
@@ -822,10 +884,10 @@ function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58, isR59 = 
     }
     months = [...new Set(operatingMonths)];
   }
-  const canonicalR59OffPeak = isR59 &&
+  const canonicalR59OffPeak =
     isCanonical2027OffPeakWin(feeContext?.sales) &&
     isCanonical2027OffPeakStorageWin(feeContext?.storage);
-  const canonicalR59Peak = isR59 && isCanonical2027PeakWin(feeContext?.sales);
+  const canonicalR59Peak = isCanonical2027PeakWin(feeContext?.sales);
   let explicitFullPeriod = null;
   if (operatingPeriod !== undefined) {
     if (operatingPeriod === 'peak') {
@@ -842,7 +904,7 @@ function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58, isR59 = 
       }
       if (!months) explicitFullPeriod = 'off_peak';
       months = months ?? [2, 3, 4, 5, 6, 7, 8, 9];
-    } else if (isR58 && operatingPeriod === 'annual') {
+    } else if (operatingPeriod === 'annual') {
       const all12 = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
       if (months && (all12.some(m => !months.includes(m)) || months.length !== 12)) {
         return { valid: false, months: null, explicitFullPeriod: null };
@@ -853,19 +915,19 @@ function resolveRequiredMonths(operatingPeriod, operatingMonths, isR58, isR59 = 
       return { valid: false, months: null, explicitFullPeriod: null };
     }
   }
-  if (isR58 && months === null) return { valid: false, months: null, explicitFullPeriod: null };
+  if (months === null) return { valid: false, months: null, explicitFullPeriod: null };
   return { valid: true, months, explicitFullPeriod, canonicalR59OffPeak, canonicalR59Peak };
 }
 
-function resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context }, isR59 = false) {
-  const periodSpec = resolveRequiredMonths(operating_period, operating_months, true, isR59, fee_context);
-  if (!periodSpec.valid) return { valid: false, reason: 'Revision 58 requires explicit valid operating_period or operating_months.' };
+function resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context }) {
+  const periodSpec = resolveRequiredMonths(operating_period, operating_months, fee_context);
+  if (!periodSpec.valid) return { valid: false, reason: 'Revision 59 requires explicit valid operating_period or operating_months.' };
   if (!fee_context || typeof fee_context !== 'object' ||
     !text(fee_context.package_ref) ||
     (fee_context.marketplace !== undefined && fee_context.marketplace !== 'US') ||
     (fee_context.currency !== undefined && fee_context.currency !== 'USD') ||
     !['sales', 'storage', 'inbound'].every(key => validWindow(fee_context[key]))) {
-    return { valid: false, reason: 'Revision 58 requires US/USD, package_ref, and explicit valid ISO date windows for fee_context.sales, storage, and inbound.' };
+    return { valid: false, reason: 'Revision 59 requires US/USD, package_ref, and explicit valid ISO date windows for fee_context.sales, storage, and inbound.' };
   }
   if (sales_window !== undefined && sales_window !== null) {
     if (!validWindow(sales_window) ||
@@ -907,13 +969,11 @@ function resolveDateContextR58({ operating_period, operating_months, sales_windo
   } else if (periodSpec.explicitFullPeriod === 'off_peak') {
     const validLegacyOffPeak = salesWin.from === `${year}-02-01` && salesWin.through === `${year}-09-30` &&
       storageWin.from === `${year}-02-01` && storageWin.through === `${year}-09-30`;
-    const validR59OffPeak = isR59 && periodSpec.canonicalR59OffPeak;
+    const validR59OffPeak = periodSpec.canonicalR59OffPeak;
     if (!validLegacyOffPeak && !validR59OffPeak) {
       return {
         valid: false,
-        reason: isR59
-          ? 'Default off_peak operating period requires sales 2027-02-01..2027-10-14 with storage 2027-02-01..2027-09-30 (or historical YYYY-02-01..YYYY-09-30).'
-          : 'Default off_peak operating period must cover full Feb 1 through Sep 30.',
+        reason: 'Default off_peak operating period requires sales 2027-02-01..2027-10-14 with storage 2027-02-01..2027-09-30 (or historical YYYY-02-01..YYYY-09-30).',
       };
     }
   }
@@ -981,8 +1041,7 @@ function resolveStorageUsd(storage, dateCtxR58, storageFeeBasis, registeredIds =
     }
   }
   if (amount === null) return null;
-  if (!dateCtxR58) return amount;
-  if (!dateCtxR58.valid || badBoolFlag) return null;
+  if (!dateCtxR58?.valid || badBoolFlag) return null;
   // Revision 58 rejects unverified pre-computed scalar/usd_per_unit storage so Q4 $2.40 / off-peak $0.78 floors cannot be bypassed.
   if (ratePerCuft === null) return null;
   const computedPkgCuft = pkgCubicFeet(pkg);
@@ -1010,8 +1069,7 @@ function resolveStorageUsd(storage, dateCtxR58, storageFeeBasis, registeredIds =
 
 function resolvePlacementUsd(placementUsd, dateCtxR58, placementFeeBasis, registeredIds = null, expectedPackageRef = null) {
   if (!finite(placementUsd) || placementUsd < 0) return null;
-  if (!dateCtxR58) return round(placementUsd);
-  if (!dateCtxR58.valid) return null;
+  if (!dateCtxR58?.valid) return null;
   const win = dateCtxR58.inboundWin;
   if (placementFeeBasis !== undefined) {
     if (!basisCoversWindow(placementFeeBasis, win, false, registeredIds, expectedPackageRef, 'placement')) return null;
@@ -1021,49 +1079,18 @@ function resolvePlacementUsd(placementUsd, dateCtxR58, placementFeeBasis, regist
   return round(placementUsd);
 }
 
-function resolveFulfillmentUsd(fulfillmentUsd, { sales_window, fee_context, fulfillment_fee_basis, operating_period, operating_months, rawInput }, dateCtxR58, registeredIds = null, expectedPackageRef = null) {
+function resolveFulfillmentUsd(fulfillmentUsd, { fulfillment_fee_basis, rawInput }, dateCtxR58, registeredIds = null, expectedPackageRef = null) {
   if (!finite(fulfillmentUsd) || fulfillmentUsd <= 0) return null;
-  if (dateCtxR58) {
-    if (!dateCtxR58.valid) return null;
-    const salesWin = dateCtxR58.salesWin;
-    if (salesWin.through > '2027-10-14' && hasProhibited2026PeakExtrapolation({ fee_basis: fulfillment_fee_basis }, rawInput)) {
-      return null;
-    }
-    if (fulfillment_fee_basis !== undefined) {
-      return basisCoversWindow(fulfillment_fee_basis, salesWin, true, registeredIds, expectedPackageRef, 'fulfillment') ? round(fulfillmentUsd) : null;
-    }
-    const withinNonPeak2027 = salesWin.from >= '2027-01-15' && salesWin.through <= '2027-10-14';
-    return withinNonPeak2027 ? round(fulfillmentUsd) : null;
+  if (!dateCtxR58?.valid) return null;
+  const salesWin = dateCtxR58.salesWin;
+  if (salesWin.through > '2027-10-14' && hasProhibited2026PeakExtrapolation({ fee_basis: fulfillment_fee_basis }, rawInput)) {
+    return null;
   }
-  // Legacy revision 57 behavior preserved verbatim.
-  const periodSpec = resolveRequiredMonths(operating_period, operating_months, false);
-  if (!periodSpec.valid) return null;
-  const salesWin = sales_window ?? fee_context?.sales ?? null;
-  if (periodSpec.months !== null) {
-    if (!salesWin || !validWindow(salesWin)) return null;
-    const winMonths = monthsIn(salesWin);
-    if (winMonths.some(month => !periodSpec.months.includes(month)) ||
-      periodSpec.months.some(month => !winMonths.includes(month))) {
-      return null;
-    }
+  if (fulfillment_fee_basis !== undefined) {
+    return basisCoversWindow(fulfillment_fee_basis, salesWin, true, registeredIds, expectedPackageRef, 'fulfillment') ? round(fulfillmentUsd) : null;
   }
-  if (salesWin !== null) {
-    if (!validWindow(salesWin)) return null;
-    const outsideNonPeak2027 = salesWin.from < '2027-01-15' || salesWin.through > '2027-10-14';
-    if (outsideNonPeak2027 || fulfillment_fee_basis !== undefined) {
-      if (fulfillment_fee_basis?.status !== 'published' || !isoDate(fulfillment_fee_basis.effective_from) ||
-        !isoDate(fulfillment_fee_basis.effective_through) || fulfillment_fee_basis.effective_through < fulfillment_fee_basis.effective_from ||
-        salesWin.from < fulfillment_fee_basis.effective_from || salesWin.through > fulfillment_fee_basis.effective_through) {
-        return null;
-      }
-    }
-  } else if (fulfillment_fee_basis !== undefined) {
-    if (fulfillment_fee_basis?.status !== 'published' || !isoDate(fulfillment_fee_basis.effective_from) ||
-      !isoDate(fulfillment_fee_basis.effective_through) || fulfillment_fee_basis.effective_through < fulfillment_fee_basis.effective_from) {
-      return null;
-    }
-  }
-  return round(fulfillmentUsd);
+  const withinNonPeak2027 = salesWin.from >= '2027-01-15' && salesWin.through <= '2027-10-14';
+  return withinNonPeak2027 ? round(fulfillmentUsd) : null;
 }
 
 function resolveReferral(referralTerms, priceUsd, refundFraction) {
@@ -1098,8 +1125,6 @@ export function evaluateEarlyScreen(input, options = {}) {
   }
   const rev = input.profile_revision ?? options.profileRevision ?? 59;
   if (!Number.isInteger(rev) || rev < 59) throw new TypeError('profileRevision must be an integer >= 59 (r50-r58 retired; see archive/r50-r58-frozen-replay-20261125).');
-  const isR58 = rev >= 58;
-  const isR59 = rev >= 59;
 
   const {
     id = 'early-screen',
@@ -1121,6 +1146,8 @@ export function evaluateEarlyScreen(input, options = {}) {
     target_sets = null,
     goods_cny_per_unit: rawGoodsCnyPerUnit = null,
     procurement_usd: rawProcurementUsd = null,
+    bare_goods_screening = undefined,
+    domestic_freight_advisory_cny_total = null,
     domestic_freight_cny_total = null,
     domestic_freight_cny_per_unit = null,
     domestic_freight_usd: rawDomesticUsd = null,
@@ -1156,45 +1183,35 @@ export function evaluateEarlyScreen(input, options = {}) {
     collection_rate,
     other_applicable_usd,
     other_payee = 'external',
-    assumptions = [isR58
-      ? 'Deterministic Gate-1 early screen on >=100 complete saleable units (carton/MOQ compliant) under revision 58.'
-      : 'Deterministic Gate-1 early screen on 100 complete saleable units before full 21-item expansion.'],
+    assumptions = ['Deterministic Gate-1 early screen on >=100 complete saleable units (carton/MOQ compliant) under revision 59.'],
   } = input;
 
   if (typeof saleable_unit !== 'string' || !saleable_unit.trim()) throw new TypeError('A nonempty saleable_unit is required.');
-  const pricing = isR58
-    ? resolveEffectivePricing({
-      price_usd: rawPriceUsd,
-      list_price_usd,
-      net_effective_price_usd,
-      ongoing_coupon_usd,
-      ongoing_coupon_pct,
-      prime_exclusive_discount_usd,
-      prime_exclusive_discount_pct,
-      promo_basis_already_net,
-    })
-    : null;
-  if (isR58 && !pricing.valid && (list_price_usd !== undefined || net_effective_price_usd !== undefined ||
+  const pricing = resolveEffectivePricing({
+    price_usd: rawPriceUsd,
+    list_price_usd,
+    net_effective_price_usd,
+    ongoing_coupon_usd,
+    ongoing_coupon_pct,
+    prime_exclusive_discount_usd,
+    prime_exclusive_discount_pct,
+    promo_basis_already_net,
+  });
+  if (!pricing.valid && (list_price_usd !== undefined || net_effective_price_usd !== undefined ||
     ongoing_coupon_usd !== undefined || ongoing_coupon_pct !== undefined ||
     prime_exclusive_discount_usd !== undefined || prime_exclusive_discount_pct !== undefined ||
     promo_basis_already_net === true)) {
     throw new TypeError(pricing.reason);
   }
-  const price_usd = isR58 && pricing?.valid ? pricing.net_effective_price_usd : rawPriceUsd;
+  const price_usd = pricing.valid ? pricing.net_effective_price_usd : rawPriceUsd;
   if (!finite(price_usd) || price_usd <= 0) throw new TypeError('A positive finite price_usd is required.');
-  if (!finite(minimum_price_usd) || minimum_price_usd < 29.99) throw new TypeError('minimum_price_usd must be at least the revision-57 floor of USD 29.99.');
-  if (!finite(margin_floor) || margin_floor < 0.3 || margin_floor >= 1) throw new TypeError('margin_floor must be in [0.3, 1) under revision 57.');
+  if (!finite(minimum_price_usd) || minimum_price_usd < 29.99) throw new TypeError('minimum_price_usd must be at least the revision-59 floor of USD 29.99.');
+  if (!finite(margin_floor) || margin_floor < 0.3 || margin_floor >= 1) throw new TypeError('margin_floor must be in [0.3, 1) under revision 59.');
 
-  const rightsState = isR58
-    ? parseTriState(input.specific_rights_conflict, 'specific_rights_conflict')
-    : Boolean(input.specific_rights_conflict ?? false);
-  const dateState = isR58
-    ? parseTriState(input.strong_date_dependency, 'strong_date_dependency')
-    : Boolean(input.strong_date_dependency ?? false);
+  const rightsState = parseTriState(input.specific_rights_conflict, 'specific_rights_conflict');
+  const dateState = parseTriState(input.strong_date_dependency, 'strong_date_dependency');
 
-  const fxCheck = isR58
-    ? resolveConsistentNumeric([rawFx, input?.source_inputs?.fx_cny_per_usd, input?.procurement?.fx_cny_per_usd], v => finite(v) && v > 0)
-    : { present: finite(rawFx) && rawFx > 0, valid: true, value: rawFx };
+  const fxCheck = resolveConsistentNumeric([rawFx, input?.source_inputs?.fx_cny_per_usd, input?.procurement?.fx_cny_per_usd], v => finite(v) && v > 0);
   const fx = fxCheck.valid && fxCheck.present ? fxCheck.value : null;
 
   let orderPlan = null;
@@ -1203,30 +1220,28 @@ export function evaluateEarlyScreen(input, options = {}) {
   let activeSkuLines = null;
   let order_units = rawOrderUnits;
   let goods_cny_per_unit = rawGoodsCnyPerUnit;
-  if (isR58) {
-    const skuRes = resolveConsistentSkuLines(input, input?.procurement && typeof input.procurement === 'object' ? input.procurement : null);
-    if (skuRes.conflict) {
-      skuLinesConflict = true;
-    } else if (skuRes.present && skuRes.skuLines !== null) {
-      activeSkuLines = skuRes.skuLines;
-      orderPlan = computeOrderPlan({
-        sku_lines: activeSkuLines,
-        min_sets: 100,
-        allow_remainder,
-        target_sets,
-        lcm_cap: input?.lcm_cap,
-        profile_revision: rev,
-      });
-      if (order_units === undefined || order_units === null) order_units = orderPlan.allocated_sets;
-      for (let i = 0; i < activeSkuLines.length; i++) {
-        const suppliedOrd = activeSkuLines[i]?.ordered_qty;
-        if (suppliedOrd !== undefined && suppliedOrd !== null && suppliedOrd !== orderPlan.sku_lines[i].ordered_qty) {
-          skuLineOrderedMismatch = true;
-        }
+  const skuRes = resolveConsistentSkuLines(input, input?.procurement && typeof input.procurement === 'object' ? input.procurement : null);
+  if (skuRes.conflict) {
+    skuLinesConflict = true;
+  } else if (skuRes.present && skuRes.skuLines !== null) {
+    activeSkuLines = skuRes.skuLines;
+    orderPlan = computeOrderPlan({
+      sku_lines: activeSkuLines,
+      min_sets: 100,
+      allow_remainder,
+      target_sets,
+      lcm_cap: input?.lcm_cap,
+      profile_revision: rev,
+    });
+    if (order_units === undefined || order_units === null) order_units = orderPlan.allocated_sets;
+    for (let i = 0; i < activeSkuLines.length; i++) {
+      const suppliedOrd = activeSkuLines[i]?.ordered_qty;
+      if (suppliedOrd !== undefined && suppliedOrd !== null && suppliedOrd !== orderPlan.sku_lines[i].ordered_qty) {
+        skuLineOrderedMismatch = true;
       }
-      if (goods_cny_per_unit === null && rawProcurementUsd === null && orderPlan.per_allocated_set_goods_cny !== null) {
-        goods_cny_per_unit = orderPlan.per_allocated_set_goods_cny;
-      }
+    }
+    if (goods_cny_per_unit === null && rawProcurementUsd === null && orderPlan.per_allocated_set_goods_cny !== null) {
+      goods_cny_per_unit = orderPlan.per_allocated_set_goods_cny;
     }
   }
 
@@ -1242,7 +1257,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     throw new TypeError('physical_return_fraction must be a fraction in [0, 1).');
   }
 
-  const nestedSetsInvalid = isR58 && [input?.source_inputs, input?.procurement].some(bag => {
+  const nestedSetsInvalid = [input?.source_inputs, input?.procurement].some(bag => {
     if (!bag || typeof bag !== 'object') return false;
     for (const k of ['complete_saleable_sets', 'order_units']) {
       if (Object.hasOwn(bag, k)) {
@@ -1252,55 +1267,46 @@ export function evaluateEarlyScreen(input, options = {}) {
     }
     return false;
   });
-  const nestedPromoInvalid = isR58 && (
+  const nestedPromoInvalid =
     (input?.source_inputs && Object.hasOwn(input.source_inputs, 'first_order_promotion') && input.source_inputs.first_order_promotion !== false) ||
-    (input?.procurement && typeof input.procurement === 'object' && Object.hasOwn(input.procurement, 'first_order_promotion') && input.procurement.first_order_promotion !== false)
-  );
+    (input?.procurement && typeof input.procurement === 'object' && Object.hasOwn(input.procurement, 'first_order_promotion') && input.procurement.first_order_promotion !== false);
   const pricePass = price_usd >= minimum_price_usd;
-  const orderUnitsValid = isR58
-    ? (!skuLinesConflict && !nestedSetsInvalid && Number.isSafeInteger(order_units) && order_units >= 100 && !skuLineOrderedMismatch && (!orderPlan || order_units === orderPlan.allocated_sets))
-    : order_units === 100;
-  const goodsPromoClear = !nestedPromoInvalid && (goods_first_order_promotion === undefined
+  const orderUnitsValid = !skuLinesConflict && !nestedSetsInvalid && Number.isSafeInteger(order_units) && order_units >= 100 && !skuLineOrderedMismatch && (!orderPlan || order_units === orderPlan.allocated_sets);
+  const goodsPromoClear = !nestedPromoInvalid && first_order_promotion !== true && (goods_first_order_promotion === undefined
     ? first_order_promotion === false
     : goods_first_order_promotion === false) && (!orderPlan || orderPlan.all_promo_clear);
   const freightPromoClear = !nestedPromoInvalid && first_order_promotion === false;
   let rawProc = null;
   let procCnyDerivation = null;
-  if (isR58) {
-    if (!orderPlan) {
-      let badProcSupply = false;
-      let usdSupply = null;
-      let cnyRat = null;
-      if (rawProcurementUsd !== null && rawProcurementUsd !== undefined) {
-        if (finite(rawProcurementUsd) && rawProcurementUsd >= 0) usdSupply = rawProcurementUsd;
-        else badProcSupply = true;
-      }
-      if (goods_cny_per_unit !== null && goods_cny_per_unit !== undefined) {
-        if (finite(goods_cny_per_unit) && goods_cny_per_unit >= 0 && finite(fx) && fx > 0) {
-          cnyRat = divBigRat(toBigRat(goods_cny_per_unit), toBigRat(fx));
-        } else badProcSupply = true;
-      }
-      if (!badProcSupply) {
-        if (cnyRat !== null && usdSupply !== null) {
-          if (ratMatchesSupply(usdSupply, cnyRat)) {
-            rawProc = roundBigRat(cnyRat.n, cnyRat.d, 10);
-            procCnyDerivation = { fx, cny_per_unit: goods_cny_per_unit };
-          }
-        } else if (cnyRat !== null) {
+  if (!orderPlan) {
+    let badProcSupply = false;
+    let usdSupply = null;
+    let cnyRat = null;
+    if (rawProcurementUsd !== null && rawProcurementUsd !== undefined) {
+      if (finite(rawProcurementUsd) && rawProcurementUsd >= 0) usdSupply = rawProcurementUsd;
+      else badProcSupply = true;
+    }
+    if (goods_cny_per_unit !== null && goods_cny_per_unit !== undefined) {
+      if (finite(goods_cny_per_unit) && goods_cny_per_unit >= 0 && finite(fx) && fx > 0) {
+        cnyRat = divBigRat(toBigRat(goods_cny_per_unit), toBigRat(fx));
+      } else badProcSupply = true;
+    }
+    if (!badProcSupply) {
+      if (cnyRat !== null && usdSupply !== null) {
+        if (ratMatchesSupply(usdSupply, cnyRat)) {
           rawProc = roundBigRat(cnyRat.n, cnyRat.d, 10);
           procCnyDerivation = { fx, cny_per_unit: goods_cny_per_unit };
-        } else if (usdSupply !== null) {
-          rawProc = usdSupply;
         }
+      } else if (cnyRat !== null) {
+        rawProc = roundBigRat(cnyRat.n, cnyRat.d, 10);
+        procCnyDerivation = { fx, cny_per_unit: goods_cny_per_unit };
+      } else if (usdSupply !== null) {
+        rawProc = usdSupply;
       }
     }
-  } else {
-    rawProc = finite(rawProcurementUsd) && rawProcurementUsd >= 0
-      ? round(rawProcurementUsd)
-      : (finite(goods_cny_per_unit) && goods_cny_per_unit >= 0 && finite(fx) && fx > 0 ? round(goods_cny_per_unit / fx) : null);
   }
   let exactProcRational = null;
-  if (isR58 && orderPlan) {
+  if (orderPlan) {
     if (orderPlan.per_allocated_set_goods_cny === null || !finite(fx) || fx <= 0) {
       rawProc = null;
     } else {
@@ -1334,60 +1340,68 @@ export function evaluateEarlyScreen(input, options = {}) {
     registeredIds = new Set(evidence.map(e => (typeof e === 'string' ? e : e?.id)).filter(text));
   }
 
+  const hasExplicitDomesticInput =
+    (rawDomesticUsd !== null && rawDomesticUsd !== undefined) ||
+    (domestic_freight_cny_per_unit !== null && domestic_freight_cny_per_unit !== undefined) ||
+    (domestic_freight_cny_total !== null && domestic_freight_cny_total !== undefined);
+  const bareGoodsMode = bare_goods_screening === true || (bare_goods_screening !== false && !hasExplicitDomesticInput);
+  const advisoryDomesticFreightCny = finite(domestic_freight_advisory_cny_total) && domestic_freight_advisory_cny_total >= 0
+    ? domestic_freight_advisory_cny_total
+    : (bare_goods_screening === true && finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0
+      ? domestic_freight_cny_total
+      : null);
+
   let domesticUsd = null;
   let domCnyDerivation = null;
-  if (freightPromoClear && orderUnitsValid) {
-    if (isR58) {
-      let badDomSupply = false;
-      let usdSupply = null;
-      const cnySpecs = [];
-      if (rawDomesticUsd !== null && rawDomesticUsd !== undefined) {
-        if (finite(rawDomesticUsd) && rawDomesticUsd >= 0) usdSupply = rawDomesticUsd;
-        else badDomSupply = true;
-      }
-      if (domestic_freight_cny_per_unit !== null && domestic_freight_cny_per_unit !== undefined) {
-        if (finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0 && finite(fx) && fx > 0) {
-          cnySpecs.push({
-            rat: divBigRat(toBigRat(domestic_freight_cny_per_unit), toBigRat(fx)),
-            deriv: { fx, cny_per_unit: domestic_freight_cny_per_unit },
-          });
-        } else badDomSupply = true;
-      }
-      if (domestic_freight_cny_total !== null && domestic_freight_cny_total !== undefined) {
-        if (finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0 && finite(fx) && fx > 0) {
-          cnySpecs.push({
-            rat: divBigRat(toBigRat(domestic_freight_cny_total), mulBigRat(toBigRat(order_units), toBigRat(fx))),
-            deriv: { fx, cny_total: domestic_freight_cny_total, order_units },
-          });
-        } else badDomSupply = true;
-      }
-      if (!badDomSupply) {
-        const cnyConsistent = cnySpecs.every(s => ratCmp(s.rat, cnySpecs[0].rat) === 0);
-        if (cnySpecs.length > 0 && cnyConsistent) {
-          const refRat = cnySpecs[0].rat;
-          if (usdSupply === null || ratMatchesSupply(usdSupply, refRat)) {
-            domesticUsd = roundBigRat(refRat.n, refRat.d, 10);
-            domCnyDerivation = cnySpecs[0].deriv;
-          }
-        } else if (cnySpecs.length === 0 && usdSupply !== null) {
-          domesticUsd = usdSupply;
+  if (bareGoodsMode) {
+    if (goodsPromoClear && orderUnitsValid) domesticUsd = 0;
+  } else if (freightPromoClear && orderUnitsValid) {
+    let badDomSupply = false;
+    let usdSupply = null;
+    const cnySpecs = [];
+    if (rawDomesticUsd !== null && rawDomesticUsd !== undefined) {
+      if (finite(rawDomesticUsd) && rawDomesticUsd >= 0) usdSupply = rawDomesticUsd;
+      else badDomSupply = true;
+    }
+    if (domestic_freight_cny_per_unit !== null && domestic_freight_cny_per_unit !== undefined) {
+      if (finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0 && finite(fx) && fx > 0) {
+        cnySpecs.push({
+          rat: divBigRat(toBigRat(domestic_freight_cny_per_unit), toBigRat(fx)),
+          deriv: { fx, cny_per_unit: domestic_freight_cny_per_unit },
+        });
+      } else badDomSupply = true;
+    }
+    if (domestic_freight_cny_total !== null && domestic_freight_cny_total !== undefined) {
+      if (finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0 && finite(fx) && fx > 0) {
+        cnySpecs.push({
+          rat: divBigRat(toBigRat(domestic_freight_cny_total), mulBigRat(toBigRat(order_units), toBigRat(fx))),
+          deriv: { fx, cny_total: domestic_freight_cny_total, order_units },
+        });
+      } else badDomSupply = true;
+    }
+    if (!badDomSupply) {
+      const cnyConsistent = cnySpecs.every(s => ratCmp(s.rat, cnySpecs[0].rat) === 0);
+      if (cnySpecs.length > 0 && cnyConsistent) {
+        const refRat = cnySpecs[0].rat;
+        if (usdSupply === null || ratMatchesSupply(usdSupply, refRat)) {
+          domesticUsd = roundBigRat(refRat.n, refRat.d, 10);
+          domCnyDerivation = cnySpecs[0].deriv;
         }
+      } else if (cnySpecs.length === 0 && usdSupply !== null) {
+        domesticUsd = usdSupply;
       }
-    } else if (finite(rawDomesticUsd) && rawDomesticUsd >= 0) domesticUsd = round(rawDomesticUsd);
-    else if (finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0 && finite(fx) && fx > 0) {
-      domesticUsd = round(domestic_freight_cny_per_unit / fx);
-    } else if (finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0 && finite(fx) && fx > 0) {
-      domesticUsd = round((domestic_freight_cny_total / order_units) / fx);
     }
   }
-  const domesticQuoteValid = goodsPromoClear && freightPromoClear && orderUnitsValid && procurementUsd !== null && domesticUsd !== null;
+  const domesticQuoteValid = bareGoodsMode
+    ? (goodsPromoClear && orderUnitsValid && procurementUsd !== null)
+    : (goodsPromoClear && freightPromoClear && orderUnitsValid && procurementUsd !== null && domesticUsd !== null);
 
   const expectedPackageRef = text(fee_context?.package_ref) ? fee_context.package_ref : null;
-  const dateCtxR58 = isR58 ? resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context }, isR59) : null;
-  const pkgResR58 = isR58 ? resolveUniquePackageByRef(input.packages, expectedPackageRef) : { present: false, valid: true, pkg: null };
-  let badPackagesR58 = isR58 && pkgResR58.present && !pkgResR58.valid;
+  const dateCtxR58 = resolveDateContextR58({ operating_period, operating_months, sales_window, fee_context });
+  const pkgResR58 = resolveUniquePackageByRef(input.packages, expectedPackageRef);
+  let badPackagesR58 = pkgResR58.present && !pkgResR58.valid;
   const effectivePkg = pkg ?? pkgResR58.pkg;
-  if (isR58 && pkg && pkgResR58.pkg) {
+  if (pkg && pkgResR58.pkg) {
     const d1 = resolvePackageDimsRat(pkg);
     const d2 = resolvePackageDimsRat(pkgResR58.pkg);
     if (!d1 || !d2 || ratCmp(d1.s1Rat, d2.s1Rat) !== 0 || ratCmp(d1.s2Rat, d2.s2Rat) !== 0 || ratCmp(d1.s3Rat, d2.s3Rat) !== 0 ||
@@ -1400,7 +1414,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     returns_processing_fee_basis?.is_apparel_or_shoes, fulfillment_fee_basis?.is_apparel_or_shoes,
     effectivePkg?.is_apparel_or_shoes, pkgResR58.pkg?.is_apparel_or_shoes,
   ]);
-  const is_apparel_or_shoes = isR58 ? apparelCheckR58.value === true : Boolean(rawApparel ?? false);
+  const is_apparel_or_shoes = apparelCheckR58.value === true;
   const dgCheckR58 = resolveConsistentBoolean([
     input.is_dangerous_goods,
     storage && typeof storage === 'object' ? storage.is_dangerous_goods : undefined,
@@ -1416,7 +1430,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     effectivePkg?.is_oversize, pkgResR58.pkg?.is_oversize,
   ]);
 
-  const headhaulRes = resolveHeadhaul(headhaul, fx, order_units, isR58, isR59);
+  const headhaulRes = resolveHeadhaul(headhaul, fx, order_units, input.steady_state_replenishment);
   const headhaulUsd = headhaulRes.amount_usd;
   const storageUsd = resolveStorageUsd(storage, dateCtxR58, storage_fee_basis, registeredIds, expectedPackageRef, effectivePkg, {
     is_oversize: input.is_oversize, is_dangerous_goods: input.is_dangerous_goods, packages: input.packages,
@@ -1424,9 +1438,9 @@ export function evaluateEarlyScreen(input, options = {}) {
   });
   let resolvedPlacementUsd = resolvePlacementUsd(placement_usd, dateCtxR58, placement_fee_basis, registeredIds, expectedPackageRef);
   let resolvedFulfillmentUsd = resolveFulfillmentUsd(fulfillment_usd, {
-    sales_window, fee_context, fulfillment_fee_basis, operating_period, operating_months, rawInput: input,
+    fulfillment_fee_basis, rawInput: input,
   }, dateCtxR58, registeredIds, expectedPackageRef);
-  if (isR59 && resolvedPlacementUsd !== null) {
+  if (resolvedPlacementUsd !== null) {
     const splitOpt = input.placement_split_option ?? placement_fee_basis?.split_option ?? null;
     const pkgTier = effectivePkg
       ? classifySizeTier2027(effectivePkg, { is_apparel: is_apparel_or_shoes, is_dangerous_goods: dgCheckR58.value === true })
@@ -1447,14 +1461,30 @@ export function evaluateEarlyScreen(input, options = {}) {
       (declaredEarlyTier.length > 0 && !declaredEarlyTier.includes('oversize'));
     if (!isConfirmedOversize &&
       (splitOpt === 'amazon_optimized' || (hasEarlyNonOversizeEvidence && round(resolvedPlacementUsd) === 0))) {
+      const earlyHeadhaulScope = input.headhaul_destination_scope ??
+        placement_fee_basis?.headhaul_destination_scope ??
+        (headhaul && typeof headhaul === 'object' ? (headhaul.destination_scope ?? headhaul.headhaul_destination_scope ?? null) : null);
+      const earlyHeadhaulRate = finite(input.headhaul_rate_cny_per_kg)
+        ? input.headhaul_rate_cny_per_kg
+        : finite(placement_fee_basis?.headhaul_rate_cny_per_kg)
+          ? placement_fee_basis.headhaul_rate_cny_per_kg
+          : (headhaul && typeof headhaul === 'object' && finite(headhaul.rate_cny_per_kg) ? headhaul.rate_cny_per_kg : null);
+      const earlySteadyState = input.steady_state_replenishment ??
+        placement_fee_basis?.steady_state_replenishment ??
+        (headhaul && typeof headhaul === 'object' ? headhaul.steady_state_replenishment : undefined) ??
+        true;
       const optOk = isAmazonOptimizedPlacementVerified2027({
         identical_cartons_count: input.identical_cartons_count ?? placement_fee_basis?.identical_cartons_count ?? null,
-        multi_destination_headhaul_verified: input.multi_destination_headhaul_verified ?? placement_fee_basis?.multi_destination_headhaul_verified ?? false,
+        multi_destination_headhaul_verified: input.multi_destination_headhaul_verified ?? placement_fee_basis?.multi_destination_headhaul_verified ?? undefined,
+        steady_state_replenishment: earlySteadyState,
+        headhaul,
+        headhaul_rate_cny_per_kg: earlyHeadhaulRate,
+        headhaul_destination_scope: earlyHeadhaulScope,
       });
       if (!optOk) resolvedPlacementUsd = null;
     }
   }
-  if (isR59 && resolvedFulfillmentUsd !== null && pricing?.valid) {
+  if (resolvedFulfillmentUsd !== null && pricing.valid) {
     const hasCouponNoPrime = (
       (pricing.ongoing_coupon_usd ?? 0) > 0 ||
       (pricing.ongoing_coupon_pct ?? 0) > 0 ||
@@ -1499,13 +1529,19 @@ export function evaluateEarlyScreen(input, options = {}) {
     if (rightsState === true) reasons.push('Confirmed specific-design rights conflict excludes this concrete form.');
     if (dateState === true) reasons.push('Strong holiday/date dependency is deferred in this profile.');
     if (dateState === 'unknown') reasons.push('Strong holiday/date dependency has not been verified.');
-    if (dateCtxR58 && !dateCtxR58.valid) reasons.push(dateCtxR58.reason);
+    if (!dateCtxR58.valid) reasons.push(dateCtxR58.reason);
     reasons.push('Category return/refund proxy (refund_fraction) is missing.');
     const gateStatus = (!pricePass || rightsState === true) ? 'fail' : dateState === true ? 'deferred' : 'pending';
     return {
       gate_status: gateStatus,
       proceed_to_21_items: false,
-      ...(isR58 ? { proceed_to_gate2: false, profile_revision: rev, order_plan: orderPlan } : {}),
+      proceed_to_gate2: false,
+      profile_revision: rev,
+      order_plan: orderPlan,
+      cost_basis: bareGoodsMode ? 'bare_goods_1688' : 'landed_domestic_explicit',
+      ...(bareGoodsMode ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
+      ...(advisoryDomesticFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomesticFreightCny } : {}),
+      ...(headhaulRes.advisory_replenishment_note ? { advisory_replenishment_note: headhaulRes.advisory_replenishment_note } : {}),
       reasons,
       checks: {
         reference_price: pricePass ? 'pass' : 'fail',
@@ -1524,7 +1560,7 @@ export function evaluateEarlyScreen(input, options = {}) {
         domestic_freight_usd: domesticQuoteValid ? domesticUsd : null, headhaul_usd: headhaulUsd,
         net_cost_usd: null, contribution_usd: null, margin: null, advertising_scenario_margin: null,
         procurement_cap_at_floor_usd: null, procurement_buffer_usd: null, procurement_buffer_cny: null,
-        ...(isR58 ? { landed_domestic_cap_at_floor_usd: null, landed_domestic_cap_at_floor_cny: null } : {}),
+        landed_domestic_cap_at_floor_usd: null, landed_domestic_cap_at_floor_cny: null,
       },
     };
   }
@@ -1535,16 +1571,10 @@ export function evaluateEarlyScreen(input, options = {}) {
   const resolvedOtherApplicable = otherApplicableValid ? round(other_applicable_usd) : null;
 
   const rPhysical = hasExplicitPhysical ? physical_return_fraction : refund_fraction;
-  const catCheck = isR58
-    ? resolveConsistentFeeCategory([returns_processing_fee_basis?.fee_category, fee_category])
-    : { present: false, valid: true, value: null };
+  const catCheck = resolveConsistentFeeCategory([returns_processing_fee_basis?.fee_category, fee_category]);
   const verifiedCat = catCheck.valid && catCheck.present ? lookupVerified2027ReturnThreshold(catCheck.value) : null;
-  const threshCheck = isR58
-    ? resolveConsistentNumeric([returns_processing_fee_basis?.return_threshold, return_threshold], v => finite(v) && v >= 0 && v < 1)
-    : { present: finite(return_threshold) && return_threshold >= 0 && return_threshold < 1, valid: true, value: return_threshold };
-  const perRetCheck = isR58
-    ? resolveConsistentNumeric([returns_processing_fee_basis?.per_return_fee_usd, per_return_fee_usd], v => finite(v) && v > 0)
-    : { present: finite(per_return_fee_usd) && per_return_fee_usd > 0, valid: true, value: per_return_fee_usd };
+  const threshCheck = resolveConsistentNumeric([returns_processing_fee_basis?.return_threshold, return_threshold], v => finite(v) && v >= 0 && v < 1);
+  const perRetCheck = resolveConsistentNumeric([returns_processing_fee_basis?.per_return_fee_usd, per_return_fee_usd], v => finite(v) && v > 0);
   const effectiveThreshold = threshCheck.valid && threshCheck.present ? threshCheck.value : null;
   const effectivePerReturn = perRetCheck.valid && perRetCheck.present ? perRetCheck.value : null;
   const hasThreshold = effectiveThreshold !== null;
@@ -1552,31 +1582,31 @@ export function evaluateEarlyScreen(input, options = {}) {
   const hasExemption = Boolean(returns_processing_exemption && typeof returns_processing_exemption === 'object' &&
     text(returns_processing_exemption.reason) &&
     Array.isArray(returns_processing_exemption.evidence) && returns_processing_exemption.evidence.length > 0 &&
-    (!isR58 || registeredIds !== null) &&
-    returns_processing_exemption.evidence.every(id => text(id) && (!registeredIds || registeredIds.has(id))));
+    registeredIds !== null &&
+    returns_processing_exemption.evidence.every(id => text(id) && registeredIds.has(id)));
 
   let resolvedReturnsProcessing = null;
   let returnsProcessingStatus = 'pending';
   let returnsProcessingBasis = 'Missing returns-processing fee or category return threshold';
   let returnsComponents = null;
 
-  if (isR58) {
+  {
     const wtCheck = resolveConsistentPkgWeightLb(effectivePkg);
     const isOfficial2027RetVersion = /^US-FBA-2027/i.test(String(returns_processing_fee_basis?.version ?? '').trim());
     const backdatedOfficial2027Ret = !isOfficial2027ScheduleWindowValid('returns_processing', returns_processing_fee_basis, is_apparel_or_shoes);
-    const minRetStart = is_apparel_or_shoes && isR59 ? '2027-01-15' : '2027-02-01';
-    const maxRetEnd = isR59 ? '2028-01-14' : '2027-12-31';
-    const in2027RetWindow = Boolean(dateCtxR58?.valid && dateCtxR58.salesWin.from >= minRetStart && dateCtxR58.salesWin.through <= maxRetEnd);
-    const verifiedPerRet = (!is_apparel_or_shoes || isR59) && (in2027RetWindow || isOfficial2027RetVersion)
-      ? lookupVerified2027PerReturnFee(effectivePkg, { isApparelOrShoes: is_apparel_or_shoes, allowAll2027Tiers: isR59 })
+    const minRetStart = is_apparel_or_shoes ? '2027-01-15' : '2027-02-01';
+    const maxRetEnd = '2028-01-14';
+    const in2027RetWindow = Boolean(dateCtxR58.valid && dateCtxR58.salesWin.from >= minRetStart && dateCtxR58.salesWin.through <= maxRetEnd);
+    const verifiedPerRet = (in2027RetWindow || isOfficial2027RetVersion)
+      ? lookupVerified2027PerReturnFee(effectivePkg, { isApparelOrShoes: is_apparel_or_shoes, allowAll2027Tiers: true })
       : null;
     const catThreshMismatch = Boolean(verifiedCat && hasThreshold && effectiveThreshold !== verifiedCat.threshold);
     const perRetMismatch = Boolean(verifiedPerRet !== null && hasPerReturn && Math.abs(effectivePerReturn - verifiedPerRet) > 1e-9);
     const preFeb2027NoBasis = Boolean(returns_processing_fee_basis === undefined && !is_apparel_or_shoes && !hasExemption && rPhysical > 0 &&
-      (!dateCtxR58?.valid || dateCtxR58.salesWin.from < '2027-02-01' || dateCtxR58.salesWin.through > '2027-12-31'));
+      (!dateCtxR58.valid || dateCtxR58.salesWin.from < '2027-02-01' || dateCtxR58.salesWin.through > '2027-12-31'));
     if (badPackagesR58 || !apparelCheckR58.valid || !dgCheckR58.valid || !overCheckR58.valid || (wtCheck.present && !wtCheck.valid) || backdatedOfficial2027Ret ||
       !catCheck.valid || !threshCheck.valid || !perRetCheck.valid || catThreshMismatch || perRetMismatch || preFeb2027NoBasis ||
-      (returns_processing_fee_basis !== undefined && (!dateCtxR58?.valid || !basisCoversWindow(returns_processing_fee_basis, dateCtxR58.salesWin, false, registeredIds, expectedPackageRef, 'returns_processing', is_apparel_or_shoes)))) {
+      (returns_processing_fee_basis !== undefined && (!dateCtxR58.valid || !basisCoversWindow(returns_processing_fee_basis, dateCtxR58.salesWin, false, registeredIds, expectedPackageRef, 'returns_processing', is_apparel_or_shoes)))) {
       resolvedReturnsProcessing = null;
       returnsProcessingStatus = 'pending';
       returnsProcessingBasis = preFeb2027NoBasis
@@ -1682,42 +1712,20 @@ export function evaluateEarlyScreen(input, options = {}) {
       } else {
         resolvedReturnsProcessing = null;
         returnsProcessingStatus = 'pending';
-        returnsProcessingBasis = 'Revision 58 requires a verified return_threshold or evidenced official exemption whenever r_physical > 0.';
+        returnsProcessingBasis = 'Revision 59 requires a verified return_threshold or evidenced official exemption whenever r_physical > 0.';
       }
-    }
-  } else {
-    // Legacy revision 57 behavior preserved verbatim.
-    const thresholdProvenBelow = hasThreshold && refund_fraction <= return_threshold;
-    if (finite(returns_processing_usd) && returns_processing_usd >= 0) {
-      resolvedReturnsProcessing = round(returns_processing_usd);
-      if (resolvedReturnsProcessing === 0 && thresholdProvenBelow) {
-        returnsProcessingStatus = 'not_applicable';
-        returnsProcessingBasis = 'Category return proxy does not exceed supplied FBA returns threshold';
-      } else if (resolvedReturnsProcessing === 0) {
-        returnsProcessingStatus = 'not_applicable';
-        returnsProcessingBasis = 'Explicitly supplied zero returns-processing fee for declared scenario';
-      } else {
-        returnsProcessingStatus = 'estimated';
-        returnsProcessingBasis = 'Supplied FBA returns-processing fee estimate';
-      }
-    } else if (returns_processing_usd === undefined && thresholdProvenBelow) {
-      resolvedReturnsProcessing = 0;
-      returnsProcessingStatus = 'not_applicable';
-      returnsProcessingBasis = 'Category return proxy does not exceed supplied FBA returns threshold';
     }
   }
 
-  const computedCouponFeeR59 = isR59
-    ? computeAmazonCouponRedemptionFee2027({
-      net_effective_price_usd: price_usd,
-      ongoing_coupon_usd,
-      ongoing_coupon_pct,
-      coupon_redemption_share: input.coupon_redemption_share ?? 1,
-      coupon_campaign_units: input.coupon_campaign_units ?? (Number.isSafeInteger(order_units) && order_units >= 100 ? order_units : 100),
-      include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
-    })
-    : { applicable: false, per_unit_usd: 0 };
-  const explicitCouponFeeUsd = isR59 && finite(input.coupon_redemption_fee_usd) && input.coupon_redemption_fee_usd > 0
+  const computedCouponFeeR59 = computeAmazonCouponRedemptionFee2027({
+    net_effective_price_usd: price_usd,
+    ongoing_coupon_usd,
+    ongoing_coupon_pct,
+    coupon_redemption_share: input.coupon_redemption_share ?? 1,
+    coupon_campaign_units: input.coupon_campaign_units ?? (Number.isSafeInteger(order_units) && order_units >= 100 ? order_units : 100),
+    include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
+  });
+  const explicitCouponFeeUsd = finite(input.coupon_redemption_fee_usd) && input.coupon_redemption_fee_usd > 0
     ? round(input.coupon_redemption_fee_usd)
     : 0;
   const requiredCouponFeeUsd = Math.max(
@@ -1756,20 +1764,31 @@ export function evaluateEarlyScreen(input, options = {}) {
     id: lineId, amount_usd: amount, status, basis,
   });
 
+  const domesticLine = bareGoodsMode
+    ? {
+      id: 'domestic_freight',
+      amount_usd: 0,
+      status: 'not_applicable',
+      bare_goods_screening: true,
+      basis: BARE_GOODS_DISCLOSURE_ZH,
+      ...(advisoryDomesticFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomesticFreightCny } : {}),
+    }
+    : {
+      ...line('domestic_freight', domesticQuoteValid ? domesticUsd : null, !freightPromoClear
+        ? 'Unconfirmed or promotional domestic shipping quote' : `${order_units ?? 100}-unit regular domestic delivery allocation`),
+      ...(domesticQuoteValid && domCnyDerivation ? { cny_derivation: domCnyDerivation } : {}),
+    };
+
   const lines = [
     {
       ...line('procurement', procurementUsd, goodsPromoClear ? `${order_units ?? 100}-unit regular repeat-order unit procurement` : 'Unconfirmed or promotional goods quote'),
-      ...(isR58 && orderPlan && procurementUsd !== null ? { order_units: orderPlan.allocated_sets, sku_lines: orderPlan.sku_lines } : {}),
-      ...(isR58 && !orderPlan && procCnyDerivation && procurementUsd !== null ? { cny_derivation: procCnyDerivation } : {}),
+      ...(orderPlan && procurementUsd !== null ? { order_units: orderPlan.allocated_sets, sku_lines: orderPlan.sku_lines } : {}),
+      ...(!orderPlan && procCnyDerivation && procurementUsd !== null ? { cny_derivation: procCnyDerivation } : {}),
     },
-    {
-      ...line('domestic_freight', domesticQuoteValid ? domesticUsd : null, !freightPromoClear
-        ? 'Unconfirmed or promotional domestic shipping quote' : `${order_units ?? 100}-unit regular domestic delivery allocation`),
-      ...(isR58 && domesticQuoteValid && domCnyDerivation ? { cny_derivation: domCnyDerivation } : {}),
-    },
+    domesticLine,
     {
       ...line('headhaul', headhaulUsd, 'Sea-freight chargeable weight plus explicit surcharge and bond'),
-      ...(isR58 && headhaulRes.cny_derivation && headhaulUsd !== null ? { cny_derivation: headhaulRes.cny_derivation } : {}),
+      ...(headhaulRes.cny_derivation && headhaulUsd !== null ? { cny_derivation: headhaulRes.cny_derivation } : {}),
     },
     line('referral', referral ? referral.net_usd : null, referral ? 'Refund-adjusted net referral fee including refund administration' : 'Missing category referral terms'),
     line('fulfillment', resolvedFulfillmentUsd, 'Applicable dated non-SIPP FBA fulfillment fee'),
@@ -1777,11 +1796,11 @@ export function evaluateEarlyScreen(input, options = {}) {
     line('storage', storageUsd, 'FBA monthly storage fee allocated to >=45 average inventory days'),
     {
       id: 'returns_processing', amount_usd: resolvedReturnsProcessing, status: returnsProcessingStatus, basis: returnsProcessingBasis,
-      ...(isR58 && hasThreshold ? { return_threshold: effectiveThreshold } : {}),
-      ...(isR58 && hasPerReturn ? { per_return_fee_usd: effectivePerReturn } : {}),
-      ...(isR58 && catCheck.present && catCheck.valid ? { fee_category: catCheck.value } : {}),
-      ...(isR58 && hasExemption ? { exemption: returns_processing_exemption } : {}),
-      ...(isR58 && is_apparel_or_shoes ? { is_apparel_or_shoes: true } : {}),
+      ...(hasThreshold ? { return_threshold: effectiveThreshold } : {}),
+      ...(hasPerReturn ? { per_return_fee_usd: effectivePerReturn } : {}),
+      ...(catCheck.present && catCheck.valid ? { fee_category: catCheck.value } : {}),
+      ...(hasExemption ? { exemption: returns_processing_exemption } : {}),
+      ...(is_apparel_or_shoes ? { is_apparel_or_shoes: true } : {}),
     },
     defer_return_outcomes
       ? { id: 'returns_disposal', amount_usd: null, status: 'deferred', basis: 'Paired return disposition and recovery deferred in initial screen' }
@@ -1807,17 +1826,17 @@ export function evaluateEarlyScreen(input, options = {}) {
   const ledger = calculateEconomics(
     {
       id, saleable_unit, price_usd, refund_fraction,
-      ...(isR59 && requiredCouponFeeUsd > 0 ? {
+      ...(requiredCouponFeeUsd > 0 ? {
         coupon_redemption_fee_usd: requiredCouponFeeUsd,
         coupon_fee_already_in_other: true,
       } : {}),
-      ...(isR58 && hasExplicitPhysical ? { physical_return_fraction } : {}),
-      ...(isR58 && orderPlan && finite(fx) && fx > 0 ? { source_inputs: { fx_cny_per_usd: fx } } : {}),
+      ...(hasExplicitPhysical ? { physical_return_fraction } : {}),
+      ...(orderPlan && finite(fx) && fx > 0 ? { source_inputs: { fx_cny_per_usd: fx } } : {}),
       assumptions, lines,
     },
-    isR58 ? { profileRevision: rev } : {},
+    { profileRevision: rev },
   );
-  const marginComplete = ledger.margin !== null && (!dateCtxR58 || dateCtxR58.valid);
+  const marginComplete = ledger.margin !== null && dateCtxR58.valid;
   const marginPass = marginComplete && ledgerMeetsMarginFloor(ledger, margin_floor);
 
   const reasons = [];
@@ -1825,17 +1844,15 @@ export function evaluateEarlyScreen(input, options = {}) {
   if (rightsState === true) reasons.push('Confirmed specific-design rights conflict excludes this concrete form.');
   if (dateState === true) reasons.push('Strong holiday/date dependency is deferred in this profile.');
   if (dateState === 'unknown') reasons.push('Strong holiday/date dependency has not been verified.');
-  if (dateCtxR58 && !dateCtxR58.valid) reasons.push(dateCtxR58.reason);
+  if (!dateCtxR58.valid) reasons.push(dateCtxR58.reason);
   if (first_order_promotion === true || goods_first_order_promotion === true) {
     reasons.push('First-order promotion on goods or domestic shipping cannot support repeat-order economics.');
-  } else if (!goodsPromoClear || !freightPromoClear) {
+  } else if (!goodsPromoClear || (!bareGoodsMode && !freightPromoClear)) {
     reasons.push('Regular repeat-order status (first_order_promotion: false) must be explicitly confirmed.');
   } else if (!orderUnitsValid) {
-    reasons.push(isR58
-      ? `Regular domestic quote must use an integer order_units >= 100 matching any sku_lines[] (received ${order_units}).`
-      : `Regular domestic quote must use 100 complete saleable units (received ${order_units}).`);
-  } else if (procurementUsd === null || domesticUsd === null) {
-    reasons.push('Regular goods or domestic freight quote is missing.');
+    reasons.push(`Regular domestic quote must use an integer order_units >= 100 matching any sku_lines[] (received ${order_units}).`);
+  } else if (procurementUsd === null || (!bareGoodsMode && domesticUsd === null)) {
+    reasons.push(bareGoodsMode ? 'Regular 1688 bare-goods quote is missing.' : 'Regular goods or domestic freight quote is missing.');
   }
   if (headhaulRes.weight_conflict && headhaulRes.conflict_reason) {
     reasons.push(headhaulRes.conflict_reason);
@@ -1848,7 +1865,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     const pctDisplay = Number(pct2) >= margin_floor * 100 ? (ledger.margin * 100).toFixed(6) : pct2;
     reasons.push(`Pre-ad net margin ${pctDisplay}% is below the ${floorPct}% floor.`);
   }
-  if (isR58 && rightsState === 'unknown' && pricePass && dateState === false && domesticQuoteValid && marginPass) {
+  if (rightsState === 'unknown' && pricePass && dateState === false && domesticQuoteValid && marginPass) {
     reasons.push('Economic checks passed; specific-design rights remain unsearched (eligible to advance to Gate 2 rights check).');
   }
 
@@ -1875,7 +1892,7 @@ export function evaluateEarlyScreen(input, options = {}) {
 
   let landedDomesticCapUsd = null;
   let landedDomesticCapCny = null;
-  if (isR58 && (!dateCtxR58 || dateCtxR58.valid)) {
+  if (dateCtxR58.valid) {
     const nonDomesticPending = ledger.pending_lines.filter(k => k !== 'procurement' && k !== 'domestic_freight');
     if (nonDomesticPending.length === 0) {
       let nonDomesticA = 0;
@@ -1888,57 +1905,15 @@ export function evaluateEarlyScreen(input, options = {}) {
     }
   }
 
-  let negotiationShortlist = null;
-  if (isR58 && !isR59 && pricePass && rightsState !== true && marginComplete && !marginPass && procurementUsd !== null && domesticUsd !== null) {
-    const negotiableCostUsd = procurementUsd > 0 ? procurementUsd : 0;
-    if (negotiableCostUsd > 0) {
-      // Exact unrounded BigInt rational shortlist check: max(0, floor*R - G) / C <= 0.12
-      const pR = toBigRat(price_usd);
-      const rR = toBigRat(refund_fraction);
-      const netRevR = { n: pR.n * (rR.d - rR.n), d: pR.d * rR.d };
-      const flR = toBigRat(margin_floor);
-      const allowCostR = { n: netRevR.n * (flR.d - flR.n), d: netRevR.d * flR.d };
-      const excludedSet = new Set([...ledger.pending_lines, ...ledger.deferred_lines]);
-      let totalCostR = { n: 0n, d: 1n };
-      for (const l of ledger.lines) {
-        if (excludedSet.has(l.id)) continue;
-        const amtR = l.exact_usd_rational && typeof l.exact_usd_rational.num === 'string' && typeof l.exact_usd_rational.den === 'string'
-          ? { n: BigInt(l.exact_usd_rational.num), d: BigInt(l.exact_usd_rational.den) }
-          : toBigRat(l.amount_usd);
-        totalCostR = addBigRat(totalCostR, l.id === 'recovery_credit' ? { n: -amtR.n, d: amtR.d } : amtR);
-      }
-      // gap = totalCost - (1 - floor)*R = floor*R - G
-      const rawGapR = addBigRat(totalCostR, { n: -allowCostR.n, d: allowCostR.d });
-      const gapR = rawGapR.n > 0n ? rawGapR : { n: 0n, d: 1n };
-      const procLineObj = ledger.lines.find(l => l.id === 'procurement');
-      const cR = procLineObj?.exact_usd_rational && typeof procLineObj.exact_usd_rational.num === 'string' && typeof procLineObj.exact_usd_rational.den === 'string'
-        ? { n: BigInt(procLineObj.exact_usd_rational.num), d: BigInt(procLineObj.exact_usd_rational.den) }
-        : toBigRat(negotiableCostUsd);
-      const maxDiscR = { n: 12n, d: 100n };
-      const rhsR = { n: maxDiscR.n * cR.n, d: maxDiscR.d * cR.d };
-      const exactEligible = gapR.n * rhsR.d <= rhsR.n * gapR.d;
-      const baseShortlist = computeNegotiationShortlist({
-        net_revenue_usd: netRevenue,
-        contribution_usd: ledger.contribution_usd,
-        negotiable_cost_usd: negotiableCostUsd,
-        margin_floor,
-      });
-      negotiationShortlist = {
-        ...baseShortlist,
-        eligible: exactEligible,
-      };
-    }
-  }
-
   let packagingRedesignShortlist = null;
-  if (isR59 && pricePass && rightsState !== true && marginComplete && !marginPass &&
-    procurementUsd !== null && domesticUsd !== null && effectivePkg && referral !== null &&
-    collectionRateValid && headhaulUsd !== null && finite(fx) && fx > 0 && dateCtxR58?.valid &&
+  if (pricePass && rightsState !== true && marginComplete && !marginPass &&
+    procurementUsd !== null && (bareGoodsMode || domesticUsd !== null) && effectivePkg && referral !== null &&
+    collectionRateValid && headhaulUsd !== null && finite(fx) && fx > 0 && dateCtxR58.valid &&
     dateCtxR58.salesWin.from >= '2027-01-15' && dateCtxR58.salesWin.through <= '2027-10-14') {
     const pkgCheck = computePackagingRedesignShortlist2027({
       pkg: effectivePkg,
       price_usd,
-      list_price_usd: pricing?.valid ? pricing.list_price_usd : input.list_price_usd,
+      list_price_usd: pricing.valid ? pricing.list_price_usd : input.list_price_usd,
       net_effective_price_usd: price_usd,
       ongoing_coupon_usd: input.ongoing_coupon_usd,
       ongoing_coupon_pct: input.ongoing_coupon_pct,
@@ -1947,13 +1922,17 @@ export function evaluateEarlyScreen(input, options = {}) {
       prime_exclusive_discount_pct: input.prime_exclusive_discount_pct,
       promo_basis_already_net: true,
       fx_cny_per_usd: fx,
-      landed_domestic_usd: round(procurementUsd + domesticUsd),
+      landed_domestic_usd: round(procurementUsd + (bareGoodsMode ? 0 : domesticUsd)),
       refund_fraction,
       physical_return_fraction: rPhysical,
       fee_category: catCheck.present && catCheck.valid ? catCheck.value : fee_category,
       return_threshold: hasThreshold ? effectiveThreshold : null,
       referral_terms,
       headhaul_usd: headhaulUsd,
+      headhaul,
+      headhaul_rate_cny_per_kg: input.headhaul_rate_cny_per_kg ?? placement_fee_basis?.headhaul_rate_cny_per_kg ?? null,
+      headhaul_destination_scope: input.headhaul_destination_scope ?? placement_fee_basis?.headhaul_destination_scope ?? null,
+      steady_state_replenishment: input.steady_state_replenishment ?? placement_fee_basis?.steady_state_replenishment ?? true,
       collection_rate,
       other_applicable_usd: couponAlreadyInOther
         ? Math.max(0, round((resolvedOtherApplicable ?? 0) - requiredCouponFeeUsd))
@@ -1982,24 +1961,23 @@ export function evaluateEarlyScreen(input, options = {}) {
   return {
     gate_status: gateStatus,
     proceed_to_21_items: gateStatus === 'pass',
-    ...(isR58 ? {
-      proceed_to_gate2: gateStatus === 'pass' || gateStatus === 'economic_pass_rights_unsearched',
-      profile_revision: rev,
-      order_plan: orderPlan,
-      returns_processing_components: returnsComponents,
-      ...(!isR59 ? { negotiation_shortlist: negotiationShortlist } : {}),
-      ...(isR59 ? {
-        ...(headhaulRes.a4_applied ? { headhaul_a4_applied: headhaulRes.a4_applied } : {}),
-        packaging_redesign_shortlist: packagingRedesignShortlist,
-        target_goods_cny_for_30pct: procurementCap !== null && finite(fx) && fx > 0 ? Math.max(0, Math.round(procurementCap * fx * 100) / 100) : null,
-        second_factory_quote_needed: !marginComplete ? null : !marginPass,
-        second_factory_quote_note: !marginComplete
-          ? null
-          : marginPass
-            ? '首家齐套 1688 报价毛利已过 30% 红线，直接停手过关，无需再多刷工厂防撞滑块。'
-            : '当前工厂报价毛利 < 30%，建议补查更便宜的第 2 家（最多第 3 家）靠谱齐套厂。',
-      } : {}),
-    } : {}),
+    proceed_to_gate2: gateStatus === 'pass' || gateStatus === 'economic_pass_rights_unsearched',
+    profile_revision: rev,
+    order_plan: orderPlan,
+    cost_basis: bareGoodsMode ? 'bare_goods_1688' : 'landed_domestic_explicit',
+    ...(bareGoodsMode ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
+    ...(advisoryDomesticFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomesticFreightCny } : {}),
+    ...(headhaulRes.advisory_replenishment_note ? { advisory_replenishment_note: headhaulRes.advisory_replenishment_note } : {}),
+    returns_processing_components: returnsComponents,
+    ...(headhaulRes.a4_applied ? { headhaul_a4_applied: headhaulRes.a4_applied } : {}),
+    packaging_redesign_shortlist: packagingRedesignShortlist,
+    target_goods_cny_for_30pct: procurementCap !== null && finite(fx) && fx > 0 ? Math.max(0, Math.round(procurementCap * fx * 100) / 100) : null,
+    second_factory_quote_needed: !marginComplete ? null : !marginPass,
+    second_factory_quote_note: !marginComplete
+      ? null
+      : marginPass
+        ? '首家齐套 1688 报价毛利已过 30% 红线，直接停手过关，无需再多刷工厂防撞滑块。'
+        : '当前工厂报价毛利 < 30%，建议补查更便宜的第 2 家（最多第 3 家）靠谱齐套厂。',
     reasons,
     checks: {
       reference_price: pricePass ? 'pass' : 'fail',
@@ -2022,10 +2000,8 @@ export function evaluateEarlyScreen(input, options = {}) {
       procurement_cap_at_floor_usd: procurementCap,
       procurement_buffer_usd: bufferUsd,
       procurement_buffer_cny: bufferCny,
-      ...(isR58 ? {
-        landed_domestic_cap_at_floor_usd: landedDomesticCapUsd,
-        landed_domestic_cap_at_floor_cny: landedDomesticCapCny,
-      } : {}),
+      landed_domestic_cap_at_floor_usd: landedDomesticCapUsd,
+      landed_domestic_cap_at_floor_cny: landedDomesticCapCny,
     },
   };
 }

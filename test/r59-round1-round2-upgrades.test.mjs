@@ -2120,7 +2120,7 @@ test('Astra Full-Capability Audit Round-1 Remediations (B1, H1-H16, M1-M9, L1)',
       goods_cny_per_unit: 40,
       domestic_freight_cny_total: 120,
       first_order_promotion: false,
-      headhaul: { actual_weight_kg_per_unit: 0.25, rate_cny_per_kg: 12, bond_cny_per_shipment: 150 }, // 25 kg < 50 kg without small_shipment_surcharge_cny_per_kg!
+      headhaul: { actual_weight_kg_per_unit: 0.25, rate_cny_per_kg: 12, bond_cny_per_shipment: 150, steady_state_replenishment: false }, // explicit small-batch <50 kg without small_shipment_surcharge_cny_per_kg!
       refund_fraction: 0.04,
       return_threshold: 0.05,
       referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5, minimum_referral_usd: 0.30 },

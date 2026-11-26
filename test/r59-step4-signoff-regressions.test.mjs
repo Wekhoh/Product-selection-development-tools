@@ -240,8 +240,10 @@ test('Astra Sign-Off #4 & #5: structured A4 headhaul in Gate 1A ($0.9166666667/s
   const estScalar = estimateGate1A2027({
     ...base,
     headhaul_usd: 660 / 100 / 7.20,
+    multi_destination_headhaul_verified: true,
   });
   assert.equal(estStruct.status, 'verified');
+  assert.equal(estStruct.components.placement.selected_usd, 0);
   assert.equal(estStruct.landed_domestic_cap_usd, estScalar.landed_domestic_cap_usd);
   assert.ok(Math.abs(estStruct.components.headhaul.amount_usd - 0.9166666667) < 1e-9);
 
@@ -1129,8 +1131,8 @@ test('Astra Round-2 Counterexamples B: $0 placement proof in calculateEconomics/
     }, { profileRevision: 59 });
     assert.equal(earlyUnproven.gate_status, 'pending', 'Standard early screen with unproven $0 placement must stay pending');
 
-    // 2) profit-check (`runFastProfitHealthcheck2027`): missing domestic freight NEVER assumed ¥0; structured A4 matches scalar!
-    const hcMissingFreight = runFastProfitHealthcheck2027({
+    // 2) profit-check (`runFastProfitHealthcheck2027`): ADR-0002 bare-goods initial screening with mandatory disclosure; structured A4 matches scalar!
+    const hcBareGoods = runFastProfitHealthcheck2027({
       pkg: { length_in: 12, width_in: 8, height_in: 3, unit_weight_lb: 1.5 },
       price_usd: 45.00,
       fx_cny_per_usd: 7.20,
@@ -1138,8 +1140,10 @@ test('Astra Round-2 Counterexamples B: $0 placement proof in calculateEconomics/
       goods_cny_total: 10480,
       headhaul_usd: 1.50,
     });
-    assert.equal(hcMissingFreight.realized_2027_off_peak.status, 'pending_domestic_freight');
-    assert.equal(hcMissingFreight.realized_2027_off_peak.margin, null);
+    assert.equal(hcBareGoods.cost_basis, 'bare_goods_1688');
+    assert.match(hcBareGoods.bare_goods_disclosure, /当前按 1688 裸货价算/);
+    assert.equal(hcBareGoods.realized_2027_off_peak.status, 'verified');
+    assert.ok(Number.isFinite(hcBareGoods.realized_2027_off_peak.margin));
 
     const hcScalarA4 = runFastProfitHealthcheck2027({
       pkg: { length_in: 12, width_in: 8, height_in: 3, unit_weight_lb: 1.5 },
@@ -1149,6 +1153,7 @@ test('Astra Round-2 Counterexamples B: $0 placement proof in calculateEconomics/
       goods_cny_total: 6000,
       domestic_freight_cny_total: 280,
       headhaul_usd: 660 / 100 / 7.20,
+      multi_destination_headhaul_verified: true,
     });
     const hcStructA4 = runFastProfitHealthcheck2027({
       pkg: { length_in: 12, width_in: 8, height_in: 3, unit_weight_lb: 1.5 },
