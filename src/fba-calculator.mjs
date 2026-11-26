@@ -589,6 +589,265 @@ function canonicalSkuSignature(skuLines) {
   return JSON.stringify(rows);
 }
 
+export const INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH =
+  '初筛仅认单一工厂一站齐套；只卖裸件或需跨两家厂另配标准袋/盒暂置归档';
+
+const FACTORY_IDENTITY_FIELDS = Object.freeze([
+  'factory_id',
+  'supplier_id',
+  'seller_member_id',
+  'company_name',
+  'shop_url',
+]);
+
+function parseSkuLinesArray(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string' && raw.trim()) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed;
+    } catch { /* ignore malformed JSON */ }
+  }
+  return null;
+}
+
+function normalizeShopUrlKey(trimmed) {
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+      const host = parsed.hostname.toLowerCase();
+      const path = parsed.pathname.replace(/\/+$/, '').toLowerCase();
+      return `${host}${path}`;
+    }
+  } catch { /* fall back to lowercased string */ }
+  return trimmed.toLowerCase();
+}
+
+function addFieldIdentity(fieldMap, fieldName, rawVal) {
+  let trimmed = '';
+  if (typeof rawVal === 'string') {
+    trimmed = rawVal.trim();
+  } else if (typeof rawVal === 'number' && Number.isSafeInteger(rawVal)) {
+    trimmed = String(rawVal);
+  }
+  if (!trimmed) return false;
+  const key = fieldName === 'shop_url' ? normalizeShopUrlKey(trimmed) : trimmed.toLowerCase();
+  const prev = fieldMap.get(key);
+  if (prev === undefined || trimmed < prev) {
+    fieldMap.set(key, trimmed);
+  }
+  return true;
+}
+
+function normalizeExpectedComponentsList(raw) {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object') {
+    if (Array.isArray(raw.components)) return raw.components;
+    if (Number.isSafeInteger(raw.qty_per_saleable_set) && raw.qty_per_saleable_set >= 1 &&
+      (typeof raw.component_id === 'string' || typeof raw.id === 'string')) {
+      return [raw];
+    }
+  }
+  return null;
+}
+
+/**
+ * Unified single-factory complete-kit adjudication shared by sourcing storage (`src/store.mjs`),
+ * cost/fee validation (`src/fba-calculator.mjs`, `src/economics.mjs`), standalone scoring
+ * (`src/scoring.mjs`), Gate 1B (`src/pipeline.mjs`), and HTML reports (`src/report.mjs`).
+ *
+ * Strictly permutation-invariant over `sku_lines[]` ordering, accepts both string and safe-integer
+ * factory IDs, compares each identity field cleanly (preserving same-factory aliases and stripping
+ * tracking query params on `shop_url`), checks all present `sku_lines[]` arrays for conflicts, and
+ * never falls back to `quote_id`, `offer_id`, or `scenario.id` when factory identity is absent.
+ */
+export function evaluateSingleFactoryCompleteKit(source) {
+  const src = source && typeof source === 'object' ? source : {};
+  const ledger = src.cost_ledger && typeof src.cost_ledger === 'object'
+    ? src.cost_ledger
+    : (src.scenario?.cost_ledger && typeof src.scenario.cost_ledger === 'object' ? src.scenario.cost_ledger : null);
+  const procFromLedger = Array.isArray(ledger?.lines)
+    ? ledger.lines.find(l => l?.id === 'procurement') ?? null
+    : (Array.isArray(src.lines) ? src.lines.find(l => l?.id === 'procurement') ?? null : null);
+  const procLine = (src.procLine && typeof src.procLine === 'object' ? src.procLine : null) ?? procFromLedger;
+
+  const containers = [
+    src,
+    src.quote,
+    src.scenario,
+    ledger,
+    src.source_inputs,
+    ledger?.source_inputs,
+    procLine,
+  ].filter(c => c && typeof c === 'object');
+
+  // Inspect ALL present sku_lines arrays so conflicting arrays (e.g., scenario vs cost_ledger) cannot hide cross-factory kits.
+  const candidateSkuArrays = [
+    parseSkuLinesArray(src.sku_lines),
+    parseSkuLinesArray(procLine?.sku_lines),
+    parseSkuLinesArray(ledger?.sku_lines),
+    parseSkuLinesArray(ledger?.source_inputs?.sku_lines),
+    parseSkuLinesArray(src.source_inputs?.sku_lines),
+    parseSkuLinesArray(src.quote?.sku_lines),
+    parseSkuLinesArray(src.scenario?.sku_lines),
+    parseSkuLinesArray(src.sku_lines_json),
+    parseSkuLinesArray(src.quote?.sku_lines_json),
+  ].filter(arr => Array.isArray(arr) && arr.length > 0);
+
+  const reasons = new Set();
+  if (candidateSkuArrays.length > 1) {
+    const sig0 = canonicalSkuSignature(candidateSkuArrays[0]);
+    for (let i = 1; i < candidateSkuArrays.length; i++) {
+      if (sig0 === null || canonicalSkuSignature(candidateSkuArrays[i]) !== sig0) {
+        reasons.add('Conflicting sku_lines[] supplied across scenario, cost_ledger, and procurement line.');
+        break;
+      }
+    }
+  }
+
+  const checkExplicitFlags = obj => {
+    if (!obj || typeof obj !== 'object') return;
+    if (obj.single_factory_complete_kit === false) {
+      reasons.add('Declared single_factory_complete_kit: false.');
+    }
+    if (obj.requires_cross_factory_packaging === true) {
+      reasons.add('Declared requires_cross_factory_packaging: true.');
+    }
+    if (obj.bare_parts_incomplete === true || obj.bare_part_only === true) {
+      reasons.add('Declared bare parts / incomplete kit only.');
+    }
+    if (obj.complete_set_verified === false) {
+      reasons.add('Declared complete_set_verified: false.');
+    }
+    if (obj.rejected_spec === true || obj.quote_status === 'rejected_spec') {
+      reasons.add('Quote or scenario is marked rejected_spec.');
+    }
+    if (obj.quote_status === 'incomplete_cross_factory_kit') {
+      reasons.add('Quote status is incomplete_cross_factory_kit.');
+    }
+  };
+  for (const c of containers) checkExplicitFlags(c);
+
+  const topMapsByField = Object.fromEntries(FACTORY_IDENTITY_FIELDS.map(f => [f, new Map()]));
+  const mergedMapsByField = Object.fromEntries(FACTORY_IDENTITY_FIELDS.map(f => [f, new Map()]));
+  let hasTopLevelFactory = false;
+  for (const c of containers) {
+    for (const f of FACTORY_IDENTITY_FIELDS) {
+      if (addFieldIdentity(topMapsByField[f], f, c[f])) {
+        addFieldIdentity(mergedMapsByField[f], f, c[f]);
+        hasTopLevelFactory = true;
+      }
+    }
+  }
+
+  for (const skuLines of candidateSkuArrays) {
+    let linesWithFactory = 0;
+    let validLineObjects = 0;
+    const lineFieldCounts = Object.fromEntries(FACTORY_IDENTITY_FIELDS.map(f => [f, 0]));
+    for (const line of skuLines) {
+      if (!line || typeof line !== 'object') continue;
+      validLineObjects += 1;
+      checkExplicitFlags(line);
+      let lineHasAny = false;
+      for (const f of FACTORY_IDENTITY_FIELDS) {
+        if (addFieldIdentity(mergedMapsByField[f], f, line[f])) {
+          lineHasAny = true;
+          lineFieldCounts[f] += 1;
+        }
+      }
+      if (lineHasAny) linesWithFactory += 1;
+    }
+    if (validLineObjects > 1 && linesWithFactory > 0) {
+      const sharedFieldCoversAllLines = FACTORY_IDENTITY_FIELDS.some(
+        f => lineFieldCounts[f] === validLineObjects,
+      );
+      const allAttributedLinesUseTopLevelField = hasTopLevelFactory && skuLines.every(line => {
+        if (!line || typeof line !== 'object') return true;
+        const lineFields = FACTORY_IDENTITY_FIELDS.filter(f => {
+          const v = line[f];
+          return (typeof v === 'string' && v.trim().length > 0) || (typeof v === 'number' && Number.isSafeInteger(v));
+        });
+        return lineFields.length === 0 || lineFields.some(f => topMapsByField[f].size > 0);
+      });
+      if (!sharedFieldCoversAllLines && !allAttributedLinesUseTopLevelField) {
+        reasons.add(
+          'Multi-SKU kit mixes attributed and unattributed or disjoint-field SKU lines without a shared single factory identity; confirm all components ship from one factory.',
+        );
+      }
+    }
+  }
+
+  // Enforce required saleable-set component coverage when expected_components / saleable_set_composition is supplied.
+  const expectedComponents =
+    normalizeExpectedComponentsList(src.expected_components) ??
+    normalizeExpectedComponentsList(src.saleable_set_composition) ??
+    normalizeExpectedComponentsList(src.scenario?.expected_components) ??
+    normalizeExpectedComponentsList(src.scenario?.saleable_set_composition) ??
+    normalizeExpectedComponentsList(ledger?.expected_components) ??
+    normalizeExpectedComponentsList(ledger?.saleable_set_composition) ??
+    null;
+  if (expectedComponents && expectedComponents.length > 0 && candidateSkuArrays.length > 0) {
+    for (const skuLines of candidateSkuArrays) {
+      for (const comp of expectedComponents) {
+        if (!comp || typeof comp !== 'object') continue;
+        const compId = typeof comp.component_id === 'string' && comp.component_id.trim()
+          ? comp.component_id.trim()
+          : (typeof comp.id === 'string' && comp.id.trim() ? comp.id.trim() : null);
+        const reqQty = comp.qty_per_saleable_set;
+        if (!compId || !Number.isSafeInteger(reqQty) || reqQty < 1) continue;
+        const matched = skuLines.filter(l => l && typeof l === 'object' && (l.component_id ?? l.sku_id) === compId);
+        const coveredQty = matched.reduce((sum, l) => sum + (Number.isSafeInteger(l.qty_per_saleable_set) ? l.qty_per_saleable_set : 0), 0);
+        if (coveredQty < reqQty) {
+          reasons.add(`Missing required saleable-set component "${compId}" (needs qty_per_saleable_set=${reqQty}, got ${coveredQty}).`);
+        }
+      }
+    }
+  }
+
+  let conflictingField = null;
+  let primaryPresentField = null;
+  for (const f of FACTORY_IDENTITY_FIELDS) {
+    const keys = [...mergedMapsByField[f].keys()].sort();
+    if (keys.length > 0 && !primaryPresentField) primaryPresentField = f;
+    if (keys.length > 1) {
+      if (!conflictingField) conflictingField = f;
+      reasons.add(
+        `Cross-factory kit detected across multiple ${f} values (${keys.join(', ')}); initial screening requires one factory to deliver the complete saleable set.`,
+      );
+    }
+  }
+
+  const isCrossFactoryOrIncomplete = reasons.size > 0;
+  const activeField = conflictingField ?? primaryPresentField;
+  const distinctFactoryIds = activeField ? [...mergedMapsByField[activeField].keys()].sort() : [];
+  const resolvedFactoryId = conflictingField || !primaryPresentField
+    ? null
+    : mergedMapsByField[primaryPresentField].get([...mergedMapsByField[primaryPresentField].keys()].sort()[0]);
+
+  return {
+    status: isCrossFactoryOrIncomplete ? 'incomplete_cross_factory_kit' : 'single_factory_complete_kit',
+    is_single_factory_complete_kit: !isCrossFactoryOrIncomplete,
+    is_cross_factory_or_incomplete: isCrossFactoryOrIncomplete,
+    distinct_factory_ids: distinctFactoryIds,
+    distinct_factory_count: distinctFactoryIds.length,
+    resolved_factory_id: resolvedFactoryId,
+    reasons: [...reasons].sort(),
+    kit_note: isCrossFactoryOrIncomplete ? INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH : null,
+  };
+}
+
+/**
+ * Canonical verified distinct-factory key resolver.
+ * Returns normalized lowercase factory identity ONLY for single-factory quotes/scenarios with an
+ * explicit factory/supplier identifier. Returns `null` for historical rows without `factory_id`
+ * and for cross-factory/incomplete/rejected kits (NEVER falls back to `quote_id`, `offer_id`, or `scenario.id`).
+ */
+export function resolveVerifiedFactoryKey(source) {
+  const kit = evaluateSingleFactoryCompleteKit(source);
+  if (kit.is_cross_factory_or_incomplete || kit.distinct_factory_ids.length !== 1) return null;
+  return kit.distinct_factory_ids[0];
+}
+
 export function resolveConsistentSkuLines(input, procLine) {
   const present = [input?.sku_lines, input?.source_inputs?.sku_lines, procLine?.sku_lines]
     .filter(v => v !== undefined);
@@ -808,6 +1067,16 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
     ])
     : null;
   const invalidSkuLines = Boolean(skuResolution.conflict || (skuCheck && !skuCheck.valid));
+  const kitCheck = isR59
+    ? evaluateSingleFactoryCompleteKit({
+      cost_ledger: input,
+      procLine,
+      sku_lines: skuResolution.present && !skuResolution.conflict ? skuResolution.skuLines : undefined,
+    })
+    : null;
+  if (kitCheck?.is_cross_factory_or_incomplete) {
+    add('procurement', 'incomplete_cross_factory_kit', kitCheck.kit_note);
+  }
 
   // Revision 58 physical return rate (distinct from refund_fraction when explicitly supplied).
   let rPhysical = input.refund_fraction;
@@ -1046,7 +1315,12 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
       }
     }
   }
-  return { status: issues.length ? 'needs_evidence' : 'validated', context: context ?? null, issues };
+  return {
+    status: issues.length ? 'needs_evidence' : 'validated',
+    context: context ?? null,
+    issues,
+    ...(kitCheck ? { single_factory_complete_kit: kitCheck } : {}),
+  };
 }
 
 /**
@@ -5149,10 +5423,23 @@ export function computeOrderPlan({
     if (unitPrice !== undefined && unitPrice !== null && (!finite(unitPrice) || unitPrice < 0)) {
       throw new TypeError(`sku_lines[${index}].unit_price_cny must be a nonnegative finite number.`);
     }
+    const keepId = v => (typeof v === 'string' && v.trim() ? v.trim() : (typeof v === 'number' && Number.isSafeInteger(v) ? String(v) : null));
+    const facId = keepId(line.factory_id);
+    const supId = keepId(line.supplier_id);
+    const sellerMemberId = keepId(line.seller_member_id);
+    const companyName = keepId(line.company_name);
+    const shopUrl = keepId(line.shop_url);
     return {
       ...(typeof line.component_id === 'string' && line.component_id.trim() ? { component_id: line.component_id.trim() } : {}),
-      ...(typeof line.factory_id === 'string' && line.factory_id.trim() ? { factory_id: line.factory_id.trim() } : {}),
-      ...(typeof line.supplier_id === 'string' && line.supplier_id.trim() ? { supplier_id: line.supplier_id.trim() } : {}),
+      ...(facId !== null ? { factory_id: facId } : {}),
+      ...(supId !== null ? { supplier_id: supId } : {}),
+      ...(sellerMemberId !== null ? { seller_member_id: sellerMemberId } : {}),
+      ...(companyName !== null ? { company_name: companyName } : {}),
+      ...(shopUrl !== null ? { shop_url: shopUrl } : {}),
+      ...(line.single_factory_complete_kit === false ? { single_factory_complete_kit: false } : {}),
+      ...(line.bare_part_only === true ? { bare_part_only: true } : {}),
+      ...(line.bare_parts_incomplete === true ? { bare_parts_incomplete: true } : {}),
+      ...(line.requires_cross_factory_packaging === true ? { requires_cross_factory_packaging: true } : {}),
       offer_id: line.offer_id ?? null,
       sku_id: line.sku_id ?? `sku-${index + 1}`,
       quote_unit: line.quote_unit ?? 'piece',

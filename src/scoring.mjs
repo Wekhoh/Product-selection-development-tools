@@ -2,8 +2,15 @@
 import { validEvidenceDate as validDate, sanitizeNewcomerMemberReviews } from './observations.mjs';
 import { BARE_GOODS_DISCLOSURE_ZH, BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import { calculateEconomics, ledgerMeetsMarginFloor, REQUIRED_COSTS, resolveSharedLedgerPackage } from './economics.mjs';
-import { resolveEffectivePricing, resolveUniquePackageByRef, hasProhibited2026PeakExtrapolation } from './fba-calculator.mjs';
-import { lookupUnifiedFulfillmentFee2027, priceBand2027 } from './fba-calculator.mjs';
+import {
+  resolveEffectivePricing,
+  resolveUniquePackageByRef,
+  hasProhibited2026PeakExtrapolation,
+  lookupUnifiedFulfillmentFee2027,
+  priceBand2027,
+  evaluateSingleFactoryCompleteKit,
+  resolveVerifiedFactoryKey,
+} from './fba-calculator.mjs';
 
 const EXPECTED_ITEMS = [
   ['refund_adjusted_pre_ad_margin', 22], ['unit_contribution', 8],
@@ -1956,14 +1963,27 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
   return { low, natural, diagnostics };
 }
 
-function datedScenario(scenario, economics, ctx, profile, forceSensitivityOnly = false) {
+function datedScenario(scenario, economics, ctx, profile, forceSensitivityOnly = false, expectedComponents = null) {
   let calculation = null, reason = null;
   try {
     const rawLedger = scenario?.cost_ledger;
     if (!rawLedger || rawLedger.id !== scenario.id || rawLedger.saleable_unit !== economics.saleable_unit) {
       throw new TypeError('Revision54 requires a cost_ledger with the same scenario ID and saleable unit.');
     }
-    const ledger = forceSensitivityOnly ? { ...rawLedger, sensitivity_only: true } : rawLedger;
+    const scenarioKitCheck = !forceSensitivityOnly
+      ? evaluateSingleFactoryCompleteKit({
+        scenario,
+        cost_ledger: rawLedger,
+        ...(expectedComponents ? { expected_components: expectedComponents } : {}),
+      })
+      : null;
+    const ledger = (forceSensitivityOnly || scenarioKitCheck?.is_cross_factory_or_incomplete)
+      ? {
+        ...rawLedger,
+        ...(forceSensitivityOnly ? { sensitivity_only: true } : {}),
+        ...(scenarioKitCheck?.is_cross_factory_or_incomplete ? { single_factory_complete_kit: false } : {}),
+      }
+      : rawLedger;
     calculation = calculateEconomics(ledger, { requireFeeBasis: true, requireRegularRepeatOrder: profile.revision >= 57,
       profileRevision: profile.revision, evidenceIds: [...ctx.evidence.keys()], operatingMonths: economics.operating_months,
       externalPackages: economics?.packages });
@@ -2099,17 +2119,18 @@ function validateR58PriceAnchor(anchor, ctx, minFloor = 29.99) {
   };
 }
 
-function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
+function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expectedComponents = null) {
   const marginDef = defs.find(item => item.id === 'refund_adjusted_pre_ad_margin');
   const contributionDef = defs.find(item => item.id === 'unit_contribution');
   const floor = profile.reference_screening.margin.minimum;
   const priceFloor = profile.reference_screening.comparable_reference_price.minimum_inclusive ?? 29.99;
-  const isR58 = profile.revision >= 58;
   const diagnostics = {
     saleable_unit: economics?.saleable_unit ?? null,
     scenarios: [],
     margin_range: null,
-    ...(isR58 ? { stress_scenarios: [], expected_primary_scenarios: null, structural_reason: null } : {}),
+    stress_scenarios: [],
+    expected_primary_scenarios: null,
+    structural_reason: null,
   };
   const idCounts = new Map();
   let structuralReason = null;
@@ -2121,7 +2142,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
     for (const scenario of economics.scenarios) {
       if (text(scenario?.id)) idCounts.set(scenario.id, (idCounts.get(scenario.id) ?? 0) + 1);
     }
-    if (isR58 && economics.expected_primary_scenarios !== undefined) {
+    if (economics.expected_primary_scenarios !== undefined) {
       const expectedList = economics.expected_primary_scenarios;
       if (!Array.isArray(expectedList) || expectedList.length === 0) {
         structuralReason = 'expected_primary_scenarios must be a nonempty array when supplied.';
@@ -2174,14 +2195,22 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
       structuralReason ??= 'A common saleable unit and nonempty supported economic scenario set are required.';
     }
     outerStructuralReason = structuralReason;
+    const effExpectedComponents = expectedComponents ?? economics?.saleable_set_composition ?? economics?.expected_components ?? null;
     for (const original of economics.scenarios) {
-      const scenario = profile.revision >= 54 ? datedScenario(original, economics, ctx, profile) : original;
+      const scenario = datedScenario(original, economics, ctx, profile, false, effExpectedComponents);
+      const kitCheck = evaluateSingleFactoryCompleteKit({
+        scenario: original,
+        cost_ledger: original?.cost_ledger,
+        ...(effExpectedComponents ? { expected_components: effExpectedComponents } : {}),
+      });
       const validRecord = text(scenario?.id) && idCounts.get(scenario.id) === 1 && scenario.saleable_unit === economics.saleable_unit &&
         scenario.coherent === true && Array.isArray(scenario.assumptions) && scenario.assumptions.length > 0 && scenario.assumptions.every(text) &&
-        (!isR58 || scenario?.calculation?.scoring_supported === true);
-      let eligibilityReason = validRecord ? null : 'Economic scenarios need unique IDs, the same saleable unit, coherent inputs and explicit assumptions.';
+        scenario?.calculation?.scoring_supported === true && !kitCheck.is_cross_factory_or_incomplete;
+      let eligibilityReason = kitCheck.is_cross_factory_or_incomplete
+        ? kitCheck.kit_note
+        : (validRecord ? null : 'Economic scenarios need unique IDs, the same saleable unit, coherent inputs and explicit assumptions.');
       let priceAnchorReason = null;
-      if (isR58 && scenario?.calculation?.price_usd !== undefined) {
+      if (scenario?.calculation?.price_usd !== undefined) {
         const ledgerPrice = scenario.calculation.price_usd;
         if (ledgerPrice < priceFloor) {
           priceAnchorReason = `Primary scenario price USD ${ledgerPrice} is below the USD ${priceFloor} minimum retail floor.`;
@@ -2206,20 +2235,21 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
         structuralReason = eligibilityReason;
       }
       const coherenceSupported = validRecord && !contradictoryTuple && !eligibilityReason;
-      const meetsFloor = margin.value !== null && (profile.revision >= 57 && scenario?.calculation?.scoring_supported
+      const meetsFloor = margin.value !== null && (scenario?.calculation?.scoring_supported
         ? ledgerMeetsMarginFloor(scenario.calculation, floor)
         : margin.value >= floor);
       const eligible = coherenceSupported && meetsFloor;
       eligibilityReason ??= margin.reason ?? (!meetsFloor ? 'The supported scenario margin is below the existing 30% floor.' : null);
       const effectiveMargin = eligible && margin.value < floor ? floor : margin.value;
       diagnostics.scenarios.push({ id: scenario?.id ?? null, input: scenario, margin, contribution,
-        coherence_supported: coherenceSupported, ...(isR58 ? { price_anchor_supported: priceAnchorReason === null } : {}),
+        coherence_supported: coherenceSupported, price_anchor_supported: priceAnchorReason === null,
+        single_factory_complete_kit: kitCheck,
         margin_eligible: eligible, eligibility_reason: eligibilityReason,
         margin_score: eligible ? numericScore(marginDef, effectiveMargin) : null,
         contribution_score: eligible && contribution.value !== null ? numericScore(contributionDef, contribution.value) : null });
     }
   }
-  if (isR58 && Array.isArray(economics?.stress_scenarios)) {
+  if (Array.isArray(economics?.stress_scenarios)) {
     const primaryHasOngoingPromo = Boolean(priceRefR58?.has_ongoing_discount) ||
       diagnostics.scenarios.some(sc => sc.input?.calculation?.ongoing_discount_usd > 0 || sc.input?.cost_ledger?.ongoing_coupon_usd > 0 ||
         sc.input?.cost_ledger?.ongoing_coupon_pct > 0 || sc.input?.cost_ledger?.prime_exclusive_discount_usd > 0 ||
@@ -2317,43 +2347,36 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
     });
   }
   const scenarios = diagnostics.scenarios;
-  const isR59 = profile.revision >= 59;
+  const incompleteKitScenarioIds = scenarios
+    .filter(s => s.single_factory_complete_kit?.is_cross_factory_or_incomplete)
+    .map(s => s.id)
+    .filter(Boolean);
+  diagnostics.single_factory_complete_kit_status = incompleteKitScenarioIds.length > 0
+    ? 'incomplete_cross_factory_kit'
+    : 'single_factory_complete_kit';
+  if (incompleteKitScenarioIds.length > 0) {
+    diagnostics.incomplete_cross_factory_kit_scenario_ids = incompleteKitScenarioIds;
+  }
   const marginsComplete = !structuralReason && scenarios.every(scenario => scenario.margin.value !== null);
   if (marginsComplete) diagnostics.margin_range = span(scenarios.map(scenario => scenario.margin.value));
   let marginStatus = 'pending';
   let marginReason = structuralReason ?? 'One or more economic scenarios lacks a supported complete margin; missing costs are not zero.';
   if (marginsComplete) {
-    const allFail = profile.revision >= 57 ? scenarios.every(s => !s.margin_eligible) : diagnostics.margin_range[1] < floor;
-    const allPass = profile.revision >= 57 ? scenarios.every(s => s.margin_eligible) : diagnostics.margin_range[0] >= floor;
-    if (isR59) {
-      const distinctFactories = new Set(
-        scenarios.map(s => {
-          const procLine = Array.isArray(s?.input?.cost_ledger?.lines)
-            ? s.input.cost_ledger.lines.find(l => l?.id === 'procurement')
-            : null;
-          const firstSku = Array.isArray(procLine?.sku_lines) ? procLine.sku_lines[0] : null;
-          const fKey = s?.input?.factory_id ??
-            s?.input?.supplier_id ??
-            s?.input?.cost_ledger?.source_inputs?.factory_id ??
-            s?.input?.cost_ledger?.source_inputs?.supplier_id ??
-            firstSku?.factory_id ??
-            firstSku?.supplier_id ??
-            firstSku?.offer_id ??
-            s?.input?.quote_id ??
-            s?.input?.cost_ledger?.source_inputs?.quote_id ??
-            s.id;
-          return String(fKey).trim();
-        }),
-      );
-      diagnostics.second_factory_quote_needed = !allPass && distinctFactories.size < 3;
-    }
+    const allFail = scenarios.every(s => !s.margin_eligible);
+    const allPass = scenarios.every(s => s.margin_eligible);
+    const distinctFactories = new Set(
+      scenarios
+        .map(s => resolveVerifiedFactoryKey(s.input))
+        .filter(Boolean),
+    );
+    diagnostics.second_factory_quote_needed = !allPass && distinctFactories.size < BUSINESS_THRESHOLDS.max_1688_factories_to_check;
     if (allFail) {
       marginStatus = 'fail';
       marginReason = 'The supported margin upper bound is below the existing 30% floor.';
     } else if (allPass) {
       marginStatus = 'pass';
       marginReason = 'All supported coherent scenarios meet the margin condition.';
-    } else if (isR59) {
+    } else {
       // Revision 59: crossing-30% coherent multi-quote / multi-price interval extends below-floor margin score
       // linearly along the exact BigInt rational slope min(22, max(0, 11 + 55 * (m - 0.30))) paired with the same scenario's unit contribution.
       const floorRat = ratFromNumber(marginDef.mapping.eligible_margin_floor);
@@ -2376,10 +2399,8 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
       diagnostics.below_floor_scenario_ids = scenarios.filter(s => !s.margin_eligible).map(s => s.id);
       marginStatus = 'crossing_pass';
       marginReason = `Supported scenarios cross the 30% floor (passing: ${diagnostics.passing_scenario_ids.join(', ')}; below floor: ${diagnostics.below_floor_scenario_ids.join(', ')}); r59 scores full interval along linear slope without inflating strict qualifying count.`;
-    } else {
-      marginReason = 'The supported margin range crosses 30%; screening remains pending.';
     }
-  } else if (isR58 && !outerStructuralReason && scenarios.length > 0) {
+  } else if (!outerStructuralReason && scenarios.length > 0) {
     // When nonnegative domestic_freight is the ONLY unconfirmed/deferred cost and every scenario's bare-goods
     // upper-bound margin is already strictly below 30%, no nonnegative domestic freight can rescue eligibility.
     const scIdCounts = new Map();
@@ -2425,7 +2446,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
   const marginEvidence = mergeRefs(...scenarios.map(scenario => scenario.input?.margin?.evidence));
   const contributionEvidence = mergeRefs(marginEvidence, ...scenarios.map(scenario => scenario.input?.contribution_usd?.evidence));
   const marginItem = completeMargin ? scored(marginDef, point(marginRange), economics, { score_range: marginRange, evidence: marginEvidence,
-    scenario_scores: scenarios.map(s => ({ id: s.id, value: s.margin.value, score: s.margin_score, ...(isR59 ? { margin_eligible: s.margin_eligible } : {}) })),
+    scenario_scores: scenarios.map(s => ({ id: s.id, value: s.margin.value, score: s.margin_score, margin_eligible: s.margin_eligible })),
     ...(diagnostics.crossing_margin_floor ? { crossing_margin_floor: true } : {}) }) :
     missing(marginDef, marginReason, economics, { evidence: marginEvidence, status: marginStatus === 'fail' ? 'ineligible' : 'needs_evidence' });
   const contributionItem = completeContribution ? scored(contributionDef, point(contributionRange), economics,
@@ -2440,25 +2461,19 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null) {
     conditionalRange = [Math.min(...ranges.map(range => range[0])), Math.max(...ranges.map(range => range[1]))];
   }
   diagnostics.reason = marginReason;
-  if (isR58) {
-    diagnostics.structural_reason = structuralReason;
-    diagnostics.expected_structural_error = outerStructuralReason;
-  }
+  diagnostics.structural_reason = structuralReason;
+  diagnostics.expected_structural_error = outerStructuralReason;
   return { margin: marginItem, contribution: contributionItem, supported_range: supportedRange, conditional_range: conditionalRange,
     screening: { id: 'margin', status: marginStatus, reason: marginReason, range: diagnostics.margin_range }, diagnostics };
 }
 
 function screenCandidate(candidate, ctx, profit, items, profile) {
   const priceInput = candidate.screening?.reference_price_usd;
-  const isR58 = profile.revision >= 58;
-  const r58Anchor = isR58 ? validateR58PriceAnchor(priceInput, ctx) : null;
-  const price = isR58 ? { value: r58Anchor.value } : readNumber(priceInput, 'USD', ctx, { min: Number.MIN_VALUE });
-  const priceSupported = isR58 ? r58Anchor.supported : (price.value !== null && priceInput.matched_spec === true);
+  const r58Anchor = validateR58PriceAnchor(priceInput, ctx);
+  const price = { value: r58Anchor.value };
+  const priceSupported = r58Anchor.supported;
   const priceRule = profile.reference_screening.comparable_reference_price;
-  const useInclusivePrice = profile.revision >= 57;
-  const pricePass = priceSupported && (useInclusivePrice
-    ? price.value >= priceRule.minimum_inclusive
-    : price.value > priceRule.strictly_greater_than);
+  const pricePass = priceSupported && price.value >= priceRule.minimum_inclusive;
   const date = candidate.screening?.strong_date_dependency;
   const dateSupported = typeof date?.value === 'boolean' && date.unit === 'boolean' && hasEvidence(date.evidence, ctx) &&
     date.supported !== false && date.material_conflict !== true;
@@ -2467,17 +2482,14 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
   const tmInput = candidate?.judgments?.trademark_conflicts;
   const aprInput = candidate?.judgments?.applicable_public_requirements;
   const spApiHardBan = candidate?.sp_api_calibration?.restrictions?.hard_category_ban === true;
-  const isR59 = profile.revision >= 59;
-  const rightsStatus = (isR59 && (sdrInput?.proven_conflict === true || tmInput?.proven_conflict === true))
+  const rightsStatus = (sdrInput?.proven_conflict === true || tmInput?.proven_conflict === true)
     ? 'fail'
     : (rights.status === 'scored' ? (rights.score === 0 ? 'fail' : 'pass') : 'pending');
   const conditions = [
     { id: 'reference_price', status: priceSupported ? pricePass ? 'pass' : 'fail' : 'pending', input: priceInput ?? null,
       reason: priceSupported
-        ? (useInclusivePrice
-          ? (pricePass ? `Supported matched-spec reference price is at least USD ${priceRule.minimum_inclusive}.` : `Supported matched-spec reference price is below USD ${priceRule.minimum_inclusive}.`)
-          : (pricePass ? 'Supported matched-spec reference price is above USD 30.' : 'Supported matched-spec reference price does not exceed USD 30.'))
-        : (isR58 ? r58Anchor.reason : null) ?? priceInput?.reason ?? 'A supported positive matched-spec reference price is required.' },
+        ? (pricePass ? `Supported matched-spec reference price is at least USD ${priceRule.minimum_inclusive}.` : `Supported matched-spec reference price is below USD ${priceRule.minimum_inclusive}.`)
+        : r58Anchor.reason ?? priceInput?.reason ?? 'A supported positive matched-spec reference price is required.' },
     profit.screening,
     { id: 'specific_form_rights', status: rightsStatus,
       reason: rights.reason, evidence: rights.evidence },
@@ -2485,7 +2497,7 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
       reason: dateSupported ? date.value ? 'The supported strong holiday/date dependency is deferred in this reference profile.' : 'No strong holiday/date dependency is identified in the supported initial check.' :
         date?.reason ?? 'Strong date dependency has not been assessed with supported evidence.' },
   ];
-  if (isR59 && (aprInput?.proven_conflict === true || aprInput?.hard_ban === true || spApiHardBan)) {
+  if (aprInput?.proven_conflict === true || aprInput?.hard_ban === true || spApiHardBan) {
     conditions.push({
       id: 'public_compliance_or_category_ban',
       status: 'fail',
@@ -2659,6 +2671,13 @@ function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
     if (!(ledger.sensitivity_only === undefined || ledger.sensitivity_only === false)) return 'ledger is sensitivity-only';
     if (sc?.input?.coherent !== true) return 'scenario is not coherent';
     if (sc.price_anchor_supported === false) return 'price anchor is not supported';
+    const peakKitCheck = evaluateSingleFactoryCompleteKit({
+      scenario: sc?.input,
+      cost_ledger: ledger,
+    });
+    if (peakKitCheck.is_cross_factory_or_incomplete) {
+      return `incomplete or cross-factory kit (${peakKitCheck.reasons.join('; ')})`;
+    }
     if (!Array.isArray(ledger.lines)) return 'cost lines are missing';
     const presentIds = new Set(ledger.lines.map(l => l?.id));
     const missingIds = REQUIRED_COSTS.filter(reqId => !presentIds.has(reqId));
@@ -2963,7 +2982,7 @@ function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, scre
   if (!periodCoverageOk) return { eligible: false, items: [] };
   if (candidate?.sourcing_disposition === 'private_mold_reserved') return { eligible: false, items: [] };
   if (candidate?.ingest_isolated_pending === true) return { eligible: false, items: [] };
-  if (candidate?.bare_part_only === true || candidate?.complete_set_verified === false) return { eligible: false, items: [] };
+  if (evaluateSingleFactoryCompleteKit(candidate).is_cross_factory_or_incomplete) return { eligible: false, items: [] };
 
   const condById = new Map((screening?.conditions ?? []).map(c => [c.id, c]));
   if (condById.get('reference_price')?.status !== 'pass') return { eligible: false, items: [] };
@@ -2977,8 +2996,8 @@ function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, scre
   if (scenarios.some(sc => {
     const inp = sc?.input;
     const si = inp?.cost_ledger?.source_inputs;
-    return inp?.rejected_spec === true || inp?.complete_set_verified === false ||
-      si?.rejected_spec === true || si?.complete_set_verified === false || si?.bare_part_only === true;
+    const kit = sc?.single_factory_complete_kit ?? evaluateSingleFactoryCompleteKit({ scenario: inp, cost_ledger: inp?.cost_ledger });
+    return inp?.rejected_spec === true || si?.rejected_spec === true || kit.is_cross_factory_or_incomplete;
   })) {
     return { eligible: false, items: [] };
   }
@@ -3603,7 +3622,8 @@ export function scoreCandidate(candidate, profile, internal = null) {
         const ledger = sc?.input?.cost_ledger;
         const lines = ledger?.lines ?? ledger?.costs ?? [];
         const ful = Array.isArray(lines) ? lines.find(x => x?.id === 'fulfillment') : null;
-        return hasProhibited2026PeakExtrapolation(ful, ledger);
+        return hasProhibited2026PeakExtrapolation(ful, ledger) ||
+          evaluateSingleFactoryCompleteKit({ scenario: sc?.input, cost_ledger: ledger }).is_cross_factory_or_incomplete;
       });
     };
     const otherPeriodsAreUnpublishedPeak = Boolean(
@@ -3624,46 +3644,38 @@ export function scoreCandidate(candidate, profile, internal = null) {
       };
       unwrappedFromUnpublishedQ4Companion = true;
     } else {
-      const isPrivateMoldReserved = isR59 && candidate.sourcing_disposition === 'private_mold_reserved';
-      const qualR58 = isR58 ? buildSeasonalQualificationR58(evaluatedPeriods, isR59, isPrivateMoldReserved) : null;
-      const displayPeriodForOps = isR58
-        ? (evaluatedPeriods.find(p => p.id === qualR58?.display_period_id) ?? evaluatedPeriods[0] ?? null)
-        : null;
-      const seasonalOps = isR58
-        ? buildOperationalDisclosuresR58(candidate, displayPeriodForOps?.diagnostics?.economics?.scenarios ?? [])
-        : null;
-      const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, isR59));
-      const coreSourcePeriod = isR59
-        ? (evaluatedPeriods.find(p => p.id === (qualR58?.primary_period_id ?? qualR58?.display_period_id)) ?? primaryOffPeak ?? evaluatedPeriods[0] ?? null)
-        : null;
-      const seasonalDispR59 = !isR59 ? undefined
-        : isPrivateMoldReserved ? 'private_mold_reserved'
-          : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
-            : primaryOffPeak?.queue === 'deferred' ? 'deferred'
-              : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
-                : qualR58?.mode === 'crossing_30pct_interval' || primaryOffPeak?.diagnostics?.economics?.crossing_margin_floor === true ? 'crossing_30pct_interval'
-                  : 'pending_evidence';
-      const allowShortlistSeasonal = !isR59;
-      const allowPkgShortlistSeasonal = isR59 && seasonalDispR59 === 'hard_excluded';
+      const isPrivateMoldReserved = candidate.sourcing_disposition === 'private_mold_reserved';
+      const qualR58 = buildSeasonalQualificationR58(evaluatedPeriods, true, isPrivateMoldReserved);
+      const displayPeriodForOps = evaluatedPeriods.find(p => p.id === qualR58?.display_period_id) ?? evaluatedPeriods[0] ?? null;
+      const seasonalOps = buildOperationalDisclosuresR58(candidate, displayPeriodForOps?.diagnostics?.economics?.scenarios ?? []);
+      const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, true));
+      const coreSourcePeriod = evaluatedPeriods.find(p => p.id === (qualR58?.primary_period_id ?? qualR58?.display_period_id)) ?? primaryOffPeak ?? evaluatedPeriods[0] ?? null;
+      const seasonalDispR59 = isPrivateMoldReserved ? 'private_mold_reserved'
+        : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
+          : primaryOffPeak?.queue === 'deferred' ? 'deferred'
+            : qualR58?.counts_toward_target === true ? 'seasonal_off_peak_qualifying'
+              : qualR58?.mode === 'crossing_30pct_interval' || primaryOffPeak?.diagnostics?.economics?.crossing_margin_floor === true ? 'crossing_30pct_interval'
+                : 'pending_evidence';
+      const allowPkgShortlistSeasonal = seasonalDispR59 === 'hard_excluded';
       return {
         candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
         profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [],
         operating_periods: evaluatedPeriods,
         total: null, total_range: null, conditional_total_range: null, supported_score: null, supported_range: null,
         covered_weight: null, unscored_weight: null, scoring_complete: null, queue: 'seasonal_review',
-        ...(isR59 && isExplicitSeasonal ? { product_seasonality: 'seasonal' } : {}),
-        ...(isR59 && coreSourcePeriod ? {
+        ...(isExplicitSeasonal ? { product_seasonality: 'seasonal' } : {}),
+        ...(coreSourcePeriod ? {
           core_85_range: coreSourcePeriod.core_85_range ?? null,
           core_85_score: coreSourcePeriod.core_85_score ?? null,
           core_85_covered_weight: coreSourcePeriod.core_85_covered_weight ?? null,
           confirmed_risk_deduction_15: coreSourcePeriod.confirmed_risk_deduction_15 ?? null,
           remaining_15_summary: coreSourcePeriod.remaining_15_summary ?? null,
         } : {}),
-        ...(isR59 ? { effective_disposition: seasonalDispR59 } : {}),
-        ...(isR59 && Array.isArray(qualR58?.sample_check_items) && qualR58.sample_check_items.length > 0 ? { sample_check_items: qualR58.sample_check_items } : {}),
-        ...(isR58 ? { qualification: qualR58, diagnostics: { operational_disclosures: seasonalOps } } : {}),
-        ...(isR58 && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
-        ...(isR58 && allowShortlistSeasonal && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
+        effective_disposition: seasonalDispR59,
+        ...(Array.isArray(qualR58?.sample_check_items) && qualR58.sample_check_items.length > 0 ? { sample_check_items: qualR58.sample_check_items } : {}),
+        qualification: qualR58,
+        diagnostics: { operational_disclosures: seasonalOps },
+        ...(Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
         ...(allowPkgShortlistSeasonal && candidate.packaging_redesign_shortlist ? { packaging_redesign_shortlist: candidate.packaging_redesign_shortlist } : {}),
       };
     }
@@ -3673,7 +3685,8 @@ export function scoreCandidate(candidate, profile, internal = null) {
     : effectiveCandidateEcon;
   const priceRefR58 = isR58 ? validateR58PriceAnchor(candidate.screening?.reference_price_usd, ctx) : null;
   const newcomers = scoreNewcomers(candidate.newcomer_cohort, ctx, profile, defs);
-  const profit = scoreEconomics(economicsInput, ctx, profile, defs, priceRefR58);
+  const candidateExpectedComponents = candidate?.saleable_set_composition ?? candidate?.expected_components ?? null;
+  const profit = scoreEconomics(economicsInput, ctx, profile, defs, priceRefR58, candidateExpectedComponents);
   const items = defs.map(item => {
     if (item.id === 'refund_adjusted_pre_ad_margin') return profit.margin;
     if (item.id === 'unit_contribution') return profit.contribution;
@@ -3731,10 +3744,16 @@ export function scoreCandidate(candidate, profile, internal = null) {
           ? effectiveCandidateEcon.unpublished_2027_q4_peak_note.trim()
           : UNPUBLISHED_2027_Q4_PEAK_METADATA_NOTE)
     : null;
-  const isPrivateMoldFlatR59 = isR59 && !isOperatingPeriod && candidate.sourcing_disposition === 'private_mold_reserved';
-  const strictComplete = !isPrivateMoldFlatR59 && candidate.ingest_isolated_pending !== true && totals.covered_weight === 100 && screening.status === 'eligible' && periodCoverageOk;
-  const crossingCompleteR59 = !isPrivateMoldFlatR59 && candidate.ingest_isolated_pending !== true && isR59 && totals.covered_weight === 100 && screening.status === 'crossing_eligible' && periodCoverageOk;
-  const samplePendingEvalR59 = isR59 && !strictComplete && !crossingCompleteR59 && (isTopLevelFlatR58 || isPrimaryOffPeakPeriodR58)
+  const isPrivateMoldFlatR59 = !isOperatingPeriod && candidate.sourcing_disposition === 'private_mold_reserved';
+  const fitJudgment = candidate?.judgments?.existing_solution_fit;
+  const hasIncompleteCrossFactoryKit = Boolean(
+    evaluateSingleFactoryCompleteKit(candidate).is_cross_factory_or_incomplete ||
+    (fitJudgment && typeof fitJudgment === 'object' && evaluateSingleFactoryCompleteKit(fitJudgment).is_cross_factory_or_incomplete) ||
+    profit.diagnostics.single_factory_complete_kit_status === 'incomplete_cross_factory_kit',
+  );
+  const strictComplete = !isPrivateMoldFlatR59 && !hasIncompleteCrossFactoryKit && candidate.ingest_isolated_pending !== true && totals.covered_weight === 100 && screening.status === 'eligible' && periodCoverageOk;
+  const crossingCompleteR59 = !isPrivateMoldFlatR59 && !hasIncompleteCrossFactoryKit && candidate.ingest_isolated_pending !== true && totals.covered_weight === 100 && screening.status === 'crossing_eligible' && periodCoverageOk;
+  const samplePendingEvalR59 = !strictComplete && !crossingCompleteR59 && !hasIncompleteCrossFactoryKit && (isTopLevelFlatR58 || isPrimaryOffPeakPeriodR58)
     ? evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, screening, periodCoverageOk)
     : { eligible: false, items: [] };
   const samplePendingQualifyingR59 = samplePendingEvalR59.eligible === true;
@@ -3794,8 +3813,11 @@ export function scoreCandidate(candidate, profile, internal = null) {
       };
     } else {
       const reasons = [];
+      if (hasIncompleteCrossFactoryKit) {
+        reasons.push('Primary procurement scenario failed unified single-factory complete-kit check (incomplete_cross_factory_kit); scenario is preserved for inspection while counts_toward_target remains false.');
+      }
       if (!fullYearDatesOk) {
-        reasons.push(isR59 && !isExplicitSeasonal
+        reasons.push(!isExplicitSeasonal
           ? 'Flat mode in revision 59 requires every primary scenario to cover either all 12 calendar months of one target year (YYYY-01-01..YYYY-12-31) or the verified 2027 off-peak window (2027-02-01..2027-10-14 sales / 2027-02-01..2027-09-30 storage).'
           : 'Flat annual mode requires every primary scenario to cover all 12 calendar months and all days of one target year (YYYY-01-01..YYYY-12-31).');
       }
@@ -3812,7 +3834,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
     }
   }
 
-  const flatDispR59 = !isR59 || isOperatingPeriod ? undefined
+  const flatDispR59 = isOperatingPeriod ? undefined
     : candidate.sourcing_disposition === 'private_mold_reserved' ? 'private_mold_reserved'
       : queue === 'excluded' ? 'hard_excluded'
         : queue === 'deferred' ? 'deferred'
@@ -3820,8 +3842,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
             : crossingCompleteR59 || profit.diagnostics.crossing_margin_floor === true ? 'crossing_30pct_interval'
               : 'pending_evidence';
 
-  const allowShortlistFlat = !isR59;
-  const allowPkgShortlistFlat = isR59 && flatDispR59 === 'hard_excluded';
+  const allowPkgShortlistFlat = flatDispR59 === 'hard_excluded';
   return {
     candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
     profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [], items, ...totals,
@@ -3835,19 +3856,18 @@ export function scoreCandidate(candidate, profile, internal = null) {
       confirmed_risk_deduction_15: coreSummaryR59.confirmed_risk_deduction_15,
       remaining_15_summary: coreSummaryR59.remaining_15_summary,
     } : {}),
-    ...(isEvergreenFlatR59 ? { product_seasonality: 'evergreen' } : (isR59 && !isOperatingPeriod && isExplicitSeasonal ? { product_seasonality: 'seasonal' } : {})),
+    ...(isEvergreenFlatR59 ? { product_seasonality: 'evergreen' } : (!isOperatingPeriod && isExplicitSeasonal ? { product_seasonality: 'seasonal' } : {})),
     ...(resolvedUnpublishedQ4Note ? { unpublished_2027_q4_peak_note: resolvedUnpublishedQ4Note } : {}),
     ...(flatDispR59 ? { effective_disposition: flatDispR59 } : {}),
     ...(samplePendingQualifyingR59 ? { sample_check_items: samplePendingEvalR59.items } : {}),
     ...(qualification ? { qualification } : {}),
-    ...(isR58 && !isOperatingPeriod && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
-    ...(isR58 && !isOperatingPeriod && allowShortlistFlat && candidate.negotiation_shortlist ? { negotiation_shortlist: candidate.negotiation_shortlist } : {}),
+    ...(!isOperatingPeriod && Array.isArray(candidate.review_notes) && candidate.review_notes.length > 0 ? { review_notes: candidate.review_notes } : {}),
     ...(!isOperatingPeriod && allowPkgShortlistFlat && candidate.packaging_redesign_shortlist ? { packaging_redesign_shortlist: candidate.packaging_redesign_shortlist } : {}),
     diagnostics: {
       bids: bidsItem,
       newcomers: newcomers.diagnostics,
       economics: profit.diagnostics,
-      ...(isR58 && !isOperatingPeriod ? { operational_disclosures: buildOperationalDisclosuresR58(candidate, profit.diagnostics.scenarios) } : {}),
+      ...(!isOperatingPeriod ? { operational_disclosures: buildOperationalDisclosuresR58(candidate, profit.diagnostics.scenarios) } : {}),
     },
   };
 }
