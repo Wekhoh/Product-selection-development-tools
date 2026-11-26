@@ -952,7 +952,10 @@ export class SelectionStore {
     }
   }
 
-  _rerankSameSpecBareGoodsLocked(formId, { spec_version = null, spec_variant_key = undefined } = {}) {
+  _rerankSameSpecBareGoodsLocked(formId, { spec_version = null, spec_variant_key = undefined, as_of_date = null } = {}) {
+    const refDay = (typeof as_of_date === 'string' && /^\d{4}-\d{2}-\d{2}/.test(as_of_date))
+      ? as_of_date.slice(0, 10)
+      : new Date().toISOString().slice(0, 10);
     const candidates = this.db.prepare(`
       SELECT * FROM sourcing_quotes_1688
       WHERE form_id = ? AND quote_status IN ('verified', 'superseded_uncompetitive') AND goods_first_order_promotion = 0 AND goods_cny_total > 0
@@ -960,6 +963,7 @@ export class SelectionStore {
     `).all(formId);
     const byGroup = new Map();
     for (const row of candidates) {
+      if (row.expires_at && String(row.expires_at).slice(0, 10) < refDay) continue;
       if (spec_version !== null && row.spec_version !== spec_version) continue;
       if (spec_variant_key !== undefined && (row.spec_variant_key ?? null) !== (spec_variant_key ?? null)) continue;
       const key = `${row.spec_version}::${row.spec_variant_key ?? ''}`;
@@ -2923,12 +2927,16 @@ export class SelectionStore {
       // ADR-0002: Rank same-spec quotes strictly by regular bare-goods unit price (`裸货价`), never domestic freight.
       const newUnitBareGoodsCny = (quote.goods_cny_total ?? 0) / actualSets;
       if (Number.isFinite(newUnitBareGoodsCny) && newUnitBareGoodsCny > 0) {
+        const refDay = typeof quote.observed_at === 'string' && /^\d{4}-\d{2}-\d{2}/.test(quote.observed_at)
+          ? quote.observed_at.slice(0, 10)
+          : new Date().toISOString().slice(0, 10);
         const existingVerified = this.db.prepare(`
-          SELECT quote_id, actual_sets, goods_cny_total, domestic_freight_cny_total, spec_variant_key
+          SELECT quote_id, actual_sets, goods_cny_total, domestic_freight_cny_total, spec_variant_key, expires_at
           FROM sourcing_quotes_1688
           WHERE form_id = ? AND spec_version = ? AND quote_status = 'verified' AND quote_id != ?
         `).all(form.form_id, specVersion, quoteId);
         for (const prev of existingVerified) {
+          if (prev.expires_at && String(prev.expires_at).slice(0, 10) < refDay) continue;
           const prevSpecKey = prev.spec_variant_key ?? null;
           if (specVariantKey !== null && prevSpecKey !== null && prevSpecKey !== specVariantKey) continue;
           if (specVariantKey !== null && prevSpecKey === null && quote.supersede_same_spec !== true) continue;

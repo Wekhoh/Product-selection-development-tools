@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   computeHeadhaulWithA4Rules,
   estimateGate1A2027,
@@ -10,6 +13,7 @@ import {
   evaluateEarlyScreen,
 } from '../src/economics.mjs';
 import { runFastProfitHealthcheck2027 } from '../src/pipeline.mjs';
+import { runPhase2Cli } from '../src/phase2-cli.mjs';
 
 const BASE_STD_PKG = {
   id: 'pkg-1',
@@ -576,4 +580,112 @@ test('Issue #5 Astra audit regressions: stale scalar headhaul_usd bypass, input.
   });
   assert.equal(g1a120.status, 'verified');
   assert.equal(g1a120.components.headhaul.amount_usd, 0.75);
+});
+
+test('Issue #5 adversarial review regressions: cartons[] vs actual_weight_kg_per_unit, carton lower-bound vs chargeable_kg_per_unit, mixed usd_per_unit bypass, and order_units conflict parity', async () => {
+  // 1) cartons[] total weight (4 x 15 = 60 kg) conflicting with actual_weight_kg_per_unit (0.40 x 100 = 40 kg)
+  const cartonsVsPerUnit = computeHeadhaulWithA4Rules({
+    cartons: [{ count: 4, carton_cm: [30, 30, 30], weight_kg: 15 }],
+    actual_weight_kg_per_unit: 0.40,
+    rate_cny_per_kg: 10.50,
+    surcharge_cny_per_kg: 0,
+    bond_cny_per_kg: 0,
+  }, 7, 100, { isR58: true, isR59: true });
+  assert.equal(cartonsVsPerUnit.amount_usd, null);
+  assert.equal(cartonsVsPerUnit.weight_conflict, true);
+
+  // 2) Unknown carton_count or partial last carton: weight_per_carton_kg lower bound rejects impossible underbilled chargeable_kg_per_unit
+  const underbilledUnknownCount = computeHeadhaulWithA4Rules({
+    weight_per_carton_kg: 15,
+    chargeable_kg_per_unit: 0.10, // 10 kg total < 15 kg single carton minimum!
+    rate_cny_per_kg: 10.0,
+    surcharge_cny_per_kg: 0,
+    bond_cny_per_kg: 1.0,
+  }, 7.2, 100, { isR58: true, isR59: true });
+  assert.equal(underbilledUnknownCount.amount_usd, null);
+  assert.equal(underbilledUnknownCount.weight_conflict, true);
+
+  const underbilledPartialCarton = computeHeadhaulWithA4Rules({
+    units_per_carton: 30, // 100 sets => at least 3 full cartons = 45 kg
+    weight_per_carton_kg: 15,
+    chargeable_kg_per_unit: 0.20, // 20 kg total < 45 kg full-carton floor!
+    rate_cny_per_kg: 10.0,
+    surcharge_cny_per_kg: 0,
+    bond_cny_per_kg: 1.0,
+  }, 7.2, 100, { isR58: true, isR59: true });
+  assert.equal(underbilledPartialCarton.amount_usd, null);
+  assert.equal(underbilledPartialCarton.weight_conflict, true);
+
+  // 3) Mixed usd_per_unit + structured per-kg/carton keys must NEVER bypass A4 conflict checks in profit-check or CLI reverse-1688
+  const mixedBypassHh = {
+    usd_per_unit: 0.27,
+    bond_included: true,
+    carton_count: 4,
+    weight_per_carton_kg: 15,
+    actual_weight_kg_total: 40,
+    rate_cny_per_kg: 10.50,
+    surcharge_cny_per_kg: 0,
+    bond_cny_per_kg: 0,
+  };
+  const directMixed = computeHeadhaulWithA4Rules(mixedBypassHh, 7, 100, { isR58: true, isR59: true });
+  assert.equal(directMixed.amount_usd, null);
+  assert.equal(directMixed.weight_conflict, true);
+
+  const hcMixed = runFastProfitHealthcheck2027({
+    pkg: BASE_STD_PKG,
+    price_usd: 45.00,
+    fx_cny_per_usd: 7.0,
+    order_units: 100,
+    goods_cny_per_unit: 50,
+    headhaul: mixedBypassHh,
+    refund_fraction: 0.04,
+    fee_category: 'Home and Kitchen',
+    referral_terms: BASE_REFERRAL,
+    collection_rate: 0.006,
+  });
+  assert.equal(hcMixed.realized_2027_off_peak.status, 'needs_calculator_verification');
+  assert.equal(hcMixed.realized_2027_off_peak.margin, null);
+
+  const dir = mkdtempSync(join(tmpdir(), 'issue5-mixed-cli-'));
+  try {
+    const specPath = join(dir, 'rev-mixed.json');
+    writeFileSync(specPath, JSON.stringify({
+      fx_cny_per_usd: 7.0,
+      pkg: BASE_STD_PKG,
+      headhaul: mixedBypassHh,
+      quote: { goods_cny_total: 5000, order_units: 100 },
+    }), 'utf8');
+    let out = '';
+    const code = await runPhase2Cli(['reverse-1688', '--db', join(dir, 't.sqlite'), '--input', specPath], {
+      stdout: { write: s => { out += String(s); } },
+      stderr: { write: () => {} },
+    });
+    assert.equal(code, 0);
+    const parsed = JSON.parse(out);
+    assert.equal(parsed.reverse_1688.solution.status, 'needs_calculator_verification');
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+
+  // 4) Conflicting outer order_units (100) vs headhaul.order_units (200) must reject consistently across ALL entrypoints
+  const orderConflictHh = {
+    carton_count: 4,
+    weight_per_carton_kg: 15,
+    order_units: 200,
+    rate_cny_per_kg: 10.50,
+    surcharge_cny_per_kg: 0,
+    bond_cny_per_kg: 0,
+  };
+  assert.equal(computeHeadhaulWithA4Rules(orderConflictHh, 7, 100, { isR58: true, isR59: true }).weight_conflict, true);
+  const esOrderConflict = evaluateEarlyScreen(makeEarlyScreenInput(orderConflictHh));
+  assert.equal(esOrderConflict.metrics.headhaul_usd, null);
+  assert.equal(esOrderConflict.ledger.margin, null);
+  const econOrderConflict = calculateEconomics(makeFormalLedger(orderConflictHh, 0.90), { profileRevision: 59, requireFeeBasis: false });
+  assert.equal(econOrderConflict.margin, null);
+  assert.ok(econOrderConflict.pending_lines.includes('headhaul'));
+  const valOrderConflict = validateFeeBasis(makeFormalLedger(orderConflictHh, 0.90), {
+    profileRevision: 59, evidenceIds: ['ev-1688', 'ev-hh', 'ev-fba'], operatingMonths: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+  });
+  assert.equal(valOrderConflict.status, 'needs_evidence');
+  assert.ok(valOrderConflict.issues.some(i => i.line === 'headhaul' && i.code === 'headhaul_weight_conflict'));
 });

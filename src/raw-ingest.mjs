@@ -30,6 +30,7 @@ import {
   lookupUnifiedReturnsProcessing2027,
   computeMatchedPeerMedianPackage,
   resolveEffectivePricing,
+  isStructuredHeadhaulSpec,
   computeHeadhaulWithA4Rules,
 } from './fba-calculator.mjs';
 import { canonicalJson, openSelectionStore, sha256Hex } from './store.mjs';
@@ -1782,12 +1783,49 @@ export function ingestTrialSpecification(spec, profile, {
       const placeLine = lines.find(l => l?.id === 'placement');
       if (placeLine && placeLine.status !== 'pending') {
         const effInbWin = (inbWin?.from >= '2027-01-15') ? inbWin : FBA_2027_DEFAULT_INBOUND_WINDOW;
+        const hhLineForPlace = lines.find(l => l?.id === 'headhaul');
+        const hhObjForPlace = ledger.headhaul ?? ledger.source_inputs?.headhaul ?? hhLineForPlace?.cny_derivation ?? null;
+        const resolvedSplitOpt = placeLine.split_option ??
+          placeLine.fee_basis?.split_option ??
+          ledger.placement_split_option ??
+          'minimal_west_conservative';
         const pl = lookupUnifiedPlacementFee2027({
           pkg: officialPkg,
           inbound_window: effInbWin,
-          split_option: placeLine.split_option ?? 'minimal_west_conservative',
+          split_option: resolvedSplitOpt,
           is_apparel: isApparel,
           is_dangerous_goods: isDg,
+          identical_cartons_count: placeLine.identical_cartons_count ?? placeLine.fee_basis?.identical_cartons_count ?? ledger.identical_cartons_count ?? null,
+          multi_destination_headhaul_verified: placeLine.multi_destination_headhaul_verified ??
+            placeLine.fee_basis?.multi_destination_headhaul_verified ??
+            ledger.multi_destination_headhaul_verified ??
+            undefined,
+          steady_state_replenishment: placeLine.steady_state_replenishment ??
+            placeLine.fee_basis?.steady_state_replenishment ??
+            ledger.steady_state_replenishment ??
+            hhObjForPlace?.steady_state_replenishment ??
+            true,
+          headhaul: hhObjForPlace,
+          extra_headhauls: [
+            ledger.headhaul,
+            ledger.source_inputs?.headhaul,
+            hhLineForPlace?.cny_derivation,
+            hhLineForPlace,
+            placeLine,
+            placeLine.fee_basis,
+            ledger,
+          ].filter(o => o && typeof o === 'object' && !Array.isArray(o)),
+          headhaul_rate_cny_per_kg: placeLine.headhaul_rate_cny_per_kg ??
+            placeLine.fee_basis?.headhaul_rate_cny_per_kg ??
+            ledger.headhaul_rate_cny_per_kg ??
+            hhObjForPlace?.rate_cny_per_kg ??
+            null,
+          headhaul_destination_scope: placeLine.headhaul_destination_scope ??
+            placeLine.fee_basis?.headhaul_destination_scope ??
+            ledger.headhaul_destination_scope ??
+            hhObjForPlace?.destination_scope ??
+            hhObjForPlace?.headhaul_destination_scope ??
+            null,
         });
         if (pl.status === 'verified') {
           placeLine.amount_usd = pl.selected_usd;
@@ -1880,24 +1918,44 @@ export function ingestTrialSpecification(spec, profile, {
       const hhLine = lines.find(l => l?.id === 'headhaul');
       if (hhLine && hhLine.status !== 'pending') {
         const rawHh = hhLine.cny_derivation ?? ledger.headhaul ?? ledger.source_inputs?.headhaul ?? null;
-        if (rawHh && typeof rawHh === 'object' && finite(rawHh.rate_cny_per_kg)) {
-          const actualKg = Number((officialPkg.unit_weight_lb * 0.45359237).toFixed(6));
-          const volKg = Number(((officialPkg.length_in * 2.54 * officialPkg.width_in * 2.54 * officialPkg.height_in * 2.54) / (rawHh.volumetric_divisor ?? 6000)).toFixed(6));
-          const updatedHh = {
-            ...rawHh,
-            actual_weight_kg_per_unit: actualKg,
-            chargeable_kg_per_unit: Math.max(rawHh.chargeable_kg_per_unit ?? 0, actualKg, volKg),
-          };
+        if (isStructuredHeadhaulSpec(rawHh)) {
           const procLine = lines.find(l => l?.id === 'procurement');
-          const effFx = updatedHh.fx ?? updatedHh.fx_cny_per_usd ?? ledger.fx_cny_per_usd ?? ledger.source_inputs?.fx_cny_per_usd ?? procLine?.fx_cny_per_usd;
-          const effUnits = updatedHh.order_units ?? ledger.order_units ?? procLine?.order_units ?? 100;
-          const hhCalc = computeHeadhaulWithA4Rules(updatedHh, effFx, effUnits, { isR58: true, isR59: effectiveRev >= 59 });
-          if (hhCalc.amount_usd !== null && !hhCalc.missing_surcharge_quote) {
-            hhLine.amount_usd = hhCalc.amount_usd;
-            if (hhLine.cny_derivation) hhLine.cny_derivation = updatedHh;
-            if (ledger.headhaul) ledger.headhaul = updatedHh;
-            if (ledger.source_inputs?.headhaul) ledger.source_inputs.headhaul = updatedHh;
-            mutated = true;
+          const effFx = rawHh.fx ?? rawHh.fx_cny_per_usd ?? ledger.fx_cny_per_usd ?? ledger.source_inputs?.fx_cny_per_usd ?? ledger.source_inputs?.fx_usdcny ?? procLine?.fx_cny_per_usd;
+          const effUnits = ledger.order_units ?? procLine?.order_units ?? rawHh.order_units ?? 100;
+          const priorHhCalc = computeHeadhaulWithA4Rules(rawHh, effFx, effUnits, {
+            isR58: true,
+            isR59: effectiveRev >= 59,
+            steadyStateReplenishment: ledger.steady_state_replenishment,
+          });
+          if (!priorHhCalc.weight_conflict) {
+            const actualKg = Number((officialPkg.unit_weight_lb * 0.45359237).toFixed(6));
+            const volKg = Number(((officialPkg.length_in * 2.54 * officialPkg.width_in * 2.54 * officialPkg.height_in * 2.54) / (rawHh.volumetric_divisor ?? 6000)).toFixed(6));
+            const priorBilledPerUnit = (finite(priorHhCalc?.a4_applied?.billed_total_kg) && effUnits > 0)
+              ? Number((priorHhCalc.a4_applied.billed_total_kg / effUnits).toFixed(6))
+              : (rawHh.chargeable_kg_per_unit ?? 0);
+            const {
+              weight_per_carton_kg: _staleCartonWt,
+              actual_weight_kg_total: _staleTotalWt,
+              cartons: _staleCartons,
+              ...baseHh
+            } = rawHh;
+            const updatedHh = {
+              ...baseHh,
+              actual_weight_kg_per_unit: actualKg,
+              chargeable_kg_per_unit: Math.max(priorBilledPerUnit, rawHh.chargeable_kg_per_unit ?? 0, actualKg, volKg),
+            };
+            const hhCalc = computeHeadhaulWithA4Rules(updatedHh, effFx, effUnits, {
+              isR58: true,
+              isR59: effectiveRev >= 59,
+              steadyStateReplenishment: ledger.steady_state_replenishment,
+            });
+            if (hhCalc.amount_usd !== null && !hhCalc.missing_surcharge_quote && !hhCalc.weight_conflict) {
+              hhLine.amount_usd = hhCalc.amount_usd;
+              if (hhLine.cny_derivation) hhLine.cny_derivation = updatedHh;
+              if (ledger.headhaul) ledger.headhaul = updatedHh;
+              if (ledger.source_inputs?.headhaul) ledger.source_inputs.headhaul = updatedHh;
+              mutated = true;
+            }
           }
         }
       }

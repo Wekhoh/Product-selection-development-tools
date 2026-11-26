@@ -839,7 +839,7 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         let firstExpectedUsd = null;
         for (const rawHhSpec of rawHhSpecs) {
           const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
-          const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
+          const effUnits = input.order_units ?? procLine?.order_units ?? rawHhSpec.order_units ?? null;
           const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, {
             isR58: true,
             isR59: true,
@@ -1119,15 +1119,27 @@ const A4_HEADHAUL_EXTRA_KEYS = [
   'small_carton_surcharge_cny_per_kg',
 ];
 
+const STRUCTURED_PER_KG_HEADHAUL_KEYS = [
+  'rate_cny_per_kg',
+  'chargeable_kg_per_unit',
+  'surcharge_cny_per_kg',
+  'bond_cny_per_kg',
+  'bond_cny_per_shipment',
+  ...A4_HEADHAUL_EXTRA_KEYS,
+];
+
+export function isStructuredHeadhaulSpec(cand) {
+  if (!cand || typeof cand !== 'object' || Array.isArray(cand)) return false;
+  return STRUCTURED_PER_KG_HEADHAUL_KEYS.some(k => cand[k] !== undefined && cand[k] !== null);
+}
+
 export function collectStructuredHeadhaulSpecs(...candidates) {
   const seen = new Set();
   const out = [];
   for (const cand of candidates) {
-    if (!cand || typeof cand !== 'object' || Array.isArray(cand) || seen.has(cand)) continue;
-    if (cand.rate_cny_per_kg !== undefined || A4_HEADHAUL_EXTRA_KEYS.some(k => cand[k] !== undefined && cand[k] !== null)) {
-      seen.add(cand);
-      out.push(cand);
-    }
+    if (!isStructuredHeadhaulSpec(cand) || seen.has(cand)) continue;
+    seen.add(cand);
+    out.push(cand);
   }
   return out;
 }
@@ -1226,6 +1238,16 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, {
     small_carton_surcharge_cny_per_kg,
   } = headhaul;
 
+  if (headhaul.usd_per_unit !== undefined && headhaul.usd_per_unit !== null) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      weight_conflict: true,
+      conflict_reason: 'headhaul cannot mix scalar usd_per_unit with per-kg/A4 CNY headhaul tariff fields.',
+      a4_applied: { weight_conflict: true },
+    };
+  }
   if (typeof steadyStateReplenishment === 'boolean' &&
     typeof headhaul.steady_state_replenishment === 'boolean' &&
     steadyStateReplenishment !== headhaul.steady_state_replenishment) {
@@ -1253,6 +1275,17 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, {
   const hasA4Extras = A4_HEADHAUL_EXTRA_KEYS.some(k => headhaul[k] !== undefined && headhaul[k] !== null);
   const hasPerKgBond = finite(bondPerKg) && bondPerKg >= 0;
   const hasShipmentBond = finite(bondPerShipment) && bondPerShipment >= 0;
+  if (finite(orderUnits) && orderUnits > 0 && finite(headhaul.order_units) && headhaul.order_units > 0 &&
+    orderUnits !== headhaul.order_units) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      weight_conflict: true,
+      conflict_reason: `Conflicting order_units (${orderUnits}) vs headhaul.order_units (${headhaul.order_units}).`,
+      a4_applied: { weight_conflict: true },
+    };
+  }
   const effectiveUnits = finite(orderUnits) && orderUnits > 0
     ? orderUnits
     : (finite(headhaul.order_units) && headhaul.order_units > 0 ? headhaul.order_units : null);
@@ -1493,6 +1526,24 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, {
     }
   }
 
+  if (cartonsActualTotalR && actualTotalFromPerUnitR &&
+    !totalsConsistentWithinDecimalPrecision(actual_weight_kg_per_unit, unitsR, null, cartonsActualTotalR)) {
+    const derivedKg = roundBigRat(cartonsActualTotalR.n, cartonsActualTotalR.d, 6);
+    const suppliedKg = roundBigRat(actualTotalFromPerUnitR.n, actualTotalFromPerUnitR.d, 6);
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      weight_conflict: true,
+      conflict_reason: `cartons[] summed weight (${derivedKg} kg) conflicts with actual_weight_kg_per_unit * order_units (${suppliedKg} kg).`,
+      a4_applied: {
+        weight_conflict: true,
+        derived_actual_weight_kg_total: derivedKg,
+        supplied_actual_weight_kg_total: suppliedKg,
+      },
+    };
+  }
+
   let actualTotalR = actualTotalFromTotalR ?? actualTotalFromPerUnitR ?? cartonsActualTotalR;
   let actualWeightDerivedFromCartons = Boolean(!actualTotalFromTotalR && !actualTotalFromPerUnitR && cartonsActualTotalR);
 
@@ -1524,23 +1575,45 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, {
         actualTotalR = cartonDerivedTotalR;
         actualWeightDerivedFromCartons = true;
       }
-    } else if (actualTotalR === null && declaredChargeableTotalR === null) {
-      const missingReason = isMixedCartons
-        ? 'actual_weight_kg_total_required_for_mixed_cartons'
-        : (hasPartialLastCarton
-          ? 'actual_weight_kg_total_required_for_partial_carton'
-          : 'carton_count_required_for_carton_weight');
-      return {
-        amount_usd: null,
-        exact_usd_rational: null,
-        cny_derivation: null,
-        missing_surcharge_quote: true,
-        a4_applied: {
-          ...(isMixedCartons ? { mixed_cartons: true } : {}),
-          ...(hasPartialLastCarton ? { partial_last_carton: true } : {}),
-          missing_surcharge_quote: missingReason,
-        },
-      };
+    } else if (actualTotalR === null) {
+      if (declaredChargeableTotalR === null) {
+        const missingReason = isMixedCartons
+          ? 'actual_weight_kg_total_required_for_mixed_cartons'
+          : (hasPartialLastCarton
+            ? 'actual_weight_kg_total_required_for_partial_carton'
+            : 'carton_count_required_for_carton_weight');
+        return {
+          amount_usd: null,
+          exact_usd_rational: null,
+          cny_derivation: null,
+          missing_surcharge_quote: true,
+          a4_applied: {
+            ...(isMixedCartons ? { mixed_cartons: true } : {}),
+            ...(hasPartialLastCarton ? { partial_last_carton: true } : {}),
+            missing_surcharge_quote: missingReason,
+          },
+        };
+      }
+      const minFullCartons = hasPartialLastCarton
+        ? Math.max(1, Math.floor(effectiveUnits / headhaul.units_per_carton))
+        : 1;
+      const minGuaranteedActualR = mulBigRat(toBigRat(weight_per_carton_kg), toBigRat(minFullCartons));
+      if (ratCmp(declaredChargeableTotalR, minGuaranteedActualR) < 0) {
+        const minKg = roundBigRat(minGuaranteedActualR.n, minGuaranteedActualR.d, 6);
+        const declKg = roundBigRat(declaredChargeableTotalR.n, declaredChargeableTotalR.d, 6);
+        return {
+          amount_usd: null,
+          exact_usd_rational: null,
+          cny_derivation: null,
+          weight_conflict: true,
+          conflict_reason: `Minimum full-carton actual weight (${minFullCartons} * ${weight_per_carton_kg} kg = ${minKg} kg) exceeds supplied chargeable_kg_per_unit * order_units (${declKg} kg).`,
+          a4_applied: {
+            weight_conflict: true,
+            derived_actual_weight_kg_total: minKg,
+            supplied_actual_weight_kg_total: declKg,
+          },
+        };
+      }
     }
   }
 
@@ -3329,7 +3402,7 @@ export function isUsWestSingleWarehouseHeadhaul({
   if (scopes.some(s => US_WEST_SINGLE_SCOPES.has(s))) return true;
   const rates = [
     headhaul_rate_cny_per_kg,
-    ...specs.map(s => s.rate_cny_per_kg),
+    ...specs.flatMap(s => [s.rate_cny_per_kg, s.headhaul_rate_cny_per_kg]),
   ].filter(v => finite(v));
   return rates.some(r => r < BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg);
 }
@@ -3356,7 +3429,7 @@ export function isNationwideMultiWarehouseHeadhaul({
   }
   const rates = [
     headhaul_rate_cny_per_kg,
-    ...specs.map(s => s.rate_cny_per_kg),
+    ...specs.flatMap(s => [s.rate_cny_per_kg, s.headhaul_rate_cny_per_kg]),
   ].filter(v => finite(v));
   return rates.some(r => r >= BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg);
 }
@@ -4048,10 +4121,9 @@ function estimateGate1AWithLandedCost({
   let resolvedHeadhaulUsd = null;
   let resolvedHeadhaulExactRat = null;
   let resolvedHeadhaulA4 = null;
-  const structuredHeadhaulObj = headhaul && typeof headhaul === 'object' && !Array.isArray(headhaul) &&
-    (headhaul.rate_cny_per_kg !== undefined || A4_HEADHAUL_EXTRA_KEYS.some(k => headhaul[k] !== undefined && headhaul[k] !== null))
-    ? headhaul
-    : null;
+  let resolvedHeadhaulRate = null;
+  const headhaulObj = headhaul && typeof headhaul === 'object' && !Array.isArray(headhaul) ? headhaul : null;
+  const structuredHeadhaulObj = isStructuredHeadhaulSpec(headhaulObj) ? headhaulObj : null;
   if (structuredHeadhaulObj) {
     if (!finite(fx_cny_per_usd) || fx_cny_per_usd <= 0) {
       return { status: 'needs_calculator_verification', reason: 'Valid fx_cny_per_usd > 0 is required to verify structured headhaul inputs.' };
@@ -4107,6 +4179,7 @@ function estimateGate1AWithLandedCost({
     resolvedHeadhaulUsd = a4Res.amount_usd;
     resolvedHeadhaulExactRat = a4Res.exact_usd_rational ?? null;
     resolvedHeadhaulA4 = a4Res.a4_applied ?? null;
+    resolvedHeadhaulRate = finite(a4Res.cny_derivation?.rate_cny_per_kg) ? a4Res.cny_derivation.rate_cny_per_kg : null;
   } else if (explicitScalarHeadhaulUsd !== null) {
     resolvedHeadhaulUsd = explicitScalarHeadhaulUsd;
   } else if (headhaul !== null && headhaul !== undefined) {
@@ -4157,12 +4230,12 @@ function estimateGate1AWithLandedCost({
   // Under official Amazon US Coupon rules (r59), $10/$50 FBA fulfillment tier is determined by standard list price when a Coupon is active.
   const fulfillmentTierPriceUsd = isR59Coupon && !hasPrimeDiscount ? pricing.list_price_usd : effectivePriceUsd;
 
-  const effectivePlacementHeadhaulScope = headhaul_destination_scope ?? structuredHeadhaulObj?.destination_scope ?? structuredHeadhaulObj?.headhaul_destination_scope ?? null;
+  const effectivePlacementHeadhaulScope = headhaul_destination_scope ?? headhaulObj?.destination_scope ?? headhaulObj?.headhaul_destination_scope ?? null;
   const effectivePlacementHeadhaulRate = finite(headhaul_rate_cny_per_kg)
     ? headhaul_rate_cny_per_kg
-    : (finite(structuredHeadhaulObj?.rate_cny_per_kg) ? structuredHeadhaulObj.rate_cny_per_kg : null);
-  if (structuredHeadhaulObj) {
-    const innerRate = finite(structuredHeadhaulObj.rate_cny_per_kg) ? structuredHeadhaulObj.rate_cny_per_kg : null;
+    : (finite(headhaulObj?.rate_cny_per_kg) ? headhaulObj.rate_cny_per_kg : resolvedHeadhaulRate);
+  if (headhaulObj) {
+    const innerRate = finite(headhaulObj.rate_cny_per_kg) ? headhaulObj.rate_cny_per_kg : resolvedHeadhaulRate;
     if (finite(headhaul_rate_cny_per_kg) && innerRate !== null && Math.abs(headhaul_rate_cny_per_kg - innerRate) > 1e-6) {
       return {
         status: 'needs_calculator_verification',
@@ -4170,7 +4243,7 @@ function estimateGate1AWithLandedCost({
       };
     }
     const outerScopeNorm = String(headhaul_destination_scope ?? '').trim().toLowerCase();
-    const innerScopeNorm = String(structuredHeadhaulObj.destination_scope ?? structuredHeadhaulObj.headhaul_destination_scope ?? '').trim().toLowerCase();
+    const innerScopeNorm = String(headhaulObj.destination_scope ?? headhaulObj.headhaul_destination_scope ?? '').trim().toLowerCase();
     if (outerScopeNorm && innerScopeNorm && outerScopeNorm !== innerScopeNorm) {
       return {
         status: 'needs_calculator_verification',
@@ -4178,9 +4251,9 @@ function estimateGate1AWithLandedCost({
       };
     }
   }
-  const effectiveSteadyState = steady_state_replenishment !== false && structuredHeadhaulObj?.steady_state_replenishment !== false;
+  const effectiveSteadyState = steady_state_replenishment !== false && headhaulObj?.steady_state_replenishment !== false;
   const placementNationwideOk = isNationwideMultiWarehouseHeadhaul({
-    headhaul: structuredHeadhaulObj,
+    headhaul: headhaulObj,
     headhaul_rate_cny_per_kg: effectivePlacementHeadhaulRate,
     headhaul_destination_scope: effectivePlacementHeadhaulScope,
     multi_destination_headhaul_verified,
@@ -4205,7 +4278,7 @@ function estimateGate1AWithLandedCost({
       identical_cartons_count,
       multi_destination_headhaul_verified,
       steady_state_replenishment: effectiveSteadyState,
-      headhaul: structuredHeadhaulObj,
+      headhaul: headhaulObj,
       headhaul_rate_cny_per_kg: effectivePlacementHeadhaulRate,
       headhaul_destination_scope: effectivePlacementHeadhaulScope,
     });
@@ -4252,7 +4325,7 @@ function estimateGate1AWithLandedCost({
         identical_cartons_count,
         multi_destination_headhaul_verified,
         steady_state_replenishment: effectiveSteadyState,
-        headhaul: structuredHeadhaulObj,
+        headhaul: headhaulObj,
         headhaul_rate_cny_per_kg: effectivePlacementHeadhaulRate,
         headhaul_destination_scope: effectivePlacementHeadhaulScope,
       }),
@@ -4270,7 +4343,7 @@ function estimateGate1AWithLandedCost({
           identical_cartons_count,
           multi_destination_headhaul_verified,
           steady_state_replenishment: effectiveSteadyState,
-          headhaul: structuredHeadhaulObj,
+          headhaul: headhaulObj,
           headhaul_rate_cny_per_kg: effectivePlacementHeadhaulRate,
           headhaul_destination_scope: effectivePlacementHeadhaulScope,
         })
@@ -4283,7 +4356,7 @@ function estimateGate1AWithLandedCost({
           identical_cartons_count,
           multi_destination_headhaul_verified,
           steady_state_replenishment: effectiveSteadyState,
-          headhaul: structuredHeadhaulObj,
+          headhaul: headhaulObj,
           headhaul_rate_cny_per_kg: effectivePlacementHeadhaulRate,
           headhaul_destination_scope: effectivePlacementHeadhaulScope,
         }));
@@ -4701,6 +4774,14 @@ export function solveMinPriceForMargin2027({
         reason: 'Quote requires positive goods, at least 100 actual sets, optional nonnegative domestic freight, and no separate landed cost.',
       };
     }
+    if (bare_goods_screening === false && !hasQuoteDomFreight) {
+      return {
+        status: 'pending_domestic_freight',
+        calculator_name_zh: CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
+        cost_basis: 'landed_domestic_explicit',
+        reason: 'Explicit landed-freight floor-price check (bare_goods_screening: false) requires domestic_freight_cny_total.',
+      };
+    }
     if (!hasQuoteDomFreight || isBareGoodsBasis) {
       isBareGoodsBasis = true;
       if (hasQuoteDomFreight && domesticFreightAdvisoryCnyTotal === null) {
@@ -4955,6 +5036,7 @@ export function solveMinPriceForMargin2027({
     return { contribution_usd: contrib, margin: contrib / est.net_revenue_usd };
   };
   const winningEst = feasibleSol ? feasibleSol.estimate : unconstrained.estimate;
+  const solverAdvisoryReplenishmentNote = winningEst?.components?.headhaul?.a4_applied?.advisory_replenishment_note ?? null;
 
   return {
     status: 'verified',
@@ -4962,6 +5044,7 @@ export function solveMinPriceForMargin2027({
     cost_basis: costBasis,
     ...(isBareGoodsBasis ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
     ...(domesticFreightAdvisoryCnyTotal !== null ? { domestic_freight_advisory_cny_total: domesticFreightAdvisoryCnyTotal } : {}),
+    ...(solverAdvisoryReplenishmentNote ? { advisory_replenishment_note: solverAdvisoryReplenishmentNote } : {}),
     ...(quoteInputs ? { pricing_input_basis: quoteInputs.pricing_input_basis } : {}),
     version: winningEst.version ?? FBA_2027_METADATA.version,
     landed_domestic_usd: landedUsd,

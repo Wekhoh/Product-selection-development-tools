@@ -25,6 +25,7 @@ import {
   computeNegotiationShortlist,
   computePackagingRedesignShortlist2027,
   computeMatchedPeerMedianPackage,
+  isStructuredHeadhaulSpec,
   computeHeadhaulWithA4Rules,
   bindSourcingQuotePricingInputs,
   solveMinPriceForMargin2027,
@@ -823,7 +824,7 @@ function verifyStage3ContainerBindings({
             undefined,
           steady_state_replenishment: plcLine.fee_basis?.steady_state_replenishment ?? ledger.steady_state_replenishment ?? hhSpec?.steady_state_replenishment ?? true,
           headhaul: hhSpec,
-          extra_headhauls: [ledger.headhaul, ledger.source_inputs?.headhaul, hhLine?.cny_derivation],
+          extra_headhauls: [ledger.headhaul, ledger.source_inputs?.headhaul, hhLine, hhLine?.fee_basis, hhLine?.cny_derivation, plcLine, plcLine.fee_basis, ledger],
           headhaul_rate_cny_per_kg: plcLine.fee_basis?.headhaul_rate_cny_per_kg ?? ledger.headhaul_rate_cny_per_kg ?? hhSpec?.rate_cny_per_kg ?? null,
           headhaul_destination_scope: plcLine.fee_basis?.headhaul_destination_scope ?? ledger.headhaul_destination_scope ?? hhSpec?.destination_scope ?? null,
         });
@@ -5210,19 +5211,21 @@ export function runFastProfitHealthcheck2027(spec = {}) {
   let resolvedHeadhaulUsd;
   let headhaulCheckReason = null;
   let headhaulAdvisoryNote = null;
-  const hasStructuredHeadhaul = Boolean(
-    spec.headhaul && typeof spec.headhaul === 'object' && !Array.isArray(spec.headhaul) &&
-    !finite(spec.headhaul.usd_per_unit) &&
-    (spec.headhaul.rate_cny_per_kg !== undefined ||
-      spec.headhaul.weight_per_carton_kg !== undefined ||
-      spec.headhaul.actual_weight_kg_total !== undefined ||
-      spec.headhaul.actual_weight_kg_per_unit !== undefined ||
-      spec.headhaul.carton_cm !== undefined ||
-      spec.headhaul.cartons !== undefined),
-  );
-  if (hasStructuredHeadhaul) {
+  const specHeadhaulObj = spec.headhaul && typeof spec.headhaul === 'object' && !Array.isArray(spec.headhaul) ? spec.headhaul : null;
+  const hasStructuredHeadhaul = isStructuredHeadhaulSpec(specHeadhaulObj);
+  if (specHeadhaulObj) {
+    const innerScopePre = String(specHeadhaulObj.destination_scope ?? specHeadhaulObj.headhaul_destination_scope ?? '').trim().toLowerCase();
+    const outerScopePre = String(spec.headhaul_destination_scope ?? '').trim().toLowerCase();
+    if (outerScopePre && innerScopePre && outerScopePre !== innerScopePre) {
+      headhaulCheckReason = `Conflicting outer headhaul_destination_scope (${outerScopePre}) vs headhaul.destination_scope (${innerScopePre}).`;
+    } else if (finite(spec.headhaul_rate_cny_per_kg) && finite(specHeadhaulObj.rate_cny_per_kg) &&
+      Math.abs(spec.headhaul_rate_cny_per_kg - specHeadhaulObj.rate_cny_per_kg) > 1e-6) {
+      headhaulCheckReason = `Conflicting outer headhaul_rate_cny_per_kg (${spec.headhaul_rate_cny_per_kg}) vs headhaul.rate_cny_per_kg (${specHeadhaulObj.rate_cny_per_kg}).`;
+    }
+  }
+  if (headhaulCheckReason === null && hasStructuredHeadhaul) {
     if (fx !== null) {
-      const a4 = computeHeadhaulWithA4Rules(spec.headhaul, fx, orderUnits, {
+      const a4 = computeHeadhaulWithA4Rules(specHeadhaulObj, fx, orderUnits, {
         isR58: true,
         isR59: true,
         steadyStateReplenishment: spec.steady_state_replenishment,
@@ -5230,13 +5233,9 @@ export function runFastProfitHealthcheck2027(spec = {}) {
       if (a4?.advisory_replenishment_note || a4?.a4_applied?.advisory_replenishment_note) {
         headhaulAdvisoryNote = a4.advisory_replenishment_note ?? a4.a4_applied.advisory_replenishment_note;
       }
-      const innerRate = finite(spec.headhaul.rate_cny_per_kg) ? spec.headhaul.rate_cny_per_kg : a4?.cny_derivation?.rate_cny_per_kg;
-      const innerScope = String(spec.headhaul.destination_scope ?? spec.headhaul.headhaul_destination_scope ?? '').trim().toLowerCase();
-      const outerScope = String(spec.headhaul_destination_scope ?? '').trim().toLowerCase();
+      const innerRate = finite(specHeadhaulObj.rate_cny_per_kg) ? specHeadhaulObj.rate_cny_per_kg : a4?.cny_derivation?.rate_cny_per_kg;
       if (finite(spec.headhaul_rate_cny_per_kg) && finite(innerRate) && Math.abs(spec.headhaul_rate_cny_per_kg - innerRate) > 1e-6) {
         headhaulCheckReason = `Conflicting outer headhaul_rate_cny_per_kg (${spec.headhaul_rate_cny_per_kg}) vs headhaul.rate_cny_per_kg (${innerRate}).`;
-      } else if (outerScope && innerScope && outerScope !== innerScope) {
-        headhaulCheckReason = `Conflicting outer headhaul_destination_scope (${outerScope}) vs headhaul.destination_scope (${innerScope}).`;
       } else if (a4?.weight_conflict) {
         headhaulCheckReason = a4.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.';
       } else if (a4?.missing_surcharge_quote) {
@@ -5249,11 +5248,11 @@ export function runFastProfitHealthcheck2027(spec = {}) {
         }
       }
     }
-  } else if (scalarHeadhaulUsd !== undefined) {
+  } else if (headhaulCheckReason === null && scalarHeadhaulUsd !== undefined) {
     resolvedHeadhaulUsd = scalarHeadhaulUsd;
-  } else if (spec.headhaul && typeof spec.headhaul === 'object') {
-    if (finite(spec.headhaul.usd_per_unit) && (spec.headhaul.bond_included === true || finite(spec.headhaul.bond_usd_per_unit))) {
-      resolvedHeadhaulUsd = spec.headhaul.usd_per_unit + (spec.headhaul.bond_included === true ? 0 : spec.headhaul.bond_usd_per_unit);
+  } else if (headhaulCheckReason === null && specHeadhaulObj) {
+    if (finite(specHeadhaulObj.usd_per_unit) && (specHeadhaulObj.bond_included === true || finite(specHeadhaulObj.bond_usd_per_unit))) {
+      resolvedHeadhaulUsd = specHeadhaulObj.usd_per_unit + (specHeadhaulObj.bond_included === true ? 0 : specHeadhaulObj.bond_usd_per_unit);
     }
   }
 
@@ -5482,7 +5481,7 @@ export function buildAutoEarlyScreenScenariosFromGate1A(gate1aScenarios = [], {
       profile_revision,
       id: nonemptyStr(rawSc.id) ? rawSc.id.trim() : `scenario-${idx + 1}`,
       saleable_unit: nonemptyStr(rawSc.saleable_unit) ? rawSc.saleable_unit.trim() : saleable_unit,
-      order_units: 100,
+      order_units: rawSc.order_units ?? 100,
       first_order_promotion: false,
       goods_first_order_promotion: false,
       headhaul: rawSc.headhaul ?? (resolvedHeadhaulUsd !== null
@@ -5504,6 +5503,9 @@ export function buildAutoEarlyScreenScenariosFromGate1A(gate1aScenarios = [], {
       },
       fulfillment_usd: est.components?.fulfillment?.total_usd ?? null,
       placement_usd: est.components?.placement?.selected_usd ?? null,
+      ...(rawSc.placement_split_option ?? est.components?.placement?.split_option
+        ? { placement_split_option: rawSc.placement_split_option ?? est.components?.placement?.split_option }
+        : {}),
       storage: {
         cubic_feet_per_unit: est.components?.storage?.cubic_feet ?? null,
         rate_usd_per_cuft_month: est.components?.storage?.rate_usd_per_cuft_month ?? null,

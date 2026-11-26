@@ -22,6 +22,7 @@ import {
   computeHeadhaulWithA4Rules,
   computeOrderPlan,
   getFba2027RateTableSnapshot,
+  isStructuredHeadhaulSpec,
   registerSupplementalOutOfTableRule2027,
   solveMinPriceForMargin2027,
 } from './fba-calculator.mjs';
@@ -1366,6 +1367,7 @@ export async function runPhase2Cli(
           calculator_name_zh: solution.calculator_name_zh ?? CALCULATOR_1688_FLOOR_PRICE_NAME_ZH,
           ...(solution.cost_basis ? { cost_basis: solution.cost_basis } : {}),
           ...(solution.bare_goods_disclosure ? { bare_goods_disclosure: solution.bare_goods_disclosure } : {}),
+          ...(solution.advisory_replenishment_note ? { advisory_replenishment_note: solution.advisory_replenishment_note } : {}),
           solution,
           min_retail_price_for_30pct_usd: solution.margin_floor === 0.30 ? price : null,
           mature_band_comparison: comparison,
@@ -2858,21 +2860,23 @@ export async function runPhase2Cli(
               ? qObj.headhaul_usd + (qObj.bond_included === false ? Number(qObj.bond_usd_per_unit ?? spec.bond_usd_per_unit) : 0)
               : undefined);
           const rawRevHeadhaulObj = spec.headhaul ?? qObj.headhaul ?? null;
-          const hasStructuredRevHeadhaul = Boolean(
-            rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object' && !Array.isArray(rawRevHeadhaulObj) &&
-            !Number.isFinite(rawRevHeadhaulObj.usd_per_unit) &&
-            (rawRevHeadhaulObj.rate_cny_per_kg !== undefined ||
-              rawRevHeadhaulObj.weight_per_carton_kg !== undefined ||
-              rawRevHeadhaulObj.actual_weight_kg_total !== undefined ||
-              rawRevHeadhaulObj.actual_weight_kg_per_unit !== undefined ||
-              rawRevHeadhaulObj.carton_cm !== undefined ||
-              rawRevHeadhaulObj.cartons !== undefined),
-          );
+          const revHeadhaulObj = rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object' && !Array.isArray(rawRevHeadhaulObj) ? rawRevHeadhaulObj : null;
+          const hasStructuredRevHeadhaul = isStructuredHeadhaulSpec(revHeadhaulObj);
           let resolvedRevHeadhaulUsd;
           let revHeadhaulErrorReason = null;
           let revHeadhaulAdvisoryNote = null;
-          if (hasStructuredRevHeadhaul) {
-            const a4Rev = computeHeadhaulWithA4Rules(rawRevHeadhaulObj, fxVal, orderUnits, {
+          if (revHeadhaulObj) {
+            const innerRevScopePre = String(revHeadhaulObj.destination_scope ?? revHeadhaulObj.headhaul_destination_scope ?? '').trim().toLowerCase();
+            const outerRevScopePre = String(spec.headhaul_destination_scope ?? '').trim().toLowerCase();
+            if (outerRevScopePre && innerRevScopePre && outerRevScopePre !== innerRevScopePre) {
+              revHeadhaulErrorReason = `Conflicting outer headhaul_destination_scope (${outerRevScopePre}) vs headhaul.destination_scope (${innerRevScopePre}).`;
+            } else if (Number.isFinite(spec.headhaul_rate_cny_per_kg) && Number.isFinite(revHeadhaulObj.rate_cny_per_kg) &&
+              Math.abs(spec.headhaul_rate_cny_per_kg - revHeadhaulObj.rate_cny_per_kg) > 1e-6) {
+              revHeadhaulErrorReason = `Conflicting outer headhaul_rate_cny_per_kg (${spec.headhaul_rate_cny_per_kg}) vs headhaul.rate_cny_per_kg (${revHeadhaulObj.rate_cny_per_kg}).`;
+            }
+          }
+          if (revHeadhaulErrorReason === null && hasStructuredRevHeadhaul) {
+            const a4Rev = computeHeadhaulWithA4Rules(revHeadhaulObj, fxVal, orderUnits, {
               isR58: true,
               isR59: true,
               steadyStateReplenishment: spec.steady_state_replenishment,
@@ -2880,13 +2884,9 @@ export async function runPhase2Cli(
             if (a4Rev?.advisory_replenishment_note || a4Rev?.a4_applied?.advisory_replenishment_note) {
               revHeadhaulAdvisoryNote = a4Rev.advisory_replenishment_note ?? a4Rev.a4_applied.advisory_replenishment_note;
             }
-            const innerRevRate = Number.isFinite(rawRevHeadhaulObj.rate_cny_per_kg) ? rawRevHeadhaulObj.rate_cny_per_kg : a4Rev?.cny_derivation?.rate_cny_per_kg;
-            const innerRevScope = String(rawRevHeadhaulObj.destination_scope ?? rawRevHeadhaulObj.headhaul_destination_scope ?? '').trim().toLowerCase();
-            const outerRevScope = String(spec.headhaul_destination_scope ?? '').trim().toLowerCase();
+            const innerRevRate = Number.isFinite(revHeadhaulObj.rate_cny_per_kg) ? revHeadhaulObj.rate_cny_per_kg : a4Rev?.cny_derivation?.rate_cny_per_kg;
             if (Number.isFinite(spec.headhaul_rate_cny_per_kg) && Number.isFinite(innerRevRate) && Math.abs(spec.headhaul_rate_cny_per_kg - innerRevRate) > 1e-6) {
               revHeadhaulErrorReason = `Conflicting outer headhaul_rate_cny_per_kg (${spec.headhaul_rate_cny_per_kg}) vs headhaul.rate_cny_per_kg (${innerRevRate}).`;
-            } else if (outerRevScope && innerRevScope && outerRevScope !== innerRevScope) {
-              revHeadhaulErrorReason = `Conflicting outer headhaul_destination_scope (${outerRevScope}) vs headhaul.destination_scope (${innerRevScope}).`;
             } else if (a4Rev?.weight_conflict) {
               revHeadhaulErrorReason = a4Rev.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.';
             } else if (a4Rev?.missing_surcharge_quote) {
@@ -2898,15 +2898,15 @@ export async function runPhase2Cli(
                 resolvedRevHeadhaulUsd = a4Rev.amount_usd;
               }
             }
-          } else if (scalarRevHeadhaulUsd !== undefined) {
+          } else if (revHeadhaulErrorReason === null && scalarRevHeadhaulUsd !== undefined) {
             resolvedRevHeadhaulUsd = scalarRevHeadhaulUsd;
-          } else if (rawRevHeadhaulObj && typeof rawRevHeadhaulObj === 'object') {
+          } else if (revHeadhaulErrorReason === null && revHeadhaulObj) {
             if (
-              Number.isFinite(rawRevHeadhaulObj.usd_per_unit) &&
-              rawRevHeadhaulObj.usd_per_unit >= 0 &&
-              (rawRevHeadhaulObj.bond_included === true || Number.isFinite(rawRevHeadhaulObj.bond_usd_per_unit))
+              Number.isFinite(revHeadhaulObj.usd_per_unit) &&
+              revHeadhaulObj.usd_per_unit >= 0 &&
+              (revHeadhaulObj.bond_included === true || Number.isFinite(revHeadhaulObj.bond_usd_per_unit))
             ) {
-              resolvedRevHeadhaulUsd = rawRevHeadhaulObj.usd_per_unit + (rawRevHeadhaulObj.bond_included === true ? 0 : rawRevHeadhaulObj.bond_usd_per_unit);
+              resolvedRevHeadhaulUsd = revHeadhaulObj.usd_per_unit + (revHeadhaulObj.bond_included === true ? 0 : revHeadhaulObj.bond_usd_per_unit);
             }
           }
           const bareGoodsScreening = spec.bare_goods_screening === true ||

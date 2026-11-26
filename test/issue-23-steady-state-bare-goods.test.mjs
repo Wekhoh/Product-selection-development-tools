@@ -22,7 +22,9 @@ import {
   runFastProfitHealthcheck2027,
   runGate1AForForm,
   runGate1BForForm,
+  runPhase2Batch,
 } from '../src/pipeline.mjs';
+import { ingestTrialSpecification } from '../src/raw-ingest.mjs';
 import { scoreBatch } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
 import { runPhase2Cli } from '../src/phase2-cli.mjs';
@@ -806,6 +808,399 @@ test('Issue #23 Astra audit regressions (P1-1..P1-5 & P2-1..P2-5): advisory frei
     } finally {
       migratedRankStore.close();
     }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+});
+
+test('Issue #23 adversarial review regressions: Kaiqi default ¥10/kg parity, usd_per_unit us_west_single block, bare-goods freight-only promo, explicit non-bare solveMinPrice & replenishment note, and expired-quote immunity', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'issue23-adv-core-'));
+  try {
+    // 1) Kaiqi nationwide default ¥10.0/kg with chargeable_kg_per_unit (rate_cny_per_kg omitted) matches across ALL entrypoints
+    const kaiqiDefaultChg = { destination_scope: 'nationwide_multi_warehouse', chargeable_kg_per_unit: 0.60, bond_cny_per_kg: 1.0 };
+    const hhDef = computeHeadhaulWithA4Rules(kaiqiDefaultChg, 7.2, 100, { isR58: true, isR59: true });
+    assert.ok(Math.abs(hhDef.amount_usd - (0.60 * 11 / 7.2)) < 1e-6);
+
+    const g1aDef = estimateGate1A2027({
+      pkg: STD_PKG, price_usd: 45, fx_cny_per_usd: 7.2, refund_fraction: 0.04,
+      fee_category: 'Home and Kitchen', referral_terms: REF_TERMS, collection_rate: 0.006,
+      order_units: 100, headhaul: kaiqiDefaultChg, profile_revision: 59,
+    });
+    assert.equal(g1aDef.status, 'verified');
+    assert.equal(g1aDef.components.placement.selected_usd, 0);
+    assert.equal(g1aDef.components.headhaul.amount_usd, hhDef.amount_usd);
+
+    const hcDef = runFastProfitHealthcheck2027({
+      pkg: STD_PKG, price_usd: 45, fx_cny_per_usd: 7.2, order_units: 100,
+      goods_cny_total: 4200, headhaul: kaiqiDefaultChg,
+    });
+    assert.equal(hcDef.realized_2027_off_peak.status, 'verified');
+
+    const revDefPath = join(dir, 'rev-kaiqi-default.json');
+    writeFileSync(revDefPath, JSON.stringify({
+      fx_cny_per_usd: 7.2, pkg: STD_PKG, headhaul: kaiqiDefaultChg,
+      quote: { goods_cny_total: 4200, order_units: 100 },
+    }), 'utf8');
+    const revDefStreams = makeCapturingStreams();
+    assert.equal(await runPhase2Cli(['reverse-1688', '--db', join(dir, 'rev.sqlite'), '--input', revDefPath], revDefStreams), 0);
+    const revDefOut = JSON.parse(revDefStreams.getOut());
+    assert.equal(revDefOut.reverse_1688.solution.status, 'verified');
+
+    // 2) usd_per_unit-only headhaul with destination_scope:'us_west_single' is blocked from $0 placement in Gate 1A AND calculateEconomics
+    const usWestUsdHh = { usd_per_unit: 0.70, bond_included: true, destination_scope: 'us_west_single' };
+    const g1aUsWestUsd = estimateGate1A2027({
+      pkg: STD_PKG, price_usd: 45, fx_cny_per_usd: 7.2, refund_fraction: 0.04,
+      fee_category: 'Home and Kitchen', referral_terms: REF_TERMS, collection_rate: 0.006,
+      order_units: 100, headhaul: usWestUsdHh, placement_split_option: 'amazon_optimized',
+      identical_cartons_count: 5, multi_destination_headhaul_verified: true, profile_revision: 59,
+    });
+    assert.equal(g1aUsWestUsd.status, 'sensitivity_only');
+
+    const econUsWestLedger = structuredClone(synthBatch.candidates[0].economics.scenarios[0].cost_ledger);
+    econUsWestLedger.headhaul = usWestUsdHh;
+    const plcLn = econUsWestLedger.lines.find(l => l.id === 'placement');
+    plcLn.amount_usd = 0;
+    plcLn.split_option = 'amazon_optimized';
+    plcLn.fee_basis = { ...(plcLn.fee_basis ?? {}), split_option: 'amazon_optimized' };
+    econUsWestLedger.multi_destination_headhaul_verified = true;
+    const econUsWestRes = calculateEconomics(econUsWestLedger, { profileRevision: 59, requireFeeBasis: false });
+    assert.equal(econUsWestRes.margin, null, 'calculateEconomics must hold pending when usd_per_unit us_west_single pairs with $0 placement');
+    assert.ok(econUsWestRes.pending_lines.includes('placement'));
+
+    // 3) evaluateEarlyScreen bare-goods ignores freight-only first_order_promotion when goods_first_order_promotion === false
+    const esBase = {
+      profile_revision: 59, id: 'es-bare-promo', saleable_unit: '1 organizer',
+      price_usd: 45, fx_cny_per_usd: 7.2, order_units: 100, goods_cny_per_unit: 42,
+      headhaul: { carton_count: 5, weight_per_carton_kg: 12, rate_cny_per_kg: 10.0, surcharge_cny_per_kg: 0, bond_cny_per_kg: 1.0 },
+      refund_fraction: 0.04, physical_return_fraction: 0.04, return_threshold: 0.081, returns_processing_usd: 0,
+      fee_category: 'Home and Kitchen', pkg: STD_PKG, is_apparel_or_shoes: false, referral_terms: REF_TERMS,
+      fulfillment_usd: 4.50, placement_usd: 0, placement_split_option: 'amazon_optimized',
+      storage: { cubic_feet_per_unit: 0.1389, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+      operating_period: 'off_peak', operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+      fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'pkg-std', ...WIN_2027 },
+      collection_rate: 0.006, other_applicable_usd: 0, specific_rights_conflict: false, strong_date_dependency: false,
+    };
+    const esFreightOnlyPromo = evaluateEarlyScreen({
+      ...esBase, bare_goods_screening: true, goods_first_order_promotion: false, first_order_promotion: true,
+    });
+    assert.equal(esFreightOnlyPromo.gate_status, 'pass');
+    assert.equal(esFreightOnlyPromo.cost_basis, 'bare_goods_1688');
+    // Still rejects when goods_first_order_promotion is omitted (ambiguous promo) or non-bare-goods mode
+    const esAmbigPromo = evaluateEarlyScreen({ ...esBase, bare_goods_screening: true, first_order_promotion: true });
+    assert.equal(esAmbigPromo.gate_status, 'pending');
+
+    // 4) solveMinPriceForMargin2027 rejects bare_goods_screening:false + null freight AND exposes advisory_replenishment_note (+ CLI solve-min-price)
+    const solveNeedFreight = solveMinPriceForMargin2027({
+      pkg: STD_PKG, fx_cny_per_usd: 7.2, headhaul_usd: 1.5, refund_fraction: 0.04,
+      fee_category: 'Home and Kitchen', referral_terms: REF_TERMS, collection_rate: 0.006,
+      bare_goods_screening: false,
+      landed_domestic_quote: { goods_cny_total: 4200, domestic_freight_cny_total: null, actual_sets: 100, fx_cny_per_usd: 7.2, pkg: STD_PKG },
+    });
+    assert.equal(solveNeedFreight.status, 'pending_domestic_freight');
+    assert.equal(solveNeedFreight.cost_basis, 'landed_domestic_explicit');
+
+    const lightHh = { carton_count: 2, weight_per_carton_kg: 12, rate_cny_per_kg: 10.0, surcharge_cny_per_kg: 0, bond_cny_per_kg: 1.0 };
+    const solveWithNote = solveMinPriceForMargin2027({
+      pkg: STD_PKG, fx_cny_per_usd: 7.2, headhaul: lightHh, refund_fraction: 0.04,
+      fee_category: 'Home and Kitchen', referral_terms: REF_TERMS, collection_rate: 0.006,
+      bare_goods_quote: { goods_cny_total: 4200, actual_sets: 100, fx_cny_per_usd: 7.2, pkg: STD_PKG },
+    });
+    assert.equal(solveWithNote.status, 'verified');
+    assert.match(solveWithNote.advisory_replenishment_note ?? '', /50 kg/);
+
+    const solveCliPath = join(dir, 'solve-min.json');
+    writeFileSync(solveCliPath, JSON.stringify({
+      pkg: STD_PKG, fx_cny_per_usd: 7.2, headhaul: lightHh, refund_fraction: 0.04,
+      fee_category: 'Home and Kitchen', referral_terms: REF_TERMS, collection_rate: 0.006,
+      bare_goods_quote: { goods_cny_total: 4200, actual_sets: 100, fx_cny_per_usd: 7.2, pkg: STD_PKG },
+    }), 'utf8');
+    const solveStreams = makeCapturingStreams();
+    assert.equal(await runPhase2Cli(['solve-min-price', '--db', join(dir, 'solve.sqlite'), '--input', solveCliPath], solveStreams), 0);
+    const solveCliOut = JSON.parse(solveStreams.getOut());
+    assert.match(solveCliOut.advisory_replenishment_note ?? '', /50 kg/);
+
+    // 5) Expired quotes are NEVER promoted during legacy migration reranking AND NEVER supersede fresh quotes in recordSourcingQuote1688
+    const expDbPath = join(dir, 'expired-immunity.sqlite');
+    const rawExp = new DatabaseSync(expDbPath);
+    try {
+      rawExp.exec(`
+        CREATE TABLE candidate_forms (
+          form_id TEXT PRIMARY KEY, product_family_key TEXT NOT NULL, spec_version INTEGER NOT NULL DEFAULT 1,
+          spec_sha256 TEXT NOT NULL, label TEXT NOT NULL, buyer_task TEXT NOT NULL,
+          saleable_set_composition_json TEXT NOT NULL, lifecycle_status TEXT NOT NULL DEFAULT 'discovered',
+          created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE sourcing_quotes_1688 (
+          quote_id TEXT PRIMARY KEY, form_id TEXT NOT NULL REFERENCES candidate_forms(form_id),
+          spec_version INTEGER NOT NULL, sku_lines_json TEXT NOT NULL, order_plan_json TEXT,
+          pack_multiple INTEGER NOT NULL, moq_sets INTEGER NOT NULL, actual_sets INTEGER NOT NULL, actual_complete_sets INTEGER NOT NULL,
+          goods_cny_total REAL CHECK(goods_cny_total > 0),
+          domestic_freight_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND domestic_freight_cny_total IS NOT NULL AND domestic_freight_cny_total >= 0)),
+          pkg_json TEXT, fx_cny_per_usd REAL, factory_id TEXT, spec_variant_key TEXT, kit_note TEXT,
+          goods_first_order_promotion INTEGER NOT NULL, freight_first_order_promotion INTEGER NOT NULL,
+          lead_time_days INTEGER, sensitive_freebie_flags_json TEXT NOT NULL, redacted_destination TEXT NOT NULL,
+          redacted_screenshot_path TEXT, redacted_webp_sha256 TEXT, raw_readback_ref TEXT,
+          observed_at TEXT NOT NULL, expires_at TEXT, quote_status TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        INSERT INTO candidate_forms VALUES ('f-exp','f-exp',1,'sha','Exp Test','Task','[{"component_id":"unit","qty_per_saleable_set":1}]','discovered','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z');
+        INSERT INTO sourcing_quotes_1688 VALUES
+          ('q-expired-cheap','f-exp',1,'[]',NULL,1,100,100,100,3500,500,NULL,7.2,'fac-old','v1',NULL,0,0,7,'{}','广东深圳',NULL,NULL,'rb://old','2026-01-01T00:00:00Z','2026-02-01','superseded_uncompetitive','2026-01-01T00:00:00Z'),
+          ('q-active-cur','f-exp',1,'[]',NULL,1,100,100,100,4000,0,NULL,7.2,'fac-cur','v1',NULL,0,0,7,'{}','广东深圳',NULL,NULL,'rb://cur','2026-11-20T00:00:00Z',NULL,'verified','2026-11-20T00:00:00Z');
+      `);
+    } finally {
+      rawExp.close();
+    }
+    const expStore = openSelectionStore(expDbPath);
+    try {
+      assert.equal(expStore.getQuoteById('q-expired-cheap').quote_status, 'superseded_uncompetitive', 'Expired quote must NOT be resurrected by migration rerank');
+      assert.equal(expStore.getQuoteById('q-active-cur').quote_status, 'verified', 'Active quote must stay verified when only cheaper peer is expired');
+    } finally {
+      expStore.close();
+    }
+
+    // Seed a fresh DB with an expired 'verified' cheap quote (¥35) and insert a fresh quote (¥40) -> fresh quote must stay 'verified'!
+    const expRecStore = openSelectionStore(join(dir, 'expired-rec.sqlite'));
+    try {
+      expRecStore.upsertCandidateForm({
+        form_id: 'f-exp-rec', product_family_key: 'f-exp-rec', label: 'Exp Rec', buyer_task: 'Task',
+        saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+      });
+      expRecStore.db.prepare(`
+        INSERT INTO sourcing_quotes_1688 (
+          quote_id, form_id, spec_version, sku_lines_json, order_plan_json, pack_multiple, moq_sets, actual_sets, actual_complete_sets,
+          goods_cny_total, domestic_freight_cny_total, pkg_json, fx_cny_per_usd, factory_id, spec_variant_key, kit_note,
+          goods_first_order_promotion, freight_first_order_promotion, lead_time_days, sensitive_freebie_flags_json,
+          redacted_destination, redacted_screenshot_path, redacted_webp_sha256, raw_readback_ref, observed_at, expires_at, quote_status, created_at
+        ) VALUES ('q-exp-ver','f-exp-rec',1,'[]',NULL,1,100,100,100,3500,NULL,NULL,7.2,'fac-exp','v1',NULL,0,0,7,'{}','广东深圳',NULL,NULL,'rb://e','2026-01-01T00:00:00Z','2026-02-01','verified','2026-01-01T00:00:00Z')
+      `).run();
+      const freshRec = expRecStore.recordSourcingQuote1688({
+        quote_id: 'q-fresh-40', form_id: 'f-exp-rec', factory_id: 'fac-new', spec_variant_key: 'v1',
+        observed_at: '2026-11-26T10:00:00Z', redacted_destination: '广东深圳',
+        goods_first_order_promotion: false, quote_status: 'verified',
+        goods_cny_total: 4000, domestic_freight_cny_total: null, fx_cny_per_usd: 7.2,
+        raw_readback_ref: 'rb://fresh',
+        ui_readback: { logged_in: true, viewport_width_px: 1440, selected_sku_row_visible: true, settlement_bar_visible: true, applied_quantity_confirmed: true },
+        sku_lines: [{ component_id: 'unit', offer_id: 'o-f', sku_id: 's-f', factory_id: 'fac-new', pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: 40, regular_goods_promo_false: true }],
+      });
+      assert.equal(freshRec.quote.quote_status, 'verified', 'Fresh quote must NOT be superseded by an expired verified quote');
+    } finally {
+      expRecStore.close();
+    }
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+});
+
+test('Issue #23 adversarial review regressions: raw-ingest SP-API calibration preserves $0 placement & recalibrates carton headhaul, Stage 3 rejects [0,0]+us_west_single, and report renders pending bare-goods + mobile CSS cleanly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'issue23-adv-e2e-'));
+  try {
+    // 1) ingestTrialSpecification with SQLite bare-goods quote (¥500 advisory freight + freight promo) + omitted domestic_freight + SP-API calibration
+    const spDb = join(dir, 'sp-bare.sqlite');
+    const spStore = openSelectionStore(spDb);
+    try {
+      spStore.upsertCandidateForm({
+        form_id: 'form-sp-bare', product_family_key: 'form-sp-bare', label: 'SP Bare', buyer_task: 'Task',
+        saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+      });
+      spStore.recordSourcingQuote1688({
+        quote_id: 'q-sp-bare', form_id: 'form-sp-bare', factory_id: 'fac-sp',
+        observed_at: '2026-11-26T10:00:00Z', redacted_destination: '广东深圳',
+        goods_first_order_promotion: false, freight_first_order_promotion: true,
+        bare_goods_screening: true, quote_status: 'verified',
+        goods_cny_total: 4200, domestic_freight_cny_total: 500, fx_cny_per_usd: 7.2, pkg: STD_PKG,
+        raw_readback_ref: 'rb://sp-bare',
+        ui_readback: { logged_in: true, viewport_width_px: 1440, selected_sku_row_visible: true, settlement_bar_visible: true, applied_quantity_confirmed: true },
+        sku_lines: [{ component_id: 'unit', offer_id: 'o-sp', sku_id: 's-sp', factory_id: 'fac-sp', pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: 42, regular_goods_promo_false: true }],
+      });
+
+      const makeSpCand = (id, cartonWtKg) => {
+        const c = structuredClone(synthBatch.candidates[0]);
+        c.id = id;
+        c.form_id = 'form-sp-bare';
+        c.screening.reference_price_usd = {
+          value: 45, unit: 'USD', matched_spec: true, target_variant_asin: 'B0SYNSP001',
+          fulfillment_channel: 'FBA', sales_history_supported: true, evidence: ['synthetic-evidence'],
+        };
+        for (const sc of c.economics.scenarios) {
+          sc.quote_id = 'q-sp-bare';
+          sc.cost_ledger.cost_basis = 'bare_goods_1688';
+          sc.cost_ledger.fx_cny_per_usd = 7.2;
+          sc.cost_ledger.order_units = 100;
+          sc.cost_ledger.multi_destination_headhaul_verified = true;
+          sc.cost_ledger.lines = sc.cost_ledger.lines.filter(l => l.id !== 'domestic_freight');
+          const proc = sc.cost_ledger.lines.find(l => l.id === 'procurement');
+          proc.amount_usd = Number((42 / 7.2).toFixed(6));
+          proc.order_units = 100;
+          proc.first_order_promotion = false;
+          const plc = sc.cost_ledger.lines.find(l => l.id === 'placement');
+          plc.amount_usd = 0;
+          plc.split_option = 'amazon_optimized';
+          plc.fee_basis = { ...(plc.fee_basis ?? {}), split_option: 'amazon_optimized' };
+          const hh = sc.cost_ledger.lines.find(l => l.id === 'headhaul');
+          hh.cny_derivation = {
+            carton_count: 4, weight_per_carton_kg: cartonWtKg, carton_cm: [30, 30, 30],
+            rate_cny_per_kg: 10.0, surcharge_cny_per_kg: 0, bond_cny_per_kg: 1.0,
+          };
+          hh.amount_usd = Number(((4 * cartonWtKg * 11) / 100 / 7.2).toFixed(6));
+        }
+        return c;
+      };
+
+      // (a) Heavier SP-API unit weight (2.0 lb = 0.907185 kg/unit > 0.60 kg/unit carton weight) updates headhaul cleanly AND preserves $0 placement
+      // (b) Lighter SP-API unit weight (1.0 lb = 0.453592 kg/unit < 0.60 kg/unit carton weight) preserves supplier's heavier master-carton gross weight (60 kg)
+      const ingHeavier = ingestTrialSpecification({
+        profile_revision: 59, allow_synthetic_without_receipts: true, evidence: synthBatch.evidence,
+        candidates: [{
+          candidate: makeSpCand('cand-sp-heavier', 15),
+          sp_api_calibration_inputs: {
+            asin: 'B0SYNSP001', price_usd: 45,
+            catalogItemRaw: {
+              asin: 'B0SYNSP001',
+              dimensions: [{ marketplaceId: 'ATVPDKIKX0DER', package: { length: { value: 10, unit: 'inches' }, width: { value: 8, unit: 'inches' }, height: { value: 3, unit: 'inches' }, weight: { value: 2.0, unit: 'pounds' } } }],
+            },
+          },
+        }],
+      }, r59Profile, { store: spStore });
+      const lHeavier = ingHeavier.batch.candidates[0].economics.scenarios[0].cost_ledger;
+      assert.equal(lHeavier.lines.find(l => l.id === 'placement').amount_usd, 0, 'SP-API calibration must preserve steady-state $0 amazon_optimized placement');
+      const hhHeavierAmt = lHeavier.lines.find(l => l.id === 'headhaul').amount_usd;
+      assert.ok(hhHeavierAmt > 1.35 && hhHeavierAmt < 1.42, `Expected SP-API 2.0 lb headhaul ~$1.386, got ${hhHeavierAmt}`);
+
+      const ingLighter = ingestTrialSpecification({
+        profile_revision: 59, allow_synthetic_without_receipts: true, evidence: synthBatch.evidence,
+        candidates: [{
+          candidate: makeSpCand('cand-sp-lighter', 15),
+          sp_api_calibration_inputs: {
+            asin: 'B0SYNSP001', price_usd: 45,
+            catalogItemRaw: {
+              asin: 'B0SYNSP001',
+              dimensions: [{ marketplaceId: 'ATVPDKIKX0DER', package: { length: { value: 8, unit: 'inches' }, width: { value: 6, unit: 'inches' }, height: { value: 2, unit: 'inches' }, weight: { value: 1.0, unit: 'pounds' } } }],
+            },
+          },
+        }],
+      }, r59Profile, { store: spStore });
+      const lLighter = ingLighter.batch.candidates[0].economics.scenarios[0].cost_ledger;
+      assert.equal(lLighter.lines.find(l => l.id === 'placement').amount_usd, 0);
+      const hhLighterAmt = lLighter.lines.find(l => l.id === 'headhaul').amount_usd;
+      assert.ok(Math.abs(hhLighterAmt - ((60 * 11) / 100 / 7.2)) < 1e-6, `Lighter SP-API unit weight must not underbill 60 kg master carton ($0.9167), got ${hhLighterAmt}`);
+    } finally {
+      spStore.close();
+    }
+
+    // 2) Stage 3 runPhase2Batch (verifyStage3ContainerBindings) blocks [0,0] placement when cny_derivation has destination_scope:'us_west_single'
+    const st3Db = join(dir, 'stage3-uswest.sqlite');
+    const st3Store = openSelectionStore(st3Db);
+    try {
+      const kaiqiHh = { carton_count: 5, weight_per_carton_kg: 12, rate_cny_per_kg: 10.0, surcharge_cny_per_kg: 0, bond_cny_per_kg: 1.0 };
+      const st3Est = estimateGate1A2027({
+        pkg: STD_PKG, price_usd: 45, fx_cny_per_usd: 7.2, refund_fraction: 0.04,
+        fee_category: 'Home and Kitchen', referral_terms: REF_TERMS, collection_rate: 0.006,
+        order_units: 100, headhaul: kaiqiHh, profile_revision: 59,
+      });
+      const st3FulUsd = st3Est.components.fulfillment.total_usd;
+      const st3HhUsd = st3Est.components.headhaul.amount_usd;
+      const st3Out = await runPhase2Batch(st3Store, {
+        profile: r59Profile,
+        as_of_date: '2026-11-26',
+        sourcing_executor: async () => ({
+          status: 'quoted',
+          quote: {
+            quote_id: 'q-st3-usw', factory_id: 'fac-st3', observed_at: '2026-11-26T10:00:00Z',
+            redacted_destination: '广东深圳', raw_readback_ref: 'rb://st3',
+            goods_first_order_promotion: false, freight_first_order_promotion: false,
+            fx_cny_per_usd: 7.2, pkg: STD_PKG,
+            ui_readback: { logged_in: true, viewport_width_px: 1440, selected_sku_row_visible: true, settlement_bar_visible: true, applied_quantity_confirmed: true },
+            sku_lines: [{ component_id: 'unit', offer_id: 'o-s3', sku_id: 's-s3', factory_id: 'fac-st3', pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: 42, regular_goods_promo_false: true }],
+            goods_cny_total: 4200, domestic_freight_cny_total: null,
+          },
+        }),
+        deep_research_executor: async ({ form }) => {
+          const batchCopy = structuredClone(synthBatch);
+          const c = batchCopy.candidates[0];
+          c.id = form.form_id;
+          c.form_id = form.form_id;
+          const sc = c.economics.scenarios[0];
+          sc.id = 'sc-st3-usw';
+          sc.quote_id = 'q-st3-usw';
+          sc.cost_ledger.price_usd = 45;
+          sc.cost_ledger.fx_cny_per_usd = 7.2;
+          sc.cost_ledger.order_units = 100;
+          sc.cost_ledger.cost_basis = 'bare_goods_1688';
+          sc.cost_ledger.lines = sc.cost_ledger.lines.filter(l => l.id !== 'domestic_freight');
+          sc.cost_ledger.lines.find(l => l.id === 'procurement').amount_usd = Number((42 / 7.2).toFixed(6));
+          sc.cost_ledger.lines.find(l => l.id === 'fulfillment').amount_usd = st3FulUsd;
+          const plc = sc.cost_ledger.lines.find(l => l.id === 'placement');
+          plc.amount_usd = 0;
+          plc.split_option = 'amazon_optimized';
+          plc.fee_basis = { ...(plc.fee_basis ?? {}), split_option: 'amazon_optimized' };
+          const hh = sc.cost_ledger.lines.find(l => l.id === 'headhaul');
+          hh.amount_usd = st3HhUsd;
+          hh.cny_derivation = { ...kaiqiHh, destination_scope: 'us_west_single' };
+          c.economics.scenarios = [sc];
+          batchCopy.candidates = [c];
+          return { batch: batchCopy };
+        },
+        items: [{
+          leads: [{
+            lead_id: 'lead-st3-usw', source_channel: 'reddit',
+            source_ref: 'https://www.reddit.com/r/tools/comments/st3usw/',
+            phrase_or_title: 'synthetic organizer', observed_at: '2026-11-26', disposition: 'product',
+          }],
+          form: { form_id: 'form-st3-usw', label: 'Stage 3 USW Guard', buyer_task: 'Task', saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }] },
+          gate1a_scenarios: [{
+            id: 'sc-st3-usw', price_usd: 45, pkg: STD_PKG, fx_cny_per_usd: 7.2, order_units: 100,
+            refund_fraction: 0.04, physical_return_fraction: 0.04, fee_category: 'Home and Kitchen',
+            referral_terms: REF_TERMS, headhaul: kaiqiHh, collection_rate: 0.006, other_applicable_usd: 0,
+          }],
+          early_screen_builder: () => [{
+            profile_revision: 59, id: 'sc-st3-usw', saleable_unit: '1 organizer',
+            price_usd: 45, pkg: STD_PKG, fx_cny_per_usd: 7.2,
+            order_units: 100, headhaul: kaiqiHh, refund_fraction: 0.04, physical_return_fraction: 0.04,
+            return_threshold: 0.081, returns_processing_usd: 0, fee_category: 'Home and Kitchen',
+            referral_terms: REF_TERMS, fulfillment_usd: st3FulUsd, placement_usd: 0,
+            placement_split_option: 'amazon_optimized',
+            storage: { cubic_feet_per_unit: (10 * 8 * 3) / 1728, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+            operating_period: 'off_peak', operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+            fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'pkg-std', ...WIN_2027 },
+            collection_rate: 0.006, other_applicable_usd: 0, specific_rights_conflict: false, strong_date_dependency: false,
+          }],
+        }],
+      });
+      const st3Entry = st3Out.gate2_3.find(x => x.form_id === 'form-st3-usw');
+      assert.equal(st3Entry.status, 'gate2_3_error');
+      assert.match(st3Entry.error, /US-West single-warehouse|us_west_single/i);
+    } finally {
+      st3Store.close();
+    }
+
+    // 3) Pending bare-goods card renders bare-goods labels, disclosure, stress cap label, AND mobile CSS --m4:"1688百套裸货"
+    const pendingBareBatch = structuredClone(synthBatch);
+    const pCand = pendingBareBatch.candidates[0];
+    pendingBareBatch.candidates = [pCand];
+    for (const sc of pCand.economics.scenarios) {
+      sc.cost_ledger.cost_basis = 'bare_goods_1688';
+      sc.cost_ledger.lines = sc.cost_ledger.lines.filter(l => l.id !== 'domestic_freight');
+      if (sc.cost_ledger.source_inputs) delete sc.cost_ledger.source_inputs.domestic_per_unit_cny;
+      // Leave headhaul pending so activeLedgers is empty and card enters pending queue
+      const hh = sc.cost_ledger.lines.find(l => l.id === 'headhaul');
+      hh.status = 'pending';
+      hh.amount_usd = null;
+    }
+    const stBareLedger = structuredClone(synthBatch.candidates[0].economics.scenarios[0].cost_ledger);
+    stBareLedger.id = 'st-bare-1';
+    stBareLedger.cost_basis = 'bare_goods_1688';
+    stBareLedger.lines = stBareLedger.lines.filter(l => l.id !== 'domestic_freight');
+    pCand.economics.stress_scenarios = [
+      { id: 'st-bare-1', label: 'Promo Stress', cost_ledger: stBareLedger },
+    ];
+
+    const pScored = scoreBatch(pendingBareBatch, r59Profile);
+    const pHtml = renderReport(pScored, pendingBareBatch, r59Profile);
+    assert.ok(pHtml.includes('1688百套裸货'), 'Pending bare-goods card must render 1688百套裸货');
+    assert.ok(pHtml.includes('保 30% 裸货封顶'), 'Pending bare-goods card hero must render 保 30% 裸货封顶');
+    assert.ok(pHtml.includes('保30%裸货上限'), 'Stress scenario on bare-goods card must render 保30%裸货上限');
+    assert.ok(pHtml.includes(EXPECTED_DISCLOSURE), 'Pending bare-goods card must render mandatory bare-goods disclosure');
+    assert.ok(pHtml.includes('--m4:"1688百套裸货"'), 'Mobile CSS @container override must match bare-goods overview header');
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
