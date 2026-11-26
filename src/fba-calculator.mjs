@@ -819,21 +819,34 @@ export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, req
         : 'Revision 57 requires explicit order_units: 100 and first_order_promotion: false on both regular repeat-order procurement and domestic delivery.');
     }
     if (isR59 && line.id === 'headhaul' && line.status !== 'pending') {
-      const rawHhSpec = line.cny_derivation
-        ?? (input.headhaul && typeof input.headhaul === 'object' ? input.headhaul : null)
-        ?? (input.source_inputs?.headhaul && typeof input.source_inputs.headhaul === 'object' ? input.source_inputs.headhaul : null);
-      if (rawHhSpec && typeof rawHhSpec === 'object' && rawHhSpec.rate_cny_per_kg !== undefined) {
-        const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
-        const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
-        const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
-        if (hhCalc.missing_surcharge_quote) {
-          add('headhaul', 'headhaul_surcharge_quote_required', `Freight A4 surcharge triggered (${hhCalc.a4_applied?.missing_surcharge_quote ?? 'small shipment / carton'}) without an explicit surcharge quote.`);
-        } else if (!hhCalc.exact_usd_rational) {
-          add('headhaul', 'invalid_headhaul_tariff', 'Supplied Freight A4 headhaul tariff inputs are incomplete or invalid.');
-        } else {
+      const rawHhSpecs = collectStructuredHeadhaulSpecs(line.cny_derivation, input.headhaul, input.source_inputs?.headhaul);
+      if (rawHhSpecs.length > 0) {
+        let firstExpectedUsd = null;
+        for (const rawHhSpec of rawHhSpecs) {
+          const effFx = rawHhSpec.fx ?? rawHhSpec.fx_cny_per_usd ?? input.fx_cny_per_usd ?? input.source_inputs?.fx_cny_per_usd;
+          const effUnits = rawHhSpec.order_units ?? input.order_units ?? procLine?.order_units ?? null;
+          const hhCalc = computeHeadhaulWithA4Rules(rawHhSpec, effFx, effUnits, { isR58: true, isR59: true });
+          if (hhCalc.weight_conflict) {
+            add('headhaul', 'headhaul_weight_conflict', hhCalc.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.');
+            break;
+          }
+          if (hhCalc.missing_surcharge_quote) {
+            add('headhaul', 'headhaul_surcharge_quote_required', `Freight A4 surcharge triggered (${hhCalc.a4_applied?.missing_surcharge_quote ?? 'small shipment / carton'}) without an explicit surcharge quote.`);
+            break;
+          }
+          if (!hhCalc.exact_usd_rational) {
+            add('headhaul', 'invalid_headhaul_tariff', 'Supplied Freight A4 headhaul tariff inputs are incomplete or invalid.');
+            break;
+          }
           const expectedHhUsd = roundBigRat(hhCalc.exact_usd_rational.n, hhCalc.exact_usd_rational.d, 10);
+          if (firstExpectedUsd !== null && Math.abs(firstExpectedUsd - expectedHhUsd) > 0.005) {
+            add('headhaul', 'headhaul_weight_conflict', `Conflicting structured headhaul specs compute different per-unit costs ($${firstExpectedUsd} vs $${expectedHhUsd}).`);
+            break;
+          }
+          firstExpectedUsd = expectedHhUsd;
           if (finite(line.amount_usd) && Math.abs(line.amount_usd - expectedHhUsd) > 0.005) {
             add('headhaul', 'headhaul_tariff_mismatch', `Supplied headhaul amount_usd (${line.amount_usd}) conflicts with recomputed Freight A4 tariff (${expectedHhUsd}).`);
+            break;
           }
         }
       }
@@ -1070,6 +1083,11 @@ export function computeAmazonCouponRedemptionFee2027({
 const A4_HEADHAUL_EXTRA_KEYS = [
   'carton_cm',
   'carton_count',
+  'units_per_carton',
+  'cartons',
+  'mixed_cartons',
+  'identical_cartons',
+  'uniform_cartons',
   'actual_weight_kg_total',
   'actual_weight_kg_per_unit',
   'weight_per_carton_kg',
@@ -1082,9 +1100,80 @@ const A4_HEADHAUL_EXTRA_KEYS = [
   'small_carton_surcharge_cny_per_kg',
 ];
 
+export function collectStructuredHeadhaulSpecs(...candidates) {
+  const seen = new Set();
+  const out = [];
+  for (const cand of candidates) {
+    if (!cand || typeof cand !== 'object' || Array.isArray(cand) || seen.has(cand)) continue;
+    if (cand.rate_cny_per_kg !== undefined || A4_HEADHAUL_EXTRA_KEYS.some(k => cand[k] !== undefined && cand[k] !== null)) {
+      seen.add(cand);
+      out.push(cand);
+    }
+  }
+  return out;
+}
+
+function normalizeCartonDimensionsCm(cm) {
+  if (cm === undefined || cm === null) return { present: false, valid: true, dims: null };
+  if (Array.isArray(cm)) {
+    if (cm.length === 3 && cm.every(v => finite(v) && v > 0)) {
+      return { present: true, valid: true, dims: [cm[0], cm[1], cm[2]] };
+    }
+    return { present: true, valid: false, dims: null };
+  }
+  if (typeof cm === 'object') {
+    const l = cm.length_cm ?? cm.l_cm;
+    const w = cm.width_cm ?? cm.w_cm;
+    const h = cm.height_cm ?? cm.h_cm;
+    if (finite(l) && l > 0 && finite(w) && w > 0 && finite(h) && h > 0) {
+      return { present: true, valid: true, dims: [l, w, h] };
+    }
+    return { present: true, valid: false, dims: null };
+  }
+  return { present: true, valid: false, dims: null };
+}
+
+function decimalPlacesOfNumber(num) {
+  const s = String(num).toLowerCase();
+  const [mantissa, expStr] = s.split('e');
+  const exp = expStr ? Number(expStr) : 0;
+  const fracLen = mantissa.includes('.') ? mantissa.split('.')[1].length : 0;
+  return Math.max(0, fracLen - exp);
+}
+
+function halfUlpRat(num) {
+  const d = decimalPlacesOfNumber(num);
+  if (d <= 0) return { n: 0n, d: 1n };
+  return { n: 1n, d: 2n * (10n ** BigInt(d)) };
+}
+
+function absRatDiff(a, b) {
+  const diff = addBigRat(a, { n: -b.n, d: b.d });
+  return diff.n < 0n ? { n: -diff.n, d: diff.d } : diff;
+}
+
+function totalsConsistentWithinDecimalPrecision(unitNum, countR, totalNum, totalR) {
+  const unitR = toBigRat(unitNum);
+  const derivedTotalR = mulBigRat(unitR, countR);
+  if (ratCmp(derivedTotalR, totalR) === 0) return true;
+  const unitHalfUlp = halfUlpRat(unitNum);
+  if (unitHalfUlp.n > 0n) {
+    const expectedUnitR = divBigRat(totalR, countR);
+    if (ratCmp(absRatDiff(unitR, expectedUnitR), unitHalfUlp) <= 0) return true;
+  }
+  if (finite(totalNum)) {
+    const totalHalfUlp = halfUlpRat(totalNum);
+    if (totalHalfUlp.n > 0n && ratCmp(absRatDiff(derivedTotalR, totalR), totalHalfUlp) <= 0) return true;
+  }
+  return false;
+}
+
 /**
  * Shared exact BigInt rational headhaul calculator incorporating freight-forwarder A4 rules:
- *  - Volumetric weight: carton_cm[0]*carton_cm[1]*carton_cm[2] / volumetric_divisor (default 6000) * carton_count
+ *  - Actual gross weight: `actual_weight_kg_total`, `actual_weight_kg_per_unit * order_units`,
+ *    `weight_per_carton_kg * carton_count` (for uniform cartons), or summed `cartons[]` weights
+ *  - Volumetric weight: `carton_cm[0]*carton_cm[1]*carton_cm[2] / volumetric_divisor (default 6000) * carton_count`
+ *    or summed per-carton dimensions in `cartons[]`
  *  - Minimum shipment billable weight: <10 kg billed at 10 kg minimum (enabled in r59 or when A4 fields supplied)
  *  - <50 kg small-shipment surcharge (`small_shipment_surcharge_cny_per_kg`)
  *  - <8 kg outer-carton surcharge (`small_carton_surcharge_cny_per_carton` / `small_carton_surcharge_cny_per_kg`)
@@ -1122,19 +1211,45 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
     : (finite(headhaul.order_units) && headhaul.order_units > 0 ? headhaul.order_units : null);
   const needsUnits = !isR58 || hasShipmentBond || hasA4Extras || isR59;
 
-  const normalizedCartonCm = Array.isArray(carton_cm) && carton_cm.length === 3 && carton_cm.every(v => finite(v) && v > 0)
-    ? carton_cm
-    : (carton_cm && typeof carton_cm === 'object' &&
-      finite(carton_cm.length_cm ?? carton_cm.l_cm) && (carton_cm.length_cm ?? carton_cm.l_cm) > 0 &&
-      finite(carton_cm.width_cm ?? carton_cm.w_cm) && (carton_cm.width_cm ?? carton_cm.w_cm) > 0 &&
-      finite(carton_cm.height_cm ?? carton_cm.h_cm) && (carton_cm.height_cm ?? carton_cm.h_cm) > 0
-      ? [carton_cm.length_cm ?? carton_cm.l_cm, carton_cm.width_cm ?? carton_cm.w_cm, carton_cm.height_cm ?? carton_cm.h_cm]
-      : null);
+  const cartonCmRes = normalizeCartonDimensionsCm(carton_cm);
+  if (cartonCmRes.present && !cartonCmRes.valid) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      missing_surcharge_quote: true,
+      a4_applied: {
+        volumetric_dimensions_present: true,
+        missing_surcharge_quote: 'invalid_carton_cm_dimensions',
+      },
+    };
+  }
+  const normalizedCartonCm = cartonCmRes.dims;
+
+  const hasInvalidCartonCount = carton_count !== undefined && carton_count !== null &&
+    (!Number.isSafeInteger(carton_count) || carton_count <= 0);
+  const hasInvalidUnitsPerCarton = headhaul.units_per_carton !== undefined && headhaul.units_per_carton !== null &&
+    (!Number.isSafeInteger(headhaul.units_per_carton) || headhaul.units_per_carton <= 0);
+  const hasInvalidWeightPerCarton = weight_per_carton_kg !== undefined && weight_per_carton_kg !== null &&
+    (!finite(weight_per_carton_kg) || weight_per_carton_kg <= 0);
+  const hasInvalidActualTotal = actual_weight_kg_total !== undefined && actual_weight_kg_total !== null &&
+    (!finite(actual_weight_kg_total) || actual_weight_kg_total <= 0);
+  const hasInvalidActualPerUnit = actual_weight_kg_per_unit !== undefined && actual_weight_kg_per_unit !== null &&
+    (!finite(actual_weight_kg_per_unit) || actual_weight_kg_per_unit <= 0);
+  const hasInvalidCartonsList = headhaul.cartons !== undefined && headhaul.cartons !== null &&
+    (!Array.isArray(headhaul.cartons) || headhaul.cartons.length === 0);
+  if (hasInvalidCartonCount || hasInvalidUnitsPerCarton || hasInvalidWeightPerCarton ||
+    hasInvalidActualTotal || hasInvalidActualPerUnit || hasInvalidCartonsList) {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
+  }
+
+  const hasCartonsArray = Array.isArray(headhaul.cartons) && headhaul.cartons.length > 0;
   const hasValidCartonCm = normalizedCartonCm !== null;
-  const canDeriveWeight = (finite(kgPerUnit) && kgPerUnit > 0) ||
-    (finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0) ||
-    (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) ||
-    hasValidCartonCm;
+  const hasWeightPerCarton = finite(weight_per_carton_kg) && weight_per_carton_kg > 0;
+  const hasActualTotal = finite(actual_weight_kg_total) && actual_weight_kg_total > 0;
+  const hasActualPerUnit = finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0;
+  const hasKgPerUnit = finite(kgPerUnit) && kgPerUnit > 0;
+  const canDeriveWeight = hasKgPerUnit || hasActualPerUnit || hasActualTotal || hasWeightPerCarton || hasValidCartonCm || hasCartonsArray;
 
   if (!canDeriveWeight || ![rate, surcharge].every(v => finite(v) && v >= 0) ||
     (!hasPerKgBond && !hasShipmentBond) || (hasPerKgBond && hasShipmentBond) ||
@@ -1144,26 +1259,260 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
 
   const unitsR = effectiveUnits !== null ? toBigRat(effectiveUnits) : { n: 100n, d: 1n };
   const divisorVal = finite(volumetric_divisor) && volumetric_divisor > 0 ? volumetric_divisor : 6000;
-  const derivedCartonsFromPack = Number.isSafeInteger(headhaul.units_per_carton) && headhaul.units_per_carton > 0 &&
-    finite(effectiveUnits) && effectiveUnits > 0
+  const divisorR = toBigRat(divisorVal);
+  const isMixedCartons = headhaul.mixed_cartons === true ||
+    headhaul.identical_cartons === false ||
+    headhaul.uniform_cartons === false ||
+    hasCartonsArray;
+  const explicitCartonCount = Number.isSafeInteger(carton_count) && carton_count > 0 ? carton_count : null;
+  const hasUnitsPerCarton = Number.isSafeInteger(headhaul.units_per_carton) && headhaul.units_per_carton > 0 &&
+    finite(effectiveUnits) && effectiveUnits > 0;
+  const derivedCartonsFromPack = hasUnitsPerCarton
     ? Math.ceil(effectiveUnits / headhaul.units_per_carton)
     : null;
-  const cartonCountInt = Number.isSafeInteger(carton_count) && carton_count > 0
-    ? carton_count
-    : derivedCartonsFromPack;
+  if (explicitCartonCount !== null && derivedCartonsFromPack !== null && explicitCartonCount !== derivedCartonsFromPack) {
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      weight_conflict: true,
+      conflict_reason: `carton_count (${explicitCartonCount}) conflicts with Math.ceil(order_units / units_per_carton) (${derivedCartonsFromPack}).`,
+      a4_applied: {
+        weight_conflict: true,
+        carton_count: explicitCartonCount,
+        derived_carton_count: derivedCartonsFromPack,
+      },
+    };
+  }
+  const hasPartialLastCarton = hasUnitsPerCarton && (effectiveUnits % headhaul.units_per_carton !== 0);
 
-  let actualTotalR = null;
-  if (finite(actual_weight_kg_total) && actual_weight_kg_total > 0) {
-    actualTotalR = toBigRat(actual_weight_kg_total);
-  } else if (finite(actual_weight_kg_per_unit) && actual_weight_kg_per_unit > 0) {
-    actualTotalR = mulBigRat(toBigRat(actual_weight_kg_per_unit), unitsR);
-  } else if (finite(kgPerUnit) && kgPerUnit > 0) {
-    actualTotalR = mulBigRat(toBigRat(kgPerUnit), unitsR);
+  // Sum per-carton specs when mixed `cartons[]` list is supplied.
+  let cartonsTotalCount = null;
+  let cartonsActualTotalR = null;
+  let cartonsVolTotalR = null;
+  let cartonsMinPerCartonKgR = null;
+  if (hasCartonsArray) {
+    let totalCnt = 0;
+    let anyDims = false;
+    let allDims = true;
+    let anyWt = false;
+    let allWt = true;
+    let sumVolR = { n: 0n, d: 1n };
+    let sumWtR = { n: 0n, d: 1n };
+    for (const item of headhaul.cartons) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) {
+        return {
+          amount_usd: null,
+          exact_usd_rational: null,
+          cny_derivation: null,
+          missing_surcharge_quote: true,
+          a4_applied: { mixed_cartons: true, missing_surcharge_quote: 'invalid_cartons_entry' },
+        };
+      }
+      const cnt = item.count === undefined || item.count === null ? 1 : item.count;
+      if (!Number.isSafeInteger(cnt) || cnt <= 0) {
+        return {
+          amount_usd: null,
+          exact_usd_rational: null,
+          cny_derivation: null,
+          missing_surcharge_quote: true,
+          a4_applied: { mixed_cartons: true, missing_surcharge_quote: 'invalid_carton_entry_count' },
+        };
+      }
+      totalCnt += cnt;
+      const cntR = toBigRat(cnt);
+      const rawItemCm = item.carton_cm !== undefined
+        ? item.carton_cm
+        : ((item.length_cm !== undefined || item.l_cm !== undefined || item.width_cm !== undefined || item.w_cm !== undefined || item.height_cm !== undefined || item.h_cm !== undefined)
+          ? item
+          : null);
+      const itemCm = normalizeCartonDimensionsCm(rawItemCm);
+      if (itemCm.present && !itemCm.valid) {
+        return {
+          amount_usd: null,
+          exact_usd_rational: null,
+          cny_derivation: null,
+          missing_surcharge_quote: true,
+          a4_applied: { mixed_cartons: true, volumetric_dimensions_present: true, missing_surcharge_quote: 'invalid_carton_cm_dimensions' },
+        };
+      }
+      if (itemCm.present) {
+        anyDims = true;
+        const volOneR = divBigRat(
+          mulBigRat(mulBigRat(toBigRat(itemCm.dims[0]), toBigRat(itemCm.dims[1])), toBigRat(itemCm.dims[2])),
+          divisorR,
+        );
+        sumVolR = addBigRat(sumVolR, mulBigRat(volOneR, cntR));
+      } else {
+        allDims = false;
+      }
+      const rawWt = item.weight_kg ?? item.weight_per_carton_kg;
+      if (rawWt !== undefined && rawWt !== null) {
+        if (!finite(rawWt) || rawWt <= 0) {
+          return {
+            amount_usd: null,
+            exact_usd_rational: null,
+            cny_derivation: null,
+            missing_surcharge_quote: true,
+            a4_applied: { mixed_cartons: true, missing_surcharge_quote: 'invalid_carton_entry_weight' },
+          };
+        }
+        anyWt = true;
+        const wtR = toBigRat(rawWt);
+        sumWtR = addBigRat(sumWtR, mulBigRat(wtR, cntR));
+        if (cartonsMinPerCartonKgR === null || ratCmp(wtR, cartonsMinPerCartonKgR) < 0) {
+          cartonsMinPerCartonKgR = wtR;
+        }
+      } else {
+        allWt = false;
+      }
+    }
+    if (anyDims && !allDims) {
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        missing_surcharge_quote: true,
+        a4_applied: { mixed_cartons: true, volumetric_dimensions_present: true, missing_surcharge_quote: 'incomplete_cartons_dimensions' },
+      };
+    }
+    if (anyWt && !allWt && !hasActualTotal && !hasActualPerUnit) {
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        missing_surcharge_quote: true,
+        a4_applied: { mixed_cartons: true, missing_surcharge_quote: 'incomplete_cartons_weights' },
+      };
+    }
+    if (explicitCartonCount !== null && explicitCartonCount !== totalCnt) {
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        weight_conflict: true,
+        conflict_reason: `carton_count (${explicitCartonCount}) conflicts with cartons[] summed count (${totalCnt}).`,
+        a4_applied: { weight_conflict: true, carton_count: explicitCartonCount, derived_carton_count: totalCnt },
+      };
+    }
+    cartonsTotalCount = totalCnt;
+    if (anyDims && allDims) cartonsVolTotalR = sumVolR;
+    if (anyWt && allWt) cartonsActualTotalR = sumWtR;
   }
 
-  let volTotalR = null;
+  const cartonCountInt = explicitCartonCount ?? cartonsTotalCount ?? derivedCartonsFromPack;
+  const effectiveUniformCartonCount = cartonCountInt ?? (headhaul.single_carton_verified === true && !isMixedCartons ? 1 : null);
+  const canMultiplyUniformCartons = !isMixedCartons && !hasPartialLastCarton && effectiveUniformCartonCount !== null;
+
+  const actualTotalFromTotalR = hasActualTotal ? toBigRat(actual_weight_kg_total) : null;
+  const actualTotalFromPerUnitR = hasActualPerUnit ? mulBigRat(toBigRat(actual_weight_kg_per_unit), unitsR) : null;
+  const declaredChargeableTotalR = hasKgPerUnit ? mulBigRat(toBigRat(kgPerUnit), unitsR) : null;
+
+  if (actualTotalFromTotalR && actualTotalFromPerUnitR &&
+    !totalsConsistentWithinDecimalPrecision(actual_weight_kg_per_unit, unitsR, actual_weight_kg_total, actualTotalFromTotalR)) {
+    const suppliedTotalKg = roundBigRat(actualTotalFromTotalR.n, actualTotalFromTotalR.d, 6);
+    const derivedUnitTotalKg = roundBigRat(actualTotalFromPerUnitR.n, actualTotalFromPerUnitR.d, 6);
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      weight_conflict: true,
+      conflict_reason: `actual_weight_kg_total (${suppliedTotalKg} kg) conflicts with actual_weight_kg_per_unit * order_units (${derivedUnitTotalKg} kg).`,
+      a4_applied: {
+        weight_conflict: true,
+        supplied_actual_weight_kg_total: suppliedTotalKg,
+        derived_actual_weight_kg_total: derivedUnitTotalKg,
+      },
+    };
+  }
+
+  if (cartonsActualTotalR && actualTotalFromTotalR) {
+    const totHalfUlp = halfUlpRat(actual_weight_kg_total);
+    if (ratCmp(absRatDiff(cartonsActualTotalR, actualTotalFromTotalR), totHalfUlp) > 0) {
+      const derivedKg = roundBigRat(cartonsActualTotalR.n, cartonsActualTotalR.d, 6);
+      const suppliedKg = roundBigRat(actualTotalFromTotalR.n, actualTotalFromTotalR.d, 6);
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        weight_conflict: true,
+        conflict_reason: `cartons[] summed weight (${derivedKg} kg) conflicts with actual_weight_kg_total (${suppliedKg} kg).`,
+        a4_applied: {
+          weight_conflict: true,
+          derived_actual_weight_kg_total: derivedKg,
+          supplied_actual_weight_kg_total: suppliedKg,
+        },
+      };
+    }
+  }
+
+  let actualTotalR = actualTotalFromTotalR ?? actualTotalFromPerUnitR ?? cartonsActualTotalR;
+  let actualWeightDerivedFromCartons = Boolean(!actualTotalFromTotalR && !actualTotalFromPerUnitR && cartonsActualTotalR);
+
+  if (hasWeightPerCarton) {
+    if (canMultiplyUniformCartons) {
+      const countR = toBigRat(effectiveUniformCartonCount);
+      const cartonDerivedTotalR = mulBigRat(toBigRat(weight_per_carton_kg), countR);
+      if (actualTotalR) {
+        const refTotalNum = hasActualTotal ? actual_weight_kg_total : null;
+        if (!totalsConsistentWithinDecimalPrecision(weight_per_carton_kg, countR, refTotalNum, actualTotalR)) {
+          const derivedKg = roundBigRat(cartonDerivedTotalR.n, cartonDerivedTotalR.d, 6);
+          const suppliedKg = roundBigRat(actualTotalR.n, actualTotalR.d, 6);
+          return {
+            amount_usd: null,
+            exact_usd_rational: null,
+            cny_derivation: null,
+            weight_conflict: true,
+            conflict_reason: `weight_per_carton_kg (${weight_per_carton_kg} kg) * carton_count (${effectiveUniformCartonCount}) = ${derivedKg} kg conflicts with supplied total actual weight (${suppliedKg} kg).`,
+            a4_applied: {
+              weight_conflict: true,
+              weight_per_carton_kg,
+              carton_count: effectiveUniformCartonCount,
+              derived_actual_weight_kg_total: derivedKg,
+              supplied_actual_weight_kg_total: suppliedKg,
+            },
+          };
+        }
+      } else {
+        actualTotalR = cartonDerivedTotalR;
+        actualWeightDerivedFromCartons = true;
+      }
+    } else if (actualTotalR === null && declaredChargeableTotalR === null) {
+      const missingReason = isMixedCartons
+        ? 'actual_weight_kg_total_required_for_mixed_cartons'
+        : (hasPartialLastCarton
+          ? 'actual_weight_kg_total_required_for_partial_carton'
+          : 'carton_count_required_for_carton_weight');
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        missing_surcharge_quote: true,
+        a4_applied: {
+          ...(isMixedCartons ? { mixed_cartons: true } : {}),
+          ...(hasPartialLastCarton ? { partial_last_carton: true } : {}),
+          missing_surcharge_quote: missingReason,
+        },
+      };
+    }
+  }
+
+  let volTotalR = cartonsVolTotalR;
   if (hasValidCartonCm) {
-    if (cartonCountInt === null && headhaul.single_carton_verified !== true && !(effectiveUnits === 1)) {
+    if (isMixedCartons) {
+      return {
+        amount_usd: null,
+        exact_usd_rational: null,
+        cny_derivation: null,
+        missing_surcharge_quote: true,
+        a4_applied: {
+          mixed_cartons: true,
+          volumetric_dimensions_present: true,
+          missing_surcharge_quote: 'uniform_carton_cm_invalid_for_mixed_cartons',
+        },
+      };
+    }
+    if ((cartonCountInt === null && headhaul.single_carton_verified !== true && !(effectiveUnits === 1)) || hasPartialLastCarton) {
       return {
         amount_usd: null,
         exact_usd_rational: null,
@@ -1171,22 +1520,50 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
         missing_surcharge_quote: true,
         a4_applied: {
           volumetric_dimensions_present: true,
-          missing_surcharge_quote: 'carton_count_required_for_volumetric_weight',
+          ...(hasPartialLastCarton ? { partial_last_carton: true } : {}),
+          missing_surcharge_quote: hasPartialLastCarton
+            ? 'explicit_carton_count_required_for_partial_carton_volumetric_weight'
+            : 'carton_count_required_for_volumetric_weight',
         },
       };
     }
     const volOneR = divBigRat(
       mulBigRat(mulBigRat(toBigRat(normalizedCartonCm[0]), toBigRat(normalizedCartonCm[1])), toBigRat(normalizedCartonCm[2])),
-      toBigRat(divisorVal),
+      divisorR,
     );
     volTotalR = mulBigRat(volOneR, toBigRat(cartonCountInt ?? 1));
   }
 
-  let rawTotalKgR = actualTotalR ?? volTotalR;
+  // If declared chargeable_kg_per_unit is supplied alongside actual weight, chargeable cannot be lower than actual weight.
+  if (declaredChargeableTotalR && actualTotalR && ratCmp(actualTotalR, declaredChargeableTotalR) > 0 &&
+    !totalsConsistentWithinDecimalPrecision(kgPerUnit, unitsR, hasActualTotal ? actual_weight_kg_total : null, actualTotalR)) {
+    const actualKg = roundBigRat(actualTotalR.n, actualTotalR.d, 6);
+    const declKg = roundBigRat(declaredChargeableTotalR.n, declaredChargeableTotalR.d, 6);
+    return {
+      amount_usd: null,
+      exact_usd_rational: null,
+      cny_derivation: null,
+      weight_conflict: true,
+      conflict_reason: `Actual shipment weight (${actualKg} kg) exceeds supplied chargeable_kg_per_unit * order_units (${declKg} kg).`,
+      a4_applied: {
+        weight_conflict: true,
+        derived_actual_weight_kg_total: actualKg,
+        supplied_actual_weight_kg_total: declKg,
+      },
+    };
+  }
+
+  let rawTotalKgR = actualTotalR ?? volTotalR ?? declaredChargeableTotalR;
+  if (!rawTotalKgR) {
+    return { amount_usd: null, exact_usd_rational: null, cny_derivation: null, a4_applied: null };
+  }
   let volumetricExceedsActual = false;
   if (actualTotalR && volTotalR && ratCmp(volTotalR, actualTotalR) > 0) {
     rawTotalKgR = volTotalR;
     volumetricExceedsActual = true;
+  }
+  if (declaredChargeableTotalR && ratCmp(declaredChargeableTotalR, rawTotalKgR) > 0) {
+    rawTotalKgR = declaredChargeableTotalR;
   }
 
   const applyA4Rules = Boolean(isR59 || hasA4Extras);
@@ -1231,7 +1608,9 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
     : { n: 0n, d: 1n };
 
   let perCartonKgR = null;
-  if (finite(weight_per_carton_kg) && weight_per_carton_kg > 0) {
+  if (cartonsMinPerCartonKgR !== null) {
+    perCartonKgR = cartonsMinPerCartonKgR;
+  } else if (finite(weight_per_carton_kg) && weight_per_carton_kg > 0) {
     perCartonKgR = toBigRat(weight_per_carton_kg);
   } else if (actualTotalR && cartonCountInt !== null) {
     perCartonKgR = divBigRat(actualTotalR, toBigRat(cartonCountInt));
@@ -1300,7 +1679,7 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
 
   const cnyDerivation = {
     fx,
-    chargeable_kg_per_unit: finite(kgPerUnit) && kgPerUnit > 0 ? kgPerUnit : effKgPerUnit,
+    ...(hasKgPerUnit ? { chargeable_kg_per_unit: kgPerUnit } : {}),
     rate_cny_per_kg: rate,
     surcharge_cny_per_kg: surcharge,
     ...(effectiveUnits !== null ? { order_units: effectiveUnits } : {}),
@@ -1309,9 +1688,17 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
       order_units: effectiveUnits,
       ...(hasValidCartonCm ? { carton_cm } : {}),
       ...(cartonCountInt !== null ? { carton_count: cartonCountInt } : {}),
+      ...(hasUnitsPerCarton ? { units_per_carton: headhaul.units_per_carton } : {}),
+      ...(hasCartonsArray ? { cartons: headhaul.cartons } : {}),
       ...(finite(actual_weight_kg_total) ? { actual_weight_kg_total } : {}),
       ...(finite(actual_weight_kg_per_unit) ? { actual_weight_kg_per_unit } : {}),
       ...(finite(weight_per_carton_kg) ? { weight_per_carton_kg } : {}),
+      ...(headhaul.mixed_cartons === true ? { mixed_cartons: true } : {}),
+      ...(headhaul.identical_cartons === false ? { identical_cartons: false } : {}),
+      ...(headhaul.uniform_cartons === false ? { uniform_cartons: false } : {}),
+      ...(headhaul.single_carton_verified === true ? { single_carton_verified: true } : {}),
+      ...(headhaul.small_shipment_surcharge_exempt === true ? { small_shipment_surcharge_exempt: true } : {}),
+      ...(headhaul.small_carton_surcharge_exempt === true ? { small_carton_surcharge_exempt: true } : {}),
       ...(finite(volumetric_divisor) ? { volumetric_divisor } : {}),
       ...(minBillVal > 0 ? { min_shipment_billable_kg: minBillVal } : {}),
       ...(finite(small_shipment_threshold_kg) ? { small_shipment_threshold_kg } : {}),
@@ -1331,6 +1718,9 @@ export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, { isR58 = f
       below_50kg_small_shipment: below50kg,
       below_8kg_outer_carton: below8kgCarton,
       volumetric_exceeds_actual: volumetricExceedsActual,
+      actual_weight_derived_from_cartons: actualWeightDerivedFromCartons,
+      actual_weight_kg_total: actualTotalR ? roundBigRat(actualTotalR.n, actualTotalR.d, 6) : null,
+      volumetric_weight_kg_total: volTotalR ? roundBigRat(volTotalR.n, volTotalR.d, 6) : null,
       billed_total_kg: roundBigRat(billedTotalKgR.n, billedTotalKgR.d, 6),
       effective_billed_kg_per_unit: effKgPerUnit,
     },
@@ -3366,7 +3756,7 @@ function estimateGate1AWithLandedCost({
   referral_terms,
   headhaul = null,
   headhaul_usd,
-  order_units = 100,
+  order_units = undefined,
   collection_rate,
   other_applicable_usd = 0,
   other_payee = 'external',
@@ -3430,10 +3820,71 @@ function estimateGate1AWithLandedCost({
   if (!pricing.valid) {
     return { status: 'needs_calculator_verification', reason: pricing.reason };
   }
-  let resolvedHeadhaulUsd = finite(headhaul_usd) ? headhaul_usd : null;
+  const explicitScalarHeadhaulUsd = finite(headhaul_usd) && headhaul_usd >= 0 ? headhaul_usd : null;
+  let resolvedHeadhaulUsd = null;
   let resolvedHeadhaulExactRat = null;
   let resolvedHeadhaulA4 = null;
-  if (resolvedHeadhaulUsd === null && headhaul !== null && headhaul !== undefined) {
+  const structuredHeadhaulObj = headhaul && typeof headhaul === 'object' && !Array.isArray(headhaul) &&
+    (headhaul.rate_cny_per_kg !== undefined || A4_HEADHAUL_EXTRA_KEYS.some(k => headhaul[k] !== undefined && headhaul[k] !== null))
+    ? headhaul
+    : null;
+  if (structuredHeadhaulObj) {
+    if (!finite(fx_cny_per_usd) || fx_cny_per_usd <= 0) {
+      return { status: 'needs_calculator_verification', reason: 'Valid fx_cny_per_usd > 0 is required to verify structured headhaul inputs.' };
+    }
+    if (order_units !== undefined && order_units !== null &&
+      structuredHeadhaulObj.order_units !== undefined && structuredHeadhaulObj.order_units !== null &&
+      order_units !== structuredHeadhaulObj.order_units) {
+      return {
+        status: 'needs_calculator_verification',
+        reason: `Conflicting order_units (${order_units}) vs headhaul.order_units (${structuredHeadhaulObj.order_units}).`,
+      };
+    }
+    const effOrderUnits = finite(order_units) && order_units > 0
+      ? order_units
+      : (finite(structuredHeadhaulObj.order_units) && structuredHeadhaulObj.order_units > 0 ? structuredHeadhaulObj.order_units : 100);
+    const a4Res = computeHeadhaulWithA4Rules(structuredHeadhaulObj, fx_cny_per_usd, effOrderUnits, {
+      isR58: (profile_revision ?? 59) >= 58,
+      isR59: (profile_revision ?? 59) >= 59,
+    });
+    if (a4Res.weight_conflict) {
+      return {
+        status: 'needs_calculator_verification',
+        reason: a4Res.conflict_reason ?? 'Conflicting carton weight and total actual weight in headhaul inputs.',
+        weight_conflict: true,
+        a4_applied: a4Res.a4_applied,
+      };
+    }
+    if (a4Res.missing_surcharge_quote) {
+      return {
+        status: 'needs_calculator_verification',
+        reason: `Headhaul Freight A4 requires ${a4Res.a4_applied?.missing_surcharge_quote ?? 'surcharge quote'}.`,
+        a4_applied: a4Res.a4_applied,
+      };
+    }
+    if (!finite(a4Res.amount_usd)) {
+      return { status: 'needs_calculator_verification', reason: 'Supplied structured Freight A4 headhaul inputs are incomplete or invalid.' };
+    }
+    if (explicitScalarHeadhaulUsd !== null && Math.abs(explicitScalarHeadhaulUsd - a4Res.amount_usd) > 0.005) {
+      return {
+        status: 'needs_calculator_verification',
+        reason: `Supplied headhaul_usd ($${explicitScalarHeadhaulUsd}) conflicts with recomputed structured headhaul ($${a4Res.amount_usd}).`,
+        a4_applied: a4Res.a4_applied,
+      };
+    }
+    if (finite(structuredHeadhaulObj.amount_usd) && Math.abs(structuredHeadhaulObj.amount_usd - a4Res.amount_usd) > 0.005) {
+      return {
+        status: 'needs_calculator_verification',
+        reason: `Supplied headhaul.amount_usd ($${structuredHeadhaulObj.amount_usd}) conflicts with recomputed structured headhaul ($${a4Res.amount_usd}).`,
+        a4_applied: a4Res.a4_applied,
+      };
+    }
+    resolvedHeadhaulUsd = a4Res.amount_usd;
+    resolvedHeadhaulExactRat = a4Res.exact_usd_rational ?? null;
+    resolvedHeadhaulA4 = a4Res.a4_applied ?? null;
+  } else if (explicitScalarHeadhaulUsd !== null) {
+    resolvedHeadhaulUsd = explicitScalarHeadhaulUsd;
+  } else if (headhaul !== null && headhaul !== undefined) {
     if (finite(headhaul) && headhaul >= 0) {
       resolvedHeadhaulUsd = headhaul;
     } else if (typeof headhaul === 'object') {
@@ -3441,26 +3892,6 @@ function estimateGate1AWithLandedCost({
         resolvedHeadhaulUsd = headhaul.amount_usd;
       } else if (finite(headhaul.usd_per_unit) && headhaul.usd_per_unit >= 0 && (headhaul.bond_included === true || finite(headhaul.bond_usd_per_unit))) {
         resolvedHeadhaulUsd = headhaul.usd_per_unit + (headhaul.bond_included === true ? 0 : headhaul.bond_usd_per_unit);
-      } else if (finite(fx_cny_per_usd) && fx_cny_per_usd > 0) {
-        const effOrderUnits = finite(order_units) && order_units > 0
-          ? order_units
-          : (finite(headhaul.order_units) && headhaul.order_units > 0 ? headhaul.order_units : 100);
-        const a4Res = computeHeadhaulWithA4Rules(headhaul, fx_cny_per_usd, effOrderUnits, {
-          isR58: (profile_revision ?? 59) >= 58,
-          isR59: (profile_revision ?? 59) >= 59,
-        });
-        if (a4Res.missing_surcharge_quote) {
-          return {
-            status: 'needs_calculator_verification',
-            reason: `Headhaul Freight A4 requires ${a4Res.a4_applied?.missing_surcharge_quote ?? 'surcharge quote'}.`,
-            a4_applied: a4Res.a4_applied,
-          };
-        }
-        if (finite(a4Res.amount_usd)) {
-          resolvedHeadhaulUsd = a4Res.amount_usd;
-          resolvedHeadhaulExactRat = a4Res.exact_usd_rational ?? null;
-          resolvedHeadhaulA4 = a4Res.a4_applied ?? null;
-        }
       }
     }
   }
