@@ -109,7 +109,7 @@ const USAGE = [
   '  sp-api-calibrate   --input <sp-api-bundle.json> [--output <out.json>]  (无状态，从只读 SP-API 终审回执提取官方包装尺寸、佣金比例与限售状态)',
   '  serve-report       --dir <report-dir> [--port <port>] [--check | --once]  (无状态，在 127.0.0.1 启动本地 HTML 报告渲染预览服务)',
   '  redteam-review     --packet <packet.json> --output <review.json> [--effort <xhigh|max>] [--image <file>...] [--dry-run | --offline]  (未传 --dry-run/--offline 时调用本地订阅 codex exec)',
-  '  daily-batch        --db <sqlite> --input <daily-batch.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (日常 80% 站内 + 20% 站外 + 1688 源头厂小批入口，支持滑块暂停续跑)',
+  '  daily-batch        --db <sqlite> (--input <daily-batch.json> [--limit <n>] | --from-store [--limit <n>] [--pending-pool | --include-shown] [--dry-run]) [--profile <profile.json>] [--batch-id <id>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (日常 80% 站内 + 20% 站外 + 1688 源头厂批量入口，或按需从 SQLite 拉取未确认队列；支持滑块暂停续跑)',
   '  single-product     --db <sqlite> --input <asin-or-post.json> [--profile <profile.json>] [--report-dir <dir>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (单品种子登记、Gate1A/1B/21项评分与 V4 报告导出；兼容别名 single-dive)',
   '  reverse-1688       --db <sqlite> --input <1688-spec.json> [--profile <profile.json>] [--output <out.json>] [--as-of <YYYY-MM-DD>]  (按 1688 成本算保底定价：1688 源头厂裸货价测美亚 30% 保底零售价与深挖)',
   '  profit-check       --input <profit-spec.json> [--output <out.json>]  (无状态，快速 2027 淡季利润体检 + 非 SIPP 合并费 + <=10mm 改盒可救检测)',
@@ -1156,6 +1156,10 @@ export async function runPhase2Cli(
           summary: { type: 'boolean' },
           'confirm-owner': { type: 'boolean' },
           'exclude-demo': { type: 'boolean' },
+          'from-store': { type: 'boolean' },
+          limit: { type: 'string' },
+          'pending-pool': { type: 'boolean' },
+          'include-shown': { type: 'boolean' },
         },
       });
     } catch {

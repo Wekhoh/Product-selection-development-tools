@@ -363,9 +363,35 @@ export async function runDailyWorkflowBatchCommand({
     sqlitePaths,
   } = helpers;
 
-  const inputPath = resolve(requireOption(values.input, 'input'));
-  const spec = await readJsonFileSafe(inputPath, `${command} 输入文件`);
-  checkOperatorPayload(spec);
+  const hasFromStore = values['from-store'] === true;
+  const hasPendingPool = values['pending-pool'] === true;
+  const hasIncludeShown = values['include-shown'] === true;
+  const hasDryRun = values['dry-run'] === true;
+  let explicitLimit;
+  if (values.limit !== undefined) {
+    const rawLim = String(values.limit).trim();
+    if (!/^\d+$/.test(rawLim)) {
+      throw new Phase2CliError('参数 --limit 必须为 >= 1 的整数。');
+    }
+    const parsedLim = Number(rawLim);
+    if (!Number.isSafeInteger(parsedLim) || parsedLim < 1) {
+      throw new Phase2CliError('参数 --limit 必须为 >= 1 的整数。');
+    }
+    explicitLimit = parsedLim;
+  }
+  if (command !== 'daily-batch' && (hasFromStore || hasPendingPool || hasIncludeShown || explicitLimit !== undefined)) {
+    throw new Phase2CliError(`参数 --from-store / --limit / --pending-pool / --include-shown 仅适用于 daily-batch 命令。`);
+  }
+  if (hasFromStore && values.input) {
+    throw new Phase2CliError('--from-store 与 --input 不能同时使用。');
+  }
+  if (hasPendingPool && hasIncludeShown) {
+    throw new Phase2CliError('--pending-pool 与 --include-shown 不能同时使用。');
+  }
+  if ((hasPendingPool || hasIncludeShown) && !hasFromStore) {
+    throw new Phase2CliError('--pending-pool 与 --include-shown 必须与 --from-store 一起使用。');
+  }
+
   const profilePath = values.profile ? resolve(values.profile) : DEFAULT_R59_PROFILE_PATH;
   const profile = await readJsonFileSafe(profilePath, '评分配置文件');
   if (values['profile-revision']) {
@@ -377,6 +403,74 @@ export async function runDailyWorkflowBatchCommand({
   if ((profile.revision ?? 59) < 59) {
     throw new Phase2CliError('当前主线仅运行 Revision 59+（r50–r58 已冻结归档至 Git 标签 archive/r50-r58-frozen-replay-20261125）。');
   }
+
+  if (hasFromStore) {
+    const asOfDate = values['as-of'] ? values['as-of'].trim() : new Date().toISOString().slice(0, 10);
+    const limit = explicitLimit ?? 10;
+    const queueState = store.getQueueState('gate1b_1688_queue');
+    const selection = store.selectNextStoreBatch({
+      limit,
+      pendingPool: hasPendingPool,
+      includeShown: hasIncludeShown,
+      asOfDate,
+    });
+    const discoveryPlan = planDiscoveryBatch(store, {
+      max_channels: Math.max(5, limit),
+      task_slots: Math.max(5, limit),
+      enforce_80_20_mix: true,
+    });
+    const coverageAudit = auditDiscoveryCoverage(store, { profile_revision: profile.revision });
+    const isPaused = Boolean(queueState && queueState.status === 'CAPTCHA_PAUSED');
+    let marked = { updated_count: 0, presented_at: null, form_ids: [] };
+    let selectedForms = selection.selected;
+    if (!hasDryRun && !isPaused && selection.selected.length > 0) {
+      marked = store.markFormsPresented(selection.selected.map(s => s.form_id));
+      selectedForms = selection.selected.map(s => ({
+        ...s,
+        last_presented_at: marked.presented_at,
+        presentation_count: (s.presentation_count ?? 0) + 1,
+      }));
+    }
+    const { selected: _ignoredSelected, ...selectionMeta } = selection;
+    const outStore = {
+      ok: true,
+      command,
+      mode: hasPendingPool ? 'from_store_pending_pool' : (hasIncludeShown ? 'from_store_include_shown' : 'from_store_queue'),
+      limit,
+      pending_pool: hasPendingPool,
+      include_shown: hasIncludeShown,
+      dry_run: hasDryRun,
+      ...(!hasDryRun && isPaused ? {
+        batch_paused: true,
+        pause_status: 'CAPTCHA_PAUSED',
+        pause_reason: queueState.pause_reason ?? '1688 queue is persistently paused (CAPTCHA_PAUSED); clear slider and resume before continuing batch.',
+        paused_form_id: queueState.paused_form_id ?? null,
+        resumable: true,
+      } : {}),
+      queue_state: queueState,
+      marked_presented: marked.updated_count > 0,
+      presented_at: marked.presented_at,
+      ...selectionMeta,
+      selected_forms: selectedForms,
+      discovery_plan_80_20: discoveryPlan,
+      coverage_audit: coverageAudit,
+    };
+    checkOperatorPayload(outStore);
+    const jsonStore = `${stringifyCliJson(outStore)}\n`;
+    if (values.output) {
+      await writeSingleFileSafe(
+        resolve(values.output),
+        Buffer.from(jsonStore, 'utf8'),
+        [...sqlitePaths(dbPath), profilePath],
+      );
+    }
+    streams.stdout.write(jsonStore);
+    return 0;
+  }
+
+  const inputPath = resolve(requireOption(values.input, 'input'));
+  const spec = await readJsonFileSafe(inputPath, `${command} 输入文件`);
+  checkOperatorPayload(spec);
   const asOfDate = values['as-of'] ? values['as-of'].trim() : (spec.as_of_date ?? new Date().toISOString().slice(0, 10));
   const requestedReportDir = values['report-dir']
     ? resolve(values['report-dir'])
@@ -817,7 +911,11 @@ export async function runDailyWorkflowBatchCommand({
   if (command !== 'daily-batch' && rawItems.length !== 1) {
     throw new Phase2CliError(`${command} 每次仅执行单个候选深挖。`);
   }
-  const hydratedItems = rawItems.map(hydrateWorkflowItem);
+  const inputItemCount = rawItems.length;
+  const selectedRawItems = command === 'daily-batch' && explicitLimit !== undefined
+    ? rawItems.slice(0, explicitLimit)
+    : rawItems;
+  const hydratedItems = selectedRawItems.map(hydrateWorkflowItem);
 
   // Bare seed registration mode on `single-product` (e.g. `{"asin":"B0SYNV400D"}` before SP-API/SellerSprite Gate 1A scenarios are attached):
   if (
@@ -873,6 +971,7 @@ export async function runDailyWorkflowBatchCommand({
         enforce_80_20_mix: true,
       })
     : null;
+  const batchIdOpt = values['batch-id']?.trim() || (typeof spec?.batch_id === 'string' && spec.batch_id.trim() ? spec.batch_id.trim() : null);
   const batchReport = await runPhase2Batch(store, {
     items: hydratedItems,
     profile,
@@ -881,6 +980,7 @@ export async function runDailyWorkflowBatchCommand({
     deep_research_executor: testHooks?.deepResearchExecutor ?? null,
     openai_hooks: testHooks?.openaiHooks ?? null,
     resume_skip_completed: spec.resume_skip_completed !== false,
+    batch_id: batchIdOpt,
   });
   let singleExportedReport = null;
   if ((command === 'single-product' || command === 'single-dive') && requestedReportDir) {
@@ -1081,6 +1181,13 @@ export async function runDailyWorkflowBatchCommand({
   const out = {
     ok: true,
     command,
+    ...(command === 'daily-batch' ? {
+      mode: 'input_batch',
+      input_item_count: inputItemCount,
+      limit_applied: explicitLimit ?? null,
+      selected_count: selectedRawItems.length,
+      truncated_by_limit: explicitLimit !== undefined && inputItemCount > explicitLimit,
+    } : {}),
     ...(discoveryPlan ? { discovery_plan_80_20: discoveryPlan } : {}),
     ...(coverageAudit ? { coverage_audit: coverageAudit } : {}),
     ...(reverseSolution ? { reverse_1688: reverseSolution } : {}),

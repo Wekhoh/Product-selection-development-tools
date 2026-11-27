@@ -517,6 +517,8 @@ CREATE TABLE IF NOT EXISTS candidate_forms (
   cooldown_until TEXT,
   cooldown_reason TEXT,
   promotion_track TEXT,
+  last_presented_at TEXT,
+  presentation_count INTEGER NOT NULL DEFAULT 0 CHECK(presentation_count >= 0),
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -1022,6 +1024,8 @@ ${SOURCING_QUOTES_V2_COLUMNS}
       ['promotion_track', 'TEXT'],
       ['sourcing_disposition', 'TEXT'],
       ['packaging_redesign_shortlist_json', 'TEXT'],
+      ['last_presented_at', 'TEXT'],
+      ['presentation_count', 'INTEGER NOT NULL DEFAULT 0 CHECK(presentation_count >= 0)'],
     ]);
     ensureColumns('lead_form_links', [
       ['verification_subrole', 'TEXT'],
@@ -2699,6 +2703,280 @@ ${SOURCING_QUOTES_V2_COLUMNS}
       ? 'private_mold_reserved'
       : row.lifecycle_status;
     return { ...row, effective_lifecycle_status: effectiveStatus };
+  }
+
+  /**
+   * Select up to `limit` unconfirmed eligible candidate forms from SQLite for on-demand Step 2 review,
+   * excluding drill/historical trial rows, terminal Gate 1A/1B rejections, private-mold-reserved forms,
+   * active cooldowns, legacy <r59-only archived forms, and confirmed/decided calibration rows.
+   * Supports pending-pool isolation ("待拍板池") via `pendingPool` / `includeShown`.
+   */
+  selectNextStoreBatch({
+    limit = 10,
+    pendingPool = false,
+    includeShown = false,
+    asOfDate = this._now().slice(0, 10),
+  } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      throw new TypeError('limit must be a positive integer >= 1.');
+    }
+    if (pendingPool && includeShown) {
+      throw new TypeError('pendingPool and includeShown cannot both be true.');
+    }
+    const effectiveAsOf = assertIsoDateOnly(String(asOfDate ?? this._now().slice(0, 10)).slice(0, 10), 'asOfDate');
+    const DRILL_FORM_IDS = new Set(['squirrel-basic', 'diamond-card', 'breeze-diamond-molds']);
+    const TERMINAL_LIFECYCLE = new Set(['gate1a_rejected', 'gate1b_rejected', 'excluded', 'deferred', 'private_mold_reserved']);
+    const CONFIRMED_OR_DECIDED = new Set(['keep', 'drop', 'sample_check', 'hold']);
+    const TIER1_LIFECYCLE = new Set(['discovered', 'gate1a_passed', 'gate1b_passed', 'gate1b_queued']);
+
+    const formCols = this._tableColumns('candidate_forms');
+    const hasPresentationCols = formCols.has('last_presented_at');
+    const forms = this.db.prepare('SELECT * FROM candidate_forms').all();
+
+    const channelsByForm = new Map();
+    for (const row of this.db.prepare(`
+      SELECT lfl.form_id, lfl.link_role, rl.source_channel
+      FROM lead_form_links lfl
+      JOIN raw_leads rl ON rl.lead_id = lfl.lead_id
+    `).all()) {
+      let list = channelsByForm.get(row.form_id);
+      if (!list) {
+        list = [];
+        channelsByForm.set(row.form_id, list);
+      }
+      list.push(row);
+    }
+
+    const evalsByForm = new Map();
+    for (const ev of this.db.prepare('SELECT rowid AS _rowid, * FROM evaluations ORDER BY created_at DESC, rowid DESC').all()) {
+      let list = evalsByForm.get(ev.form_id);
+      if (!list) {
+        list = [];
+        evalsByForm.set(ev.form_id, list);
+      }
+      list.push(ev);
+    }
+
+    const calByFormSpec = new Map();
+    if (this._hasTable('calibration_tracking')) {
+      for (const cal of this.db.prepare('SELECT * FROM calibration_tracking').all()) {
+        calByFormSpec.set(`${cal.form_id}::${cal.spec_version}`, this._deserializeCalibrationRow(cal));
+      }
+    }
+
+    const verifiedQuotesByFormSpec = new Map();
+    for (const q of this.db.prepare("SELECT form_id, spec_version, COUNT(*) AS cnt FROM sourcing_quotes_1688 WHERE quote_status = 'verified' GROUP BY form_id, spec_version").all()) {
+      verifiedQuotesByFormSpec.set(`${q.form_id}::${q.spec_version}`, q.cnt);
+    }
+
+    const excludedCounts = {
+      historical_trial_drill: 0,
+      terminal_lifecycle_or_private_mold: 0,
+      cooldown_active: 0,
+      gate1a_rejected_json: 0,
+      gate1b_rejected_json: 0,
+      legacy_pre_r59_archived: 0,
+      evaluation_reserved_or_excluded: 0,
+      calibration_decided_or_excluded: 0,
+    };
+
+    const unseen = [];
+    const pendingPoolItems = [];
+
+    for (const form of forms) {
+      const links = channelsByForm.get(form.form_id) ?? [];
+      const hasHistoricalLead = links.some(l => typeof l.source_channel === 'string' && l.source_channel.startsWith('historical_trial_'));
+      if (DRILL_FORM_IDS.has(form.form_id) || hasHistoricalLead) {
+        excludedCounts.historical_trial_drill += 1;
+        continue;
+      }
+      if (TERMINAL_LIFECYCLE.has(form.lifecycle_status) || form.sourcing_disposition === 'private_mold_reserved') {
+        excludedCounts.terminal_lifecycle_or_private_mold += 1;
+        continue;
+      }
+      if (form.cooldown_until && form.cooldown_until > effectiveAsOf) {
+        excludedCounts.cooldown_active += 1;
+        continue;
+      }
+
+      let g1a = null;
+      if (form.gate1a_result_json) {
+        try { g1a = JSON.parse(form.gate1a_result_json); } catch { /* ignore */ }
+      }
+      const g1aCurrent = g1a && (!g1a.spec_sha256 || g1a.spec_sha256 === form.spec_sha256) ? g1a : null;
+      if (g1aCurrent && (g1aCurrent.gate_status === 'gate1a_rejected' || g1aCurrent.specific_rights_conflict_proven === true)) {
+        excludedCounts.gate1a_rejected_json += 1;
+        continue;
+      }
+
+      let g1b = null;
+      if (form.gate1b_result_json) {
+        try { g1b = JSON.parse(form.gate1b_result_json); } catch { /* ignore */ }
+      }
+      const g1bCurrent = g1b && (!g1b.spec_sha256 || g1b.spec_sha256 === form.spec_sha256) ? g1b : null;
+      if (g1bCurrent && g1bCurrent.status === 'gate1b_rejected') {
+        excludedCounts.gate1b_rejected_json += 1;
+        continue;
+      }
+
+      const evals = evalsByForm.get(form.form_id) ?? [];
+      const evalCount = evals.length;
+      let maxEvalRev = 0;
+      for (const e of evals) {
+        if (e.profile_revision > maxEvalRev) maxEvalRev = e.profile_revision;
+      }
+      if (evalCount > 0 && maxEvalRev < 59) {
+        excludedCounts.legacy_pre_r59_archived += 1;
+        continue;
+      }
+
+      const r59Evals = evals.filter(e => e.profile_revision >= 59);
+      let latestBundleEvals = [];
+      if (r59Evals.length > 0) {
+        const latestBundleHash = r59Evals[0].evidence_bundle_sha256;
+        latestBundleEvals = r59Evals.filter(e => e.evidence_bundle_sha256 === latestBundleHash);
+      }
+      let evalReservedOrExcluded = false;
+      let latestQualificationMode = null;
+      let latestQueueBucket = null;
+      if (latestBundleEvals.length > 0) {
+        latestQueueBucket = latestBundleEvals[0].queue_bucket;
+        const quals = latestBundleEvals.map(e => {
+          try { return e.qualification_json ? JSON.parse(e.qualification_json) : null; } catch { return null; }
+        });
+        latestQualificationMode = quals.find(q => q && typeof q.mode === 'string')?.mode ?? null;
+        const hasPrivateMoldEval = quals.some(q => q?.mode === 'private_mold_reserved');
+        const allExcludedOrDeferred = latestBundleEvals.every(e => e.queue_bucket === 'excluded' || e.queue_bucket === 'deferred');
+        if (hasPrivateMoldEval || latestQualificationMode === 'hard_excluded' || latestQualificationMode === 'deferred' || allExcludedOrDeferred) {
+          evalReservedOrExcluded = true;
+        }
+      }
+      if (evalReservedOrExcluded) {
+        excludedCounts.evaluation_reserved_or_excluded += 1;
+        continue;
+      }
+
+      const cal = calByFormSpec.get(`${form.form_id}::${form.spec_version}`) ?? null;
+      if (
+        cal && (
+          cal.owner_decision_source === 'owner_confirmed' ||
+          cal.owner_decision_source === 'script_demo_excluded' ||
+          CONFIRMED_OR_DECIDED.has(cal.owner_decision) ||
+          cal.system_verdict === 'private_mold_reserved'
+        )
+      ) {
+        excludedCounts.calibration_decided_or_excluded += 1;
+        continue;
+      }
+
+      const g1bStatus = g1bCurrent?.status ?? null;
+      const isTier1Ready = TIER1_LIFECYCLE.has(form.lifecycle_status) || (evalCount === 0 && g1bStatus === 'gate1b_passed');
+      const priorityTier = isTier1Ready ? 1 : (evalCount === 0 ? 2 : 3);
+      const tier1SubRank = (g1bStatus === 'gate1b_passed' || form.lifecycle_status === 'gate1b_passed') ? 0 : 1;
+      const trackRank = form.promotion_track === 'track_a_resonance' ? 0 : 1;
+      const lastPresentedAt = hasPresentationCols ? (form.last_presented_at ?? null) : null;
+      const presentationCount = hasPresentationCols ? Number(form.presentation_count ?? 0) : 0;
+
+      const entry = {
+        form_id: form.form_id,
+        label: form.label,
+        target_child_asin: form.target_child_asin ?? null,
+        spec_version: form.spec_version,
+        lifecycle_status: form.lifecycle_status,
+        promotion_track: form.promotion_track ?? null,
+        priority_tier: priorityTier,
+        _tier1_sub_rank: tier1SubRank,
+        _track_rank: trackRank,
+        gate1a_status: g1aCurrent?.gate_status ?? null,
+        gate1b_status: g1bStatus,
+        eval_count: evalCount,
+        max_eval_rev: maxEvalRev || null,
+        latest_qualification_mode: latestQualificationMode,
+        latest_queue_bucket: latestQueueBucket,
+        verified_quotes_count: verifiedQuotesByFormSpec.get(`${form.form_id}::${form.spec_version}`) ?? 0,
+        calibration_status: cal ? {
+          system_verdict: cal.system_verdict,
+          owner_decision: cal.owner_decision,
+          owner_decision_source: cal.owner_decision_source,
+        } : null,
+        last_presented_at: lastPresentedAt,
+        presentation_count: presentationCount,
+        created_at: form.created_at,
+      };
+      if (lastPresentedAt) {
+        pendingPoolItems.push(entry);
+      } else {
+        unseen.push(entry);
+      }
+    }
+
+    const compareByPriority = (a, b) =>
+      a.priority_tier - b.priority_tier ||
+      a._tier1_sub_rank - b._tier1_sub_rank ||
+      a._track_rank - b._track_rank ||
+      String(b.created_at).localeCompare(String(a.created_at)) ||
+      a.form_id.localeCompare(b.form_id);
+    const comparePendingPool = (a, b) =>
+      String(a.last_presented_at).localeCompare(String(b.last_presented_at)) ||
+      compareByPriority(a, b);
+
+    unseen.sort(compareByPriority);
+    pendingPoolItems.sort(comparePendingPool);
+
+    let rawSelected;
+    if (pendingPool) {
+      rawSelected = pendingPoolItems.slice(0, limit);
+    } else if (includeShown) {
+      rawSelected = [...unseen, ...pendingPoolItems].slice(0, limit);
+    } else {
+      rawSelected = unseen.slice(0, limit);
+    }
+
+    const selected = rawSelected.map(({ _tier1_sub_rank, _track_rank, ...rest }) => rest);
+    const backfilledFromPending = includeShown ? Math.max(0, selected.length - unseen.length) : 0;
+    const pendingPoolSkippedCount = pendingPool
+      ? 0
+      : (includeShown ? Math.max(0, pendingPoolItems.length - backfilledFromPending) : pendingPoolItems.length);
+
+    return {
+      limit,
+      as_of_date: effectiveAsOf,
+      pool_mode: pendingPool ? 'pending_pool_only' : (includeShown ? 'unseen_then_pending_pool' : 'unseen_only'),
+      selected,
+      selected_count: selected.length,
+      total_eligible_count: unseen.length + pendingPoolItems.length,
+      unseen_eligible_count: unseen.length,
+      pending_pool_skipped_count: pendingPoolSkippedCount,
+      pending_pool_total_count: pendingPoolItems.length,
+      pending_pool_form_ids: pendingPoolItems.map(x => x.form_id),
+      excluded_counts: excludedCounts,
+    };
+  }
+
+  markFormsPresented(formIds, presentedAt = this._now()) {
+    this._assertWritable();
+    if (!Array.isArray(formIds)) {
+      throw new TypeError('formIds must be an array.');
+    }
+    const cleanIds = [...new Set(formIds.filter(id => nonemptyStr(id)).map(id => id.trim()))];
+    if (cleanIds.length === 0) {
+      return { updated_count: 0, presented_at: null, form_ids: [] };
+    }
+    const ts = this._normalizeOptionalIsoTimestamp(presentedAt, 'presentedAt') ?? this._now();
+    return this._withImmediateTx(() => {
+      const stmt = this.db.prepare(`
+        UPDATE candidate_forms
+        SET last_presented_at = ?,
+            presentation_count = COALESCE(presentation_count, 0) + 1
+        WHERE form_id = ?
+      `);
+      let updatedCount = 0;
+      for (const fid of cleanIds) {
+        const res = stmt.run(ts, fid);
+        updatedCount += res.changes;
+      }
+      return { updated_count: updatedCount, presented_at: ts, form_ids: cleanIds };
+    });
   }
 
   // ---------------------------------------------------------------------------
