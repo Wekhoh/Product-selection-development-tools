@@ -528,6 +528,7 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
       : validDates[validDates.length - 1];
     const slicedVals = [];
     const slicedDates = [];
+    const observedPriceDates = [];
     for (let i = 0; i < rawPrimaryArr.length; i++) {
       const d = tsDates[i];
       if (!d) continue;
@@ -537,6 +538,7 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
         slicedDates.push(d);
         const pv = normalizeObservationValue(rawPrimaryArr[i], { allowZero: false });
         if (pv !== null) {
+          observedPriceDates.push(d);
           const cf = couponFractionAtIndex(i, pv);
           realizedNet90dVals.push(round2(pv * (1 - cf)));
           if (cf >= BUSINESS_THRESHOLDS.heavy_single_coupon_pct_threshold) {
@@ -549,17 +551,19 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
     }
     if (slicedDates.length > 0) {
       window90dPrimary = summarizeNumericSeries({ [primaryLineKey]: slicedVals }, primaryLineKey, slicedDates, { allowZero: false });
-      const uniqueSlicedDates = [...new Set(slicedDates)].sort();
-      window90dCalendarSpanDays = uniqueSlicedDates.length >= 2
-        ? calendarDaysBetweenIso(uniqueSlicedDates[0], uniqueSlicedDates[uniqueSlicedDates.length - 1]) + 1
-        : 1;
-      window90dRange = {
-        from: uniqueSlicedDates[0],
-        through: uniqueSlicedDates[uniqueSlicedDates.length - 1],
-        sampled_days: uniqueSlicedDates.length,
-        calendar_span_days: window90dCalendarSpanDays,
-        window_days: BUSINESS_THRESHOLDS.newcomer_max_age_days,
-      };
+      const uniqueObservedDates = [...new Set(observedPriceDates)].sort();
+      window90dCalendarSpanDays = uniqueObservedDates.length >= 2
+        ? calendarDaysBetweenIso(uniqueObservedDates[0], uniqueObservedDates[uniqueObservedDates.length - 1]) + 1
+        : (uniqueObservedDates.length === 1 ? 1 : 0);
+      if (uniqueObservedDates.length > 0) {
+        window90dRange = {
+          from: uniqueObservedDates[0],
+          through: uniqueObservedDates[uniqueObservedDates.length - 1],
+          sampled_days: uniqueObservedDates.length,
+          calendar_span_days: window90dCalendarSpanDays,
+          window_days: BUSINESS_THRESHOLDS.newcomer_max_age_days,
+        };
+      }
     }
   }
 

@@ -1478,7 +1478,14 @@ export async function runPhase2Cli(
           restrictionsRaw: spec.restrictionsRaw ?? spec.listings_restrictions ?? spec.listingsRestrictions ?? null,
           sellerSpriteCachedRow: spec.sellerSpriteCachedRow ?? spec.seller_sprite_pkg ?? spec.sellerSpritePkg ?? null,
           price_usd: spec.price_usd ?? spec.priceUsd ?? null,
+          expected_package_quantity: spec.expected_package_quantity ?? spec.expectedPackageQuantity ?? null,
           target_is_own_white_label: spec.target_is_own_white_label !== false,
+          is_apparel: spec.is_apparel,
+          is_shoes: spec.is_shoes,
+          is_apparel_or_shoes: spec.is_apparel_or_shoes,
+          is_dangerous_goods: spec.is_dangerous_goods,
+          is_sipp: spec.is_sipp,
+          fee_category: spec.fee_category ?? null,
         });
         const out = { ok: true, command, calibration };
         const json = `${JSON.stringify(out, null, 2)}\n`;

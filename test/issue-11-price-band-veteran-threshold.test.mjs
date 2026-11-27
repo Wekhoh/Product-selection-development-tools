@@ -100,6 +100,7 @@ test('Issue #11: isolated registry mutation of min_veterans_before_growth_supple
     const tmpSrc = join(dir, 'src');
     cpSync(join(REPO_ROOT, 'src', 'rates'), join(tmpSrc, 'rates'), { recursive: true });
     cpSync(join(REPO_ROOT, 'src', 'utils'), join(tmpSrc, 'utils'), { recursive: true });
+    cpSync(join(REPO_ROOT, 'src', 'adapters'), join(tmpSrc, 'adapters'), { recursive: true });
     cpSync(join(REPO_ROOT, 'src', 'business-thresholds.mjs'), join(tmpSrc, 'business-thresholds.mjs'));
     cpSync(join(REPO_ROOT, 'src', 'fba-calculator.mjs'), join(tmpSrc, 'fba-calculator.mjs'));
     cpSync(join(REPO_ROOT, 'src', 'price-band.mjs'), join(tmpSrc, 'price-band.mjs'));

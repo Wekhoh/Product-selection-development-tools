@@ -70,3 +70,88 @@ export function registerStage4Form(store, {
   });
   return formId;
 }
+
+export function makeDatedKeepaReceipt({
+  asin,
+  startDate = '2026-08-30',
+  days = 90,
+  priceUsd = 49.99,
+  prices = null,
+} = {}) {
+  const startMs = Date.parse(`${startDate}T00:00:00Z`);
+  const ts = Array.from({ length: days }, (_, i) => new Date(startMs + i * 86_400_000).toISOString().slice(0, 10));
+  const priceSeries = Array.isArray(prices) ? prices : Array(days).fill(priceUsd);
+  return {
+    asin,
+    keepa_trend: {
+      ts,
+      series: {
+        price: priceSeries,
+        buybox: priceSeries,
+        couponHistory: Array(days).fill(null),
+      },
+    },
+  };
+}
+
+export function makeSpApiCatalogItem({
+  asin,
+  length = 12,
+  width = 8,
+  height = 4,
+  weight = 2.0,
+  dimUnit = 'inches',
+  weightUnit = 'pounds',
+  marketplaceId = 'ATVPDKIKX0DER',
+  packageQuantity = 1,
+} = {}) {
+  return {
+    asin,
+    dimensions: [
+      {
+        marketplaceId,
+        package: {
+          length: { value: length, unit: dimUnit },
+          width: { value: width, unit: dimUnit },
+          height: { value: height, unit: dimUnit },
+          weight: { value: weight, unit: weightUnit },
+        },
+      },
+    ],
+    attributes: {
+      number_of_items: [{ value: packageQuantity, marketplace_id: marketplaceId }],
+    },
+  };
+}
+
+export function makeSpApiFeesEstimate({
+  asin,
+  priceUsd,
+  referralUsd,
+  fbaUsd,
+  marketplaceId = 'ATVPDKIKX0DER',
+  currency = 'USD',
+} = {}) {
+  return {
+    FeesEstimateResult: {
+      Status: 'Success',
+      FeesEstimateIdentifier: {
+        MarketplaceId: marketplaceId,
+        IdType: 'ASIN',
+        IdValue: asin,
+        IsAmazonFulfilled: true,
+        PriceToEstimateFees: {
+          ListingPrice: { CurrencyCode: currency, Amount: priceUsd },
+        },
+      },
+      FeesEstimate: {
+        TotalFeesEstimate: { CurrencyCode: currency, Amount: Number((referralUsd + fbaUsd).toFixed(2)) },
+        FeeDetailList: [
+          { FeeType: 'ReferralFee', FinalFee: { CurrencyCode: currency, Amount: referralUsd } },
+          { FeeType: 'FBAFees', FinalFee: { CurrencyCode: currency, Amount: fbaUsd } },
+        ],
+      },
+    },
+  };
+}
+

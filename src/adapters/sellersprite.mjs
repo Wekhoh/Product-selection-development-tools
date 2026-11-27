@@ -47,12 +47,15 @@ export function extractItemCategoryRoot(obj) {
 }
 
 export function extractStructuredPricesFromObject(obj) {
-  // Never treat SP-API productFees request/estimate echo structures as observed market selling prices.
+  // Never treat SP-API productFees request/estimate echo structures (native or archived summary rows) as observed market selling prices.
   if (obj && typeof obj === 'object' && (
     obj.PriceToEstimateFees !== undefined ||
     obj.FeesEstimateIdentifier !== undefined ||
     obj.FeesEstimate !== undefined ||
-    obj.FeesEstimateResult !== undefined
+    obj.FeesEstimateResult !== undefined ||
+    obj.referral_fee_usd !== undefined ||
+    obj.fba_pick_and_pack_usd !== undefined ||
+    obj.total_fees_usd !== undefined
   )) {
     return {
       observed_prices_usd: [],
