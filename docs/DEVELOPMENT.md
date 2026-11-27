@@ -1,6 +1,6 @@
 # Development workflow
 
-Status: development process, updated 2026-11-26. The bounded native-research, offline-card, SQLite multi-channel operations, Curatorial Studio (`01 视觉策展室`) report (`src/report.mjs`, `src/report-studio-css.mjs`), Scheme A `src/openai/` + subscription `Codex CLI` layer, 3-layer 2027 FBA/economics consolidation (`src/rates/`, `src/fba-calculator.mjs`, `src/economics.mjs`), provider/Keepa adapters (`src/adapters/`), daily single-item/small-batch CLI entrypoints, and audited `src/business-thresholds.mjs` registry are implemented; STATE records current cards, verification evidence, and remaining live-activation gates. Full deployment and unattended operation remain separate. For another agent's review or a refactor, follow [CONTEXT-ROUTER](CONTEXT-ROUTER.md) without restarting settled design questions. Never invent or hardcode unconfirmed business threshold numbers without explicit owner confirmation (`src/business-thresholds.mjs` + `test/business-thresholds.test.mjs`).
+Status: development process, updated 2026-11-27. The bounded native-research, offline-card, SQLite multi-channel operations, Curatorial Studio (`01 视觉策展室`) report (`src/report.mjs`, `src/report-studio-css.mjs`), Scheme A `src/openai/` + subscription `Codex CLI` layer, 3-layer 2027 FBA/economics consolidation (`src/rates/`, `src/fba-calculator.mjs`, `src/economics.mjs`), provider/Keepa adapters (`src/adapters/`), daily single-item/small-batch CLI entrypoints, and audited `src/business-thresholds.mjs` registry are implemented; STATE records current cards, verification evidence, and remaining live-activation gates. Full deployment and unattended operation remain separate. For another agent's review or a refactor, follow [CONTEXT-ROUTER](CONTEXT-ROUTER.md) without restarting settled design questions. Never invent or hardcode unconfirmed business threshold numbers without explicit owner confirmation (`src/business-thresholds.mjs` + `test/business-thresholds.test.mjs`).
 
 ## Canonical records
 
@@ -93,7 +93,7 @@ The installed v1.3.2 package was checked directly. Its user-invoked main flow in
 
 | Stage | Required useful output in this project | Completion boundary |
 | --- | --- | --- |
-| `grill-with-docs` (`grilling` + `domain-modeling`) | Agreed needs and constraints in PRODUCT, decisions and unresolved questions in DECISIONS; a glossary or focused ADR when its concrete subject warrants one | The owner understands consequential choices; unresolved choices remain explicit |
+| `grill-with-docs` (`grilling` + `domain-modeling`) | Agreed needs, constraints, and decisions in `docs/SPEC.md` and focused ADRs under `docs/adr/`, with domain terms in `GLOSSARY.md` | The owner understands consequential choices; unresolved choices remain explicit |
 | `research` / necessary `prototype` | Cited investigations and an inspectable demonstration addressing a specific question, with its verdict | Evidence or demonstrated behavior informs a decision; a demonstration is not a production release |
 | `to-spec` | One coherent first-release specification: problem, solution, user stories, settled business and implementation decisions, code/AI responsibilities, inputs/outputs/errors, testing and acceptance, out-of-scope work and open blockers | It describes a complete useful workflow and how to verify it; unresolved business choices cannot be silently filled in |
 | `to-tickets` | Reviewable end-to-end work items with acceptance criteria, ownership and real dependencies, linked from STATE | Each item delivers a verifiable path through the required layers; no competing task/recovery board |
@@ -118,47 +118,38 @@ Keep STATE as the single maintained task/recovery record. Use existing repositor
 
 Use the relevant frontend/design workflow for usability and visual acceptance, and current official documentation for changing platform capabilities. Skills guide the work; their templates do not turn proposals, prototypes or passing tests into owner decisions or business results.
 
-## Adversarial review steering, Two-Tier Review System, Three-Tier Independent Ruling Gate & UI preview conventions
+## Adversarial review steering, 1-Round GPT Review, Zero-Edit Owner Approval Gate & UI preview conventions
 
-- **Two-Tier Review System (`GPT-6.2 Astra` via local subscription `Codex CLI`, `$0` API spend):**
-  - **Runtime defaults:** Every fresh-context `codex exec` review runs `-m gpt-6.2-astra -c model_reasoning_effort="max" -c service_tier="default"` at **normal/default speed** (explicitly overriding any host `~/.codex/config.toml` `ultrafast` setting per `2026-11-26 21:12 +08:00` owner override unless re-enabled later, `$0` API spend), passing direct raw file/log/transcript paths without second-hand compression.
-  - **Tier 1 — Routine Small PR Focused Review:** Lightweight, fast Standards + Spec dual-axis check on a frozen single-PR diff, capped at **1 remediation round (`<= 2` calls)**. **Mandatory** for ANY PR touching **private-data handling or redaction (including PII, raw reviews, and private business evidence/quotes)**, **OpenAI spending / budget ledgers**, **request recovery**, or **core economics / scoring / gate logic**. Pure typo/non-spec doc hygiene PRs may use ordinary diff and link verification.
-  - **Tier 2 — Major Checkpoint Holistic Business-Logic Audit:** Fixed **1-round** full-context `GPT-6.2 Astra` audit (`serviceTier: 'default'`, `max` reasoning, `web_search: 'live'`, `$0` API spend) passing raw main/sidechat transcripts, living specs (`docs/SPEC.md`, `docs/STATE.md`, `docs/adr/`, `src/business-thresholds.mjs`), and `.local/trials/` real benchmark cards at **Pause Point 1**, **Pause Point 2**, and **before major architectural refactors**, explicitly inviting first-principles business-logic challenge against single-person local Amazon FBA tool reality, followed by primary-agent **Three-Tier Independent Ruling** (`[采纳 · 真洞察]` / `[极简补]` / `[驳回 · 脱离单人卖家现实]`) and explicit owner sign-off before starting implementation work. (Subsequent core/architecture **code remediation** uses its own max **3 rounds** limit below.)
-- **Single-PR `GPT-6.2 Astra` Review Prompt Template (copy-pasteable):**
-  Use the standard **"目标 + 验收标准 + 两条边界 + 自由发挥"** structure for Tier 1 PR reviews:
+- **1-Round GPT Review System (`GPT-6.2 Astra` via local subscription `Codex CLI`, `$0` API spend):**
+  - **Runtime defaults:** Every fresh-context `codex exec` review runs `-m gpt-6.2-astra -c model_reasoning_effort="max" -c service_tier="default"` at **normal/default speed** (explicitly overriding any host `~/.codex/config.toml` `ultrafast` setting per `2026-11-26 21:12 +08:00` owner override unless re-enabled later, `$0` API spend), retaining **full project context**, `web_search="live"`, and **read-only full-repo inspection permission** (passing direct raw file/log/transcript paths without second-hand compression).
+  - **Strict 1-Round Hard Cap (ALL GPT reviews):** Every GPT review — whether focused single-PR Standards + Spec dual-axis review (**mandatory** for non-exempt PRs touching **private-data handling or redaction**, **OpenAI spending / budget ledgers**, **request recovery**, or **core economics / scoring / gate logic**) or full-scope holistic audit (e.g., M6 closeout review after Step 1 & Step 2 complete) — is **strictly capped at 1 round max** (no follow-up GPT re-reviews or multi-round retries).
+  - **Exemptions:** Pure docs/hygiene-only PRs and owner-approved slimming PRs are **exempt** from external GPT review (covered by offline `node --test` + verification wave), with the final 1-round full-scope GPT review running in M6 after Step 1 & Step 2 complete.
+- **GPT-6.2 Astra Review Prompt Template (SSOT, copy-pasteable):**
+  Use the standard **"目标 + 验收标准 + 两条边界"** structure for ALL GPT reviews (never include nitpick-inducing checklists or GPT pre-labeling):
 
   ```text
   【目标】
-  请以“单人本地亚马逊美站 FBA 选品工具”的第一性原理，对本 PR（Issue #<id> / 分支 <branch> / commit <sha>）做 Standards + Spec 双轴独立审查。
-  请直接读取以下原始文件与 diff（禁止依赖二手摘要）：
+  请以“单人本地亚马逊美站 FBA 选品工具”的第一性原理，对本 PR（Issue #<id> / 分支 <branch> / commit <sha>）或当前全仓成果做 Standards + Spec 独立审查（仅此 1 轮）。
+  请直接读取以下原始文件与 diff（保留完整项目背景与全仓只读核查权限，禁止依赖二手摘要）：
   - 当前阶段与原始需求：<current stage / milestone & ORIGINAL_REQUEST.md path>
   - 规格与约束：docs/SPEC.md、AGENTS.md、src/business-thresholds.mjs
-  - 本次改动文件：<exact changed file paths>
+  - 本次改动文件：<exact changed file paths or full repo scope>
   - 验证命令与原始输出：<raw test output path or reproducible `node --test` command>
 
   【验收标准】
-  1. 真实缺陷拦截（BLOCKER）：是否引入资金/毛利算错、误杀蓝海、漏拦 IP/侵权冲突、真实外部 API 载荷崩溃、未确认业务阈值硬编码，或 PII/密钥/原评论泄露。
-  2. 单人本地工具 Non-Goals 检查：明确标出任何违背“单人本地桌面/CLI 工具”前提的过度防御（例如：多租户、分布式锁、防进程内 JS 原型篡改、SSRF 过度防护、重复平台 $200 硬上限的核弹级额度锁、或脱离真实调用链的冗余测试）。
-  3. Fowler 四大坏味道检查（仅针对本次改动及直接耦合边界）：
-     - Divergent Change（发散式变化：一个模块承担过多不相关变化轴）
-     - Shotgun Surgery（霰弹式修改：一个业务规则变动被迫散改多处）
-     - Speculative Generality（臆测性泛化：为假想未来需求提前搭空架子/抽象层）
-     - Duplicated Code（重复代码：同源规则或逻辑在多处各自维护）
-  4. 合规与可独立裁决输出：每条发现必须给出精确文件路径、行号与可复现证据，便于主代理执行独立三档裁决（`[采纳 · 真问题]` / `[极简修]` / `[驳回 · 过度防御]`）；严禁为凑 PASS 建议堆砌防御性代码。
+  1. 真实缺陷拦截（BLOCKER）：仅排查是否引入资金/毛利算错、误杀蓝海、漏拦 IP/侵权冲突、真实外部 API 载荷崩溃、未确认业务阈值硬编码，或 PII/密钥/原评论泄露。
+  2. 单人本地工具边界（必须跳过非本地单人工具假想威胁）：明确跳过进程内 JS 原型篡改（in-process prototype/Proxy tampering）、本地磁盘 symlink/hardlink 攻击、多租户 RBAC 鉴权、分布式锁、SSRF 过度防护、或重复平台 $200 硬上限的核弹级额度锁；禁止为凑意见诱导挑刺或建议堆砌防御性代码。
+  3. 极简输出格式（严禁 GPT 预先替主人贴裁决标签）：每条发现仅输出 **`位置（文件:行号） + 最小复现输入 + 1 句真实业务影响`**（location + repro input + 1-sentence real-world business impact），严禁预先输出任何裁决标签或长篇改造方案。
 
   【两条边界】
   1. 严禁修改主工作区任何文件或 SQLite 账本（`.local/state/selection.sqlite` 等仅只读）。
-  2. 严禁执行任何亚马逊店铺/广告真实写操作；全程走本地订阅 `Codex CLI`（`service_tier="default"`、`max` 推理），保持 `$0` 付费 API 消耗。
-
-  【自由发挥】
-  除上述检查项外，如发现本次改动存在未覆盖的真实边界失效、回归风险或更极简的结构改法，请直接指出原因、利弊与最小可行方案；禁止阿谀奉承。
+  2. 严禁执行任何亚马逊店铺/广告真实写操作；全程走本地订阅 `Codex CLI`（`service_tier="default"`、`max` 推理、`web_search="live"`），保持 `$0` 付费 API 消耗。
   ```
 
-- **Highest engineering discipline — Three-Tier Independent Ruling Gate (anti-bloat barrier):** Never blindly accept all `GPT-6.2` review comments. Before modifying any code after a `GPT-6.2` audit (Tier 1 or Tier 2), the primary agent MUST independently judge every single comment from first principles of a **single-person local Amazon FBA product-selection tool**, assign one of three verdicts with a one-sentence rationale, and act strictly accordingly:
-  1. **`[采纳 · 真问题]`** — genuinely miscalculates money/margin, falsely kills blue oceans, misses IP/counterfeit conflicts, crashes on real provider payload shapes, or leaks PII/secrets -> fix cleanly at the structural seam and apply the Poteto ratchet (structural/interface prevention > deterministic guard test with fix instructions > minimal prose deleted once guarded).
-  2. **`[极简修]`** — real defect exists, but GPT's proposed design is over-engineered -> apply the simplest adequate fix without creating complex new subsystems (e.g., flat columns in an existing table instead of event sourcing).
-  3. **`[驳回 · 过度防御]`** — extreme hypothetical absent from a single-person local tool (in-process caller JS prototype/`Proxy` tampering, local disk hardlink races, imaginary local attackers, nuclear-grade local settlement locks duplicating platform `Auto-recharge OFF` + `$200` hard cap, heavy shared-Buy-Box attribution/blind-test subsystems for front-end lead sourcing, or redundant tests) -> explicitly reject with rationale and add **zero** defensive lines; never pile up bloat merely to chase a GPT `PASS`.
-  - When genuinely uncertain whether to adopt or reject a comment, present one-sentence arguments from both sides to `主人` for a decision. Enforce a hard ceiling of **1 remediation round (`<= 2` calls) for routine small PR / card reviews** and **3 rounds maximum for major core/architecture code remediation** (separate from Tier 2's fixed **1-round** pre-code holistic business-logic audit).
+- **Highest engineering discipline — Zero-Edit Owner Two-Bucket Approval Gate (no maintainer/agent bypass):** After ANY `GPT-6.2` review returns, the primary agent MUST perform **strictly ZERO code edits (even for routine engineering findings — no maintainer or agent bypass)** until it presents a plain, concise Simplified Chinese two-bucket summary (`大白话`, avoiding programmer jargon) to `主人` and receives `主人`'s explicit approval on which items to edit:
+  1. **`桶 A: 真问题·建议修`** — genuinely miscalculates money/margin, falsely kills blue oceans, misses IP/counterfeit conflicts, crashes on real provider payload shapes, or leaks PII/secrets -> explain in 1 plain Chinese sentence what breaks for the seller; edit ONLY after `主人` approves.
+  2. **`桶 B: 过度防御·建议驳回`** — extreme hypothetical absent from a single-person local tool (in-process prototype tampering, symlink/hardlink attacks, multi-tenant RBAC, imaginary local attackers, nuclear local settlement locks duplicating platform `Auto-recharge OFF` + `$200` hard cap, heavy front-end attribution engines, or redundant tests) -> explain in plain Chinese why it does not apply to a single-person local workflow; add **zero** defensive lines unless `主人` explicitly directs otherwise.
+  - Enforce a strict **1-round hard ceiling** on all GPT reviews across the project.
 - **Global check first & sustained disciplined slimming:** Never halt delivery for a full-repo rewrite, and never impose arbitrary "delete X% lines" quotas. Instead, track verified over-defensive bloat (such as abolished lock/tamper/hardlink layers in `src/openai/` and monolithic command routing in `src/phase2-cli.mjs`) on the cleanup roadmap, verify all real callers and test dependencies before removing dead code, and keep core business behavior and `node --test` 100% green.
 - **Curatorial Studio (`01 视觉策展室`) UI invariants & local preview:** Future HTML report or workbench updates must preserve the anti-AI-slop editorial aesthetic (`0` Impeccable warnings), unboxed typographic navigation (zero pill-box tag clutter), and high-contrast CJK ink legibility (`--ink-2: #1c1d22`, `--muted: #383a42`, `>= 11:1` contrast, body weight `>= 460`). Never hand the owner a bare local `.html` file path to click in chat (which opens raw HTML source in the editor); always serve and link a rendered `http://127.0.0.1:<port>/...` local preview URL with refresh instructions.
 
@@ -168,7 +159,7 @@ Adopted 2026-11-26 as permanent stage & `retro` engineering discipline (executed
 
 1. **Design code and tests for long-term evolution (low coupling, zero bloat):**
    - Keep every new module and refactor cleanly decoupled with narrow interfaces so adding new discovery channels, updating 2028+ annual fee schedules, or swapping AI models stays low-friction.
-   - Apply the **Three-Tier Independent Ruling Gate (`[采纳 · 真问题]` / `[极简修]` / `[驳回 · 过度防御]`)** to **both source code and tests** — reject redundant, brittle, or hostile-in-process over-testing detached from single-person local tool reality. Test real ledgers, real interface contracts, and realistic boundaries so future refactors stay unblocked.
+   - Apply the **single-person local tool reality check (and Zero-Edit Owner Two-Bucket Approval Gate for GPT findings)** to **both source code and tests** — reject redundant, brittle, or hostile-in-process over-testing detached from single-person local tool reality. Test real ledgers, real interface contracts, and realistic boundaries so future refactors stay unblocked.
 2. **Maintain repository docs, files, branches, and local hygiene by signal-vs-noise (no arbitrary size caps):**
    - Write useful Matt/Poteto living docs (`docs/SPEC.md`, `docs/adr/`, `GLOSSARY.md`, `docs/STATE.md`, issue plans, and TDD/acceptance evidence) as thoroughly as needed — never impose artificial KB or line limits on high-signal records.
    - Periodically prune duplicated copy-pasting, stale contradictions, and obsolete noise with one clear benchmark: **a brand-new AI with zero prior chat history reading only the repository's living docs and `.local/state/` can resume work seamlessly with zero ambiguity or misreading.**

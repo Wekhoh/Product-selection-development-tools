@@ -21,6 +21,73 @@ const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 // Ratchet rule: this ceiling may only decrease (prune dead branches), never increase.
 const RESIDUAL_R50_R58_MAX = 56;
 
+// Baseline allowlist of chronicle test files in test/ (M1 PR A1).
+// Ratchet rule: new issue-*/batch-*/stage*/r59-* files are forbidden; M3 shrinks this list as tests consolidate.
+const CHRONICLE_TEST_ALLOWLIST = new Set([
+  'batch-a1-pricing-keepa-channel-fixes.test.mjs',
+  'batch-a2-report-ad-dedup-fixes.test.mjs',
+  'batch-a3-batch-cli-resume-fixes.test.mjs',
+  'issue-11-price-band-veteran-threshold.test.mjs',
+  'issue-23-steady-state-bare-goods.test.mjs',
+  'issue-28-1688-luna-ranking-anti-false-kill.test.mjs',
+  'issue-33-dated-keepa-sp-api-calibration.test.mjs',
+  'issue-5-carton-weight-headhaul.test.mjs',
+  'issue-6-sourcing-parity-and-guardrails.test.mjs',
+  'issue-8-review-dispute-scenario-linkage.test.mjs',
+  'issue-9-calibration-tracking-separation.test.mjs',
+  'r59-round1-round2-upgrades.test.mjs',
+  'r59-round3-closure.test.mjs',
+  'r59-step2-ranking-evergreen.test.mjs',
+  'r59-step3-daily-entrypoints.test.mjs',
+  'r59-step4-signoff-regressions.test.mjs',
+  'stage5a-return-inquiry.test.mjs',
+]);
+
+// Baseline allowlist of duplicate utility declarations in src/ outside src/utils/ (and src/contracts.mjs for assertNonemptyString).
+// Ratchet rule: zero new duplicates allowed; M2 shrinks this allowlist to empty.
+const DUPLICATE_UTIL_ALLOWLIST = new Set([
+  'openai/budget-ledger.mjs:generatePiiSafeUuid',
+  'openai/client.mjs:assertPlainObject',
+  'openai/client.mjs:generatePiiSafeUuid',
+  'openai/client.mjs:isPlainObject',
+  'openai/codex-runner.mjs:generatePiiSafeUuid',
+  'openai/codex-runner.mjs:isPlainObject',
+  'openai/evidence-review.mjs:assertNonemptyString',
+  'openai/evidence-review.mjs:assertPlainObject',
+  'openai/evidence-review.mjs:deepFreeze',
+  'openai/evidence-review.mjs:isPlainObject',
+  'openai/response-envelope.mjs:assertPlainObject',
+  'openai/response-envelope.mjs:isPlainObject',
+  'openai/stage5-return-inquiry.mjs:assertNonemptyString',
+  'openai/stage5-return-inquiry.mjs:assertPlainObject',
+  'openai/stage5-return-inquiry.mjs:deepFreeze',
+  'openai/stage5-return-inquiry.mjs:isPlainObject',
+  'openai/workflow-tasks.mjs:assertNonemptyString',
+  'openai/workflow-tasks.mjs:assertPlainObject',
+  'openai/workflow-tasks.mjs:deepFreeze',
+  'openai/workflow-tasks.mjs:isPlainObject',
+  'store.mjs:canonicalJson',
+  'store.mjs:sha256Hex',
+]);
+
+// Baseline per-file ceiling of duplicate email redaction regexes in src/ outside src/contracts.mjs (7 across 6 files).
+const DUPLICATE_EMAIL_REGEX_ALLOWLIST = Object.freeze({
+  'openai/background.mjs': 1,
+  'openai/client.mjs': 1,
+  'openai/stage5-return-inquiry.mjs': 1,
+  'openai/workflow-tasks.mjs': 1,
+  'report.mjs': 1,
+  'store.mjs': 2,
+});
+
+const R1_GOVERNANCE_FILES = Object.freeze([
+  'AGENTS.md',
+  'docs/DEVELOPMENT.md',
+  'docs/SPEC.md',
+  '.github/PULL_REQUEST_TEMPLATE.md',
+  'docs/API-MIGRATION.md',
+]);
+
 // Frozen SHA-256 + byte-length manifest of all 22 files under docs/archive/ (PR #40 merged main).
 // Embedded directly so immutability is enforced even under shallow CI checkouts (fetch-depth: 1).
 const FROZEN_ARCHIVE_MANIFEST = Object.freeze({
@@ -226,8 +293,7 @@ function stripFencedCodeBlocks(markdown) {
   return out.join('\n');
 }
 
-function scanBrokenRelativeMdLinks(docsDir) {
-  const mdFiles = walkFiles(docsDir, (_, name) => name.endsWith('.md'));
+function scanBrokenRelativeMdLinksForFiles(mdFiles, baseRoot) {
   const broken = [];
   let checkedCount = 0;
   const inlineLinkRe = /\[([^\]]+)\]\(([^)\n]+)\)/g;
@@ -247,7 +313,7 @@ function scanBrokenRelativeMdLinks(docsDir) {
       const resolved = resolve(dirname(mdFile), filePart);
       if (!existsSync(resolved) || !statSync(resolved).isFile()) {
         broken.push({
-          from: toPosixRel(docsDir, mdFile),
+          from: toPosixRel(baseRoot, mdFile),
           target: rawTarget,
         });
       }
@@ -256,12 +322,27 @@ function scanBrokenRelativeMdLinks(docsDir) {
   return { mdFilesCount: mdFiles.length, checkedCount, broken };
 }
 
+function scanBrokenRelativeMdLinks(docsDir) {
+  const mdFiles = walkFiles(docsDir, (_, name) => name.endsWith('.md'));
+  return scanBrokenRelativeMdLinksForFiles(mdFiles, docsDir);
+}
+
 function assertNoBrokenRelativeMdLinks(docsDir) {
   const result = scanBrokenRelativeMdLinks(docsDir);
   assert.deepEqual(
     result.broken,
     [],
     `Broken relative .md links under docs/: ${result.broken.map(b => `${b.from} -> ${b.target}`).join('; ')}`,
+  );
+  return result;
+}
+
+function assertNoBrokenRelativeMdLinksInFiles(mdFiles, baseRoot) {
+  const result = scanBrokenRelativeMdLinksForFiles(mdFiles, baseRoot);
+  assert.deepEqual(
+    result.broken,
+    [],
+    `Broken relative .md links in root docs: ${result.broken.map(b => `${b.from} -> ${b.target}`).join('; ')}`,
   );
   return result;
 }
@@ -450,6 +531,435 @@ test('hygiene rule 3 (negative & boundary): appending body text or adding an une
     assert.throws(
       () => verifyFrozenArchive(dir, manifest),
       /Unexpected new file\(s\) added to frozen archive: unexpected\.md/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Rule 2 extension: root README.md, AGENTS.md, GLOSSARY.md relative .md link check ---
+
+test('hygiene rule 2b (live): root README.md, AGENTS.md, and GLOSSARY.md contain zero broken relative .md links', () => {
+  const rootFiles = ['README.md', 'AGENTS.md', 'GLOSSARY.md'].map(f => join(REPO_ROOT, f));
+  const res = assertNoBrokenRelativeMdLinksInFiles(rootFiles, REPO_ROOT);
+  assert.equal(res.mdFilesCount, 3);
+  assert.ok(res.checkedCount >= 20);
+});
+
+test('hygiene rule 2b (negative & boundary): catches broken relative .md links in root docs without false-positiving on valid links', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hygiene-r2b-'));
+  try {
+    mkdirSync(join(dir, 'docs'), { recursive: true });
+    writeFileSync(join(dir, 'docs', 'SPEC.md'), '# Spec\n', 'utf8');
+    const readme = join(dir, 'README.md');
+    const agents = join(dir, 'AGENTS.md');
+    const glossary = join(dir, 'GLOSSARY.md');
+    writeFileSync(readme, 'See [Spec](docs/SPEC.md#top) and [Site](https://example.com/a.md).\n', 'utf8');
+    writeFileSync(agents, 'Read [Glossary](GLOSSARY.md).\n', 'utf8');
+    writeFileSync(glossary, '# Glossary\n', 'utf8');
+
+    const ok = assertNoBrokenRelativeMdLinksInFiles([readme, agents, glossary], dir);
+    assert.equal(ok.checkedCount, 2);
+
+    writeFileSync(agents, 'Broken [Missing](docs/NOPE.md).\n', 'utf8');
+    assert.throws(
+      () => assertNoBrokenRelativeMdLinksInFiles([readme, agents, glossary], dir),
+      /Broken relative \.md links in root docs: AGENTS\.md -> docs\/NOPE\.md/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Rule 4: Chronicle test anti-fragmentation ratchet ---
+
+const CHRONICLE_TEST_NAME_RE = /^(?:issue-|batch-|stage|r59-).*\.test\.mjs$/i;
+
+function assertChronicleTestAllowlist(testDir, allowlist = CHRONICLE_TEST_ALLOWLIST) {
+  const matching = readdirSync(testDir, { withFileTypes: true })
+    .filter(e => e.isFile() && CHRONICLE_TEST_NAME_RE.test(e.name))
+    .map(e => e.name)
+    .sort();
+  const matchingSet = new Set(matching);
+
+  const unexpected = matching.filter(name => !allowlist.has(name));
+  const stale = [...allowlist].filter(name => !matchingSet.has(name)).sort();
+
+  assert.deepEqual(
+    unexpected,
+    [],
+    `Unexpected new chronicle test file(s) detected (consolidate into domain test files instead): ${unexpected.join(', ')}`,
+  );
+  assert.deepEqual(
+    stale,
+    [],
+    `Stale entry(ies) in CHRONICLE_TEST_ALLOWLIST (remove retired files to ratchet debt down): ${stale.join(', ')}`,
+  );
+  return matching.length;
+}
+
+test('hygiene rule 4 (live): test/ contains only the exact 17 allowlisted chronicle test files', () => {
+  const count = assertChronicleTestAllowlist(join(REPO_ROOT, 'test'));
+  assert.equal(count, 17);
+});
+
+test('hygiene rule 4 (negative & boundary): forbids new issue-/batch-/stage/r59- test files and catches stale allowlist entries', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hygiene-r4-'));
+  try {
+    writeFileSync(join(dir, 'scoring.test.mjs'), '// domain test\n', 'utf8');
+    writeFileSync(join(dir, 'issue-5-carton-weight-headhaul.test.mjs'), '// allowlisted\n', 'utf8');
+    const allowlist = new Set(['issue-5-carton-weight-headhaul.test.mjs']);
+
+    assert.equal(assertChronicleTestAllowlist(dir, allowlist), 1);
+
+    for (const badName of ['issue-99-new.test.mjs', 'batch-b1-new.test.mjs', 'stage6-new.test.mjs', 'r59-extra.test.mjs']) {
+      const badPath = join(dir, badName);
+      writeFileSync(badPath, '// fragmented test\n', 'utf8');
+      assert.throws(
+        () => assertChronicleTestAllowlist(dir, allowlist),
+        new RegExp(`Unexpected new chronicle test file\\(s\\) detected.*${badName.replace('.', '\\.')}`),
+      );
+      rmSync(badPath);
+    }
+
+    rmSync(join(dir, 'issue-5-carton-weight-headhaul.test.mjs'));
+    assert.throws(
+      () => assertChronicleTestAllowlist(dir, allowlist),
+      /Stale entry\(ies\) in CHRONICLE_TEST_ALLOWLIST.*issue-5-carton-weight-headhaul\.test\.mjs/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Rule 5: Duplicate utility definitions & email regex ratchets in src/ ---
+
+const DUPLICATE_UTIL_DECL_RE =
+  /\b(?:function|const|let|var)\s+(isPlainObject|assertPlainObject|assertNonemptyString|deepFreeze|generatePiiSafeUuid|canonicalJson|sha256Hex)\b/g;
+
+const REGEX_PREV_KEYWORDS = new Set([
+  'return', 'case', 'throw', 'in', 'of', 'typeof', 'delete', 'void', 'await', 'yield', 'else',
+]);
+const EMAIL_REGEX_BODY_RE = /(?:\[[^\]]*\]|[^\s@])+\+?@[^\r\n]*\\\./;
+
+function scanJsLexical(source) {
+  let codeWithoutCommentsOrStrings = '';
+  const regexLiterals = [];
+  let i = 0;
+  let line = 1;
+  let prevSig = '';
+  let prevWord = '';
+  const n = source.length;
+  while (i < n) {
+    const ch = source[i];
+    if (ch === '\n') {
+      codeWithoutCommentsOrStrings += '\n';
+      line++;
+      i++;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t' || ch === '\r') {
+      codeWithoutCommentsOrStrings += ch;
+      i++;
+      continue;
+    }
+    if (ch === '/' && source[i + 1] === '/') {
+      i += 2;
+      while (i < n && source[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === '/' && source[i + 1] === '*') {
+      i += 2;
+      while (i < n && !(source[i] === '*' && source[i + 1] === '/')) {
+        if (source[i] === '\n') {
+          codeWithoutCommentsOrStrings += '\n';
+          line++;
+        }
+        i++;
+      }
+      i += 2;
+      continue;
+    }
+    if (ch === '\'' || ch === '"' || ch === '`') {
+      const q = ch;
+      codeWithoutCommentsOrStrings += q;
+      i++;
+      while (i < n && source[i] !== q) {
+        if (source[i] === '\\') {
+          if (source[i + 1] === '\n') {
+            codeWithoutCommentsOrStrings += '\n';
+            line++;
+          }
+          i += 2;
+        } else {
+          if (source[i] === '\n') {
+            codeWithoutCommentsOrStrings += '\n';
+            line++;
+          }
+          i++;
+        }
+      }
+      if (i < n) i++;
+      codeWithoutCommentsOrStrings += q;
+      prevSig = q;
+      prevWord = '';
+      continue;
+    }
+    if (
+      ch === '/' &&
+      (!prevSig || '=(,[!&|?:;{}~^+-*%<>!'.includes(prevSig) || REGEX_PREV_KEYWORDS.has(prevWord))
+    ) {
+      const startLine = line;
+      let j = i + 1;
+      let inClass = false;
+      let closed = false;
+      while (j < n && source[j] !== '\n' && source[j] !== '\r') {
+        const c = source[j];
+        if (c === '\\') { j += 2; continue; }
+        if (c === '[') inClass = true;
+        else if (c === ']') inClass = false;
+        else if (c === '/' && !inClass) { closed = true; break; }
+        j++;
+      }
+      if (closed && j > i + 1) {
+        const body = source.slice(i + 1, j);
+        regexLiterals.push({ line: startLine, body });
+        codeWithoutCommentsOrStrings += '//';
+        i = j + 1;
+        while (i < n && /[gimsuvy]/.test(source[i])) i++;
+        prevSig = '/';
+        prevWord = '';
+        continue;
+      }
+    }
+    if (/[A-Za-z0-9_$]/.test(ch)) {
+      let k = i;
+      while (k < n && /[A-Za-z0-9_$]/.test(source[k])) k++;
+      prevWord = source.slice(i, k);
+      codeWithoutCommentsOrStrings += prevWord;
+      prevSig = source[k - 1];
+      i = k;
+      continue;
+    }
+    codeWithoutCommentsOrStrings += ch;
+    prevSig = ch;
+    prevWord = '';
+    i++;
+  }
+  return { codeWithoutCommentsOrStrings, regexLiterals };
+}
+
+function scanDuplicateUtils(srcDir) {
+  const files = walkFiles(srcDir, (_, name) => name.endsWith('.mjs'));
+  const pairs = [];
+  for (const file of files) {
+    const rel = toPosixRel(srcDir, file);
+    if (rel.startsWith('utils/')) continue;
+    const { codeWithoutCommentsOrStrings } = scanJsLexical(readFileSync(file, 'utf8'));
+    for (const match of codeWithoutCommentsOrStrings.matchAll(DUPLICATE_UTIL_DECL_RE)) {
+      const symbol = match[1];
+      if (rel === 'contracts.mjs' && symbol === 'assertNonemptyString') continue;
+      pairs.push(`${rel}:${symbol}`);
+    }
+  }
+  return pairs.sort();
+}
+
+function assertDuplicateUtilsRatchet(srcDir, allowlist = DUPLICATE_UTIL_ALLOWLIST) {
+  const found = scanDuplicateUtils(srcDir);
+  const foundSet = new Set(found);
+  const unexpected = found.filter(pair => !allowlist.has(pair));
+  const stale = [...allowlist].filter(pair => !foundSet.has(pair)).sort();
+
+  assert.deepEqual(
+    unexpected,
+    [],
+    `Unexpected duplicate utility declaration(s) outside src/utils/ (import shared helpers instead): ${unexpected.join(', ')}`,
+  );
+  assert.deepEqual(
+    stale,
+    [],
+    `Stale entry(ies) in DUPLICATE_UTIL_ALLOWLIST (remove consolidated entries to ratchet debt down): ${stale.join(', ')}`,
+  );
+  return found;
+}
+
+function scanDuplicateEmailRegexes(srcDir) {
+  const files = walkFiles(srcDir, (_, name) => name.endsWith('.mjs'));
+  const counts = {};
+  const hits = [];
+  for (const file of files) {
+    const rel = toPosixRel(srcDir, file);
+    if (rel === 'contracts.mjs') continue;
+    const { regexLiterals } = scanJsLexical(readFileSync(file, 'utf8'));
+    for (const r of regexLiterals) {
+      if (EMAIL_REGEX_BODY_RE.test(r.body)) {
+        counts[rel] = (counts[rel] ?? 0) + 1;
+        hits.push({ file: rel, line: r.line, body: r.body });
+      }
+    }
+  }
+  return { counts, hits };
+}
+
+function assertDuplicateEmailRegexesRatchet(srcDir, allowlist = DUPLICATE_EMAIL_REGEX_ALLOWLIST) {
+  const { counts, hits } = scanDuplicateEmailRegexes(srcDir);
+  const violations = [];
+  for (const [file, actualCount] of Object.entries(counts)) {
+    const allowed = allowlist[file] ?? 0;
+    if (actualCount > allowed) {
+      violations.push(`${file}: ${actualCount} > allowed ${allowed}`);
+    }
+  }
+  assert.deepEqual(
+    violations,
+    [],
+    `Unexpected duplicate email regex(es) outside src/contracts.mjs (use canonical redaction helper): ${violations.join('; ')}`,
+  );
+  return { counts, hits };
+}
+
+test('hygiene rule 5 (live): duplicate utility definitions (22) and email regexes (7) stay within exact allowlists without false-positiving on SAFE_API_BASE_URL_RE or NEAR_30_DAYS', () => {
+  const utilsFound = assertDuplicateUtilsRatchet(join(REPO_ROOT, 'src'));
+  assert.equal(utilsFound.length, 22);
+
+  const emailRes = assertDuplicateEmailRegexesRatchet(join(REPO_ROOT, 'src'));
+  assert.equal(emailRes.hits.length, 7);
+  assert.equal(emailRes.counts['budget-ledger.mjs'] ?? 0, 0);
+  assert.equal(emailRes.counts['scoring.mjs'] ?? 0, 0);
+});
+
+test('hygiene rule 5 (negative & boundary): catches new duplicate utils and email regexes while ignoring canonical homes, comments, SAFE_API_BASE_URL_RE, and NEAR_30_DAYS', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hygiene-r5-'));
+  try {
+    mkdirSync(join(dir, 'utils'), { recursive: true });
+    writeFileSync(
+      join(dir, 'utils', 'objects.mjs'),
+      'export function isPlainObject(v) { return Boolean(v); }\nexport function deepFreeze(v) { return v; }\n',
+      'utf8',
+    );
+    writeFileSync(
+      join(dir, 'contracts.mjs'),
+      'export function assertNonemptyString(v) { return v; }\nexport const EMAIL_RE = /\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b/gi;\n',
+      'utf8',
+    );
+    writeFileSync(
+      join(dir, 'clean.mjs'),
+      [
+        '// function isPlainObject() {}',
+        'const SAFE_API_BASE_URL_RE = /^https?:\\/\\/[A-Za-z0-9._:\\-[\\]]{1,255}(?:\\/[A-Za-z0-9._~:@!$&\'()*+,;=-]+)*$/i;',
+        'const NEAR_30 = /^NEAR_30_DAYS(?:@\\d{4}-\\d{2}-\\d{2})?$/i;',
+        'const str = "function assertPlainObject() {} foo@bar.com";',
+        'export function ok(a, b) { return a / b; }',
+      ].join('\n'),
+      'utf8',
+    );
+
+    assert.equal(assertDuplicateUtilsRatchet(dir, new Set()).length, 0);
+    assert.equal(assertDuplicateEmailRegexesRatchet(dir, {}).hits.length, 0);
+
+    // Negative 1: duplicate utility outside src/utils/ and contracts.mjs
+    const badUtil = join(dir, 'bad-util.mjs');
+    writeFileSync(badUtil, 'function isPlainObject(x) { return !!x; }\n', 'utf8');
+    assert.throws(
+      () => assertDuplicateUtilsRatchet(dir, new Set()),
+      /Unexpected duplicate utility declaration.*bad-util\.mjs:isPlainObject/,
+    );
+    rmSync(badUtil);
+
+    const badStr = join(dir, 'bad-str.mjs');
+    writeFileSync(badStr, 'const assertNonemptyString = v => v;\n', 'utf8');
+    assert.throws(
+      () => assertDuplicateUtilsRatchet(dir, new Set()),
+      /Unexpected duplicate utility declaration.*bad-str\.mjs:assertNonemptyString/,
+    );
+    rmSync(badStr);
+
+    // Negative 2: stale allowlist entry
+    assert.throws(
+      () => assertDuplicateUtilsRatchet(dir, new Set(['missing.mjs:isPlainObject'])),
+      /Stale entry\(ies\) in DUPLICATE_UTIL_ALLOWLIST/,
+    );
+
+    // Negative 3: duplicate email regex (including return /.../ form)
+    const badEmail = join(dir, 'bad-email.mjs');
+    writeFileSync(badEmail, 'export function hasEmail(s) { return /[^\\s@]+@[^\\s@]+\\.[^\\s@]+/.test(s); }\n', 'utf8');
+    assert.throws(
+      () => assertDuplicateEmailRegexesRatchet(dir, {}),
+      /Unexpected duplicate email regex.*bad-email\.mjs: 1 > allowed 0/,
+    );
+    rmSync(badEmail);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- Rule 6: R1 governance docs ratchet ---
+
+const R1_BANNED_PATTERNS = [
+  { label: '自由发挥', re: /自由发挥/ },
+  { label: '3 rounds / 3轮', re: /\b3\s*rounds?\b|3\s*轮/i },
+  { label: '<= 2 calls', re: /<=\s*2\s*calls/i },
+];
+
+function assertR1GovernanceDocs(repoRoot, files = R1_GOVERNANCE_FILES) {
+  const failures = [];
+  for (const rel of files) {
+    const content = readFileSync(join(repoRoot, rel), 'utf8');
+    for (const { label, re } of R1_BANNED_PATTERNS) {
+      if (re.test(content)) {
+        failures.push(`${rel}: contains banned R1 pattern (${label})`);
+      }
+    }
+    if (!/(?:1-round|1\s+round|1\s*轮)/i.test(content)) {
+      failures.push(`${rel}: missing strict 1-round GPT cap`);
+    }
+    if (!/strictly\s+ZERO\s+(?:post-review\s+)?code\s+edits/i.test(content)) {
+      failures.push(`${rel}: missing strictly ZERO code edits gate`);
+    }
+    if (!/桶\s*A/.test(content) || !/桶\s*B/.test(content)) {
+      failures.push(`${rel}: missing Chinese two-bucket approval summary (桶 A / 桶 B)`);
+    }
+    if (rel === 'docs/DEVELOPMENT.md' && !content.includes('目标 + 验收标准 + 两条边界')) {
+      failures.push(`${rel}: missing SSOT prompt template "目标 + 验收标准 + 两条边界"`);
+    }
+  }
+  assert.deepEqual(
+    failures,
+    [],
+    `R1 governance doc invariant failure(s):\n${failures.map(f => `  - ${f}`).join('\n')}`,
+  );
+  return files.length;
+}
+
+test('hygiene rule 6 (live): 5 governance/template files enforce strict 1-round GPT cap + zero-edit owner two-bucket gate and ban nitpick/multi-round rules', () => {
+  assert.equal(assertR1GovernanceDocs(REPO_ROOT), 5);
+});
+
+test('hygiene rule 6 (negative & boundary): detects banned 自由发挥 / 3 rounds / <= 2 calls or missing R1 two-bucket gate', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'hygiene-r6-'));
+  try {
+    const docPath = join(dir, 'GOV.md');
+    const validText = [
+      'Strict 1-round cap on ALL GPT reviews.',
+      'Strictly ZERO code edits after ANY GPT review until owner approves.',
+      'Present 桶 A: 真问题·建议修 / 桶 B: 过度防御·建议驳回 in plain Chinese.',
+    ].join('\n');
+    writeFileSync(docPath, validText, 'utf8');
+    assert.equal(assertR1GovernanceDocs(dir, ['GOV.md']), 1);
+
+    for (const badLine of ['Add + 自由发挥', 'Max 3 rounds allowed', 'Capped at <= 2 calls']) {
+      writeFileSync(docPath, `${validText}\n${badLine}\n`, 'utf8');
+      assert.throws(
+        () => assertR1GovernanceDocs(dir, ['GOV.md']),
+        /R1 governance doc invariant failure/,
+      );
+    }
+
+    writeFileSync(docPath, 'Strict 1-round cap only.\n', 'utf8');
+    assert.throws(
+      () => assertR1GovernanceDocs(dir, ['GOV.md']),
+      /missing strictly ZERO code edits gate/,
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });

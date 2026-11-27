@@ -40,7 +40,7 @@ These rows explain changes; owning documents define exact conditions. An example
 
 ## Trace a change through code and checks
 
-The local path is `src/cli.mjs` -> optional discovery preparation/attachment -> `scoreBatch` -> economics/fee and item checks -> HTML/result/receipt persistence. Research and native-tool collection precede it. The CLI does not discover products, classify buyer intent, inspect supplier pages or authenticate fee sources by itself.
+The local operational path is `src/phase2-cli.mjs` (while `src/cli.mjs` remains the standalone synthetic batch runner) -> optional discovery preparation/attachment -> `scoreBatch` -> economics/fee and item checks -> HTML/result/receipt persistence. Research and native-tool collection precede it. The CLI does not discover products, classify buyer intent, inspect supplier pages or authenticate fee sources by itself.
 
 | Review topic | Owning specification | Implementation and existing checks |
 | --- | --- | --- |
@@ -50,7 +50,7 @@ The local path is `src/cli.mjs` -> optional discovery preparation/attachment -> 
 | Exact bids and 3-tier progressive weighting | [SPEC](SPEC.md), [SUGGESTED-BID](archive/design/SUGGESTED-BID.draft.md) | `src/scoring.mjs`, `test/single-entry-bid.test.mjs`, `test/equal-entry-bid.test.mjs`, `test/revision59-foundations.test.mjs` |
 | `<= 90d` newcomers, 3-tier age priority & Q31 `4 + 1` | [SPEC](SPEC.md), [Q31](archive/design/Q31-NORMAL-NEWCOMER.draft.md) | `src/scoring.mjs`, `src/price-band.mjs`, `test/revision58.test.mjs`, `test/r59-round3-closure.test.mjs` |
 | 2027 FBA rates, Freight A4, SP-API calibration & margins | [SPEC](SPEC.md), [PROFITABILITY](archive/design/PROFITABILITY.draft.md) | `src/rates/`, `src/fba-calculator.mjs`, `src/economics.mjs`, `test/economics.test.mjs`, `test/fee-basis.test.mjs`, `test/r59-round1-round2-upgrades.test.mjs` |
-| V4 Curatorial Studio (`01 视觉策展室`) HTML & receipts | [SPEC](SPEC.md), [API-MIGRATION](API-MIGRATION.md) | `src/report.mjs`, `src/report-studio-css.mjs`, `src/receipt-verifier.mjs`, `src/cli.mjs`, `test/report.test.mjs`, `test/report-ai-sections.test.mjs` |
+| V4 Curatorial Studio (`01 视觉策展室`) HTML & receipts | [SPEC](SPEC.md), [API-MIGRATION](API-MIGRATION.md) | `src/report.mjs`, `src/report-studio-css.mjs`, `src/receipt-verifier.mjs`, `src/phase2-cli.mjs`, `src/cli.mjs`, `test/report.test.mjs`, `test/report-ai-sections.test.mjs` |
 
 Use Node.js24+ and README/STATE commands. Public synthetic fixtures and the [offline workflow](../.github/workflows/offline.yml) need no credentials or provider calls. Select affected checks, then required CI; replaying arithmetic does not require fresh live requests. Reuse unchanged acceptance, and verify changed dependencies and the resulting real card.
 
