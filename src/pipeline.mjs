@@ -71,6 +71,7 @@ import {
   buildWorkflowTaskRequest,
   freezeWorkflowTaskContext,
   parseWorkflowTaskResult,
+  resolveFactoryInquiryEligibility,
   freezeEvidenceReviewPacket,
   isEvidenceReviewStale,
   validateEvidenceReviewOutput,
@@ -3541,6 +3542,45 @@ export function runOptionalSpecMatcher(input, options = {}) {
   return runOptionalTerraWorkflowTask('spec-matcher', input, options);
 }
 
+export function runOptionalReturnCauseDiagnosis(input, options = {}) {
+  return runOptionalTerraWorkflowTask('return-cause-diagnosis', input, options);
+}
+
+export function runOptionalFactoryInquiryChecklist(input, options = {}) {
+  return runOptionalTerraWorkflowTask('factory-inquiry-1688', input, options);
+}
+
+function stripAdvisoryAttachmentsForBundleHash(cand) {
+  if (!cand || typeof cand !== 'object' || Array.isArray(cand)) return cand;
+  const hasTop =
+    Object.hasOwn(cand, 'evidence_review') ||
+    Object.hasOwn(cand, 'return_cause_diagnosis') ||
+    Object.hasOwn(cand, 'factory_inquiry_1688');
+  const hasPres = Boolean(
+    cand.presentation &&
+    typeof cand.presentation === 'object' &&
+    !Array.isArray(cand.presentation) &&
+    (Object.hasOwn(cand.presentation, 'return_cause_diagnosis') ||
+      Object.hasOwn(cand.presentation, 'factory_inquiry_1688')),
+  );
+  if (!hasTop && !hasPres) return cand;
+  const {
+    evidence_review: _ev,
+    return_cause_diagnosis: _rc,
+    factory_inquiry_1688: _fi,
+    ...rest
+  } = cand;
+  if (hasPres) {
+    const {
+      return_cause_diagnosis: _prc,
+      factory_inquiry_1688: _pfi,
+      ...presRest
+    } = cand.presentation;
+    rest.presentation = presRest;
+  }
+  return rest;
+}
+
 const ENGLISH_WORD_COUNTS = Object.freeze({
   one: 1, single: 1, two: 2, pair: 2, three: 3, four: 4, five: 5,
   six: 6, seven: 7, eight: 8, nine: 9, ten: 10, twelve: 12,
@@ -4652,9 +4692,7 @@ function computePreEvalResumeFingerprint({
           if (!inputCand) {
             staticValidationFailed = true;
           } else {
-            const deterministicCandInput = Object.hasOwn(inputCand, 'evidence_review')
-              ? (() => { const { evidence_review: _advisory, ...rest } = inputCand; return rest; })()
-              : inputCand;
+            const deterministicCandInput = stripAdvisoryAttachmentsForBundleHash(inputCand);
             staticResearchOutSha = sha256Hex(canonicalJson({
               candidate_input: deterministicCandInput,
               spec_matches: staticResearchOut.spec_matches ?? staticResearchOut.spec_match ?? null,
@@ -5389,10 +5427,8 @@ export async function runPhase2Batch(store, {
       }
 
       // Compute deterministic evidence_bundle_sha256 BEFORE attaching advisory Gate-4 evidence_review
-      // so advisory red-team reviews never fracture deterministic evaluation identity.
-      const deterministicCandInput = Object.hasOwn(inputCand, 'evidence_review')
-        ? (() => { const { evidence_review: _advisory, ...rest } = inputCand; return rest; })()
-        : inputCand;
+      // or Stage 5A return_cause_diagnosis / factory_inquiry_1688 so advisory/copy updates never fracture evaluation identity.
+      const deterministicCandInput = stripAdvisoryAttachmentsForBundleHash(inputCand);
       const bundleHash = computeEvidenceBundleHash({
         form_spec_sha256: latestForm.spec_sha256,
         candidate_input: deterministicCandInput,
@@ -5466,6 +5502,64 @@ export async function runPhase2Batch(store, {
             { expectedCandId: formId, expectedSpecSha: latestForm.spec_sha256 },
           );
           inputCand.evidence_review = attachedEvidenceReview;
+        }
+      }
+
+      // Optional Stage 5A Embedded Points ② (ReturnCauseDiagnosis) & ③ (FactoryInquiryChecklist1688):
+      // Strictly non-scoring, post-bundleHash, manual-handoff-only, and disabled unless hooks are enabled.
+      let returnCauseOut = null;
+      const returnCauseInputRaw = researchOut.return_cause_diagnosis_input ?? item.return_cause_diagnosis_input ?? null;
+      if (returnCauseInputRaw && typeof returnCauseInputRaw === 'object') {
+        const rcHookOpts = openai_hooks?.return_cause_diagnosis ?? {};
+        const rcInput = {
+          form_id: formId,
+          product_label: scoredCand.label ?? inputCand.label ?? formId,
+          target_spec: scoredCand.form ?? inputCand.form ?? latestForm.spec_summary ?? formId,
+          ...returnCauseInputRaw,
+        };
+        returnCauseOut = await runOptionalReturnCauseDiagnosis(rcInput, rcHookOpts);
+        if (returnCauseOut?.attempt_id) attemptIds.push(returnCauseOut.attempt_id);
+        if (returnCauseOut?.status === 'ready' && returnCauseOut.result) {
+          inputCand.return_cause_diagnosis = returnCauseOut.result;
+        }
+      }
+
+      let factoryInquiryOut = null;
+      const inqHookOpts = openai_hooks?.factory_inquiry_1688 ?? {};
+      const rawInquiryInput = researchOut.factory_inquiry_input ?? item.factory_inquiry_input ?? null;
+      const shouldAttemptFactoryInquiry = Boolean(
+        rawInquiryInput ||
+        (inqHookOpts.enabled === true && (qualification?.counts_toward_target === true || item.allow_on_demand_pending === true)),
+      );
+      if (shouldAttemptFactoryInquiry) {
+        const inqInput = {
+          form_id: formId,
+          product_label: scoredCand.label ?? inputCand.label ?? formId,
+          target_spec: scoredCand.form ?? inputCand.form ?? latestForm.spec_summary ?? formId,
+          qualification,
+          queue: scoredCand.queue,
+          effective_disposition: scoredCand.effective_disposition,
+          screening: scoredCand.screening,
+          sample_check_items: Array.isArray(scoredCand.sample_check_items) ? scoredCand.sample_check_items : [],
+          packaging_redesign_shortlist: scoredResult.packaging_redesign_shortlist ?? inputCand.packaging_redesign_shortlist ?? null,
+          ...(inputCand.return_cause_diagnosis ? { return_cause_diagnosis: inputCand.return_cause_diagnosis } : {}),
+          ...(item.allow_on_demand_pending === true ? { allow_on_demand_pending: true } : {}),
+          ...(rawInquiryInput && typeof rawInquiryInput === 'object' ? rawInquiryInput : {}),
+        };
+        const inqEligibility = resolveFactoryInquiryEligibility(inqInput);
+        if (inqEligibility.eligible) {
+          factoryInquiryOut = await runOptionalFactoryInquiryChecklist(inqInput, inqHookOpts);
+          if (factoryInquiryOut?.attempt_id) attemptIds.push(factoryInquiryOut.attempt_id);
+          if (factoryInquiryOut?.status === 'ready' && factoryInquiryOut.result) {
+            inputCand.factory_inquiry_1688 = factoryInquiryOut.result;
+          }
+        } else {
+          factoryInquiryOut = {
+            status: 'skipped_non_qualifying',
+            task: 'factory-inquiry-1688',
+            result: null,
+            reason: inqEligibility.reason,
+          };
         }
       }
 
@@ -5586,6 +5680,8 @@ export async function runPhase2Batch(store, {
         ...(rightsPreScreenOut ? { rights_prescreen: rightsPreScreenOut } : {}),
         ...(reviewJudgeOut ? { review_judge: reviewJudgeOut } : {}),
         ...(persistedEvidenceReview ? { evidence_review: persistedEvidenceReview } : {}),
+        ...(returnCauseOut ? { return_cause_diagnosis: returnCauseOut } : {}),
+        ...(factoryInquiryOut ? { factory_inquiry_1688: factoryInquiryOut } : {}),
       });
     } catch (error) {
       // Isolate per-form Stage 3 error so sibling ready forms still complete,

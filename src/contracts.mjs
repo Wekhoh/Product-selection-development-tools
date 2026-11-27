@@ -23,11 +23,17 @@ export const ALLOWED_DISPOSITIONS = Object.freeze([
 const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
 const NON_PHONE_MACHINE_TOKEN_RE = /\b(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}|[0-9a-f]{96}|[0-9a-f]{128}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b|\bdata:image\/(?:png|jpeg|webp);base64,[A-Za-z0-9+/=]+/gi;
 
+const CHINESE_NON_FLOOR_LAYER_SUFFIX = '硬盒|纸箱|瓦楞|纸板|实木|木板|胶合|板|搁板|架|收纳|抽屉|托盘|隔板|漆|涂装|刀片|防护|过滤|海绵|泡棉|内衬|缓冲|包装|结构|工艺|材料|材质|卡|滑|裂|坏|松|紧|弯|断|薄|厚|高|低|宽|窄|深|浅|空|满|装|放|摆|叠';
+const CHINESE_BUILDING_UNIT_RE = new RegExp(
+  `(?:栋|幢|单元|室|号楼|楼层)\\s*[零一二三四五六七八九十百千\\d]+|[零一二三四五六七八九十百千\\d]+\\s*(?:栋|幢|单元|室|号楼)|(?<!第)[零一二三四五六七八九十百千\\d]+\\s*层(?!${CHINESE_NON_FLOOR_LAYER_SUFFIX})`,
+);
+const CHINESE_BUILDING_UNIT_GLOBAL_RE = new RegExp(CHINESE_BUILDING_UNIT_RE.source, 'g');
+
 const PII_PATTERNS = [
   { name: 'cn_mobile_number', re: /(?<!\d)1[3-9]\d[\s-]?\d{4}[\s-]?\d{4}(?!\d)/, maskMachineTokens: true },
   { name: 'cn_landline_number', re: /(?<!\d)0\d{2,3}[\s-]\d{7,8}(?!\d)/, maskMachineTokens: true },
   { name: 'receiver_contact_label', re: /(收货人|收件人|联系人)\s*[:：]\s*[^\s,，;；]+/ },
-  { name: 'detailed_street_address', re: /(?:路|大道|街|巷|弄)\s*[零一二三四五六七八九十百千\d]+\s*号|(?:栋|幢|单元|室|号楼|楼层)\s*[零一二三四五六七八九十百千\d]+|[零一二三四五六七八九十百千\d]+\s*(?:栋|幢|单元|室|号楼)|[零一二三四五六七八九十百千\d]+\s*层(?!硬盒|纸箱|瓦楞|纸板|实木|木板|胶合|板|搁板|架|收纳|抽屉|托盘|隔板|漆|涂装|刀片|防护|过滤)/ },
+  { name: 'detailed_street_address', re: new RegExp(`(?:路|大道|街|巷|弄)\\s*[零一二三四五六七八九十百千\\d]+\\s*号|${CHINESE_BUILDING_UNIT_RE.source}`) },
   { name: 'windows_user_path', re: /[A-Za-z]:\\Users\\[^\\\s"'<>]+/i },
   { name: 'posix_user_path', re: /(?:^|[\s"'(=/])(?:file:\/\/\/)?(?:Users|home)\/[^/\s"'<>]+/i },
 ];
@@ -141,7 +147,7 @@ export function sanitizeDiagnosticText(text) {
     (_, qk, bk) => (qk ? `"${qk}":"[REDACTED_NAME]"` : `${bk}=[REDACTED_NAME]`),
   );
   out = out.replace(/(?:路|大道|街|巷|弄)\s*[零一二三四五六七八九十百千\d]+\s*号/g, '[REDACTED_STREET]');
-  out = out.replace(/(?:栋|幢|单元|室|号楼|楼层)\s*[零一二三四五六七八九十百千\d]+|[零一二三四五六七八九十百千\d]+\s*(?:栋|幢|单元|室|号楼|层)/g, '[REDACTED_UNIT]');
+  out = out.replace(CHINESE_BUILDING_UNIT_GLOBAL_RE, '[REDACTED_UNIT]');
   out = out.replace(/[A-Za-z]:\\Users\\[^\\\s"'<>]+(?:\\[^\s"'<>]*)*/gi, '[REDACTED_PATH]');
   out = out.replace(/(?:file:\/\/\/)?\/?(?:Users|home)\/[^/\s"'<>]+(?:\/[^\s"'<>]*)*/gi, '[REDACTED_PATH]');
   out = out.replace(/\b(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9_]{6,}|github_pat_[A-Za-z0-9_]{6,}|xox[bpas]-[A-Za-z0-9-]{6,}|pk_live_[A-Za-z0-9_-]{6,}|rk_live_[A-Za-z0-9_-]{6,}|ya29\.[A-Za-z0-9._-]{8,}|1\/\/[0-9A-Za-z_-]{12,}|oauth_[A-Za-z0-9._-]{8,}|AIza[A-Za-z0-9_-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{6,})/g, '[REDACTED_TOKEN]');
