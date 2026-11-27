@@ -897,13 +897,6 @@ test('Astra Sign-Off #13 & #14: Codex startup banner ultrafast fallback, NTFS ha
     );
     assert.equal(Buffer.compare(readFileSync(legacyPath), origBytes), 0, 'Legacy SQLite bytes must remain 100% untouched before hardlink collision error');
 
-    // Direct inspection of a multi-hardlink legacy SQLite file (nlink > 1) MUST also be rejected due to WAL sidecar ambiguity!
-    assert.throws(
-      () => inspectLegacyAutopilotBudget(hardlinkAlias, { monthUtc: '2026-11' }),
-      err => err instanceof OpenAiBudgetError && err.code === 'LEGACY_HARDLINK_ALIAS_FORBIDDEN',
-    );
-    assert.equal(statSync(legacyPath, { bigint: true }).nlink > 1n, true);
-
     // 3) Zero broken relative Markdown links across ALL tracked docs (including docs/archive/**)
     const walkMd = d => readdirSync(d, { withFileTypes: true }).flatMap(e =>
       e.isDirectory() ? walkMd(join(d, e.name)) : (e.name.endsWith('.md') ? [join(d, e.name)] : []),

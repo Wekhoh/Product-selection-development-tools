@@ -5,7 +5,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
-  deduplicateParentSalesRows,
   extractNewcomerReviewOriginBreakdown,
   resolveCategoryReturnWithFallback,
   sanitizeNewcomerMemberReviews,
@@ -13,7 +12,7 @@ import {
 import { scoreBatch } from './scoring.mjs';
 import { calculateEconomics, netReferral } from './economics.mjs';
 import { assertNoRawPii, containsSecretToken } from './contracts.mjs';
-import { analyzeMainstreamPriceBand, parseSingleUnitUsdCoupon } from './price-band.mjs';
+import { analyzeMainstreamPriceBand } from './price-band.mjs';
 import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 import {
   FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
@@ -36,15 +35,12 @@ import {
 import { canonicalJson, openSelectionStore, sha256Hex } from './store.mjs';
 import {
   ASIN_EXACT_RE,
-  ASIN_TOKEN_RE,
-  hasUpstreamErrorMarkers,
   isPayloadUpstreamFailure,
   hasEnvelopeFailureMarkers,
   isFailedOrEmptyRawReceipt,
   unwrapMcpEnvelope,
   isFailedUnwrappedBody,
   extractItemCategoryRoot,
-  extractStructuredPricesFromObject,
   reconcileAsinPriceProvenance,
   extractVerifiedAsinCatalogFromRawPayloads,
   extractVerifiedAsinSetFromRawPayloads,
@@ -86,6 +82,15 @@ export {
 const finite = v => typeof v === 'number' && Number.isFinite(v);
 const nonemptyStr = v => typeof v === 'string' && v.trim().length > 0;
 const round2 = v => Number(v.toFixed(2));
+
+function readScenarioPrice(sc) {
+  const ledger = sc?.cost_ledger ?? {};
+  const eff = resolveEffectivePricing(ledger);
+  if (eff.valid && finite(eff.net_effective_price_usd)) return round2(eff.net_effective_price_usd);
+  if (finite(ledger.price_usd)) return round2(ledger.price_usd);
+  if (finite(sc?.price_anchor?.value)) return round2(sc.price_anchor.value);
+  return null;
+}
 
 export function resolveStage1QualitativeJudgments({
   evidence = [],
@@ -432,8 +437,7 @@ export function buildPairedSeasonalOperatingPeriods({
   }
 
   const useLegacyR58Window = Boolean(
-    (profile_revision ?? 59) < 59 ||
-    (off_peak_window && off_peak_window.from === '2027-02-01' && off_peak_window.through === '2027-09-30'),
+    off_peak_window && off_peak_window.from === '2027-02-01' && off_peak_window.through === '2027-09-30',
   );
   const activeOffPeakSalesWin = useLegacyR58Window
     ? { from: '2027-02-01', through: '2027-09-30' }
@@ -496,15 +500,6 @@ export function buildPairedSeasonalOperatingPeriods({
     offPeakExpectedPrimary = normalizedOffPeak.map(s => ({ id: s.id, status: 'active' }));
   }
 
-  const resolveScenarioPriceForMatrix = sc => {
-    const ledger = sc?.cost_ledger ?? {};
-    const eff = resolveEffectivePricing(ledger);
-    if (eff.valid && finite(eff.net_effective_price_usd)) return round2(eff.net_effective_price_usd);
-    if (finite(ledger.price_usd)) return round2(ledger.price_usd);
-    if (finite(sc?.price_anchor?.value)) return round2(sc.price_anchor.value);
-    return null;
-  };
-
   const implicitQuotesInScenarios = [...new Set(
     normalizedOffPeak
       .map(s => s?.quote_id ?? s?.cost_ledger?.source_inputs?.quote_id ?? null)
@@ -518,7 +513,7 @@ export function buildPairedSeasonalOperatingPeriods({
   const explicitReqPrices = Array.isArray(required_prices_usd)
     ? [...new Set(required_prices_usd.filter(finite).map(round2))]
     : [];
-  const observedOffPeakPrices = [...new Set(normalizedOffPeak.map(resolveScenarioPriceForMatrix).filter(finite))];
+  const observedOffPeakPrices = [...new Set(normalizedOffPeak.map(readScenarioPrice).filter(finite))];
   if (strict_declared_completeness && explicitReqPrices.length > 0) {
     const missingPrices = explicitReqPrices.filter(rp => !observedOffPeakPrices.some(op => Math.abs(op - rp) <= 0.02));
     if (missingPrices.length > 0) {
@@ -540,7 +535,7 @@ export function buildPairedSeasonalOperatingPeriods({
     const presentPriceQuoteCells = new Set();
     for (const s of normalizedOffPeak) {
       const qid = (s?.quote_id ?? s?.cost_ledger?.source_inputs?.quote_id ?? '').trim();
-      const pr = resolveScenarioPriceForMatrix(s);
+      const pr = readScenarioPrice(s);
       if (!qid) {
         throw new TypeError(
           `buildPairedSeasonalOperatingPeriods scenario "${s?.id ?? 'unknown'}" must specify an explicit quote_id when multiple quotes (${normReqQuotes.join(', ')}) participate.`,
@@ -1317,19 +1312,10 @@ function assertCandidateRawProvenanceAndPriceBinding(cand, candCatalog, {
 
 function enforceCandidateContainerMatrixAndDbParity(cand, {
   dbConstraints = null,
-  effectiveRev = 58,
+  effectiveRev = 59,
 } = {}) {
   const containers = collectPrimaryContainersForChecks(cand);
   if (containers.length === 0) return { unverifiedUiQuoteUsed: false };
-
-  const resolveScPrice = sc => {
-    const ledger = sc?.cost_ledger ?? {};
-    const eff = resolveEffectivePricing(ledger);
-    if (eff.valid && finite(eff.net_effective_price_usd)) return round2(eff.net_effective_price_usd);
-    if (finite(ledger.price_usd)) return round2(ledger.price_usd);
-    if (finite(sc?.price_anchor?.value)) return round2(sc.price_anchor.value);
-    return null;
-  };
 
   const usableQuotes = dbConstraints?.usableQuotes ?? [];
   const usableQuotesById = new Map(usableQuotes.map(q => [q.quote_id, q]));
@@ -1349,7 +1335,7 @@ function enforceCandidateContainerMatrixAndDbParity(cand, {
 
   for (const container of containers) {
     const scens = container.scenarios;
-    const obsPrices = [...new Set(scens.map(resolveScPrice).filter(finite))];
+    const obsPrices = [...new Set(scens.map(readScenarioPrice).filter(finite))];
     if (dbDeclaredPrices.length > 0) {
       const missingDbPrices = dbDeclaredPrices.filter(dp => !obsPrices.some(op => Math.abs(op - dp) <= 0.02));
       if (missingDbPrices.length > 0) {
@@ -1504,7 +1490,7 @@ function enforceCandidateContainerMatrixAndDbParity(cand, {
       for (const sc of scens) {
         const rawQid = String(sc?.quote_id ?? sc?.cost_ledger?.source_inputs?.quote_id ?? '').trim();
         const qid = rawQid || (requiredQuoteIds.length === 1 ? requiredQuoteIds[0] : '');
-        const pr = resolveScPrice(sc);
+        const pr = readScenarioPrice(sc);
         if (!qid) {
           throw new TypeError(
             `Candidate "${cand.id}" (${container.container_id}) scenario "${sc?.id ?? 'unknown'}" must specify an explicit quote_id when multiple quotes (${requiredQuoteIds.join(', ')}) participate.`,
@@ -2801,7 +2787,6 @@ export function ingestTrialSpecification(spec, profile, {
     schema_version: 1,
     profile_revision: spec.profile_revision ?? profile.revision,
     ...(spec.presentation ? { presentation: spec.presentation } : {}),
-    ...(effectiveRev < 59 && Array.isArray(spec.negotiation_shortlist) ? { negotiation_shortlist: spec.negotiation_shortlist } : {}),
     ...(Array.isArray(spec.packaging_redesign_shortlist) ? { packaging_redesign_shortlist: spec.packaging_redesign_shortlist } : {}),
     candidates: builtCandidates,
   };

@@ -10,20 +10,25 @@
  *  5. evaluations          (immutable per (form_id, period_id, profile_revision, evidence_bundle_sha256))
  */
 import { DatabaseSync } from 'node:sqlite';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve } from 'node:path';
+import { canonicalJson, sha256Hex } from './utils/objects.mjs';
 import { validEvidenceDate } from './observations.mjs';
 import {
   ALLOWED_DISPOSITIONS,
   assertNoRawPii,
+  containsRawEmail,
   containsSecretToken,
+  redactRawEmails,
   sanitizeDiagnosticText,
   validateRedactedDestination,
   validateSocialBridgeOutput,
   validateSpecMatcherOutput,
   validateSourcingVerifier1688Output,
 } from './contracts.mjs';
+
+export { canonicalJson, sha256Hex };
 import {
   DISCOVERY_ROUTES,
   OPPORTUNITY_TYPES,
@@ -44,7 +49,6 @@ const HEX_SHA256_RE = /^[0-9a-f]{64}$/;
 const ACCOUNT_SCOPE_ALLOWLIST_RE = /^[a-z0-9][a-z0-9._-]{0,47}$/i;
 const TOKEN_PREFIX_RE = /^(?:sk-|ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|xox[bpas]-|AIza|AKIA|ASIA|eyJ|pk_live_|rk_live_)/i;
 const SECRET_LIKE_RE = /(?:bearer\s+\S+|api[_-]?key\s*=|authorization\s*:|cookie\s*=|password\s*=|token\s*=\s*\S+)/i;
-const RAW_EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const POSITIVE_SYSTEM_VERDICTS = new Set([
   'sample',
   'sample_check',
@@ -59,37 +63,6 @@ const POSITIVE_SYSTEM_VERDICTS = new Set([
   'recommended',
 ]);
 const NEGATIVE_OR_PENDING_VERDICT_RE = /(?:exclude|reject|drop|fail|kill|defer|hold|pending_evidence|unverified|private_mold|blocked)/i;
-
-function containsRawEmailValue(value, depth = 0) {
-  if (value === null || value === undefined || depth > 32) return false;
-  if (typeof value === 'string') {
-    RAW_EMAIL_RE.lastIndex = 0;
-    return RAW_EMAIL_RE.test(value);
-  }
-  if (Array.isArray(value)) return value.some(item => containsRawEmailValue(item, depth + 1));
-  if (typeof value === 'object') {
-    for (const k of Object.keys(value)) {
-      if (containsRawEmailValue(k, depth + 1) || containsRawEmailValue(value[k], depth + 1)) return true;
-    }
-  }
-  return false;
-}
-
-function scrubRawEmailsValue(value, depth = 0) {
-  if (value === null || value === undefined || depth > 32) return value;
-  if (typeof value === 'string') {
-    return value.replace(RAW_EMAIL_RE, '[REDACTED_EMAIL]');
-  }
-  if (Array.isArray(value)) return value.map(item => scrubRawEmailsValue(item, depth + 1));
-  if (typeof value === 'object') {
-    const out = {};
-    for (const [k, v] of Object.entries(value)) {
-      out[k] = scrubRawEmailsValue(v, depth + 1);
-    }
-    return out;
-  }
-  return value;
-}
 
 function isPositiveSystemVerdict(verdict) {
   if (!nonemptyStr(verdict)) return false;
@@ -119,19 +92,6 @@ const REQUEST_MODES = Object.freeze(['historical_replay', 'fresh_observation']);
 
 const finite = v => typeof v === 'number' && Number.isFinite(v);
 const nonemptyStr = v => typeof v === 'string' && v.trim().length > 0;
-
-export function canonicalJson(value) {
-  if (typeof value === 'bigint') return JSON.stringify(value.toString());
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(item => (item === undefined ? 'null' : canonicalJson(item))).join(',')}]`;
-  const keys = Object.keys(value).filter(k => value[k] !== undefined).sort();
-  return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalJson(value[k])}`).join(',')}}`;
-}
-
-export function sha256Hex(input) {
-  const bytes = Buffer.isBuffer(input) ? input : Buffer.from(String(input), 'utf8');
-  return createHash('sha256').update(bytes).digest('hex');
-}
 
 function assertIsoDateOnly(value, label) {
   if (typeof value !== 'string' || !DATE_ONLY_RE.test(value) || !validEvidenceDate(value)) {
@@ -349,6 +309,39 @@ export function computeLogicalRequestKey({
   };
 }
 
+export function stripAdvisoryAttachmentsForBundleHash(cand) {
+  if (!cand || typeof cand !== 'object' || Array.isArray(cand)) return cand;
+  const hasTop =
+    Object.hasOwn(cand, 'evidence_review') ||
+    Object.hasOwn(cand, 'return_cause_diagnosis') ||
+    Object.hasOwn(cand, 'factory_inquiry_1688');
+  const hasPres = Boolean(
+    cand.presentation &&
+    typeof cand.presentation === 'object' &&
+    !Array.isArray(cand.presentation) &&
+    (Object.hasOwn(cand.presentation, 'evidence_review') ||
+      Object.hasOwn(cand.presentation, 'return_cause_diagnosis') ||
+      Object.hasOwn(cand.presentation, 'factory_inquiry_1688')),
+  );
+  if (!hasTop && !hasPres) return cand;
+  const {
+    evidence_review: _ev,
+    return_cause_diagnosis: _rc,
+    factory_inquiry_1688: _fi,
+    ...rest
+  } = cand;
+  if (hasPres) {
+    const {
+      evidence_review: _pev,
+      return_cause_diagnosis: _prc,
+      factory_inquiry_1688: _pfi,
+      ...presRest
+    } = cand.presentation;
+    rest.presentation = presRest;
+  }
+  return rest;
+}
+
 export function computeEvidenceBundleHash({
   form_spec_sha256,
   candidate_input,
@@ -388,8 +381,8 @@ export function canonicalizeSourceRef(sourceRef) {
   return trimmed.replace(/\\/g, '/').toLowerCase();
 }
 
-const SCHEMA_SQL = `
-CREATE TABLE IF NOT EXISTS api_request_ledger (
+// The rebuild migrations and new databases share the same ordered columns and constraints.
+const API_REQUEST_LEDGER_V2_COLUMNS = `
   attempt_id TEXT PRIMARY KEY,
   logical_request_key TEXT NOT NULL,
   semantic_lock_key TEXT NOT NULL,
@@ -429,6 +422,42 @@ CREATE TABLE IF NOT EXISTS api_request_ledger (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   finished_at TEXT
+`;
+
+const SOURCING_QUOTES_V2_COLUMNS = `
+  quote_id TEXT PRIMARY KEY,
+  form_id TEXT NOT NULL REFERENCES candidate_forms(form_id),
+  spec_version INTEGER NOT NULL CHECK(spec_version >= 1),
+  sku_lines_json TEXT NOT NULL,
+  order_plan_json TEXT,
+  pack_multiple INTEGER NOT NULL CHECK(pack_multiple >= 1),
+  moq_sets INTEGER NOT NULL CHECK(moq_sets >= 1),
+  actual_sets INTEGER NOT NULL CHECK(actual_sets >= 1),
+  actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
+  goods_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
+  domestic_freight_cny_total REAL CHECK(domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0),
+  pkg_json TEXT,
+  fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
+  factory_id TEXT,
+  spec_variant_key TEXT,
+  kit_note TEXT,
+  goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
+  freight_first_order_promotion INTEGER NOT NULL CHECK(freight_first_order_promotion IN (0, 1)),
+  lead_time_days INTEGER CHECK(lead_time_days IS NULL OR lead_time_days >= 0),
+  sensitive_freebie_flags_json TEXT NOT NULL,
+  redacted_destination TEXT NOT NULL,
+  redacted_screenshot_path TEXT,
+  redacted_webp_sha256 TEXT,
+  raw_readback_ref TEXT,
+  observed_at TEXT NOT NULL,
+  expires_at TEXT,
+  quote_status TEXT NOT NULL CHECK(quote_status IN ('verified', 'superseded_uncompetitive', 'incomplete_cross_factory_kit', 'rejected_promo', 'rejected_spec', 'expired', 'pending')),
+  created_at TEXT NOT NULL
+`;
+
+const SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS api_request_ledger (
+${API_REQUEST_LEDGER_V2_COLUMNS}
 );
 
 CREATE INDEX IF NOT EXISTS idx_ledger_logical_key ON api_request_ledger(logical_request_key);
@@ -510,34 +539,7 @@ CREATE TABLE IF NOT EXISTS lead_form_links (
 CREATE INDEX IF NOT EXISTS idx_links_form ON lead_form_links(form_id, link_role);
 
 CREATE TABLE IF NOT EXISTS sourcing_quotes_1688 (
-  quote_id TEXT PRIMARY KEY,
-  form_id TEXT NOT NULL REFERENCES candidate_forms(form_id),
-  spec_version INTEGER NOT NULL CHECK(spec_version >= 1),
-  sku_lines_json TEXT NOT NULL,
-  order_plan_json TEXT,
-  pack_multiple INTEGER NOT NULL CHECK(pack_multiple >= 1),
-  moq_sets INTEGER NOT NULL CHECK(moq_sets >= 1),
-  actual_sets INTEGER NOT NULL CHECK(actual_sets >= 1),
-  actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
-  goods_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
-  domestic_freight_cny_total REAL CHECK(domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0),
-  pkg_json TEXT,
-  fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
-  factory_id TEXT,
-  spec_variant_key TEXT,
-  kit_note TEXT,
-  goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
-  freight_first_order_promotion INTEGER NOT NULL CHECK(freight_first_order_promotion IN (0, 1)),
-  lead_time_days INTEGER CHECK(lead_time_days IS NULL OR lead_time_days >= 0),
-  sensitive_freebie_flags_json TEXT NOT NULL,
-  redacted_destination TEXT NOT NULL,
-  redacted_screenshot_path TEXT,
-  redacted_webp_sha256 TEXT,
-  raw_readback_ref TEXT,
-  observed_at TEXT NOT NULL,
-  expires_at TEXT,
-  quote_status TEXT NOT NULL CHECK(quote_status IN ('verified', 'superseded_uncompetitive', 'incomplete_cross_factory_kit', 'rejected_promo', 'rejected_spec', 'expired', 'pending')),
-  created_at TEXT NOT NULL
+${SOURCING_QUOTES_V2_COLUMNS}
 );
 
 CREATE INDEX IF NOT EXISTS idx_quotes_form ON sourcing_quotes_1688(form_id, quote_status);
@@ -880,45 +882,7 @@ export class SelectionStore {
         const colList = cols.join(', ');
         this.db.exec(`
           CREATE TABLE api_request_ledger_v2 (
-            attempt_id TEXT PRIMARY KEY,
-            logical_request_key TEXT NOT NULL,
-            semantic_lock_key TEXT NOT NULL,
-            account_scope TEXT NOT NULL,
-            provider TEXT NOT NULL CHECK(provider IN ('sellersprite', 'sif', 'exa', 'sp_api', '1688_browser', 'other')),
-            tool_name TEXT NOT NULL,
-            canonical_tool TEXT NOT NULL,
-            tool_version TEXT NOT NULL DEFAULT 'v1',
-            marketplace TEXT NOT NULL DEFAULT 'US',
-            mode TEXT NOT NULL CHECK(mode IN ('historical_replay', 'fresh_observation')),
-            observation_cutoff_date TEXT NOT NULL,
-            page_or_cursor TEXT NOT NULL DEFAULT '',
-            normalized_params_json TEXT NOT NULL,
-            form_id TEXT,
-            stage TEXT NOT NULL DEFAULT 'general' CHECK(stage IN ('discovery', 'gate1a', 'gate1b', 'gate2_3', 'replay', 'general')),
-            status TEXT NOT NULL CHECK(status IN ('reserved', 'in_flight', 'completed', 'failed', 'unknown_needs_reconciliation', 'permanently_locked')),
-            repeat_submission_allowed INTEGER NOT NULL DEFAULT 1 CHECK(repeat_submission_allowed IN (0, 1)),
-            billing_status TEXT NOT NULL DEFAULT 'known' CHECK(billing_status IN ('known', 'unknown_not_exposed')),
-            ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(ss_mcp_units >= 0),
-            ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(ss_web_realtime_tasks >= 0),
-            sif_units REAL NOT NULL DEFAULT 0 CHECK(sif_units >= 0),
-            exa_calls REAL NOT NULL DEFAULT 0 CHECK(exa_calls >= 0),
-            estimated_ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_mcp_units >= 0),
-            estimated_ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(estimated_ss_web_realtime_tasks >= 0),
-            estimated_sif_units REAL NOT NULL DEFAULT 0 CHECK(estimated_sif_units >= 0),
-            estimated_exa_calls REAL NOT NULL DEFAULT 0 CHECK(estimated_exa_calls >= 0),
-            unknown_reserved_ss_mcp_units REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_mcp_units >= 0),
-            unknown_reserved_ss_web_realtime_tasks REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_ss_web_realtime_tasks >= 0),
-            unknown_reserved_sif_units REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_sif_units >= 0),
-            unknown_reserved_exa_calls REAL NOT NULL DEFAULT 0 CHECK(unknown_reserved_exa_calls >= 0),
-            payload_sha256 TEXT,
-            response_payload_json TEXT,
-            raw_artifact_path TEXT,
-            pagination_complete INTEGER CHECK(pagination_complete IN (0, 1)),
-            source_ledger_ref TEXT,
-            reconciliation_note TEXT,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            finished_at TEXT
+${API_REQUEST_LEDGER_V2_COLUMNS}
           );
           INSERT INTO api_request_ledger_v2 (${colList}) SELECT ${colList} FROM api_request_ledger;
           DROP TABLE api_request_ledger;
@@ -969,34 +933,7 @@ export class SelectionStore {
         const colList = cols.join(', ');
         this.db.exec(`
           CREATE TABLE sourcing_quotes_1688_v2 (
-            quote_id TEXT PRIMARY KEY,
-            form_id TEXT NOT NULL REFERENCES candidate_forms(form_id),
-            spec_version INTEGER NOT NULL CHECK(spec_version >= 1),
-            sku_lines_json TEXT NOT NULL,
-            order_plan_json TEXT,
-            pack_multiple INTEGER NOT NULL CHECK(pack_multiple >= 1),
-            moq_sets INTEGER NOT NULL CHECK(moq_sets >= 1),
-            actual_sets INTEGER NOT NULL CHECK(actual_sets >= 1),
-            actual_complete_sets INTEGER NOT NULL CHECK(actual_complete_sets >= 1),
-            goods_cny_total REAL CHECK((quote_status IN ('pending', 'incomplete_cross_factory_kit') AND (goods_cny_total IS NULL OR goods_cny_total > 0)) OR (quote_status NOT IN ('pending', 'incomplete_cross_factory_kit') AND goods_cny_total IS NOT NULL AND goods_cny_total > 0)),
-            domestic_freight_cny_total REAL CHECK(domestic_freight_cny_total IS NULL OR domestic_freight_cny_total >= 0),
-            pkg_json TEXT,
-            fx_cny_per_usd REAL CHECK(fx_cny_per_usd > 0),
-            factory_id TEXT,
-            spec_variant_key TEXT,
-            kit_note TEXT,
-            goods_first_order_promotion INTEGER NOT NULL CHECK(goods_first_order_promotion IN (0, 1)),
-            freight_first_order_promotion INTEGER NOT NULL CHECK(freight_first_order_promotion IN (0, 1)),
-            lead_time_days INTEGER CHECK(lead_time_days IS NULL OR lead_time_days >= 0),
-            sensitive_freebie_flags_json TEXT NOT NULL,
-            redacted_destination TEXT NOT NULL,
-            redacted_screenshot_path TEXT,
-            redacted_webp_sha256 TEXT,
-            raw_readback_ref TEXT,
-            observed_at TEXT NOT NULL,
-            expires_at TEXT,
-            quote_status TEXT NOT NULL CHECK(quote_status IN ('verified', 'superseded_uncompetitive', 'incomplete_cross_factory_kit', 'rejected_promo', 'rejected_spec', 'expired', 'pending')),
-            created_at TEXT NOT NULL
+${SOURCING_QUOTES_V2_COLUMNS}
           );
           INSERT INTO sourcing_quotes_1688_v2 (${colList}) SELECT ${colList} FROM sourcing_quotes_1688;
           DROP TABLE sourcing_quotes_1688;
@@ -1100,35 +1037,6 @@ export class SelectionStore {
       ['review_notes_json', 'TEXT'],
       ['evidence_review_json', 'TEXT'],
     ]);
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS calibration_tracking (
-        tracking_id TEXT PRIMARY KEY,
-        form_id TEXT NOT NULL,
-        spec_version INTEGER NOT NULL DEFAULT 1,
-        form_spec_sha256 TEXT,
-        batch_id TEXT,
-        system_verdict TEXT NOT NULL,
-        system_suggested_at TEXT,
-        core_85_range_json TEXT,
-        supported_range_json TEXT,
-        pre_ad_margin_range_json TEXT,
-        owner_decision TEXT CHECK(owner_decision IS NULL OR owner_decision IN ('keep', 'drop', 'sample_check', 'hold', 'pending_owner_review')),
-        owner_decision_source TEXT CHECK(owner_decision_source IS NULL OR owner_decision_source IN ('owner_confirmed', 'legacy_unknown', 'script_demo_excluded')),
-        owner_decision_confirmed_at TEXT,
-        owner_decision_system_verdict TEXT,
-        owner_reason TEXT,
-        sample_measured_pkg_json TEXT,
-        sample_measured_at TEXT,
-        sample_spec_ref TEXT,
-        recalculated_margin_json TEXT,
-        calibration_note TEXT,
-        near_miss_spot_check_json TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        UNIQUE(form_id, spec_version)
-      );
-      CREATE INDEX IF NOT EXISTS idx_calibration_batch ON calibration_tracking(batch_id);
-    `);
     ensureColumns('calibration_tracking', [
       ['system_suggested_at', 'TEXT'],
       ['owner_decision_source', "TEXT CHECK(owner_decision_source IS NULL OR owner_decision_source IN ('owner_confirmed', 'legacy_unknown', 'script_demo_excluded'))"],
@@ -2829,7 +2737,6 @@ export class SelectionStore {
       ? quote.spec_variant_key.trim()
       : null;
     const resolvedFactoryId = kitCheck.resolved_factory_id;
-    const emailRe = /[^\s@]+@[^\s@]+\.[^\s@]+/;
     const factoryCandidatesForEmailCheck = [
       resolvedFactoryId,
       quote.factory_id,
@@ -2841,7 +2748,7 @@ export class SelectionStore {
         ? quote.sku_lines.flatMap(l => [l?.factory_id, l?.supplier_id, l?.seller_member_id, l?.company_name, l?.shop_url])
         : []),
     ];
-    if (factoryCandidatesForEmailCheck.some(v => typeof v === 'string' && emailRe.test(v.trim()))) {
+    if (factoryCandidatesForEmailCheck.some(v => typeof v === 'string' && containsRawEmail(v.trim(), { strict: true, skipDataImageUri: false }))) {
       throw new TypeError('sourcing_quote_1688 factory/seller identifier must not contain a raw email address; redact or use a non-PII factory_id before persisting.');
     }
     const isManualOwnerEntry = quote.manual_owner_entry === true;
@@ -3697,7 +3604,7 @@ export class SelectionStore {
     if (!row) return null;
     const parseOpt = s => {
       if (!s) return null;
-      try { return scrubRawEmailsValue(JSON.parse(s)); } catch { return null; }
+      try { return redactRawEmails(JSON.parse(s), 32); } catch { return null; }
     };
     const ownerDecision = row.owner_decision ?? null;
     const ownerDecisionSource = row.owner_decision_source ?? (ownerDecision !== null ? 'legacy_unknown' : null);
@@ -3707,11 +3614,11 @@ export class SelectionStore {
     const recalculatedMargin = recalcInfo.isRealized ? rawRecalcMargin : null;
     return {
       tracking_id: row.tracking_id,
-      form_id: scrubRawEmailsValue(row.form_id),
+      form_id: redactRawEmails(row.form_id, 32),
       spec_version: row.spec_version,
       form_spec_sha256: row.form_spec_sha256 ?? null,
-      batch_id: row.batch_id ? scrubRawEmailsValue(row.batch_id) : null,
-      system_verdict: scrubRawEmailsValue(row.system_verdict),
+      batch_id: row.batch_id ? redactRawEmails(row.batch_id, 32) : null,
+      system_verdict: redactRawEmails(row.system_verdict, 32),
       system_suggested_at: row.system_suggested_at ?? null,
       core_85_range: parseOpt(row.core_85_range_json),
       supported_range: parseOpt(row.supported_range_json),
@@ -3722,14 +3629,14 @@ export class SelectionStore {
         ? (row.owner_decision_confirmed_at ?? null)
         : null,
       owner_decision_system_verdict: ownerDecisionSource === 'owner_confirmed'
-        ? (row.owner_decision_system_verdict ? scrubRawEmailsValue(row.owner_decision_system_verdict) : null)
+        ? (row.owner_decision_system_verdict ? redactRawEmails(row.owner_decision_system_verdict, 32) : null)
         : null,
-      owner_reason: row.owner_reason ? scrubRawEmailsValue(row.owner_reason) : null,
+      owner_reason: row.owner_reason ? redactRawEmails(row.owner_reason, 32) : null,
       sample_measured_pkg: sampleMeasuredPkg,
       sample_measured_at: row.sample_measured_at ?? null,
-      sample_spec_ref: row.sample_spec_ref ? scrubRawEmailsValue(row.sample_spec_ref) : null,
+      sample_spec_ref: row.sample_spec_ref ? redactRawEmails(row.sample_spec_ref, 32) : null,
       recalculated_margin: recalculatedMargin,
-      calibration_note: row.calibration_note ? scrubRawEmailsValue(row.calibration_note) : null,
+      calibration_note: row.calibration_note ? redactRawEmails(row.calibration_note, 32) : null,
       near_miss_spot_check: parseOpt(row.near_miss_spot_check_json),
       created_at: row.created_at,
       updated_at: row.updated_at,
@@ -3862,7 +3769,7 @@ export class SelectionStore {
     if (containsSecretToken(record)) {
       throw new TypeError('Calibration tracking record contains a secret or token; redact before persisting.');
     }
-    if (containsRawEmailValue(record)) {
+    if (containsRawEmail(record, { skipDataImageUri: false, maxDepth: 32 })) {
       throw new TypeError('Calibration tracking record contains a raw email address; redact PII before persisting.');
     }
     assertNoRawPii(record, 'calibration_tracking');

@@ -17,9 +17,9 @@ import { fileURLToPath } from 'node:url';
 
 const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 
-// Baseline count of residual r50-r58 dead branches/fallbacks in src/ as of PR #40 merge.
+// Baseline count of residual r50-r58 dead branches/fallbacks in src/ (cleared to 0 in M2 PR A2).
 // Ratchet rule: this ceiling may only decrease (prune dead branches), never increase.
-const RESIDUAL_R50_R58_MAX = 56;
+const RESIDUAL_R50_R58_MAX = 0;
 
 // Baseline allowlist of chronicle test files in test/ (M1 PR A1).
 // Ratchet rule: new issue-*/batch-*/stage*/r59-* files are forbidden; M3 shrinks this list as tests consolidate.
@@ -43,42 +43,11 @@ const CHRONICLE_TEST_ALLOWLIST = new Set([
   'stage5a-return-inquiry.test.mjs',
 ]);
 
-// Baseline allowlist of duplicate utility declarations in src/ outside src/utils/ (and src/contracts.mjs for assertNonemptyString).
-// Ratchet rule: zero new duplicates allowed; M2 shrinks this allowlist to empty.
-const DUPLICATE_UTIL_ALLOWLIST = new Set([
-  'openai/budget-ledger.mjs:generatePiiSafeUuid',
-  'openai/client.mjs:assertPlainObject',
-  'openai/client.mjs:generatePiiSafeUuid',
-  'openai/client.mjs:isPlainObject',
-  'openai/codex-runner.mjs:generatePiiSafeUuid',
-  'openai/codex-runner.mjs:isPlainObject',
-  'openai/evidence-review.mjs:assertNonemptyString',
-  'openai/evidence-review.mjs:assertPlainObject',
-  'openai/evidence-review.mjs:deepFreeze',
-  'openai/evidence-review.mjs:isPlainObject',
-  'openai/response-envelope.mjs:assertPlainObject',
-  'openai/response-envelope.mjs:isPlainObject',
-  'openai/stage5-return-inquiry.mjs:assertNonemptyString',
-  'openai/stage5-return-inquiry.mjs:assertPlainObject',
-  'openai/stage5-return-inquiry.mjs:deepFreeze',
-  'openai/stage5-return-inquiry.mjs:isPlainObject',
-  'openai/workflow-tasks.mjs:assertNonemptyString',
-  'openai/workflow-tasks.mjs:assertPlainObject',
-  'openai/workflow-tasks.mjs:deepFreeze',
-  'openai/workflow-tasks.mjs:isPlainObject',
-  'store.mjs:canonicalJson',
-  'store.mjs:sha256Hex',
-]);
+// Duplicate utility declarations in src/ outside src/utils/ (and src/contracts.mjs for assertNonemptyString): 0 allowed.
+const DUPLICATE_UTIL_ALLOWLIST = new Set();
 
-// Baseline per-file ceiling of duplicate email redaction regexes in src/ outside src/contracts.mjs (7 across 6 files).
-const DUPLICATE_EMAIL_REGEX_ALLOWLIST = Object.freeze({
-  'openai/background.mjs': 1,
-  'openai/client.mjs': 1,
-  'openai/stage5-return-inquiry.mjs': 1,
-  'openai/workflow-tasks.mjs': 1,
-  'report.mjs': 1,
-  'store.mjs': 2,
-});
+// Per-file ceiling of duplicate email redaction regexes in src/ outside src/contracts.mjs: 0 allowed.
+const DUPLICATE_EMAIL_REGEX_ALLOWLIST = Object.freeze({});
 
 const R1_GOVERNANCE_FILES = Object.freeze([
   'AGENTS.md',
@@ -649,7 +618,46 @@ function scanJsLexical(source) {
   let line = 1;
   let prevSig = '';
   let prevWord = '';
+  let prevIsPostfix = false;
+  const templateBraceStack = [];
   const n = source.length;
+
+  const scanTemplateSegment = () => {
+    while (i < n) {
+      const tc = source[i];
+      if (tc === '\\') {
+        if (source[i + 1] === '\n') {
+          codeWithoutCommentsOrStrings += '\n';
+          line++;
+        }
+        i += 2;
+        continue;
+      }
+      if (tc === '`') {
+        i++;
+        codeWithoutCommentsOrStrings += '`';
+        prevSig = '`';
+        prevWord = '';
+        prevIsPostfix = false;
+        return;
+      }
+      if (tc === '$' && source[i + 1] === '{') {
+        i += 2;
+        codeWithoutCommentsOrStrings += ' ';
+        templateBraceStack.push(0);
+        prevSig = '{';
+        prevWord = '';
+        prevIsPostfix = false;
+        return;
+      }
+      if (tc === '\n') {
+        codeWithoutCommentsOrStrings += '\n';
+        line++;
+      }
+      i++;
+    }
+  };
+
   while (i < n) {
     const ch = source[i];
     if (ch === '\n') {
@@ -680,7 +688,7 @@ function scanJsLexical(source) {
       i += 2;
       continue;
     }
-    if (ch === '\'' || ch === '"' || ch === '`') {
+    if (ch === '\'' || ch === '"') {
       const q = ch;
       codeWithoutCommentsOrStrings += q;
       i++;
@@ -703,10 +711,18 @@ function scanJsLexical(source) {
       codeWithoutCommentsOrStrings += q;
       prevSig = q;
       prevWord = '';
+      prevIsPostfix = false;
+      continue;
+    }
+    if (ch === '`') {
+      codeWithoutCommentsOrStrings += '`';
+      i++;
+      scanTemplateSegment();
       continue;
     }
     if (
       ch === '/' &&
+      !prevIsPostfix &&
       (!prevSig || '=(,[!&|?:;{}~^+-*%<>!'.includes(prevSig) || REGEX_PREV_KEYWORDS.has(prevWord))
     ) {
       const startLine = line;
@@ -729,8 +745,35 @@ function scanJsLexical(source) {
         while (i < n && /[gimsuvy]/.test(source[i])) i++;
         prevSig = '/';
         prevWord = '';
+        prevIsPostfix = false;
         continue;
       }
+    }
+    if ((ch === '+' || ch === '-') && source[i + 1] === ch) {
+      const isOperandBefore = Boolean(
+        prevSig &&
+        !'=(,[!&|?:;{}~^+-*%<>!'.includes(prevSig) &&
+        !REGEX_PREV_KEYWORDS.has(prevWord),
+      );
+      codeWithoutCommentsOrStrings += source.slice(i, i + 2);
+      prevSig = ch;
+      prevWord = '';
+      prevIsPostfix = isOperandBefore;
+      i += 2;
+      continue;
+    }
+    if (ch === '{' && templateBraceStack.length > 0) {
+      templateBraceStack[templateBraceStack.length - 1] += 1;
+    } else if (ch === '}' && templateBraceStack.length > 0) {
+      const depth = templateBraceStack[templateBraceStack.length - 1];
+      if (depth === 0) {
+        templateBraceStack.pop();
+        codeWithoutCommentsOrStrings += ' ';
+        i++;
+        scanTemplateSegment();
+        continue;
+      }
+      templateBraceStack[templateBraceStack.length - 1] = depth - 1;
     }
     if (/[A-Za-z0-9_$]/.test(ch)) {
       let k = i;
@@ -738,12 +781,14 @@ function scanJsLexical(source) {
       prevWord = source.slice(i, k);
       codeWithoutCommentsOrStrings += prevWord;
       prevSig = source[k - 1];
+      prevIsPostfix = false;
       i = k;
       continue;
     }
     codeWithoutCommentsOrStrings += ch;
     prevSig = ch;
     prevWord = '';
+    prevIsPostfix = false;
     i++;
   }
   return { codeWithoutCommentsOrStrings, regexLiterals };
@@ -816,17 +861,27 @@ function assertDuplicateEmailRegexesRatchet(srcDir, allowlist = DUPLICATE_EMAIL_
     [],
     `Unexpected duplicate email regex(es) outside src/contracts.mjs (use canonical redaction helper): ${violations.join('; ')}`,
   );
+  const stale = [];
+  for (const [file, allowed] of Object.entries(allowlist)) {
+    const actual = counts[file] ?? 0;
+    if (!Number.isInteger(allowed) || allowed <= 0 || actual < allowed) {
+      stale.push(`${file}: actual ${actual} vs allowlist ${allowed}`);
+    }
+  }
+  assert.deepEqual(
+    stale,
+    [],
+    `Stale entry(ies) in DUPLICATE_EMAIL_REGEX_ALLOWLIST (remove or tighten allowlist): ${stale.join(', ')}`,
+  );
   return { counts, hits };
 }
 
-test('hygiene rule 5 (live): duplicate utility definitions (22) and email regexes (7) stay within exact allowlists without false-positiving on SAFE_API_BASE_URL_RE or NEAR_30_DAYS', () => {
+test('hygiene rule 5 (live): zero duplicate utility definitions or email regexes remain outside canonical modules', () => {
   const utilsFound = assertDuplicateUtilsRatchet(join(REPO_ROOT, 'src'));
-  assert.equal(utilsFound.length, 22);
+  assert.equal(utilsFound.length, 0);
 
   const emailRes = assertDuplicateEmailRegexesRatchet(join(REPO_ROOT, 'src'));
-  assert.equal(emailRes.hits.length, 7);
-  assert.equal(emailRes.counts['budget-ledger.mjs'] ?? 0, 0);
-  assert.equal(emailRes.counts['scoring.mjs'] ?? 0, 0);
+  assert.equal(emailRes.hits.length, 0);
 });
 
 test('hygiene rule 5 (negative & boundary): catches new duplicate utils and email regexes while ignoring canonical homes, comments, SAFE_API_BASE_URL_RE, and NEAR_30_DAYS', () => {
@@ -850,13 +905,26 @@ test('hygiene rule 5 (negative & boundary): catches new duplicate utils and emai
         'const SAFE_API_BASE_URL_RE = /^https?:\\/\\/[A-Za-z0-9._:\\-[\\]]{1,255}(?:\\/[A-Za-z0-9._~:@!$&\'()*+,;=-]+)*$/i;',
         'const NEAR_30 = /^NEAR_30_DAYS(?:@\\d{4}-\\d{2}-\\d{2})?$/i;',
         'const str = "function assertPlainObject() {} foo@bar.com";',
-        'export function ok(a, b) { return a / b; }',
+        'export function ok(a, b) { return a++ / b + a-- / b; }',
       ].join('\n'),
       'utf8',
     );
 
     assert.equal(assertDuplicateUtilsRatchet(dir, new Set()).length, 0);
     assert.equal(assertDuplicateEmailRegexesRatchet(dir, {}).hits.length, 0);
+
+    // Boundary: postfix ++ / -- before / must NOT open a regex literal and hide subsequent declarations
+    const postfixFile = join(dir, 'postfix-div.mjs');
+    writeFileSync(
+      postfixFile,
+      'export function div(a, b) { const q = a++ / b; const r = a-- / b; function isPlainObject(v) { return !!v; } return [q, r, isPlainObject]; }\n',
+      'utf8',
+    );
+    assert.throws(
+      () => assertDuplicateUtilsRatchet(dir, new Set()),
+      /Unexpected duplicate utility declaration.*postfix-div\.mjs:isPlainObject/,
+    );
+    rmSync(postfixFile);
 
     // Negative 1: duplicate utility outside src/utils/ and contracts.mjs
     const badUtil = join(dir, 'bad-util.mjs');
@@ -875,13 +943,17 @@ test('hygiene rule 5 (negative & boundary): catches new duplicate utils and emai
     );
     rmSync(badStr);
 
-    // Negative 2: stale allowlist entry
+    // Negative 2: stale allowlist entry (both util and email regex)
     assert.throws(
       () => assertDuplicateUtilsRatchet(dir, new Set(['missing.mjs:isPlainObject'])),
       /Stale entry\(ies\) in DUPLICATE_UTIL_ALLOWLIST/,
     );
+    assert.throws(
+      () => assertDuplicateEmailRegexesRatchet(dir, { 'missing.mjs': 1 }),
+      /Stale entry\(ies\) in DUPLICATE_EMAIL_REGEX_ALLOWLIST/,
+    );
 
-    // Negative 3: duplicate email regex (including return /.../ form)
+    // Negative 3: duplicate email regex (including return /.../ and template ${ /.../ } interpolation + nested backticks)
     const badEmail = join(dir, 'bad-email.mjs');
     writeFileSync(badEmail, 'export function hasEmail(s) { return /[^\\s@]+@[^\\s@]+\\.[^\\s@]+/.test(s); }\n', 'utf8');
     assert.throws(
@@ -889,6 +961,18 @@ test('hygiene rule 5 (negative & boundary): catches new duplicate utils and emai
       /Unexpected duplicate email regex.*bad-email\.mjs: 1 > allowed 0/,
     );
     rmSync(badEmail);
+
+    const tplEmail = join(dir, 'tpl-email.mjs');
+    writeFileSync(
+      tplEmail,
+      'export const render = s => `prefix ${`inner ${/[^\\s@]+@[^\\s@]+\\.[^\\s@]+/.test(s)}`}`;\n',
+      'utf8',
+    );
+    assert.throws(
+      () => assertDuplicateEmailRegexesRatchet(dir, {}),
+      /Unexpected duplicate email regex.*tpl-email\.mjs: 1 > allowed 0/,
+    );
+    rmSync(tplEmail);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

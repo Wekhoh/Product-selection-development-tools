@@ -7,7 +7,6 @@
  * `.local/state/selection.sqlite` alongside `SelectionStore` or run standalone.
  */
 import { DatabaseSync } from 'node:sqlite';
-import { randomUUID } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -37,7 +36,7 @@ import {
 } from './pricing.mjs';
 
 import { BUSINESS_THRESHOLDS } from '../business-thresholds.mjs';
-import { deepFreeze } from '../utils/objects.mjs';
+import { deepFreeze, generatePiiSafeUuid } from '../utils/objects.mjs';
 export const MAX_MONTHLY_LIMIT_CENTS = BUSINESS_THRESHOLDS.openai_monthly_limit_cents; // Hard $200.00 / month non-rollover ceiling
 export const DEFAULT_MONTHLY_LIMIT_CENTS = MAX_MONTHLY_LIMIT_CENTS;
 export const MAX_SAME_MONTH_PENDING_BUFFER_CENTS = 2_000;
@@ -90,17 +89,6 @@ const SECRET_LIKE_RE = /(?:bearer\s+\S+|api[_-]?key\s*=|authorization\s*:|cookie
 const SAFE_SQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 let lastInspectionStampMs = 0;
-let registeredClientUploadAuthority = null;
-
-export function _bindInternalUploadLifecycleAuthority(authorityToken) {
-  if (typeof authorityToken !== 'symbol') {
-    throw new OpenAiValidationError('authorityToken must be a private Symbol.');
-  }
-  if (registeredClientUploadAuthority !== null) {
-    throw new OpenAiPolicyError('Internal upload lifecycle authority is already bound.');
-  }
-  registeredClientUploadAuthority = authorityToken;
-}
 
 function nextInspectionStampMs() {
   const now = Date.now();
@@ -280,14 +268,6 @@ function assertSafeApiBaseUrl(apiBaseUrl) {
   }
   assertSafeStoredValue(clean, 'apiBaseUrl');
   return clean;
-}
-
-function generatePiiSafeUuid() {
-  for (let i = 0; i < 64; i++) {
-    const id = randomUUID();
-    if (!detectRawPii(id)) return id;
-  }
-  throw new OpenAiError('Unable to generate PII-safe UUID after 64 attempts.');
 }
 
 const SHA256_HEX_WORD_RE = /\b[0-9a-f]{64}\b/gi;
@@ -550,12 +530,6 @@ const SAME_MONTH_PENDING_BUFFER_SQL = `INTEGER NOT NULL DEFAULT 0
 const BACKGROUND_MODE_SQL = 'INTEGER NOT NULL DEFAULT 0 CHECK(background_mode IN (0, 1))';
 
 const OPENAI_LEDGER_TABLES_SQL = `
-CREATE TABLE IF NOT EXISTS openai_ledger_identity (
-  singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-  ledger_instance_id TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS openai_budget_policy (
   account_scope TEXT PRIMARY KEY,
   enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
@@ -1558,12 +1532,6 @@ export function inspectLegacyAutopilotBudget(
       { code: 'LEGACY_DB_NOT_FILE', notDispatched: true },
     );
   }
-  if (typeof st.nlink === 'bigint' && st.nlink > 1n) {
-    throw new OpenAiBudgetError(
-      `Hardlinked legacy budget SQLite file has multiple directory entries (nlink=${st.nlink.toString()}: ${displayPath}); WAL sidecar identity is ambiguous — remove hardlink aliases and inspect the canonical file directly.`,
-      { code: 'LEGACY_HARDLINK_ALIAS_FORBIDDEN', notDispatched: true },
-    );
-  }
   const canonicalRealPath = realpathNativeSafe(resolvedPath);
   const sourcePathSha256 = sha256Hex(
     process.platform === 'win32' ? canonicalRealPath.toLowerCase() : canonicalRealPath,
@@ -1577,13 +1545,6 @@ export function inspectLegacyAutopilotBudget(
   const hadWal = existsSync(walPath) || existsSync(aliasWalPath);
   const hadJournal = existsSync(journalPath) || existsSync(aliasJournalPath);
   const hadShm = existsSync(shmPath);
-
-  if (canonicalRealPath !== resolvedPath && (existsSync(aliasWalPath) || existsSync(aliasJournalPath))) {
-    throw new OpenAiBudgetError(
-      `Symlinked legacy budget path has ambiguous sidecar files (${displayPath}); inspect the canonical path directly.`,
-      { code: 'LEGACY_HARDLINK_ALIAS_FORBIDDEN', notDispatched: true },
-    );
-  }
 
   if (!hadWal && !hadJournal) {
     const bytesBefore = readFileSync(canonicalRealPath);
@@ -2021,11 +1982,6 @@ export class OpenAiBudgetLedger {
 
   _migrateSchema() {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS openai_ledger_identity (
-        singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-        ledger_instance_id TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS openai_legacy_carryover (
         account_scope TEXT NOT NULL,
         month_utc TEXT NOT NULL,
@@ -2060,14 +2016,6 @@ export class OpenAiBudgetLedger {
         PRIMARY KEY (attempt_id, stage)
       );
     `);
-    const existingIdentity = this.db.prepare(
-      'SELECT ledger_instance_id FROM openai_ledger_identity WHERE singleton = 1',
-    ).get();
-    if (!existingIdentity) {
-      this.db.prepare(
-        'INSERT INTO openai_ledger_identity (singleton, ledger_instance_id, created_at) VALUES (1, ?, ?)',
-      ).run(generatePiiSafeUuid(), this._nowIso());
-    }
 
     // 1. Add ALL missing openai_budget_policy columns BEFORE selecting policy rows!
     const policyCols = new Set(
@@ -2387,19 +2335,9 @@ export class OpenAiBudgetLedger {
   // Cross-Process Persistent Canonical Ledger Registry & Policy Management
   // ---------------------------------------------------------------------------
 
-  _getLedgerInstanceId() {
-    if (!this._hasTable('openai_ledger_identity')) return null;
-    const row = this.db.prepare(
-      'SELECT ledger_instance_id FROM openai_ledger_identity WHERE singleton = 1',
-    ).get();
-    return typeof row?.ledger_instance_id === 'string' && row.ledger_instance_id.trim()
-      ? row.ledger_instance_id.trim()
-      : null;
-  }
-
   /**
    * Evidenced operator API key rotation or note update for a ledger scope.
-   * Requires a nonempty operator `note` and a reconciled file-backed ledger.
+   * Requires a nonempty operator `note` and a file-backed ledger.
    */
   rotateOrRelocateCanonicalBinding({
     accountScope = 'openai-default',
@@ -2427,16 +2365,10 @@ export class OpenAiBudgetLedger {
 
     return this._withImmediateTx(() => {
       const existingPolicy = this.db.prepare('SELECT * FROM openai_budget_policy WHERE account_scope = ?').get(scope);
-      if (!existingPolicy || existingPolicy.legacy_reconciled !== 1) {
+      if (!existingPolicy) {
         throw new OpenAiBudgetError(
-          `Cannot rotate or relocate canonical binding for "${scope}" before legacy reconciliation (legacy_reconciled=false).`,
-          { code: 'LEGACY_NOT_RECONCILED', notDispatched: true },
-        );
-      }
-      if (!this.testMode && existingPolicy.baseline_mode !== 'verified_production') {
-        throw new OpenAiPolicyError(
-          `Cannot update production policy binding for "${scope}" without a verified_production baseline.`,
-          { code: 'UNVERIFIED_SYNTHETIC_BASELINE', notDispatched: true },
+          `Cannot rotate or relocate canonical binding for "${scope}" before budget policy initialization.`,
+          { code: 'BUDGET_POLICY_NOT_FOUND', notDispatched: true },
         );
       }
       if (nextFp !== null) {
@@ -2677,20 +2609,6 @@ export class OpenAiBudgetLedger {
       const nextHardMonthlyLimit = hardMonthlyLimitConfirmed !== undefined
         ? hardMonthlyLimitConfirmed
         : (existing ? existing.hard_monthly_limit_confirmed === 1 : false);
-
-      if (nextEnabled && !nextLegacyReconciled) {
-        throw new OpenAiBudgetError(
-          `Cannot enable OpenAI budget policy for "${scope}" before legacy budget reconciliation (legacy_reconciled=false).`,
-          { code: 'LEGACY_NOT_RECONCILED' },
-        );
-      }
-
-      if (nextEnabled && !this.testMode && existing?.baseline_mode !== 'verified_production') {
-        throw new OpenAiPolicyError(
-          `Cannot enable production OpenAI budget policy for "${scope}" when baseline_mode="${String(existing?.baseline_mode ?? 'unreconciled')}"; reconcile an authentic production legacy budget file first.`,
-          { code: 'UNVERIFIED_SYNTHETIC_BASELINE', notDispatched: true },
-        );
-      }
 
       if (nextEnabled && (!nextAutoRechargeOff || !nextHardMonthlyLimit)) {
         throw new OpenAiPolicyError(
@@ -3200,19 +3118,7 @@ export class OpenAiBudgetLedger {
   // Durable Batch Upload Receipts (`openai_batch_uploads`) & Private Payloads
   // ---------------------------------------------------------------------------
 
-  /**
-   * Direct caller-asserted upload receipts are forbidden (`P0-01`).
-   * Reusable upload receipts can only be created inside the verified upload lifecycle
-   * from an admitted pre-upload attempt and observed HTTP 200 transport evidence.
-   */
-  recordBatchUploadReceipt() {
-    throw new OpenAiPolicyError(
-      'Direct recordBatchUploadReceipt is forbidden; upload receipts can only be minted inside the verified OpenAiClient upload lifecycle from admitted bytes and an observed /v1/files response.',
-      { code: 'UNVERIFIED_BATCH_UPLOAD_RECEIPT_FORBIDDEN', notDispatched: true },
-    );
-  }
-
-  _commitVerifiedBatchUploadReceipt(authorityToken, {
+  _commitVerifiedBatchUploadReceipt({
     sourceAttemptId,
     accountScope = 'openai-default',
     uploadedFileId,
@@ -3221,15 +3127,6 @@ export class OpenAiBudgetLedger {
     credentialFingerprintSha256,
     transportReceipt,
   }) {
-    if (
-      registeredClientUploadAuthority === null ||
-      authorityToken !== registeredClientUploadAuthority
-    ) {
-      throw new OpenAiPolicyError(
-        'Unverified batch upload receipt call rejected.',
-        { code: 'UNVERIFIED_BATCH_UPLOAD_RECEIPT_FORBIDDEN', notDispatched: true },
-      );
-    }
     this._assertWritable();
     const scope = assertSafeOpenAiAccountScope(accountScope);
     const cleanFileId = assertSafeShortLabel(uploadedFileId, 'uploadedFileId', 128);
@@ -4246,7 +4143,6 @@ export class OpenAiBudgetLedger {
     batchManifest = null,
     responseFormat = null,
     lockedLogicalIds = null,
-    requireStage4Media = false,
     credentialFingerprintSha256 = null,
     isLiveTransport = false,
   }) {
@@ -4260,9 +4156,6 @@ export class OpenAiBudgetLedger {
     }
     if (typeof cleanupRequired !== 'boolean') {
       throw new OpenAiValidationError('cleanupRequired must be a boolean.');
-    }
-    if (typeof requireStage4Media !== 'boolean') {
-      throw new OpenAiValidationError('requireStage4Media must be a boolean.');
     }
     if ((isLiveTransport || !this.testMode) && allowTestClockOverride) {
       throw new OpenAiPolicyError(
@@ -4426,35 +4319,14 @@ export class OpenAiBudgetLedger {
 
       this._assertNoCrossColumnIdCollision(resolvedAttemptId, cleanLogicalId);
 
-      // 3. P1-36: Enforce budget policy enablement, baseline_mode, legacy reconciliation, billing controls,
-      // Stage-4 media gate, AND local credential compatibility BEFORE registering in the canonical registry!
+      // 3. P1-36: Enforce budget policy enablement, billing controls,
+      // AND local credential compatibility BEFORE registering in the canonical registry!
       const rawPolicyRow = this.db.prepare('SELECT * FROM openai_budget_policy WHERE account_scope = ?').get(scope);
       if (!rawPolicyRow || rawPolicyRow.enabled !== 1) {
         throw new OpenAiBudgetError(
-          `OpenAI budget ledger for "${scope}" is disabled (enabled=false). Reconcile legacy budget and explicitly enable before live API calls.`,
+          `OpenAI budget ledger for "${scope}" is disabled (enabled=false). Enable budget policy and confirm billing controls before live API calls.`,
           { code: 'BUDGET_DISABLED', notDispatched: true },
         );
-      }
-      if (!this.testMode && rawPolicyRow.baseline_mode !== 'verified_production') {
-        throw new OpenAiPolicyError(
-          `OpenAI budget ledger for "${scope}" has baseline_mode="${String(rawPolicyRow.baseline_mode)}" rather than "verified_production"; synthetic baselines cannot authorize live spend.`,
-          { code: 'UNVERIFIED_SYNTHETIC_BASELINE', notDispatched: true },
-        );
-      }
-      if (rawPolicyRow.legacy_reconciled !== 1) {
-        throw new OpenAiBudgetError(
-          `OpenAI budget ledger for "${scope}" has not reconciled legacy budget state (legacy_reconciled=false).`,
-          { code: 'LEGACY_NOT_RECONCILED', notDispatched: true },
-        );
-      }
-      if (!this.testMode && rawPolicyRow.legacy_all_months_complete !== 1) {
-        const carryInfo = this._lookupMonthCarryoverInfo(scope, month, this._hydratePolicyRow(rawPolicyRow));
-        if (!carryInfo.foundExplicitMonth) {
-          throw new OpenAiBudgetError(
-            `OpenAI budget ledger for "${scope}" lacks an all-months or ${month} carryover baseline; re-run legacy reconciliation with inspectLegacyAutopilotBudget.`,
-            { code: 'LEGACY_MONTH_NOT_RECONCILED', notDispatched: true },
-          );
-        }
       }
       if (rawPolicyRow.auto_recharge_off_confirmed !== 1 || rawPolicyRow.hard_monthly_limit_confirmed !== 1) {
         throw new OpenAiPolicyError(
@@ -4806,7 +4678,7 @@ export class OpenAiBudgetLedger {
    * Atomically claim the `POST /v1/batches` creation stage AFTER `/v1/files` upload (`P0-19`, `P1-02`).
    * Re-verifies inside `BEGIN IMMEDIATE`:
    *   - UTC month has not rolled over since reservation (`BATCH_MONTH_ROLLOVER_ABORTED`)
-   *   - `enabled === 1`, `legacy_reconciled === 1`, billing controls, `allow_stage4_media`
+   *   - `enabled === 1` and billing controls confirmed
    *   - no other fencing attempt appeared concurrently
    *   - current `effective_committed_cents <= monthly_limit_cents` (in case `monthly_limit_cents` was lowered during upload)
    */
@@ -4814,7 +4686,6 @@ export class OpenAiBudgetLedger {
     accountScope = 'openai-default',
     uploadedFileId,
     batchPostSha256,
-    requireStage4Media = false,
     monthUtc = undefined,
     allowTestClockOverride = false,
   }) {
@@ -4823,9 +4694,6 @@ export class OpenAiBudgetLedger {
     const scope = assertSafeOpenAiAccountScope(accountScope);
     const cleanFileId = assertSafeShortLabel(uploadedFileId, 'uploadedFileId', 128);
     const postSha = assertSha256Hex(batchPostSha256, 'batchPostSha256');
-    if (typeof requireStage4Media !== 'boolean') {
-      throw new OpenAiValidationError('requireStage4Media must be a boolean.');
-    }
     if (typeof allowTestClockOverride !== 'boolean') {
       throw new OpenAiValidationError('allowTestClockOverride must be a boolean.');
     }
@@ -4909,28 +4777,6 @@ export class OpenAiBudgetLedger {
           reason,
           new OpenAiBudgetError(reason, {
             code: 'BUDGET_DISABLED',
-            notDispatched: false,
-            details: { attempt_id: existing.attempt_id, uploaded_file_id: cleanFileId },
-          }),
-        );
-      }
-      if (!this.testMode && policyRow.baseline_mode !== 'verified_production') {
-        const reason = `OpenAI budget baseline_mode for "${scope}" is not verified_production before POST /v1/batches; aborting batch creation.`;
-        return abortAndRejectAttempt(
-          reason,
-          new OpenAiPolicyError(reason, {
-            code: 'UNVERIFIED_SYNTHETIC_BASELINE',
-            notDispatched: false,
-            details: { attempt_id: existing.attempt_id, uploaded_file_id: cleanFileId },
-          }),
-        );
-      }
-      if (policyRow.legacy_reconciled !== 1) {
-        const reason = `OpenAI legacy reconciliation for "${scope}" was revoked before POST /v1/batches; aborting batch creation.`;
-        return abortAndRejectAttempt(
-          reason,
-          new OpenAiBudgetError(reason, {
-            code: 'LEGACY_NOT_RECONCILED',
             notDispatched: false,
             details: { attempt_id: existing.attempt_id, uploaded_file_id: cleanFileId },
           }),

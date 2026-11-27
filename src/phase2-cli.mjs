@@ -8,7 +8,7 @@
  * read-only without mutating active in-flight requests. Leaves legacy src/cli.mjs untouched.
  */
 import { createServer } from 'node:http';
-import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { mkdir, open, readFile, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -16,7 +16,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { CALCULATOR_1688_FLOOR_PRICE_NAME_ZH } from './business-thresholds.mjs';
-import { canonicalJson, computeEvidenceBundleHash, openSelectionStore, sha256Hex } from './store.mjs';
+import { canonicalJson, computeEvidenceBundleHash, openSelectionStore, sha256Hex, stripAdvisoryAttachmentsForBundleHash } from './store.mjs';
 import {
   buildOutOfTableLookupDirective,
   getFba2027RateTableSnapshot,
@@ -38,7 +38,6 @@ import {
   runGate1BForForm,
   runOptionalStage12LunaTriage,
   runOptionalTerraWorkflowTask,
-  runPhase2Batch,
 } from './pipeline.mjs';
 import {
   evaluateGate0CategoryBoundary,
@@ -58,7 +57,6 @@ import {
   DEFAULT_CODEX_SERVICE_TIER,
   WORKFLOW_RESPONSES_TASKS,
   OpenAiClient,
-  assertAuthorizedReviewExecutionPolicy,
   assertSafeOpenAiAccountScope,
   assertValidMonthUtc,
   currentMonthUtc,
@@ -546,6 +544,27 @@ function formatNarrowLedgerStatus(st) {
   };
 }
 
+function qualifiesForEconomicShortlist(row) {
+  if (row.lifecycle_status !== 'gate1b_rejected') return false;
+  let g1b = null;
+  try {
+    g1b = row.gate1b_result_json ? JSON.parse(row.gate1b_result_json) : null;
+  } catch { g1b = null; }
+  if (!g1b || g1b.margin_interval_verdict !== 'all_below_30pct') return false;
+  if (g1b.spec_sha256 && g1b.spec_sha256 !== row.spec_sha256) return false;
+  let hasRights = false;
+  for (const raw of [row.gate1a_result_json, row.gate1b_result_json]) {
+    if (!raw) continue;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed?.specific_rights_conflict_proven === true && (!parsed.spec_sha256 || parsed.spec_sha256 === row.spec_sha256)) {
+        hasRights = true;
+      }
+    } catch { /* ignore */ }
+  }
+  return !hasRights;
+}
+
 function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
   const {
     profileRevision = null,
@@ -599,9 +618,7 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
       let expectedBundleSha = null;
       if (form?.spec_sha256 && profile && effectiveFeeSnapshot) {
         try {
-          const deterministicCandInput = Object.hasOwn(cand, 'evidence_review')
-            ? (() => { const { evidence_review: _adv, ...rest } = cand; return rest; })()
-            : cand;
+          const deterministicCandInput = stripAdvisoryAttachmentsForBundleHash(cand);
           expectedBundleSha = computeEvidenceBundleHash({
             form_spec_sha256: form.spec_sha256,
             candidate_input: deterministicCandInput,
@@ -768,24 +785,7 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
   for (const row of shortlistForms) {
     // Only Gate 1B economically rejected forms where all scenarios fell below 30% may enter negotiation_shortlist;
     // 30%-crossing / gate1b_pending forms never enter the shortlist.
-    if (row.lifecycle_status !== 'gate1b_rejected') continue;
-    let g1b = null;
-    try {
-      g1b = row.gate1b_result_json ? JSON.parse(row.gate1b_result_json) : null;
-    } catch { g1b = null; }
-    if (!g1b || g1b.margin_interval_verdict !== 'all_below_30pct') continue;
-    if (g1b.spec_sha256 && g1b.spec_sha256 !== row.spec_sha256) continue;
-    let hasRights = false;
-    for (const raw of [row.gate1a_result_json, row.gate1b_result_json]) {
-      if (!raw) continue;
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed?.specific_rights_conflict_proven === true && (!parsed.spec_sha256 || parsed.spec_sha256 === row.spec_sha256)) {
-          hasRights = true;
-        }
-      } catch { /* ignore */ }
-    }
-    if (hasRights) continue;
+    if (!qualifiesForEconomicShortlist(row)) continue;
     try {
       const neg = JSON.parse(row.negotiation_shortlist_json);
       const disc = neg?.required_discount_fraction ?? neg?.required_reduction_fraction;
@@ -806,24 +806,7 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
   `).all();
   const storedPackagingShortlist = [];
   for (const row of packagingForms) {
-    if (row.lifecycle_status !== 'gate1b_rejected') continue;
-    let g1b = null;
-    try {
-      g1b = row.gate1b_result_json ? JSON.parse(row.gate1b_result_json) : null;
-    } catch { g1b = null; }
-    if (!g1b || g1b.margin_interval_verdict !== 'all_below_30pct') continue;
-    if (g1b.spec_sha256 && g1b.spec_sha256 !== row.spec_sha256) continue;
-    let hasRights = false;
-    for (const raw of [row.gate1a_result_json, row.gate1b_result_json]) {
-      if (!raw) continue;
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed?.specific_rights_conflict_proven === true && (!parsed.spec_sha256 || parsed.spec_sha256 === row.spec_sha256)) {
-          hasRights = true;
-        }
-      } catch { /* ignore */ }
-    }
-    if (hasRights) continue;
+    if (!qualifiesForEconomicShortlist(row)) continue;
     try {
       const pkg = JSON.parse(row.packaging_redesign_shortlist_json);
       const trimM = pkg?.redesigned_margin ?? pkg?.trimmed_margin;
@@ -1148,8 +1131,6 @@ export async function runPhase2Cli(
           'usage-cost-micros': { type: 'string' },
           'posted-billed-cents': { type: 'string' },
           'provider-response-id': { type: 'string' },
-          'allow-stage4-media': { type: 'boolean' },
-          'disallow-stage4-media': { type: 'boolean' },
           task: { type: 'string' },
           packet: { type: 'string' },
           model: { type: 'string' },
@@ -1627,15 +1608,6 @@ export async function runPhase2Cli(
         }
 
         const packet = await readJsonFileSafe(packetPath, '红队复核数据包');
-        if (!isDryRun) {
-          try {
-            assertAuthorizedReviewExecutionPolicy(packet);
-          } catch {
-            throw new Phase2CliError(
-              '数据包缺少已授权的 execution_policy_ref（或为 null / disabled，禁止本地实时执行）；请传入 --dry-run 或 --offline 进行离线校验。',
-            );
-          }
-        }
 
         const packetSubjectId = typeof packet?.candidate?.subject_id === 'string' && packet.candidate.subject_id.trim()
           ? packet.candidate.subject_id.trim()
@@ -1854,9 +1826,6 @@ export async function runPhase2Cli(
         if (values.enable === true && values.disable === true) {
           throw new Phase2CliError('--enable 与 --disable 不能同时传入。');
         }
-        if (values['allow-stage4-media'] === true && values['disallow-stage4-media'] === true) {
-          throw new Phase2CliError('--allow-stage4-media 与 --disallow-stage4-media 不能同时传入。');
-        }
         // P0-11: Physical file-identity collision check (resolving junctions, symlinks, and hard links) BEFORE writable open!
         if (legacyPath && budgetDbPath !== ':memory:' && isSamePhysicalFileCli(legacyPath, budgetDbPath)) {
           throw new Phase2CliError('--legacy-budget 不能与目标可写 --db 指向同一物理数据库文件（含软硬链接/目录联接）。');
@@ -1865,9 +1834,6 @@ export async function runPhase2Cli(
         const enableFlag = values.enable === true ? true : (values.disable === true ? false : undefined);
         const confirmAutoRechargeOff = values['confirm-auto-recharge-off'] === true ? true : undefined;
         const confirmHardLimit = values['confirm-hard-limit'] === true ? true : undefined;
-        const allowStage4Media = values['allow-stage4-media'] === true
-          ? true
-          : (values['disallow-stage4-media'] === true ? false : undefined);
         const monthlyLimitCents = parseOptionalNonNegSafeInt(values['monthly-limit-cents'], 'monthly-limit-cents');
         const sameMonthPendingBufferCents = parseOptionalNonNegSafeInt(values['same-month-pending-buffer-cents'], 'same-month-pending-buffer-cents');
         if (sameMonthPendingBufferCents > 2000) throw new Phase2CliError('--same-month-pending-buffer-cents 不能超过 2000。');
@@ -2265,19 +2231,7 @@ export async function runPhase2Cli(
             if (notes && notes.length > 0) sc.review_notes = notes;
           }
         }
-        if ((profile.revision ?? 59) < 59 && storedShortlist.length > 0) {
-          const existingList = Array.isArray(scoredResult.negotiation_shortlist) ? scoredResult.negotiation_shortlist : [];
-          const seenIds = new Set(existingList.map(x => x?.form_id || x?.id).filter(Boolean));
-          const mergedShortlist = [...existingList];
-          for (const item of storedShortlist) {
-            if (!seenIds.has(item.form_id)) {
-              seenIds.add(item.form_id);
-              mergedShortlist.push(item);
-            }
-          }
-          scoredResult.negotiation_shortlist = mergedShortlist;
-        }
-        if ((profile.revision ?? 59) >= 59 && Array.isArray(storedPackagingShortlist) && storedPackagingShortlist.length > 0) {
+        if (Array.isArray(storedPackagingShortlist) && storedPackagingShortlist.length > 0) {
           const existingPkgList = Array.isArray(scoredResult.packaging_redesign_shortlist) ? scoredResult.packaging_redesign_shortlist : [];
           const seenPkgIds = new Set(existingPkgList.map(x => x?.form_id || x?.candidate_id || x?.id).filter(Boolean));
           const mergedPkgShortlist = [...existingPkgList];

@@ -1,7 +1,7 @@
 /**
- * Shared plain-object, deep-freeze, canonical JSON, and SHA-256 helpers.
+ * Shared plain-object, deep-freeze, canonical JSON, PII-safe UUID, and SHA-256 helpers.
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 export const finite = v => typeof v === 'number' && Number.isFinite(v);
 export const nonemptyStr = v => typeof v === 'string' && v.trim().length > 0;
@@ -10,6 +10,22 @@ export function isPlainObject(value) {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+export function assertPlainObject(value, label, ErrorClass = TypeError) {
+  if (!isPlainObject(value)) {
+    throw new ErrorClass(`${label} must be a plain object.`);
+  }
+  for (const key of ['__proto__', 'constructor', 'prototype']) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      throw new ErrorClass(`${label} contains forbidden key "${key}".`);
+    }
+  }
+  return value;
+}
+
+export function generatePiiSafeUuid() {
+  return randomUUID();
 }
 
 export function deepFreeze(value, seen = new WeakSet()) {
@@ -24,6 +40,7 @@ export function deepFreeze(value, seen = new WeakSet()) {
 }
 
 export function canonicalJson(value) {
+  if (typeof value === 'bigint') return JSON.stringify(value.toString());
   if (value === null || typeof value !== 'object') {
     return JSON.stringify(value);
   }
@@ -37,11 +54,8 @@ export function canonicalJson(value) {
 }
 
 export function sha256Hex(input) {
-  const h = createHash('sha256');
-  if (typeof input === 'string') {
-    h.update(input, 'utf8');
-  } else {
-    h.update(input);
-  }
-  return h.digest('hex');
+  const bytes = (Buffer.isBuffer(input) || ArrayBuffer.isView(input))
+    ? input
+    : (input instanceof ArrayBuffer ? new Uint8Array(input) : Buffer.from(String(input), 'utf8'));
+  return createHash('sha256').update(bytes).digest('hex');
 }

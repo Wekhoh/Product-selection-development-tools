@@ -987,10 +987,10 @@ export function storageMeets2027Floor(input, storageLine, storageMonths) {
   return true;
 }
 
-export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, requireRegularRepeatOrder = false, profileRevision = 0 } = {}) {
-  const strictR57 = Boolean(requireRegularRepeatOrder || profileRevision >= 57);
-  const isR58 = profileRevision >= 58;
-  const isR59 = profileRevision >= 59;
+export function validateFeeBasis(input, { evidenceIds = [], operatingMonths, requireRegularRepeatOrder = false, profileRevision = 59 } = {}) {
+  const strictR57 = true;
+  const isR58 = true;
+  const isR59 = (profileRevision ?? 59) >= 59 || profileRevision === 0;
   const context = input.fee_context;
   const sources = new Set(evidenceIds);
   const evidenced = refs => Array.isArray(refs) && refs.length > 0 && refs.every(id => text(id) && sources.has(id));
@@ -1506,7 +1506,7 @@ function totalsConsistentWithinDecimalPrecision(unitNum, countR, totalNum, total
  *  - Base rate + product surcharge + per-kg or per-shipment carrier bond
  */
 export function computeHeadhaulWithA4Rules(headhaul, fx, orderUnits, {
-  isR58 = false,
+  isR58 = true,
   isR59 = false,
   steadyStateReplenishment = undefined,
 } = {}) {
@@ -3001,6 +3001,56 @@ export const lookupUnifiedStorageFee2027 = lookupBulkyStorageFee2027;
 export const lookupDangerousGoodsStorageFee2027 = (params = {}) =>
   lookupBulkyStorageFee2027({ ...params, is_dangerous_goods: true });
 
+function standardPlacementFeeForTier(cls, split_option, optimized) {
+  if (split_option === 'amazon_optimized') {
+    const { optVerified, usWestSingleBlocked, steady_state_replenishment, effOptCartons } = optimized;
+    if (!optVerified) {
+      return {
+        status: 'sensitivity_only',
+        version: FBA_2027_METADATA.version,
+        size_tier: cls.size_tier,
+        split_option,
+        range_usd: [0, 0],
+        selected_usd: 0,
+        reason: usWestSingleBlocked
+          ? `Standard-size amazon_optimized ($0 placement) cannot pair with pure US-West single-warehouse headhaul (< ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg or us_west_single); use Kaiqi nationwide multi-warehouse >= ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg.`
+          : 'Standard-size amazon_optimized ($0 placement) requires verified nationwide multi-warehouse headhaul (and >= 5 identical cartons when steady_state_replenishment is false); sensitivity-only otherwise.',
+        effective_from: FBA_2027_METADATA.placement_effective_from,
+        source_url: FBA_2027_METADATA.official_sources.placement,
+      };
+    }
+    return {
+      status: 'verified',
+      version: FBA_2027_METADATA.version,
+      size_tier: cls.size_tier,
+      split_option,
+      range_usd: [0, 0],
+      selected_usd: 0,
+      steady_state_replenishment: steady_state_replenishment !== false,
+      identical_cartons_count: effOptCartons,
+      multi_destination_headhaul_verified: true,
+      note: 'Steady-state Amazon-optimized splits incur $0 placement fee (paired with nationwide multi-warehouse sea-truck headhaul >= ¥10.0/kg).',
+      effective_from: FBA_2027_METADATA.placement_effective_from,
+      source_url: FBA_2027_METADATA.official_sources.placement,
+    };
+  }
+  const range = cls.size_tier === 'small_standard'
+    ? (PLACEMENT_MINIMAL_SMALL_OZ.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.range ?? null)
+    : (PLACEMENT_MINIMAL_LARGE_LB.find(r => ratCmp(cls.rawRat.shipLbRat, toRat(r.max_lb)) <= 0)?.range ?? null);
+  if (!range) return { status: 'needs_calculator_verification', reason: 'Unlisted placement weight bracket.' };
+  const selectedUsd = split_option === 'minimal_east_low' ? range[0] : range[1];
+  return {
+    status: 'verified',
+    version: FBA_2027_METADATA.version,
+    size_tier: cls.size_tier,
+    split_option,
+    range_usd: [...range],
+    selected_usd: selectedUsd,
+    effective_from: FBA_2027_METADATA.placement_effective_from,
+    source_url: FBA_2027_METADATA.official_sources.placement,
+  };
+}
+
 export function lookupBulkyPlacementFee2027({
   pkg,
   inbound_window = null,
@@ -3044,52 +3094,9 @@ export function lookupBulkyPlacementFee2027({
     headhaul_destination_scope,
   });
   if (cls.size_tier === 'small_standard' || cls.size_tier === 'large_standard') {
-    if (split_option === 'amazon_optimized') {
-      if (!optVerified) {
-        return {
-          status: 'sensitivity_only',
-          version: FBA_2027_METADATA.version,
-          size_tier: cls.size_tier,
-          split_option,
-          range_usd: [0, 0],
-          selected_usd: 0,
-          reason: usWestSingleBlocked
-            ? `Standard-size amazon_optimized ($0 placement) cannot pair with pure US-West single-warehouse headhaul (< ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg or us_west_single); use Kaiqi nationwide multi-warehouse >= ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg.`
-            : 'Standard-size amazon_optimized ($0 placement) requires verified nationwide multi-warehouse headhaul (and >= 5 identical cartons when steady_state_replenishment is false); sensitivity-only otherwise.',
-          effective_from: FBA_2027_METADATA.placement_effective_from,
-          source_url: FBA_2027_METADATA.official_sources.placement,
-        };
-      }
-      return {
-        status: 'verified',
-        version: FBA_2027_METADATA.version,
-        size_tier: cls.size_tier,
-        split_option,
-        range_usd: [0, 0],
-        selected_usd: 0,
-        steady_state_replenishment: steady_state_replenishment !== false,
-        identical_cartons_count: effOptCartons,
-        multi_destination_headhaul_verified: true,
-        note: 'Steady-state Amazon-optimized splits incur $0 placement fee (paired with nationwide multi-warehouse sea-truck headhaul >= ¥10.0/kg).',
-        effective_from: FBA_2027_METADATA.placement_effective_from,
-        source_url: FBA_2027_METADATA.official_sources.placement,
-      };
-    }
-    const range = cls.size_tier === 'small_standard'
-      ? (PLACEMENT_MINIMAL_SMALL_OZ.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.range ?? null)
-      : (PLACEMENT_MINIMAL_LARGE_LB.find(r => ratCmp(cls.rawRat.shipLbRat, toRat(r.max_lb)) <= 0)?.range ?? null);
-    if (!range) return { status: 'needs_calculator_verification', reason: 'Unlisted placement weight bracket.' };
-    const selectedUsd = split_option === 'minimal_east_low' ? range[0] : range[1];
-    return {
-      status: 'verified',
-      version: FBA_2027_METADATA.version,
-      size_tier: cls.size_tier,
-      split_option,
-      range_usd: [...range],
-      selected_usd: selectedUsd,
-      effective_from: FBA_2027_METADATA.placement_effective_from,
-      source_url: FBA_2027_METADATA.official_sources.placement,
-    };
+    return standardPlacementFeeForTier(cls, split_option, {
+      optVerified, usWestSingleBlocked, steady_state_replenishment, effOptCartons,
+    });
   }
   if (cls.tier_family === 'oversize') {
     return {
@@ -3792,54 +3799,11 @@ export function lookupPlacementFee2027({
       headhaul_rate_cny_per_kg,
       headhaul_destination_scope,
     });
-    if (!optVerified) {
-      return {
-        status: 'sensitivity_only',
-        version: FBA_2027_METADATA.version,
-        size_tier: cls.size_tier,
-        split_option,
-        range_usd: [0, 0],
-        selected_usd: 0,
-        reason: usWestSingleBlocked
-          ? `Standard-size amazon_optimized ($0 placement) cannot pair with pure US-West single-warehouse headhaul (< ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg or us_west_single); use Kaiqi nationwide multi-warehouse >= ¥${BUSINESS_THRESHOLDS.kaiqi_nationwide_sea_truck_base_cny_per_kg}/kg.`
-          : 'Standard-size amazon_optimized ($0 placement) requires verified nationwide multi-warehouse headhaul (and >= 5 identical cartons when steady_state_replenishment is false); sensitivity-only otherwise.',
-        effective_from: FBA_2027_METADATA.placement_effective_from,
-        source_url: FBA_2027_METADATA.official_sources.placement,
-      };
-    }
-    return {
-      status: 'verified',
-      version: FBA_2027_METADATA.version,
-      size_tier: cls.size_tier,
-      split_option,
-      range_usd: [0, 0],
-      selected_usd: 0,
-      steady_state_replenishment: steady_state_replenishment !== false,
-      identical_cartons_count: effOptCartons,
-      multi_destination_headhaul_verified: true,
-      note: 'Steady-state Amazon-optimized splits incur $0 placement fee (paired with nationwide multi-warehouse sea-truck headhaul >= ¥10.0/kg).',
-      effective_from: FBA_2027_METADATA.placement_effective_from,
-      source_url: FBA_2027_METADATA.official_sources.placement,
-    };
+    return standardPlacementFeeForTier(cls, split_option, {
+      optVerified, usWestSingleBlocked, steady_state_replenishment, effOptCartons,
+    });
   }
-  let range = null;
-  if (cls.size_tier === 'small_standard') {
-    range = PLACEMENT_MINIMAL_SMALL_OZ.find(r => ratCmp(cls.rawRat.ozRat, toRat(r.max_oz)) <= 0)?.range ?? null;
-  } else {
-    range = PLACEMENT_MINIMAL_LARGE_LB.find(r => ratCmp(cls.rawRat.shipLbRat, toRat(r.max_lb)) <= 0)?.range ?? null;
-  }
-  if (!range) return { status: 'needs_calculator_verification', reason: 'Unlisted placement weight bracket.' };
-  const selectedUsd = split_option === 'minimal_east_low' ? range[0] : range[1];
-  return {
-    status: 'verified',
-    version: FBA_2027_METADATA.version,
-    size_tier: cls.size_tier,
-    split_option,
-    range_usd: [...range],
-    selected_usd: selectedUsd,
-    effective_from: FBA_2027_METADATA.placement_effective_from,
-    source_url: FBA_2027_METADATA.official_sources.placement,
-  };
+  return standardPlacementFeeForTier(cls, split_option);
 }
 
 export function lookupReturnsProcessing2027({
@@ -4435,7 +4399,7 @@ function estimateGate1AWithLandedCost({
       ? order_units
       : (finite(structuredHeadhaulObj.order_units) && structuredHeadhaulObj.order_units > 0 ? structuredHeadhaulObj.order_units : 100);
     const a4Res = computeHeadhaulWithA4Rules(structuredHeadhaulObj, fx_cny_per_usd, effOrderUnits, {
-      isR58: (profile_revision ?? 59) >= 58,
+      isR58: true,
       isR59: (profile_revision ?? 59) >= 59,
       steadyStateReplenishment: steady_state_replenishment,
     });

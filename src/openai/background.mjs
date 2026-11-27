@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { link, lstat, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
-import { containsSecretToken, detectRawPii } from '../contracts.mjs';
+import { containsRawEmail, containsSecretToken, detectRawPii } from '../contracts.mjs';
 import { OpenAiValidationError } from './pricing.mjs';
 
 const DEFAULT_POLL_INTERVAL_MS = 5_000;
@@ -110,7 +110,8 @@ export async function getBackgroundResponseWithinWait(retrieve, signal, remainin
 function cleanQuery(query) {
   // The input was already scrubbed by the client. Omit values still carrying private markers,
   // contact patterns or a URL whose path or query string could contain identifiers.
-  if (/\[REDACTED_|\bhttps?:\/\/|\bwww\.|[^\s@]+@[^\s@]+\.[^\s@]+|(?:\+\d{1,3}[ .-]?)?\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}\b/i.test(query) ||
+  if (/\[REDACTED_|\bhttps?:\/\/|\bwww\.|(?:\+\d{1,3}[ .-]?)?\(?\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}\b/i.test(query) ||
+    containsRawEmail(query, { strict: true, skipDataImageUri: false }) ||
     detectRawPii(query) || containsSecretToken(query)) return null;
   const clean = query.normalize('NFKC').replace(/[\p{Cc}\p{Cf}\s]+/gu, ' ').trim();
   return clean ? clean.slice(0, MAX_QUERY_LENGTH) : null;

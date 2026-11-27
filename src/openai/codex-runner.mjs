@@ -17,7 +17,6 @@
  *    `verifySavedCodexReceipt`.
  */
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -59,6 +58,7 @@ import {
   sanitizeDiagnosticText,
 } from '../contracts.mjs';
 import { canonicalJson, sha256Hex } from '../store.mjs';
+import { generatePiiSafeUuid, isPlainObject } from '../utils/objects.mjs';
 import {
   ALLOWED_GATE4_EFFORTS,
   MAX_RECEIPT_FILE_BYTES,
@@ -73,7 +73,6 @@ import {
 import {
   EVIDENCE_REVIEW_JSON_SCHEMA,
   SCHEMA_VERSION,
-  assertAuthorizedReviewExecutionPolicy,
   buildEvidenceReviewPrompt,
   freezeEvidenceReviewPacket,
   validateEvidenceReviewOutput,
@@ -124,15 +123,6 @@ function extractPostEchoCodexDiagnosticStderr(stderrText, promptText = '') {
   return norm.replace(CODEX_STARTUP_BANNER_LINE_RE, '').trim();
 }
 
-
-function generatePiiSafeUuid() {
-  for (let i = 0; i < 64; i++) {
-    const id = randomUUID();
-    if (!detectRawPii(id)) return id;
-  }
-  return randomUUID();
-}
-
 export class CodexRunnerError extends Error {
   constructor(message, {
     code = 'CODEX_EXEC_ERROR',
@@ -169,12 +159,6 @@ export class CodexRunnerError extends Error {
     this.retainedArtifactDir = retainedArtifactDir ?? null;
     this.retainedOutputPath = retainedOutputPath ?? null;
   }
-}
-
-function isPlainObject(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
 }
 
 function isTrustedAbsolutePath(candidatePath, platform = process.platform) {
@@ -258,16 +242,6 @@ function dirnameForPlatform(platform, p) {
     return pathPosix.dirname(p);
   }
   return dirname(p);
-}
-
-function basenameForPlatform(platform, p) {
-  if (isWinStylePath(p)) {
-    return pathWin32.basename(p);
-  }
-  if (platform !== 'win32' || (typeof p === 'string' && p.startsWith('/'))) {
-    return pathPosix.basename(p);
-  }
-  return basename(p);
 }
 
 function resolveVendorExeUnderDir(shimDir, arch, fsImpl, platform = 'win32') {
@@ -1733,21 +1707,19 @@ function preflightPrivateReceiptDestination({
       if (existingLstat.isSymbolicLink()) {
         throw new TypeError('receiptPath must not point to an existing symlink or file alias.');
       }
-      let stBig = null;
       let realRec = absReceipt;
       try {
-        stBig = statSync(absReceipt, { bigint: true });
         realRec = realpathSync(absReceipt);
       } catch {
-        stBig = null;
+        realRec = absReceipt;
       }
-      if (existingLstat.isDirectory() || stBig?.isDirectory?.()) {
+      if (existingLstat.isDirectory()) {
         throw new TypeError('receiptPath points to an existing directory; supply a new receipt file path or receiptDir.');
       }
       if (!existingLstat.isFile()) {
         throw new TypeError('receiptPath points to an existing special/non-regular file.');
       }
-      if (collidesWithProtected(absReceipt, realRec, stBig)) {
+      if (collidesWithProtected(absReceipt, realRec)) {
         throw new TypeError('receiptPath must not overwrite or alias a protected input or executable file.');
       }
       throw new TypeError('receiptPath already exists; refusing to truncate or overwrite an existing receipt file.');
@@ -1761,7 +1733,7 @@ function preflightPrivateReceiptDestination({
       }
       const realAnc = realpathSync(ancestor.path);
       const projectedRealReceipt = resolve(realAnc, relative(ancestor.path, absReceipt));
-      if (collidesWithProtected(absReceipt, projectedRealReceipt, null)) {
+      if (collidesWithProtected(absReceipt, projectedRealReceipt)) {
         throw new TypeError('receiptPath resolves via directory alias to a protected input or executable file.');
       }
     }
@@ -1783,20 +1755,19 @@ function preflightPrivateReceiptDestination({
       if (dirLstat.isSymbolicLink()) {
         throw new TypeError('receiptDir must not be a symlink or alias.');
       }
-      const stBig = statSync(absDir, { bigint: true });
-      const realDir = realpathSync(absDir);
-      if (collidesWithProtected(absDir, realDir, stBig)) {
-        throw new TypeError('receiptDir must not collide with a protected input or executable file.');
-      }
-      if (!stBig.isDirectory()) {
+      if (!dirLstat.isDirectory()) {
         throw new TypeError('receiptDir points to an existing non-directory file.');
+      }
+      const realDir = realpathSync(absDir);
+      if (collidesWithProtected(absDir, realDir)) {
+        throw new TypeError('receiptDir must not collide with a protected input or executable file.');
       }
     } else {
       const ancestor = findNearestExistingAncestor(absDir);
       if (ancestor) {
         const ancStat = statSync(ancestor.path, { bigint: true });
         const realAnc = realpathSync(ancestor.path);
-        if (collidesWithProtected(ancestor.path, realAnc, ancStat) || !ancStat.isDirectory()) {
+        if (collidesWithProtected(ancestor.path, realAnc) || !ancStat.isDirectory()) {
           throw new TypeError('receiptDir ancestor is not a valid directory or collides with a protected file.');
         }
       }
@@ -2908,9 +2879,6 @@ export async function runCodexEvidenceReview(packetInput, {
   receiptStoreDir = null,
   candidateId = null,
   formSpecSha256 = null,
-  authorizedPolicies = undefined,
-  authorizedPolicyIds = undefined,
-  resolvePolicy = undefined,
   fsImpl = undefined,
   platform = process.platform,
   taskkillImpl = spawnSync,
@@ -3003,106 +2971,7 @@ export async function runCodexEvidenceReview(packetInput, {
     });
   }
   const hasSuppliedImages = Array.isArray(imagePaths) && imagePaths.length > 0;
-
-  if (enabled === true && dryRun === false) {
-    try {
-      assertAuthorizedReviewExecutionPolicy(packetInput, {
-        authorizedPolicies,
-        authorizedPolicyIds,
-        resolvePolicy,
-        hasAttachments: hasSuppliedImages,
-      });
-    } catch (polErr) {
-      if (polErr?.code === 'EXECUTION_POLICY_DISABLED') {
-        let fallbackReviewId = null;
-        let fallbackPacketSha256 = null;
-        try {
-          const frozenForMeta = freezeEvidenceReviewPacket(packetInput);
-          fallbackReviewId = frozenForMeta.review_id;
-          fallbackPacketSha256 = frozenForMeta.packet_sha256;
-        } catch {
-          // Preserve unavailable policy denial safely even if packet admission also fails.
-        }
-        return Object.freeze({
-          status: 'unavailable',
-          execution_status: 'not_submitted',
-          content_status: null,
-          dry_run: false,
-          advisory_only: true,
-          execution_provenance: executionProvenance,
-          receipt_sha256: null,
-          private_receipt_ref: null,
-          schema_version: SCHEMA_VERSION,
-          review_id: fallbackReviewId,
-          packet_sha256: fallbackPacketSha256,
-          payload_sha256: null,
-          attachment_sha256s: Object.freeze([]),
-          raw_output_sha256: null,
-          reviewer_label: reviewerLabel,
-          model: normalizedModel,
-          reasoning_effort: reasoningEffort,
-          error_code: 'EXECUTION_POLICY_DISABLED',
-          tier_fallback_used: false,
-          disposition_counts: null,
-          review: null,
-          subjects: Object.freeze([]),
-          answers: Object.freeze([]),
-          contradictions: Object.freeze([]),
-          gaps: Object.freeze([]),
-          conclusion: null,
-          reason: sanitizeDiagnosticText(String(polErr?.message || 'Evidence review execution policy is missing or disabled.')),
-        });
-      }
-      throw polErr;
-    }
-  }
-
   const frozenPacket = freezeEvidenceReviewPacket(packetInput);
-  if (enabled === true && dryRun === false) {
-    try {
-      assertAuthorizedReviewExecutionPolicy(packetInput, {
-        authorizedPolicies,
-        authorizedPolicyIds,
-        resolvePolicy,
-        hasAttachments: hasSuppliedImages || (Array.isArray(frozenPacket.attachment_sha256s) && frozenPacket.attachment_sha256s.length > 0),
-        frozenPacket,
-      });
-    } catch (polErr) {
-      if (polErr?.code === 'EXECUTION_POLICY_DISABLED') {
-        return Object.freeze({
-          status: 'unavailable',
-          execution_status: 'not_submitted',
-          content_status: null,
-          dry_run: false,
-          advisory_only: true,
-          execution_provenance: executionProvenance,
-          receipt_sha256: null,
-          private_receipt_ref: null,
-          schema_version: SCHEMA_VERSION,
-          review_id: frozenPacket.review_id,
-          packet_sha256: frozenPacket.packet_sha256,
-          payload_sha256: null,
-          attachment_sha256s: Object.freeze([]),
-          raw_output_sha256: null,
-          reviewer_label: reviewerLabel,
-          model: normalizedModel,
-          reasoning_effort: reasoningEffort,
-          error_code: 'EXECUTION_POLICY_DISABLED',
-          tier_fallback_used: false,
-          disposition_counts: null,
-          review: null,
-          subjects: Object.freeze([]),
-          answers: Object.freeze([]),
-          contradictions: Object.freeze([]),
-          gaps: Object.freeze([]),
-          conclusion: null,
-          reason: sanitizeDiagnosticText(String(polErr?.message || 'Evidence review execution policy rejected packet or attachments.')),
-        });
-      }
-      throw polErr;
-    }
-  }
-
   const prompt = buildEvidenceReviewPrompt(frozenPacket);
   const admittedAttachments = stageAndHashReviewAttachments(imagePaths, {
     stageDir: null,

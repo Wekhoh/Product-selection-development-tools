@@ -1,4 +1,3 @@
-import { BUSINESS_THRESHOLDS } from './business-thresholds.mjs';
 /**
  * Multi-channel anti-convergence discovery registry, Track A/B/C promotion classifier,
  * discovery batch planner, and coverage auditor (docs/PRODUCT.md & 04 section 2.6 / 6.1).

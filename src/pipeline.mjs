@@ -10,10 +10,11 @@ import {
  *  Stage 2: Gate 1B serial 1688 sourcing queue (exclusive DB lease) with persistent CAPTCHA_PAUSED isolation
  *  Stage 3: Gate 2/3 guarded deep research (forced fresh_observation, isolated per-form errors) -> immutable evaluations
  */
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { evaluateEarlyScreen } from './economics.mjs';
+import { stripAdvisoryAttachmentsForBundleHash } from './store.mjs';
 import {
   FBA_2027_DEFAULT_OFF_PEAK_WINDOW,
   FBA_2027_DEFAULT_OFF_PEAK_STORAGE_WINDOW,
@@ -34,7 +35,6 @@ import {
   isAmazonOptimizedPlacementVerified2027,
   lookupFulfillmentFee2027,
   lookupBulkyFulfillmentFee2027,
-  lookupUnifiedFulfillmentFee2027,
 } from './fba-calculator.mjs';
 import {
   toBigRat,
@@ -65,7 +65,6 @@ import { canonicalJson, computeEvidenceBundleHash, isSocialBridgeAlignedWithForm
 import {
   OpenAiAmbiguousOutcomeError,
   SCHEMA_VERSION as EVIDENCE_REVIEW_SCHEMA_VERSION,
-  assertAuthorizedReviewExecutionPolicy,
   buildStage1DecisionsRequests,
   parseStage1DecisionsResponses,
   buildWorkflowTaskRequest,
@@ -348,44 +347,7 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
     ? { factory_id: persistedQuote.factory_id.trim() }
     : {};
 
-  if (skuLines.length > 0) {
-    return {
-      ...sanitizedRaw,
-      ...authoritativeFactory,
-      profile_revision: resolvedRev,
-      order_units: persistedQuote.actual_sets,
-      target_sets: persistedQuote.actual_sets,
-      allow_remainder: Boolean(orderPlan?.mode === 'allow_remainder'),
-      sku_lines: skuLines,
-      goods_cny_per_unit: null,
-      procurement_usd: null,
-      ...(bareGoodsQuote ? {
-        bare_goods_screening: true,
-        domestic_freight_cny_total: null,
-        ...(advisoryDomFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomFreightCny } : {}),
-      } : {
-        bare_goods_screening: false,
-        cost_basis: 'landed_domestic_explicit',
-        domestic_freight_cny_total: persistedQuote.domestic_freight_cny_total,
-      }),
-      domestic_freight_cny_per_unit: null,
-      domestic_freight_usd: null,
-      goods_first_order_promotion: Boolean(persistedQuote.goods_first_order_promotion),
-      first_order_promotion: bareGoodsQuote
-        ? Boolean(persistedQuote.goods_first_order_promotion)
-        : Boolean(persistedQuote.freight_first_order_promotion),
-    };
-  }
-
-  const goodsPerSetRat = divBigRat(toBigRat(persistedQuote.goods_cny_total), toBigRat(persistedQuote.actual_sets));
-  const goodsCnyPerUnit = roundBigRat(goodsPerSetRat.n, goodsPerSetRat.d, 10);
-  return {
-    ...sanitizedRaw,
-    ...authoritativeFactory,
-    profile_revision: resolvedRev,
-    order_units: persistedQuote.actual_sets,
-    sku_lines: null,
-    goods_cny_per_unit: goodsCnyPerUnit,
+  const quoteCostFields = {
     procurement_usd: null,
     ...(bareGoodsQuote ? {
       bare_goods_screening: true,
@@ -402,6 +364,32 @@ function applyAuthoritativeQuoteToScreenInput(rawInput, persistedQuote, orderPla
     first_order_promotion: bareGoodsQuote
       ? Boolean(persistedQuote.goods_first_order_promotion)
       : Boolean(persistedQuote.freight_first_order_promotion),
+  };
+
+  if (skuLines.length > 0) {
+    return {
+      ...sanitizedRaw,
+      ...authoritativeFactory,
+      profile_revision: resolvedRev,
+      order_units: persistedQuote.actual_sets,
+      target_sets: persistedQuote.actual_sets,
+      allow_remainder: Boolean(orderPlan?.mode === 'allow_remainder'),
+      sku_lines: skuLines,
+      goods_cny_per_unit: null,
+      ...quoteCostFields,
+    };
+  }
+
+  const goodsPerSetRat = divBigRat(toBigRat(persistedQuote.goods_cny_total), toBigRat(persistedQuote.actual_sets));
+  const goodsCnyPerUnit = roundBigRat(goodsPerSetRat.n, goodsPerSetRat.d, 10);
+  return {
+    ...sanitizedRaw,
+    ...authoritativeFactory,
+    profile_revision: resolvedRev,
+    order_units: persistedQuote.actual_sets,
+    sku_lines: null,
+    goods_cny_per_unit: goodsCnyPerUnit,
+    ...quoteCostFields,
   };
 }
 
@@ -3550,37 +3538,6 @@ export function runOptionalFactoryInquiryChecklist(input, options = {}) {
   return runOptionalTerraWorkflowTask('factory-inquiry-1688', input, options);
 }
 
-function stripAdvisoryAttachmentsForBundleHash(cand) {
-  if (!cand || typeof cand !== 'object' || Array.isArray(cand)) return cand;
-  const hasTop =
-    Object.hasOwn(cand, 'evidence_review') ||
-    Object.hasOwn(cand, 'return_cause_diagnosis') ||
-    Object.hasOwn(cand, 'factory_inquiry_1688');
-  const hasPres = Boolean(
-    cand.presentation &&
-    typeof cand.presentation === 'object' &&
-    !Array.isArray(cand.presentation) &&
-    (Object.hasOwn(cand.presentation, 'return_cause_diagnosis') ||
-      Object.hasOwn(cand.presentation, 'factory_inquiry_1688')),
-  );
-  if (!hasTop && !hasPres) return cand;
-  const {
-    evidence_review: _ev,
-    return_cause_diagnosis: _rc,
-    factory_inquiry_1688: _fi,
-    ...rest
-  } = cand;
-  if (hasPres) {
-    const {
-      return_cause_diagnosis: _prc,
-      factory_inquiry_1688: _pfi,
-      ...presRest
-    } = cand.presentation;
-    rest.presentation = presRest;
-  }
-  return rest;
-}
-
 const ENGLISH_WORD_COUNTS = Object.freeze({
   one: 1, single: 1, two: 2, pair: 2, three: 3, four: 4, five: 5,
   six: 6, seven: 7, eight: 8, nine: 9, ten: 10, twelve: 12,
@@ -3818,14 +3775,6 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
     };
   }
 
-  let hasAuthorizedExecutionPolicy = false;
-  try {
-    assertAuthorizedReviewExecutionPolicy(packetInput);
-    hasAuthorizedExecutionPolicy = true;
-  } catch {
-    hasAuthorizedExecutionPolicy = false;
-  }
-
   const normalizedGate4Model = model === null || model === undefined
     ? null
     : (typeof model === 'string' ? model.trim() : String(model));
@@ -3900,21 +3849,6 @@ export async function runOptionalGate4EvidenceReview(packetInput, {
       packet_sha256: frozenPacket.packet_sha256,
       review: null,
       reason: 'Gate-4 evidence review is disabled (enabled=false).',
-    };
-  }
-
-  if (!hasAuthorizedExecutionPolicy) {
-    return {
-      status: 'unavailable',
-      execution_status: 'not_submitted',
-      content_status: null,
-      advisory_only: true,
-      schema_version: EVIDENCE_REVIEW_SCHEMA_VERSION,
-      review_id: frozenPacket.review_id,
-      packet_sha256: frozenPacket.packet_sha256,
-      error_code: 'EXECUTION_POLICY_DISABLED',
-      review: null,
-      reason: 'Local execution_policy_ref is missing or disabled; live Gate-4 evidence review blocked.',
     };
   }
 
@@ -4838,6 +4772,18 @@ export async function runPhase2Batch(store, {
     skipped_zero_incremental: [],
   };
 
+  // Issue #54: Refuse to launch Stage 0/Stage 1 (including Luna triage external AI calls) when Gate 1B queue is CAPTCHA_PAUSED.
+  const initialQueue = store.getQueueState('gate1b_1688_queue');
+  if (initialQueue && initialQueue.status === 'CAPTCHA_PAUSED') {
+    report.batch_paused = true;
+    report.pause_status = 'CAPTCHA_PAUSED';
+    report.pause_reason = initialQueue.pause_reason ?? '1688 queue is persistently paused (CAPTCHA_PAUSED); clear slider and resume before continuing batch.';
+    report.paused_form_id = initialQueue.paused_form_id ?? null;
+    report.queue_state = initialQueue;
+    report.resumable = true;
+    return report;
+  }
+
   // Stage 0: Ingest leads, candidate forms, and links (including validated SocialBridge payloads).
   for (const item of items) {
     const { form } = store.upsertCandidateForm(item.form);
@@ -4982,18 +4928,6 @@ export async function runPhase2Batch(store, {
   }
 
   // Stage 2: Gate 1B serial 1688 queue (isolated sanitized per-form errors + CAPTCHA_PAUSED isolation).
-  if ((profile.revision ?? 59) >= 59) {
-    const initialQueue = store.getQueueState('gate1b_1688_queue');
-    if (initialQueue && initialQueue.status === 'CAPTCHA_PAUSED') {
-      report.batch_paused = true;
-      report.pause_status = 'CAPTCHA_PAUSED';
-      report.pause_reason = initialQueue.pause_reason ?? '1688 queue is persistently paused (CAPTCHA_PAUSED); clear slider and resume before continuing batch.';
-      report.paused_form_id = initialQueue.paused_form_id ?? null;
-      report.queue_state = initialQueue;
-      report.resumable = true;
-      return report;
-    }
-  }
   const readyForGate23 = [];
   for (const entry of afterGate1A) {
     const { item, form_id: formId, existing_quote: existingQuote, existing_quotes: existingQuotes } = entry;

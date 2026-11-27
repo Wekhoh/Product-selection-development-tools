@@ -1,3 +1,4 @@
+import { isPlainObject, assertPlainObject } from '../utils/objects.mjs';
 /**
  * Shared acyclic `/v1/responses` & Batch response-envelope extractor.
  *
@@ -5,24 +6,6 @@
  * and every `output[]` item and `content[]` part for errors, refusals (string or object),
  * non-2xx status codes, and incomplete states BEFORE parsing structured JSON once.
  */
-
-function isPlainObject(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function assertPlainObject(value, label) {
-  if (!isPlainObject(value)) {
-    throw new TypeError(`${label} must be a plain object.`);
-  }
-  for (const key of ['__proto__', 'constructor', 'prototype']) {
-    if (Object.prototype.hasOwnProperty.call(value, key)) {
-      throw new TypeError(`${label} contains forbidden key "${key}".`);
-    }
-  }
-  return value;
-}
 
 function parseJsonObjectOnce(rawText, taskLabel) {
   const trimmed = rawText.trim();

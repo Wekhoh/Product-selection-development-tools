@@ -57,7 +57,6 @@ function buildSyntheticPacket(overrides = {}) {
   return {
     schema_version: SCHEMA_VERSION,
     review_id: 'rev-phase4-synth-01',
-    execution_policy_ref: 'local-authorized-policy',
     candidate: {
       subject_id: 'synthetic-complete',
       intended_use: 'Desktop dual-shelf cable and stationery organizer',
@@ -423,17 +422,18 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       assert.equal(existsSync(`${realLegInDir}-wal`), false);
       assert.equal(existsSync(`${realLegInDir}-shm`), false);
 
-      // 2) Attempting `--enable` before `--legacy-budget` reconciliation must fail cleanly
-      const sFailEnable = makeCapturingStreams();
-      const codeFailEnable = await runPhase2Cli([
+      // 2) Enabling directly on a fresh blank DB succeeds once billing controls are confirmed (no legacy deadlock!)
+      const blankEnableDbPath = join(tempDir, 'blank-enable.sqlite');
+      const sDirectEnable = makeCapturingStreams();
+      const codeDirectEnable = await runPhase2Cli([
         'openai-reconcile',
-        '--db', targetDbPath,
+        '--db', blankEnableDbPath,
         '--enable',
         '--confirm-auto-recharge-off',
         '--confirm-hard-limit',
-      ], sFailEnable);
-      assert.equal(codeFailEnable, 2);
-      assert.match(sFailEnable.getErr(), /legacy_reconciled=false|legacy budget/i);
+      ], sDirectEnable);
+      assert.equal(codeDirectEnable, 0, sDirectEnable.getErr());
+      assert.equal(JSON.parse(sDirectEnable.getOut()).status.policy.enabled, true);
 
       // P0-06: `--enable` without platform billing control confirmations or with limit > 20000 must fail!
       const sNoBillingConfirm = makeCapturingStreams();
@@ -675,7 +675,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       const imgPath = join(tempDir, 'sample.png');
       const mockCodexScript = join(tempDir, 'mock-codex.mjs');
 
-      const packet = buildSyntheticPacket({ execution_policy_ref: 'local-policy-only' });
+      const packet = buildSyntheticPacket();
       writeFileSync(packetPath, JSON.stringify(packet, null, 2), 'utf8');
       writeFileSync(imgPath, Buffer.from(ONE_PIXEL_PNG_B64, 'base64'));
 
@@ -698,7 +698,6 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       assert.equal(detectRawPii(sDry.getOut()), null);
 
       const dryFile = JSON.parse(readFileSync(dryOutPath, 'utf8'));
-      assert.equal(Object.hasOwn(dryFile.frozen_packet, 'execution_policy_ref'), false);
       assert.equal(
         dryFile.cli_args_preview.includes('service_tier="default"'),
         true,
@@ -719,7 +718,7 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       const optInFile = JSON.parse(readFileSync(optInOutPath, 'utf8'));
       assert.equal(optInFile.cli_args_preview.includes('service_tier="ultrafast"'), true);
 
-      // 1b) P0-25 & P2-11: `--offline`, `execution_policy_ref: null`, and colliding `--output` must NEVER spawn codex!
+      // 1b) P0-25 & P2-11: `--offline` and colliding `--output` must NEVER spawn codex!
       const sentinelPath = join(tempDir, 'must-not-spawn.txt');
       const sentinelCodexScript = join(tempDir, 'sentinel-codex.mjs');
       writeFileSync(sentinelCodexScript, [
@@ -739,32 +738,6 @@ describe('Phase 4 Integration: src/openai barrel, client<->task seams, CLI subco
       ], sOffline);
       assert.equal(offlineCode, 0, sOffline.getErr());
       assert.equal(existsSync(sentinelPath), false, '--offline must perform zero codex spawns');
-
-      const nullPolicyPacketPath = join(tempDir, 'packet-null-policy.json');
-      writeFileSync(nullPolicyPacketPath, JSON.stringify(buildSyntheticPacket({ execution_policy_ref: null }), null, 2), 'utf8');
-      const sNullPol = makeCapturingStreams();
-      const nullPolCode = await runPhase2Cli([
-        'redteam-review',
-        '--packet', nullPolicyPacketPath,
-        '--output', join(tempDir, 'null-pol-out.json'),
-        '--codex-bin', sentinelCodexScript,
-      ], sNullPol);
-      assert.equal(nullPolCode, 2);
-      assert.equal(existsSync(sentinelPath), false, 'null execution_policy_ref must block before spawning codex');
-
-      const missingPolicyPacket = buildSyntheticPacket();
-      delete missingPolicyPacket.execution_policy_ref;
-      const missingPolicyPacketPath = join(tempDir, 'packet-missing-policy.json');
-      writeFileSync(missingPolicyPacketPath, JSON.stringify(missingPolicyPacket, null, 2), 'utf8');
-      const sMissingPol = makeCapturingStreams();
-      const missingPolCode = await runPhase2Cli([
-        'redteam-review',
-        '--packet', missingPolicyPacketPath,
-        '--output', join(tempDir, 'missing-pol-out.json'),
-        '--codex-bin', sentinelCodexScript,
-      ], sMissingPol);
-      assert.equal(missingPolCode, 2);
-      assert.equal(existsSync(sentinelPath), false, 'missing execution_policy_ref must block before spawning codex');
 
       // P0-26: Public CLI MUST REJECT `--test-mode` flag (test doubles are in-process programmatic hooks only, never OS spawns!)
       const sCliTestModeRejected = makeCapturingStreams();

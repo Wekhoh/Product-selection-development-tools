@@ -66,9 +66,69 @@ function assertObject(value, label) {
   return value;
 }
 
-function assertNonemptyString(value, label) {
-  if (!nonemptyStr(value)) throw new TypeError(`${label} must be a nonempty string.`);
-  return value.trim();
+export function assertNonemptyString(value, label, { maxLength = 8192 } = {}) {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new TypeError(`${label} must be a nonempty string.`);
+  }
+  const trimmed = value.trim();
+  if (trimmed.length > maxLength) {
+    throw new RangeError(`${label} exceeds maximum length (${maxLength}).`);
+  }
+  return trimmed;
+}
+
+const RAW_EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/;
+const RAW_EMAIL_GLOBAL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+const STRICT_EMAIL_RE = /[^\s@]+@[^\s@]+\.[^\s@]+/;
+const DATA_IMAGE_URI_PREFIX_RE = /^data:image\/(?:png|jpeg|jpg|webp|gif);base64,/i;
+
+function scanRawEmailValue(value, re, skipDataImageUri, maxDepth, seen, depth) {
+  if (value === null || value === undefined || depth > maxDepth) return false;
+  if (typeof value === 'string') {
+    if (skipDataImageUri && DATA_IMAGE_URI_PREFIX_RE.test(value)) return false;
+    return re.test(value);
+  }
+  if (typeof value !== 'object') return false;
+  if (seen.has(value)) return false;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.some(item => scanRawEmailValue(item, re, skipDataImageUri, maxDepth, seen, depth + 1));
+  }
+  for (const k of Object.keys(value)) {
+    if (scanRawEmailValue(k, re, skipDataImageUri, maxDepth, seen, depth + 1) ||
+      scanRawEmailValue(value[k], re, skipDataImageUri, maxDepth, seen, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function containsRawEmail(value, { strict = false, skipDataImageUri = true, maxDepth = 64 } = {}) {
+  const re = strict ? STRICT_EMAIL_RE : RAW_EMAIL_RE;
+  return scanRawEmailValue(value, re, skipDataImageUri, maxDepth, new Set(), 0);
+}
+
+function scrubRawEmailValue(value, maxDepth, seen, depth) {
+  if (value === null || value === undefined || depth > maxDepth) return value;
+  if (typeof value === 'string') {
+    if (DATA_IMAGE_URI_PREFIX_RE.test(value)) return value;
+    return value.replace(RAW_EMAIL_GLOBAL_RE, '[REDACTED_EMAIL]');
+  }
+  if (typeof value !== 'object') return value;
+  if (seen.has(value)) return value;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value.map(item => scrubRawEmailValue(item, maxDepth, seen, depth + 1));
+  }
+  const out = {};
+  for (const [k, v] of Object.entries(value)) {
+    out[k] = scrubRawEmailValue(v, maxDepth, seen, depth + 1);
+  }
+  return out;
+}
+
+export function redactRawEmails(value, maxDepth = 64) {
+  return scrubRawEmailValue(value, maxDepth, new Set(), 0);
 }
 
 function assertBoolean(value, label) {
@@ -167,6 +227,7 @@ export function sanitizeDiagnosticText(text) {
     /\b(api[_-]?key|access[_-]?token|refresh[_-]?token|oauth[_-]?token|client[_-]?secret|id[_-]?token|secret[_-]?key|token|authorization|cookie|password)\s*[:=]\s*(?!\[REDACTED_SECRET\])(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
     (_, bk) => `${bk}=[REDACTED_SECRET]`,
   );
+  out = out.replace(RAW_EMAIL_GLOBAL_RE, '[REDACTED_EMAIL]');
   return out;
 }
 

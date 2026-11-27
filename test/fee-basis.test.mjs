@@ -20,10 +20,11 @@ function ledger() {
       ['returns_processing', 0.3], ['returns_disposal', 0], ['collection', 0.5],
       ['other_applicable', 0], ['recovery_credit', 0],
     ].map(([id, amount_usd]) => ({ id, amount_usd, status: 'estimated', basis: 'Synthetic fixture',
-      evidence: ['synthetic-source'], components: [id],
+      evidence: ['synthetic-source'], components: id === 'headhaul' ? ['headhaul', 'carrier_bond'] : [id],
       ...(id === 'procurement' ? { order_units: 100, first_order_promotion: false } : {}),
       ...(id === 'domestic_freight' ? { order_units: 100, first_order_promotion: false } : {}),
       ...(id === 'headhaul' ? { bond_included: true } : {}),
+      ...(id === 'returns_processing' ? { return_threshold: 0.081 } : {}),
       ...(['referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'other_applicable'].includes(id)
         ? { fee_basis: { status: 'published', version: 'synthetic-2027', marketplace: 'US', currency: 'USD',
           package_ref: 'synthetic-pack', effective_from: '2027-01-01', effective_through: '2027-12-31',

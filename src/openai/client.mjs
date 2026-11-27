@@ -13,14 +13,20 @@
  *  - 50%-discount Batch `.jsonl` builder/parser & durable upload-bound submission (`/v1/responses`)
  */
 import { readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
 import {
   assertNoRawPii,
+  containsRawEmail,
   containsSecretToken,
   detectRawPii,
+  redactRawEmails,
   sanitizeDiagnosticText,
 } from '../contracts.mjs';
 import { canonicalJson, sha256Hex } from '../store.mjs';
+import {
+  assertPlainObject as assertPlainObjectBase,
+  generatePiiSafeUuid,
+  isPlainObject,
+} from '../utils/objects.mjs';
 import {
   assertSupportedStrictJsonSchema,
   validateJsonAgainstStrictSchema,
@@ -44,7 +50,6 @@ import {
 import {
   OpenAiBudgetError,
   OpenAiBudgetLedger,
-  _bindInternalUploadLifecycleAuthority,
   areSamePhysicalSqliteFile,
 } from './budget-ledger.mjs';
 import {
@@ -57,9 +62,6 @@ import {
   readReportedWebSearchCalls,
   validateBackgroundOptions,
 } from './background.mjs';
-
-const UPLOAD_AUTHORITY_TOKEN = Symbol('OpenAiClient.uploadAuthority');
-_bindInternalUploadLifecycleAuthority(UPLOAD_AUTHORITY_TOKEN);
 
 const DEFAULT_BASE_URL = 'https://api.openai.com';
 export const DEFAULT_SYNC_TIMEOUT_MS = 480_000;
@@ -120,8 +122,6 @@ const LOCAL_ONLY_REQUEST_KEYS = new Set([
   'logicalRequestId',
   'packet_sha256',
   'packetSha256',
-  'execution_policy_ref',
-  'executionPolicyRef',
   '_offline_draft_only',
   'offline_draft_only',
   '_locked_logical_request_id',
@@ -201,18 +201,8 @@ function cloneSafeMapRecord(sourceObj) {
   return out;
 }
 
-function isPlainObject(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function assertPlainObject(value, label) {
-  if (!isPlainObject(value)) {
-    throw new OpenAiValidationError(`${label} must be a plain object.`);
-  }
-  return value;
-}
+const requirePlainObject = (value, label) =>
+  assertPlainObjectBase(value, label, OpenAiValidationError);
 
 function assertOptionalBoolean(value, label) {
   if (value === undefined) return undefined;
@@ -245,7 +235,7 @@ function snapshotPlainValue(value, label = 'input', seen = new Set(), depth = 0)
     if (Array.isArray(value)) {
       return value.map((item, idx) => snapshotPlainValue(item, `${label}[${idx}]`, seen, depth + 1));
     }
-    assertPlainObject(value, label);
+    requirePlainObject(value, label);
     const out = Object.create(null);
     for (const key of Object.keys(value)) {
       if (!Object.hasOwn(value, key)) continue;
@@ -312,14 +302,6 @@ function normalizeBaseUrl(baseUrl, { allowInsecureLocalBaseUrl = false } = {}) {
 
 function formatAuthHeader(apiKey) {
   return ['Bearer', apiKey].join(' ');
-}
-
-function generatePiiSafeUuid() {
-  for (let i = 0; i < 64; i++) {
-    const id = randomUUID();
-    if (!detectRawPii(id)) return id;
-  }
-  throw new OpenAiError('Unable to generate PII-safe UUID after 64 attempts.');
 }
 
 function isAmbiguousHttpStatus(status) {
@@ -420,29 +402,6 @@ export function computeRequestPayloadSha256(endpoint, wireBodyOrJson) {
   return sha256Hex(Buffer.from(`${endpoint}\n${serialized}`, 'utf8'));
 }
 
-const RAW_EMAIL_RE = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-const DATA_IMAGE_URI_PREFIX_RE = /^data:image\/(?:png|jpeg|jpg|webp|gif);base64,/i;
-
-function containsRawEmail(value, depth = 0) {
-  if (value === null || value === undefined || depth > 64) return false;
-  if (typeof value === 'string') {
-    if (DATA_IMAGE_URI_PREFIX_RE.test(value)) return false;
-    RAW_EMAIL_RE.lastIndex = 0;
-    return RAW_EMAIL_RE.test(value);
-  }
-  if (Array.isArray(value)) {
-    return value.some(item => containsRawEmail(item, depth + 1));
-  }
-  if (typeof value === 'object') {
-    for (const k of Object.keys(value)) {
-      if (containsRawEmail(k, depth + 1) || containsRawEmail(value[k], depth + 1)) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
 function assertCleanOutgoingPayload(wireBody, label = 'openai_request') {
   assertNoRawPii(wireBody, label);
   if (containsRawEmail(wireBody)) {
@@ -466,7 +425,7 @@ function scrubTextForReceipt(text, literalSecret = null) {
   }
   s = sanitizeDiagnosticText(s);
   s = s.replace(/\bBearer\s+\S+/gi, '[REDACTED_BEARER]');
-  s = s.replace(RAW_EMAIL_RE, '[REDACTED_EMAIL]');
+  s = redactRawEmails(s);
   return s;
 }
 
@@ -838,7 +797,7 @@ function validateAndNormalizeDecisionInput(input) {
   let totalInputJsonBytes = 0;
 
   const normalizePart = (part, pathLabel) => {
-    assertPlainObject(part, pathLabel);
+    requirePlainObject(part, pathLabel);
     if (part.file_id !== undefined || part.fileId !== undefined) {
       throw new OpenAiValidationError(`${pathLabel} cannot reference file_id.`, {
         code: 'UNBOUNDED_CONTEXT_REF_FORBIDDEN',
@@ -929,7 +888,7 @@ function validateDecisionQuestions(questions) {
   const normalizedQuestions = [];
 
   for (let i = 0; i < questions.length; i++) {
-    const q = assertPlainObject(questions[i], `questions[${i}]`);
+    const q = requirePlainObject(questions[i], `questions[${i}]`);
     if (!VALID_DECISION_QUESTION_TYPES.has(q.type)) {
       throw new OpenAiValidationError(
         `questions[${i}].type must be predicate, choice, or score (got "${String(q.type)}").`,
@@ -1223,7 +1182,7 @@ function validateAndBoundResponsesInputTree(input) {
   let imageTokens = 0;
   const walk = (node, pathLabel) => {
     if (typeof node === 'string') return;
-    assertPlainObject(node, pathLabel);
+    requirePlainObject(node, pathLabel);
 
     for (const forbiddenRef of ['file_id', 'fileId', 'file_url', 'fileUrl', 'previous_response_id', 'conversation']) {
       if (node[forbiddenRef] !== undefined && node[forbiddenRef] !== null) {
@@ -1293,7 +1252,7 @@ function validateAndNormalizeResponsesBody(rawParams, {
       : null;
 
   const params = snapshotPlainValue(rawParams, 'Responses params');
-  assertPlainObject(params, 'Responses params');
+  requirePlainObject(params, 'Responses params');
   if (params._offline_draft_only === true || params.offline_draft_only === true) {
     throw new OpenAiPolicyError(
       'Offline draft request (_offline_draft_only) cannot be dispatched or serialized into Batch.',
@@ -1375,7 +1334,7 @@ function validateAndNormalizeResponsesBody(rawParams, {
 
   let effort = null;
   if (wire.reasoning !== null) {
-    assertPlainObject(wire.reasoning, 'reasoning');
+    requirePlainObject(wire.reasoning, 'reasoning');
     if (wire.reasoning.effort !== undefined) {
       if (typeof wire.reasoning.effort !== 'string' || !VALID_REASONING_EFFORTS.has(wire.reasoning.effort)) {
         throw new OpenAiValidationError(
@@ -1411,7 +1370,7 @@ function validateAndNormalizeResponsesBody(rawParams, {
       );
     }
     if (wire.tools.length === 1) {
-      const rawTool = assertPlainObject(wire.tools[0], 'tools[0]');
+      const rawTool = requirePlainObject(wire.tools[0], 'tools[0]');
       if (rawTool.type !== 'web_search') {
         throw new OpenAiValidationError(
           `Responses tool "${String(rawTool.type)}" is forbidden; only { type: "web_search" } is permitted.`,
@@ -1920,7 +1879,7 @@ export function buildBatchJsonl(rawRequests, options = {}) {
   let totalEstimatedMicrosBig = 0n;
 
   for (let i = 0; i < requests.length; i++) {
-    const item = assertPlainObject(requests[i], `requests[${i}]`);
+    const item = requirePlainObject(requests[i], `requests[${i}]`);
     const customId = item.custom_id ?? item.customId;
     if (typeof customId !== 'string' || !customId.trim() || customId.length > 512 || /[\r\n\0]/.test(customId)) {
       throw new OpenAiValidationError(`requests[${i}].custom_id must be a nonempty single-line string (<= 512 chars).`);
@@ -1949,7 +1908,7 @@ export function buildBatchJsonl(rawRequests, options = {}) {
 
     const origBodyRef = rawRequests[i]?.body ?? rawRequests[i]?.request;
     const rawBody = item.body ?? item.request;
-    assertPlainObject(rawBody, `requests[${i}].body`);
+    requirePlainObject(rawBody, `requests[${i}].body`);
 
     const {
       wire,
@@ -2113,10 +2072,10 @@ export function parseBatchOutputJsonl(jsonlText, {
     throw new OpenAiValidationError('Batch output JSONL is empty.');
   }
   if (lineModels !== null && lineModels !== undefined) {
-    assertPlainObject(lineModels, 'lineModels');
+    requirePlainObject(lineModels, 'lineModels');
   }
   if (lineSpecs !== null && lineSpecs !== undefined) {
-    assertPlainObject(lineSpecs, 'lineSpecs');
+    requirePlainObject(lineSpecs, 'lineSpecs');
   }
 
   const seenCustomIds = new Set();
@@ -2409,7 +2368,7 @@ function summarizeSettledBatchUsage(results) {
 }
 
 function validateExternalBatchManifest(rawManifest, { endpoint, allowAstraApi, explicitReservationCents }) {
-  assertPlainObject(rawManifest, 'batchManifest');
+  requirePlainObject(rawManifest, 'batchManifest');
   if (rawManifest.endpoint !== endpoint) {
     throw new OpenAiValidationError(
       `batchManifest.endpoint ("${String(rawManifest.endpoint)}") must match endpoint "${endpoint}".`,
@@ -2440,7 +2399,7 @@ function validateExternalBatchManifest(rawManifest, { endpoint, allowAstraApi, e
       { code: 'BATCH_MANIFEST_INVALID' },
     );
   }
-  assertPlainObject(rawManifest.line_models, 'batchManifest.line_models');
+  requirePlainObject(rawManifest.line_models, 'batchManifest.line_models');
 
   const seenIds = new Set();
   const cleanCustomIds = [];
@@ -2593,7 +2552,7 @@ export class OpenAiClient {
 
   _resolveEffectivePolicy(policy = {}) {
     if (policy !== undefined && policy !== null) {
-      assertPlainObject(policy, 'policy');
+      requirePlainObject(policy, 'policy');
     }
     const p = policy ?? {};
     if (p.maxRetries !== undefined && p.maxRetries !== 0) {
@@ -2769,22 +2728,6 @@ export class OpenAiClient {
     }
   }
 
-  _assertStage4MediaAuthorized(eff, ledger) {
-    if (eff.enableStage4Media !== true) {
-      throw new OpenAiPolicyError(
-        'Stage-4 media generation is disabled by default; pass policy.enableStage4Media: true with explicit authorization.',
-        { code: 'STAGE4_MEDIA_DISABLED', notDispatched: true },
-      );
-    }
-    const policyRow = ledger.getPolicy(eff.accountScope);
-    if (policyRow.allow_stage4_media !== true) {
-      throw new OpenAiPolicyError(
-        `Stage-4 media generation is disabled on budget policy for "${eff.accountScope}" (allow_stage4_media=false).`,
-        { code: 'STAGE4_MEDIA_DISABLED', notDispatched: true },
-      );
-    }
-  }
-
   _resolveApiKeyAndFingerprint(eff) {
     const apiKey = loadOpenAiApiKey({
       credentialFile: eff.credentialFile,
@@ -2884,7 +2827,7 @@ export class OpenAiClient {
       );
     }
     const params = snapshotPlainValue(rawParams, 'Decision params');
-    assertPlainObject(params, 'Decision params');
+    requirePlainObject(params, 'Decision params');
     const eff = this._resolveEffectivePolicy(policy);
     const requestSignal = buildTimeoutSignal(eff.timeoutMs, eff.signal);
 
@@ -2937,7 +2880,7 @@ export class OpenAiClient {
       throw new OpenAiValidationError('prompt_cache_key must be a nonempty string when provided.');
     }
     if (wire.prompt_cache_options !== undefined) {
-      assertPlainObject(wire.prompt_cache_options, 'prompt_cache_options');
+      requirePlainObject(wire.prompt_cache_options, 'prompt_cache_options');
     }
     if (wire.max_output_tokens !== undefined && (!Number.isSafeInteger(wire.max_output_tokens) || wire.max_output_tokens < 1)) {
       throw new OpenAiValidationError('max_output_tokens must be a positive safe integer when provided.');
@@ -4153,6 +4096,34 @@ export class OpenAiClient {
       };
     }
 
+    const pendingResponse = (responseStatus, contentStatus) => ({
+      ok: false,
+      usable: false,
+      status: 'pending_recovery',
+      response_status: responseStatus,
+      content_status: contentStatus,
+      attempt_id: attempt.attempt_id,
+      logical_request_id: attempt.logical_request_id,
+      provider_response_id: returnedId,
+      model: sanitizedBody.model ?? requestedModel,
+      output: [],
+      output_text: '',
+      refusal: null,
+      refusals: [],
+      incomplete_details: null,
+      web_search_calls: extractWebSearchCallsFromOutput(sanitizedBody),
+      usage: provisional.usage,
+      provisional_usage_cost_micros: provisional.micros,
+      usage_cost_micros: null,
+      reserved_cents: attempt.reserved_cents,
+      cleanup: {
+        requested: cleanupRequired,
+        status: cleanupRequired ? 'pending_cleanup' : 'not_requested',
+        verified_404: false,
+      },
+      raw_response: sanitizedBody,
+    });
+
     // P0-15: If caller requested 1x standard/default cap and provider returned 2x fast/priority tier, hold in pending_recovery!
     const returnedTierNorm = typeof sanitizedBody.service_tier === 'string'
       ? sanitizedBody.service_tier.trim().toLowerCase()
@@ -4174,33 +4145,7 @@ export class OpenAiClient {
         rawBodySha256: scrubbedRawSha256,
         reason,
       });
-      return {
-        ok: false,
-        usable: false,
-        status: 'pending_recovery',
-        response_status: typeof sanitizedBody.status === 'string' ? sanitizedBody.status : 'completed',
-        content_status: 'invalid',
-        attempt_id: attempt.attempt_id,
-        logical_request_id: attempt.logical_request_id,
-        provider_response_id: returnedId,
-        model: sanitizedBody.model ?? requestedModel,
-        output: [],
-        output_text: '',
-        refusal: null,
-        refusals: [],
-        incomplete_details: null,
-        web_search_calls: extractWebSearchCallsFromOutput(sanitizedBody),
-        usage: provisional.usage,
-        provisional_usage_cost_micros: provisional.micros,
-        usage_cost_micros: null,
-        reserved_cents: attempt.reserved_cents,
-        cleanup: {
-          requested: cleanupRequired,
-          status: cleanupRequired ? 'pending_cleanup' : 'not_requested',
-          verified_404: false,
-        },
-        raw_response: sanitizedBody,
-      };
+      return pendingResponse(typeof sanitizedBody.status === 'string' ? sanitizedBody.status : 'completed', 'invalid');
     }
 
     const rawStatus = typeof sanitizedBody.status === 'string' ? sanitizedBody.status : '';
@@ -4217,33 +4162,7 @@ export class OpenAiClient {
         rawBodySha256: scrubbedRawSha256,
         reason,
       });
-      return {
-        ok: false,
-        usable: false,
-        status: 'pending_recovery',
-        response_status: rawStatus || 'unknown',
-        content_status: 'invalid',
-        attempt_id: attempt.attempt_id,
-        logical_request_id: attempt.logical_request_id,
-        provider_response_id: returnedId,
-        model: sanitizedBody.model ?? requestedModel,
-        output: [],
-        output_text: '',
-        refusal: null,
-        refusals: [],
-        incomplete_details: null,
-        web_search_calls: extractWebSearchCallsFromOutput(sanitizedBody),
-        usage: provisional.usage,
-        provisional_usage_cost_micros: provisional.micros,
-        usage_cost_micros: null,
-        reserved_cents: attempt.reserved_cents,
-        cleanup: {
-          requested: cleanupRequired,
-          status: cleanupRequired ? 'pending_cleanup' : 'not_requested',
-          verified_404: false,
-        },
-        raw_response: sanitizedBody,
-      };
+      return pendingResponse(rawStatus || 'unknown', 'invalid');
     }
 
     if (rawStatus === 'in_progress' || rawStatus === 'queued') {
@@ -4258,33 +4177,7 @@ export class OpenAiClient {
         rawBodySha256: scrubbedRawSha256,
         reason: `OpenAI response "${returnedId}" is still "${rawStatus}"; retaining reservation and fence.`,
       });
-      return {
-        ok: false,
-        usable: false,
-        status: 'pending_recovery',
-        response_status: rawStatus,
-        content_status: null,
-        attempt_id: attempt.attempt_id,
-        logical_request_id: attempt.logical_request_id,
-        provider_response_id: returnedId,
-        model: sanitizedBody.model ?? requestedModel,
-        output: [],
-        output_text: '',
-        refusal: null,
-        refusals: [],
-        incomplete_details: null,
-        web_search_calls: extractWebSearchCallsFromOutput(sanitizedBody),
-        usage: provisional.usage,
-        provisional_usage_cost_micros: provisional.micros,
-        usage_cost_micros: null,
-        reserved_cents: attempt.reserved_cents,
-        cleanup: {
-          requested: cleanupRequired,
-          status: cleanupRequired ? 'pending_cleanup' : 'not_requested',
-          verified_404: false,
-        },
-        raw_response: sanitizedBody,
-      };
+      return pendingResponse(rawStatus, null);
     }
 
     const extracted = extractResponsesContent(sanitizedBody, { expectsJsonObject, jsonSchema });
@@ -5127,7 +5020,7 @@ export class OpenAiClient {
         });
       }
 
-      const committedUpload = ledger._commitVerifiedBatchUploadReceipt(UPLOAD_AUTHORITY_TOKEN, {
+      const committedUpload = ledger._commitVerifiedBatchUploadReceipt({
         accountScope: eff.accountScope,
         sourceAttemptId: uploadAttempt.attempt_id,
         uploadedFileId,
@@ -5332,7 +5225,7 @@ export class OpenAiClient {
 
     let clonedMetadata = null;
     if (params.metadata !== undefined && params.metadata !== null) {
-      assertPlainObject(params.metadata, 'metadata');
+      requirePlainObject(params.metadata, 'metadata');
       assertCleanOutgoingPayload(params.metadata, 'batch_metadata');
       clonedMetadata = snapshotPlainValue(params.metadata, 'metadata');
     }
@@ -5449,7 +5342,7 @@ export class OpenAiClient {
         }
         inputFileId = safeUploadedId;
 
-        ledger._commitVerifiedBatchUploadReceipt(UPLOAD_AUTHORITY_TOKEN, {
+        ledger._commitVerifiedBatchUploadReceipt({
           accountScope: eff.accountScope,
           sourceAttemptId: attempt.attempt_id,
           uploadedFileId: inputFileId,
@@ -5594,11 +5487,8 @@ export class OpenAiClient {
           'BATCH_ATTEMPT_NO_LONGER_ACTIVE',
           'BATCH_MONTH_ROLLOVER_ABORTED',
           'BUDGET_DISABLED',
-          'STAGE4_MEDIA_DISABLED',
           'ACCOUNT_FENCED_PENDING_RECOVERY',
           'MONTHLY_BUDGET_EXCEEDED',
-          'LEGACY_NOT_RECONCILED',
-          'UNVERIFIED_SYNTHETIC_BASELINE',
           'PLATFORM_BILLING_CONTROLS_UNVERIFIED',
           'MONTH_CLOCK_OVERRIDE_FORBIDDEN',
         ].includes(err.code)
