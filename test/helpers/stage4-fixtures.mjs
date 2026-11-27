@@ -12,8 +12,19 @@ export function makeSteadyPeer({
   monthlyUnits = 120,
   title = 'Solid Wood Desktop Paint Rack Organizer',
   fulfillment = 'FBA',
+  startDate = '2026-08-30',
+  days = 90,
   ...extra
 }) {
+  const includeDefaultKeepa =
+    extra.keepa_trend === undefined &&
+    extra.keepa === undefined &&
+    extra.keepa_peer_facts === undefined &&
+    extra.series === undefined &&
+    extra.has_timestamps !== false &&
+    extra.keepa_has_timestamps !== false &&
+    extra.keepa_90d_steady !== false &&
+    extra.keepa_price_steady !== false;
   return {
     asin,
     parent_asin: `P${asin.slice(1)}`,
@@ -22,6 +33,7 @@ export function makeSteadyPeer({
     price_usd: priceUsd,
     monthly_units: monthlyUnits,
     age_days: ageDays,
+    ...(includeDefaultKeepa ? { keepa_trend: makeDatedKeepaReceipt({ asin, startDate, days, priceUsd }).keepa_trend } : {}),
     keepa_90d_steady: true,
     keepa_90d_median_usd: priceUsd,
     ...extra,

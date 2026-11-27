@@ -1155,6 +1155,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     goods_cny_per_unit: rawGoodsCnyPerUnit = null,
     procurement_usd: rawProcurementUsd = null,
     bare_goods_screening = undefined,
+    cost_basis = undefined,
     domestic_freight_advisory_cny_total = null,
     domestic_freight_cny_total = null,
     domestic_freight_cny_per_unit = null,
@@ -1278,11 +1279,18 @@ export function evaluateEarlyScreen(input, options = {}) {
   const nestedPromoInvalid =
     (input?.source_inputs && Object.hasOwn(input.source_inputs, 'first_order_promotion') && input.source_inputs.first_order_promotion !== false) ||
     (input?.procurement && typeof input.procurement === 'object' && Object.hasOwn(input.procurement, 'first_order_promotion') && input.procurement.first_order_promotion !== false);
-  const hasExplicitDomesticInput =
-    (rawDomesticUsd !== null && rawDomesticUsd !== undefined) ||
-    (domestic_freight_cny_per_unit !== null && domestic_freight_cny_per_unit !== undefined) ||
-    (domestic_freight_cny_total !== null && domestic_freight_cny_total !== undefined);
-  const bareGoodsMode = bare_goods_screening === true || (bare_goods_screening !== false && !hasExplicitDomesticInput);
+  if (cost_basis !== undefined && cost_basis !== null && cost_basis !== 'bare_goods_1688' && cost_basis !== 'landed_domestic_explicit') {
+    throw new TypeError(`Invalid cost_basis "${cost_basis}"; expected "bare_goods_1688" or "landed_domestic_explicit".`);
+  }
+  if ((bare_goods_screening === true && cost_basis === 'landed_domestic_explicit') ||
+      (bare_goods_screening === false && cost_basis === 'bare_goods_1688')) {
+    throw new TypeError(`Conflicting bare_goods_screening (${bare_goods_screening}) and cost_basis (${cost_basis}).`);
+  }
+  const explicitLandedRequested =
+    bare_goods_screening === false ||
+    cost_basis === 'landed_domestic_explicit' ||
+    (bare_goods_screening !== true && cost_basis !== 'bare_goods_1688' && rawDomesticUsd !== null && rawDomesticUsd !== undefined);
+  const bareGoodsMode = !explicitLandedRequested;
   const freightOnlyPromoIgnored = bareGoodsMode && goods_first_order_promotion === false;
   const pricePass = price_usd >= minimum_price_usd;
   const orderUnitsValid = !skuLinesConflict && !nestedSetsInvalid && Number.isSafeInteger(order_units) && order_units >= 100 && !skuLineOrderedMismatch && (!orderPlan || order_units === orderPlan.allocated_sets);
@@ -1356,9 +1364,23 @@ export function evaluateEarlyScreen(input, options = {}) {
 
   const advisoryDomesticFreightCny = finite(domestic_freight_advisory_cny_total) && domestic_freight_advisory_cny_total >= 0
     ? domestic_freight_advisory_cny_total
-    : (bare_goods_screening === true && finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0
+    : (bareGoodsMode && finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0
       ? domestic_freight_cny_total
-      : null);
+      : (bareGoodsMode && finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0 && finite(order_units) && order_units > 0
+        ? round(domestic_freight_cny_per_unit * order_units, 4)
+        : null));
+  const advisoryDomesticCnyPerUnit = bareGoodsMode
+    ? (finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0
+      ? domestic_freight_cny_per_unit
+      : (advisoryDomesticFreightCny !== null && finite(order_units) && order_units > 0
+        ? round(advisoryDomesticFreightCny / order_units, 6)
+        : null))
+    : null;
+  const advisoryDomesticUsdPerUnit = bareGoodsMode
+    ? (advisoryDomesticCnyPerUnit !== null && finite(fx) && fx > 0
+      ? round(advisoryDomesticCnyPerUnit / fx, 6)
+      : (finite(rawDomesticUsd) && rawDomesticUsd >= 0 ? round(rawDomesticUsd, 6) : null))
+    : null;
 
   let domesticUsd = null;
   let domCnyDerivation = null;
@@ -1982,6 +2004,27 @@ export function evaluateEarlyScreen(input, options = {}) {
     packagingRedesignShortlist = pkgCheck;
   }
 
+  const domesticFreightAdvisory = bareGoodsMode && (
+    advisoryDomesticFreightCny !== null ||
+    advisoryDomesticCnyPerUnit !== null ||
+    advisoryDomesticUsdPerUnit !== null
+  )
+    ? {
+      advisory_only: true,
+      excluded_from_bare_goods_margin: true,
+      cny_total: advisoryDomesticFreightCny,
+      cny_per_unit: advisoryDomesticCnyPerUnit,
+      usd_per_unit: advisoryDomesticUsdPerUnit,
+      landed_contribution_usd_if_incurred: ledger.contribution_usd !== null && advisoryDomesticUsdPerUnit !== null
+        ? round(ledger.contribution_usd - advisoryDomesticUsdPerUnit, 6)
+        : null,
+      landed_margin_if_incurred: ledger.contribution_usd !== null && ledger.net_revenue_usd > 0 && advisoryDomesticUsdPerUnit !== null
+        ? round((ledger.contribution_usd - advisoryDomesticUsdPerUnit) / ledger.net_revenue_usd, 6)
+        : null,
+      note_zh: '仅旁路参考：1688 初筛默认按裸货价核算，可见国内运费不扣减初筛毛利，大货物流另谈。',
+    }
+    : null;
+
   return {
     gate_status: gateStatus,
     proceed_to_21_items: gateStatus === 'pass',
@@ -1991,6 +2034,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     cost_basis: bareGoodsMode ? 'bare_goods_1688' : 'landed_domestic_explicit',
     ...(bareGoodsMode ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
     ...(advisoryDomesticFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomesticFreightCny } : {}),
+    ...(domesticFreightAdvisory ? { domestic_freight_advisory: domesticFreightAdvisory } : {}),
     ...(headhaulRes.advisory_replenishment_note ? { advisory_replenishment_note: headhaulRes.advisory_replenishment_note } : {}),
     returns_processing_components: returnsComponents,
     ...(headhaulRes.a4_applied ? { headhaul_a4_applied: headhaulRes.a4_applied } : {}),

@@ -2203,8 +2203,59 @@ export function ingestTrialSpecification(spec, profile, {
         for (const member of cand.newcomer_cohort.members) {
           const mAsin = nonemptyStr(member?.asin) ? member.asin.trim().toUpperCase() : null;
           const mKeepa = mAsin ? entryKeepaByAsin.get(mAsin) : null;
-          if (mKeepa?.review_trajectory?.has_drop_event && member.keepa_review_drop_detected === undefined) {
+          const revTraj = mKeepa?.review_trajectory ?? null;
+          if (!revTraj) continue;
+          if (revTraj.has_drop_event && member.keepa_review_drop_detected === undefined) {
             member.keepa_review_drop_detected = true;
+          }
+          if (revTraj.has_jump_event && member.keepa_review_jump_detected === undefined) {
+            member.keepa_review_jump_detected = true;
+          }
+          const rawEvents = Array.isArray(revTraj.events) ? revTraj.events : [];
+          if (rawEvents.length > 0) {
+            const normalizedEvents = rawEvents.map(ev => ({
+              direction: ev.direction ?? (ev.delta < 0 ? 'drop' : 'jump'),
+              delta: ev.delta,
+              from_count: ev.from_count,
+              to_count: ev.to_count,
+              date_from: ev.date_from ?? null,
+              date_to: ev.date_to ?? null,
+              asin: ev.asin ?? mAsin,
+            }));
+            if (member.keepa_review_anomaly_events === undefined) {
+              member.keepa_review_anomaly_events = normalizedEvents;
+            }
+            if (member.keepa_review_anomaly_summary === undefined) {
+              const jumpEvents = normalizedEvents.filter(ev => ev.direction === 'jump');
+              const dropEvents = normalizedEvents.filter(ev => ev.direction === 'drop');
+              const largestJump = jumpEvents.reduce((best, ev) => (!best || ev.delta > best.delta ? ev : best), null);
+              const largestDrop = dropEvents.reduce((best, ev) => (!best || ev.delta < best.delta ? ev : best), null);
+              const parts = [];
+              if (largestJump) {
+                const datePart = largestJump.date_from && largestJump.date_to
+                  ? `，${largestJump.date_from} 至 ${largestJump.date_to}`
+                  : '';
+                parts.push(`最大单步增评 +${largestJump.delta}（${largestJump.from_count}->${largestJump.to_count}${datePart}）`);
+              }
+              if (largestDrop) {
+                const datePart = largestDrop.date_from && largestDrop.date_to
+                  ? `，${largestDrop.date_from} 至 ${largestDrop.date_to}`
+                  : '';
+                parts.push(`最大单步掉评 ${largestDrop.delta}（${largestDrop.from_count}->${largestDrop.to_count}${datePart}）`);
+              }
+              member.keepa_review_anomaly_summary = {
+                asin: mAsin,
+                parent_asin: nonemptyStr(member?.parent_asin) ? member.parent_asin.trim().toUpperCase() : null,
+                has_jump: jumpEvents.length > 0,
+                has_drop: dropEvents.length > 0,
+                event_count: normalizedEvents.length,
+                max_jump_delta: largestJump ? largestJump.delta : 0,
+                max_drop_delta: largestDrop ? largestDrop.delta : 0,
+                largest_jump: largestJump,
+                largest_drop: largestDrop,
+                note_zh: `Keepa 评论曲线记录到波动（共 ${normalizedEvents.length} 次）：${parts.join('；')}；仅作客观留底，不自动扣分或淘汰。`,
+              };
+            }
           }
         }
       }
@@ -2216,6 +2267,7 @@ export function ingestTrialSpecification(spec, profile, {
       cand.price_band_analysis = analyzeMainstreamPriceBand(mergedPeers, {
         ...(entryAsOfDate ? { as_of_date: entryAsOfDate } : {}),
         ...(entry.price_band_options ?? {}),
+        require_keepa_steady_evidence: true,
       });
     }
     const targetVariantAsin = nonemptyStr(entry.sp_api_calibration_inputs?.asin)

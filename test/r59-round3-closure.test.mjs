@@ -20,6 +20,7 @@ import { containsSecretToken, sanitizeDiagnosticText } from '../src/contracts.mj
 import { openSelectionStore, sha256Hex } from '../src/store.mjs';
 import { replayBatchIntoStore } from '../src/history-import.mjs';
 import { analyzeMainstreamPriceBand, evaluateGate0CategoryBoundary } from '../src/price-band.mjs';
+import { makeDatedKeepaReceipt } from './helpers/stage4-fixtures.mjs';
 import { resolveTargetChildSalesObservation } from '../src/observations.mjs';
 import {
   buildPairedSeasonalOperatingPeriods,
@@ -411,8 +412,8 @@ test('Step 1.2: Excluded/deferred priority over crossing_30pct, pre-score Terra 
     // 3) Distinct factory_id cap: 3 quote revisions from Factory A count as 1 factory, allowing Factory B!
     store.upsertCandidateForm({ form_id: 'form-fac-cap', label: 'Adult Storage Rack', buyer_task: 'Hold pantry jars', saleable_set_composition: { qty: 1 } });
     const pbMature = analyzeMainstreamPriceBand([
-      { asin: 'B0FAC00001', price_usd: 42.99, fulfillment: 'FBA', monthlySales: 80, age_days: 400, keepa_price_steady: true },
-      { asin: 'B0FAC00002', price_usd: 44.99, fulfillment: 'FBA', monthlySales: 90, age_days: 420, keepa_price_steady: true },
+      { asin: 'B0FAC00001', price_usd: 42.99, fulfillment: 'FBA', monthlySales: 80, age_days: 400, keepa_trend: makeDatedKeepaReceipt({ asin: 'B0FAC00001', startDate: '2026-08-27', days: 90, priceUsd: 42.99 }).keepa_trend },
+      { asin: 'B0FAC00002', price_usd: 44.99, fulfillment: 'FBA', monthlySales: 90, age_days: 420, keepa_trend: makeDatedKeepaReceipt({ asin: 'B0FAC00002', startDate: '2026-08-27', days: 90, priceUsd: 44.99 }).keepa_trend },
     ], { as_of_date: '2026-11-24', strict_mature_only: true });
     const g1aFac = runGate1AForForm(store, {
       form_id: 'form-fac-cap',

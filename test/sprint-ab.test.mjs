@@ -44,6 +44,7 @@ import { attachGate1APriceCliffStress, runGate1AForForm, runGate1BForForm, runPh
 import { attachStoreDiscoveryProvenance } from '../src/discovery.mjs';
 import { scoreBatch, scoreCandidate } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
+import { makeDatedKeepaReceipt } from './helpers/stage4-fixtures.mjs';
 
 const DEFAULT_R59_UI_READBACK = {
   logged_in: true,
@@ -1421,13 +1422,14 @@ test('GPT Review Regressions H1-H10 & M1-M9 & L1-L2: fees, guards, judgments, 4-
     assert.equal(g1aChild.gate0.hard_exclusion, true);
 
     sTight.upsertCandidateForm({ form_id: 'f-wide-g1a', label: 'Desk Shelf', buyer_task: 'Organize desk', saleable_set_composition: { qty: 1 } });
+    const wideStart = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
     const g1aWide = runGate1AForForm(sTight, {
       form_id: 'f-wide-g1a',
       profile_revision: 59,
       scenarios: [makeGate1AScenario({ price_usd: 54.99 })],
       price_band_analysis: [
-        { asin: 'W1', price_usd: 25, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400, keepa_price_steady: true },
-        { asin: 'W2', price_usd: 75, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400, keepa_price_steady: true },
+        { asin: 'W1', price_usd: 25, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400, keepa_trend: makeDatedKeepaReceipt({ asin: 'W1', startDate: wideStart, days: 91, priceUsd: 25 }).keepa_trend },
+        { asin: 'W2', price_usd: 75, units_30d: 300, fulfillment_channel: 'FBA', age_days: 400, keepa_trend: makeDatedKeepaReceipt({ asin: 'W2', startDate: wideStart, days: 91, priceUsd: 75 }).keepa_trend },
       ],
     });
     assert.equal(g1aWide.gate_status, 'gate1a_passed');
