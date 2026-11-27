@@ -752,34 +752,17 @@ export function extractNewcomerReviewOriginBreakdown(raw = {}) {
   };
 }
 
-function hasRawReviewPayloadInObject(obj, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 4) return false;
-  if (Array.isArray(obj)) return true;
-  if (obj.reviews_raw !== undefined && obj.reviews_raw !== null) return true;
-  if (Array.isArray(obj.reviews_list) || Array.isArray(obj.reviews) || Array.isArray(obj.content)) return true;
-  if (obj.structuredContent && typeof obj.structuredContent === 'object') return true;
-  if (obj.data !== undefined && obj.data !== null && typeof obj.data === 'object') {
-    return hasRawReviewPayloadInObject(obj.data, depth + 1);
-  }
-  return false;
-}
-
-function stripRawReviewPayloadFromObject(obj, depth = 0) {
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || depth > 4) return obj;
-  const out = { ...obj };
-  if (out.reviews_raw !== undefined && out.reviews_raw !== null) delete out.reviews_raw;
-  if (Array.isArray(out.reviews_list)) delete out.reviews_list;
-  if (Array.isArray(out.reviews)) delete out.reviews;
-  if (Array.isArray(out.content)) delete out.content;
-  if (out.structuredContent && typeof out.structuredContent === 'object') delete out.structuredContent;
-  if (out.data !== undefined && out.data !== null && typeof out.data === 'object') {
-    if (Array.isArray(out.data)) {
-      delete out.data;
-    } else if (hasRawReviewPayloadInObject(out.data, depth + 1)) {
-      out.data = stripRawReviewPayloadFromObject(out.data, depth + 1);
-    }
-  }
-  return out;
+function hasDirectRawReviewFields(obj) {
+  return Boolean(
+    obj && typeof obj === 'object' && (
+      Array.isArray(obj) ||
+      (obj.reviews_raw !== undefined && obj.reviews_raw !== null) ||
+      Array.isArray(obj.reviews_list) ||
+      Array.isArray(obj.reviews) ||
+      Array.isArray(obj.content) ||
+      (obj.structuredContent && typeof obj.structuredContent === 'object')
+    ),
+  );
 }
 
 /**
@@ -789,10 +772,23 @@ function stripRawReviewPayloadFromObject(obj, depth = 0) {
  */
 export function sanitizeNewcomerMemberReviews(member) {
   if (!member || typeof member !== 'object' || Array.isArray(member)) return member;
-  if (!hasRawReviewPayloadInObject(member)) return member;
+  const hasDirect = hasDirectRawReviewFields(member);
+  const hasNestedData = Boolean(
+    member.data && typeof member.data === 'object' && (
+      hasDirectRawReviewFields(member.data) ||
+      hasDirectRawReviewFields(member.data.data)
+    ),
+  );
+  if (!hasDirect && !hasNestedData) return member;
 
   const originBreakdown = extractNewcomerReviewOriginBreakdown(member);
-  const sanitized = stripRawReviewPayloadFromObject(member);
+  const sanitized = { ...member };
+  delete sanitized.reviews_raw;
+  if (Array.isArray(sanitized.reviews_list)) delete sanitized.reviews_list;
+  if (Array.isArray(sanitized.reviews)) delete sanitized.reviews;
+  if (Array.isArray(sanitized.content)) delete sanitized.content;
+  if (sanitized.structuredContent && typeof sanitized.structuredContent === 'object') delete sanitized.structuredContent;
+  if (hasNestedData) delete sanitized.data;
   if (originBreakdown) {
     sanitized.review_origin_breakdown = originBreakdown;
   } else {
