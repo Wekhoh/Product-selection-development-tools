@@ -1116,9 +1116,15 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     lone_newcomer_note: null,
     absence_note: null,
   };
-  const pending = reason => ({
-    low: missing(lowDef, reason, cohort), natural: missing(naturalDef, reason, cohort), diagnostics,
-  });
+  const reviewAnomalyAdvisories = [];
+  const pending = reason => {
+    if (isR59 && reviewAnomalyAdvisories.length > 0) {
+      diagnostics.review_anomaly_advisories = reviewAnomalyAdvisories;
+    }
+    return {
+      low: missing(lowDef, reason, cohort), natural: missing(naturalDef, reason, cohort), diagnostics,
+    };
+  };
 
   const isR59 = profile.revision >= 59;
   const validGrains = isR59
@@ -1222,7 +1228,6 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
 
   let invalidReference = false;
   const classified = [];
-  const reviewAnomalyAdvisories = [];
 
   for (const member of cohort.members) {
     const record = { ...member, effective_status: member?.status ?? 'pending', age_days: null, launch_calendar_date: null };
@@ -1259,6 +1264,95 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     if (launchCal && launchCal <= obsCal) {
       record.launch_calendar_date = launchCal;
       record.age_days = calendarDayDiff(obsCal, launchCal);
+    }
+
+    let keepaAnomalyRecorded = false;
+    const recordKeepaReviewAnomaly = ({ allowHighRatingFallback = false } = {}) => {
+      if (!isR59 || keepaAnomalyRecorded) return;
+      const rawSummary = member?.keepa_review_anomaly_summary && typeof member.keepa_review_anomaly_summary === 'object'
+        ? member.keepa_review_anomaly_summary
+        : null;
+      const rawEventsList = Array.isArray(member?.keepa_review_anomaly_events) && member.keepa_review_anomaly_events.length > 0
+        ? member.keepa_review_anomaly_events
+        : [rawSummary?.largest_jump, rawSummary?.largest_drop].filter(e => e && typeof e === 'object');
+      const normalizedEvents = rawEventsList
+        .map(ev => {
+          if (!ev || typeof ev !== 'object') return null;
+          const fromCnt = number(ev.from_count) ? ev.from_count : null;
+          const toCnt = number(ev.to_count) ? ev.to_count : null;
+          const rawDelta = number(ev.delta)
+            ? ev.delta
+            : (fromCnt !== null && toCnt !== null ? toCnt - fromCnt : null);
+          const dir = ev.direction === 'drop' || ev.kind === 'review_count_drop' || (rawDelta !== null && rawDelta < 0)
+            ? 'drop'
+            : (ev.direction === 'jump' || ev.kind === 'review_count_increase' || (rawDelta !== null && rawDelta > 0) ? 'jump' : null);
+          if (!dir) return null;
+          const dateFrom = text(ev.date_from) ? ev.date_from.trim() : null;
+          const dateTo = text(ev.date_to) ? ev.date_to.trim() : (text(ev.at) ? ev.at.trim() : null);
+          return {
+            direction: dir,
+            delta: rawDelta,
+            from_count: fromCnt,
+            to_count: toCnt,
+            date_from: dateFrom,
+            date_to: dateTo,
+            asin: text(ev.asin) ? ev.asin.trim() : (text(member?.asin) ? member.asin.trim() : null),
+          };
+        })
+        .filter(Boolean);
+      const hasJump = Boolean(
+        member?.keepa_review_jump_detected === true ||
+        rawSummary?.has_jump === true ||
+        normalizedEvents.some(e => e.direction === 'jump'),
+      );
+      const hasDrop = Boolean(
+        member?.keepa_review_drop_detected === true ||
+        rawSummary?.has_drop === true ||
+        normalizedEvents.some(e => e.direction === 'drop'),
+      );
+      const hasLegacyOrHighRatingAnomaly = allowHighRatingFallback && Boolean(
+        member?.keepa_review_anomaly === true ||
+        member?.review_velocity_anomaly === true ||
+        member?.suspected_merged_or_vine_spike === true ||
+        (ratingsReading.value !== null && ratingsReading.value >= 100 && record.age_days !== null && record.age_days <= 90),
+      );
+      if (!hasJump && !hasDrop && normalizedEvents.length === 0 && !hasLegacyOrHighRatingAnomaly) return;
+      const formatEventZh = ev => {
+        const dStr = ev.date_from && ev.date_to && ev.date_from !== ev.date_to
+          ? `${ev.date_from}→${ev.date_to} `
+          : (ev.date_to || ev.date_from ? `${ev.date_to || ev.date_from} ` : '');
+        const dirLabel = ev.direction === 'drop' ? '骤降' : '跃升';
+        const deltaStr = ev.delta !== null ? ` ${ev.delta > 0 ? `+${ev.delta}` : ev.delta}` : '';
+        const cntStr = ev.from_count !== null && ev.to_count !== null ? `（${ev.from_count} → ${ev.to_count}）` : '';
+        return `${dStr}${dirLabel}${deltaStr}${cntStr}`.trim();
+      };
+      const dirWords = [hasJump ? '跃升' : '', hasDrop ? '骤降' : ''].filter(Boolean).join('／');
+      const asinLabel = text(member?.asin) ? member.asin.trim() : '未命名ASIN';
+      const anomalyNote = text(member?.keepa_review_anomaly_note)
+        ? member.keepa_review_anomaly_note.trim()
+        : text(rawSummary?.note_zh)
+          ? rawSummary.note_zh.trim()
+          : normalizedEvents.length > 0
+            ? `90天内新品 ${asinLabel} Keepa 评论变动：${normalizedEvents.map(formatEventZh).join('；')}（非阻断提示，零扣分，请人工核查变体归属与 Vine/VP/直评构成）。`
+            : (hasJump || hasDrop)
+              ? `90天内新品 ${asinLabel} 存在 Keepa 评论${dirWords}标记：请人工核查最早评论日期、变体归属与 Vine/VP/直评构成（非阻断提示，零扣分）。`
+              : `90天内新品 ${asinLabel} 评价数达 ${ratingsReading.value ?? '高'} 条或存在 Keepa 评论陡增标记：请人工核查最早评论日期、变体归属与 Vine/VP/直评构成（非阻断提示，不一刀切淘汰）。`;
+      record.keepa_review_anomaly_advisory = anomalyNote;
+      reviewAnomalyAdvisories.push({
+        asin: member.asin ?? null,
+        family_id: member.family_id ?? null,
+        parent_asin: text(rawSummary?.parent_asin) ? rawSummary.parent_asin.trim() : (text(member?.parent_asin) ? member.parent_asin.trim() : null),
+        age_days: record.age_days,
+        ratings: ratingsReading.value,
+        has_jump: hasJump,
+        has_drop: hasDrop,
+        events: normalizedEvents,
+        note_zh: anomalyNote,
+      });
+      keepaAnomalyRecorded = true;
+    };
+    if (member?.comparability_verdict !== 'excluded_different_task') {
+      recordKeepaReviewAnomaly({ allowHighRatingFallback: false });
     }
 
     const pushClassified = (kind, poolEligible, missingPoolStats) => {
@@ -1377,23 +1471,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       continue;
     }
 
-    if (isR59 && (
-      member?.keepa_review_anomaly === true ||
-      member?.review_velocity_anomaly === true ||
-      member?.suspected_merged_or_vine_spike === true ||
-      (ratingsReading.value !== null && ratingsReading.value >= 100 && record.age_days !== null && record.age_days <= 90)
-    )) {
-      const anomalyNote = text(member?.keepa_review_anomaly_note)
-        ? member.keepa_review_anomaly_note.trim()
-        : `90天内新品 ${member.asin} 评价数达 ${ratingsReading.value ?? '高'} 条或存在 Keepa 评论陡增标记：请人工核查最早评论日期、变体归属与 Vine/VP/直评构成（非阻断提示，不一刀切淘汰）。`;
-      record.keepa_review_anomaly_advisory = anomalyNote;
-      reviewAnomalyAdvisories.push({
-        asin: member.asin,
-        age_days: record.age_days,
-        ratings: ratingsReading.value,
-        note_zh: anomalyNote,
-      });
-    }
+    recordKeepaReviewAnomaly({ allowHighRatingFallback: true });
 
     if (record.effective_status === 'ramp_up_zero_sales') {
       if (record.age_days >= 30 || !unitsReading.exactZero) {
@@ -2985,6 +3063,22 @@ const PRIMARY_OFF_PEAK_MONTHS = [2, 3, 4, 5, 6, 7, 8, 9];
 const PRIMARY_OFF_PEAK_MONTHS_R59 = [2, 3, 4, 5, 6, 7, 8, 9, 10];
 const activePricingScenarios = scenarios => (Array.isArray(scenarios) ? scenarios.filter(s => s?.excluded_from_active_pricing !== true) : []);
 
+/**
+ * Single source of truth for whether a scored scenario represents a confirmed, usable active pricing scenario
+ * (never confirmed_excluded, pending_evidence, sensitivity_only, incoherent, or unanchored).
+ */
+export function isUsableActivePricingScenario(sc) {
+  if (!sc || typeof sc !== 'object') return false;
+  if (sc.excluded_from_active_pricing === true) return false;
+  const linkStatus = sc.comparability_linkage?.status ?? null;
+  if (linkStatus === 'confirmed_excluded' || linkStatus === 'pending_evidence') return false;
+  if (sc.coherence_supported !== true) return false;
+  if (sc.price_anchor_supported === false) return false;
+  const calc = sc.input?.calculation;
+  if (calc?.status === 'sensitivity_only' || calc?.scoring_supported !== true) return false;
+  return true;
+}
+
 function isPrimaryOffPeakMonthsList(months) {
   if (!Array.isArray(months)) return false;
   if (months.length === PRIMARY_OFF_PEAK_MONTHS.length && PRIMARY_OFF_PEAK_MONTHS.every(m => months.includes(m))) {
@@ -4150,14 +4244,16 @@ export function scoreCandidate(candidate, profile, internal = null) {
     reference_bid_usd: refBidUsd,
     denominator_basis: 'ad_orders / ad_clicks (clickConvRate — never compare against search purchaseRate)',
     scenarios: profit.diagnostics.scenarios.map(sc => {
-      const calc = sc.input?.calculation;
-      const contrib = calc?.status === 'sensitivity_only' ? calc?.contribution_usd : sc.input?.contribution_usd?.value;
-      const excluded = sc.excluded_from_active_pricing === true;
+      const excluded = sc.excluded_from_active_pricing === true || sc.comparability_linkage?.status === 'confirmed_excluded';
+      const pendingComp = !excluded && sc.comparability_linkage?.status === 'pending_evidence';
+      const usable = isUsableActivePricingScenario(sc);
+      const contrib = usable ? sc.input?.contribution_usd?.value : null;
       return {
         id: sc.id,
-        contribution_usd: excluded ? null : (number(contrib) ? contrib : null),
-        break_even_click_cvr: excluded ? null : (number(contrib) && contrib > 0 ? Math.round((refBidUsd / contrib) * 1e6) / 1e6 : null),
+        contribution_usd: usable && number(contrib) ? contrib : null,
+        break_even_click_cvr: usable && number(contrib) && contrib > 0 ? Math.round((refBidUsd / contrib) * 1e6) / 1e6 : null,
         ...(excluded ? { excluded_from_active_pricing: true } : {}),
+        ...(pendingComp ? { comparability_status: 'pending_evidence' } : {}),
       };
     }),
   };
