@@ -4,6 +4,7 @@ import { estimateGate1A2027, solveMinPriceForMargin2027 } from '../src/fba-calcu
 import { runGate1AForForm, runGate1BForForm, runOptionalRightsPreScreen } from '../src/pipeline.mjs';
 import { analyzeMainstreamPriceBand, tightenClusterBands } from '../src/price-band.mjs';
 import { openSelectionStore } from '../src/store.mjs';
+import { STAGE4_AS_OF_DATE, makeDatedKeepaReceipt } from './helpers/stage4-fixtures.mjs';
 
 function scenario(overrides = {}) {
   return {
@@ -75,16 +76,17 @@ function quoteFor(store, formId, overrides = {}) {
 }
 
 test('heavy single-coupon discounts at the >=20% r59 boundary and <=90d newcomers stay outside regular and cluster price bands', () => {
-  const base = { fulfillment: 'FBA', age_days: 400, keepa_price_steady: true, monthly_units: 40 };
+  const datedKeepa = (asin, priceUsd) => makeDatedKeepaReceipt({ asin, startDate: '2026-08-30', days: 90, priceUsd }).keepa_trend;
+  const base = { fulfillment: 'FBA', age_days: 400, monthly_units: 40 };
   const listings = [
-    { ...base, asin: 'COUPON-A', list_price_usd: 30, net_price_usd: 24.00, monthly_units: 800 },
-    { ...base, asin: 'COUPON-B', list_price_usd: 32, net_price_usd: 24.90, monthly_units: 500 },
-    { ...base, asin: 'REGULAR-A', price_usd: 29.99, keepa_90d_median_usd: 35.27 },
-    { ...base, asin: 'REGULAR-B', price_usd: 31.99 },
+    { ...base, asin: 'COUPON-A', list_price_usd: 30, net_price_usd: 24.00, monthly_units: 800, keepa_price_steady: true },
+    { ...base, asin: 'COUPON-B', list_price_usd: 32, net_price_usd: 24.90, monthly_units: 500, keepa_price_steady: true },
+    { ...base, asin: 'REGULAR-A', price_usd: 29.99, keepa_90d_median_usd: 35.27, keepa_trend: datedKeepa('REGULAR-A', 29.99) },
+    { ...base, asin: 'REGULAR-B', price_usd: 31.99, keepa_trend: datedKeepa('REGULAR-B', 31.99) },
     { ...base, asin: 'YOUNG-A', age_days: 40, price_usd: 30.99, keepa_90d_median_usd: 40 },
   ];
-  const analysis = analyzeMainstreamPriceBand(listings, { profile_revision: 59 });
-  assert.deepEqual(analysis, analyzeMainstreamPriceBand([...listings].reverse(), { profile_revision: 59 }));
+  const analysis = analyzeMainstreamPriceBand(listings, { profile_revision: 59, as_of_date: STAGE4_AS_OF_DATE });
+  assert.deepEqual(analysis, analyzeMainstreamPriceBand([...listings].reverse(), { profile_revision: 59, as_of_date: STAGE4_AS_OF_DATE }));
   assert.deepEqual(analysis.spiral_watch.map(r => [r.asin, r.watch_reasons]), [
     ['COUPON-A', ['heavy_coupon_outlier']],
     ['COUPON-B', ['heavy_coupon_outlier']],
@@ -137,13 +139,15 @@ test('Gate 1A isolates the observed watch prices while retaining a different reg
   t.after(() => store.close());
   const formId = 'watched-prices';
   register(store, formId);
-  const base = { fulfillment: 'FBA', age_days: 400, keepa_price_steady: true, monthly_units: 40 };
+  const recentStart = new Date(Date.now() - 90 * 86_400_000).toISOString().slice(0, 10);
+  const datedKeepa = (asin, priceUsd) => makeDatedKeepaReceipt({ asin, startDate: recentStart, days: 91, priceUsd }).keepa_trend;
+  const base = { fulfillment: 'FBA', age_days: 400, monthly_units: 40 };
   const listings = [
     { ...base, asin: 'LAUNCH', age_days: 45, price_usd: 21 },
     { ...base, asin: 'COUPON', list_price_usd: 40, net_price_usd: 22 },
     { ...base, asin: 'YOUNG-COUPON', age_days: 45, list_price_usd: 35, net_price_usd: 28 },
-    { ...base, asin: 'REG-A', price_usd: 28 },
-    { ...base, asin: 'REG-B', price_usd: 28.50 },
+    { ...base, asin: 'REG-A', price_usd: 28, keepa_trend: datedKeepa('REG-A', 28) },
+    { ...base, asin: 'REG-B', price_usd: 28.50, keepa_trend: datedKeepa('REG-B', 28.50) },
   ];
   const watched = listings.slice(0, 3).map(peer => scenario({
     id: peer.asin, asin: peer.asin.toLowerCase(), price_usd: peer.net_price_usd ?? peer.price_usd,
@@ -153,7 +157,7 @@ test('Gate 1A isolates the observed watch prices while retaining a different reg
   assert.deepEqual(held.scenarios.map(s => s.price_basis), [
     'newcomer_le_90d_launch_ref', 'heavy_coupon_outlier', 'young_heavy_coupon_outlier',
   ]);
-  const listingsWithSteadyPeer = [...listings, { ...base, asin: 'REG-STEADY', price_usd: 40 }];
+  const listingsWithSteadyPeer = [...listings, { ...base, asin: 'REG-STEADY', price_usd: 40, keepa_trend: datedKeepa('REG-STEADY', 40) }];
   const admitted = runGate1AForForm(store, {
     form_id: formId,
     profile_revision: 59,

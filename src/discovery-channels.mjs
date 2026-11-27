@@ -232,12 +232,15 @@ export const DISCOVERY_CHANNELS = Object.freeze({
   }),
   ss_vine_sustained_traction: Object.freeze({
     channel_id: 'ss_vine_sustained_traction',
-    label: 'Vine 2/10/30-Tier Post-Review Month-2 Sustained Traction',
+    label: 'Vine 2/10/30-Tier Post-Review Month-2 Sustained Traction (RETIRED — Non-Goal #3)',
     route: 'in_site_product_market',
     entry_group: 'in_site',
     provider: 'sellersprite',
-    tool_hint: 'asin_list + SIF ops_get_asin_traffic_trend(listingSearch:false) verifying sustained post-Vine organic velocity',
+    tool_hint: 'RETIRED per docs/SPEC.md §2 Non-Goal #3 (historical read-only provenance lookup only; never actively recommended)',
     non_keyword_origin: true,
+    active: false,
+    retired: true,
+    status: 'retired_rejected',
     default_opportunity_types: Object.freeze(['growth', 'steady']),
   }),
 });
@@ -302,6 +305,7 @@ export function resolveChannelMeta(sourceChannel, explicitRoute = null, explicit
       provider: ch.provider,
       non_keyword_origin: ch.non_keyword_origin,
       known_channel: true,
+      ...(ch.retired === true ? { retired: true, active: false } : {}),
     };
   }
 
@@ -515,9 +519,10 @@ export function auditDiscoveryCoverage(store, {
   }
 
   const investigatedChannels = Object.keys(byChannel).filter(id => Object.hasOwn(DISCOVERY_CHANNELS, id)).sort();
-  const deferredChannels = Object.keys(DISCOVERY_CHANNELS).filter(id => DISCOVERY_CHANNELS[id].active === false).sort();
+  const retiredChannels = Object.keys(DISCOVERY_CHANNELS).filter(id => DISCOVERY_CHANNELS[id].retired === true).sort();
+  const deferredChannels = Object.keys(DISCOVERY_CHANNELS).filter(id => DISCOVERY_CHANNELS[id].active === false && DISCOVERY_CHANNELS[id].retired !== true).sort();
   const availableUntestedChannels = Object.keys(DISCOVERY_CHANNELS)
-    .filter(id => DISCOVERY_CHANNELS[id].active !== false && !byChannel[id])
+    .filter(id => DISCOVERY_CHANNELS[id].active !== false && DISCOVERY_CHANNELS[id].retired !== true && !byChannel[id])
     .sort();
   const totalLeads = leads.length;
   const nonKeywordShare = totalLeads > 0 ? Math.round(((nonKeywordLeadCount / totalLeads) + Number.EPSILON) * 10000) / 10000 : 0;
@@ -583,6 +588,7 @@ export function auditDiscoveryCoverage(store, {
     investigated_channels: investigatedChannels,
     available_untested_channels: availableUntestedChannels,
     deferred_channels: deferredChannels,
+    retired_channels: retiredChannels,
     active_cooldowns: activeCooldowns,
     anti_convergence_alerts: alerts,
   };
@@ -605,7 +611,7 @@ export function planDiscoveryBatch(store, {
   const totalSlots = Number.isInteger(task_slots) && task_slots > 0 ? task_slots : max_channels;
   const isStationOrigin = ch => ch.entry_group === 'in_site' || ch.entry_group === 'trends';
   const allChannels = Object.values(DISCOVERY_CHANNELS)
-    .filter(ch => (include_deferred || ch.active !== false) && (include_1688_cold_start || ch.channel_id !== '1688_factory_cold_start'));
+    .filter(ch => ch.retired !== true && (include_deferred || ch.active !== false) && (include_1688_cold_start || ch.channel_id !== '1688_factory_cold_start'));
 
   // Count independent primary-discovery leads only (excluding station_verification links used to verify off-site leads,
   // including legacy migrated databases where station_verification lives in verification_subrole).
@@ -703,6 +709,7 @@ export function planDiscoveryBatch(store, {
     })),
     primary_discovery_counts_by_channel: { ...primaryCountByChannel },
     deferred_channels: coverage.deferred_channels,
+    retired_channels: coverage.retired_channels,
     active_cooldown_forms: coverage.active_cooldowns,
     anti_convergence_alerts: coverage.anti_convergence_alerts,
   };

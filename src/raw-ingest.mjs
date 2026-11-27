@@ -736,10 +736,34 @@ export function extractKeepaFactsByAsinFromPayloads(rawPayloads = [], { asOfDate
     const parsed = parseSellerSpriteKeepaPayload(node, { as_of_date: asOfDate });
     if (!parsed?.ok || !nonemptyStr(parsed.asin)) return;
     const prev = byAsin.get(parsed.asin);
-    // Prefer full timestamped curves over undated curves, and curves over package-only snapshots.
+    // Prefer full timestamped curves over undated curves, and curves over package-only snapshots,
+    // while preserving observed review_trajectory & package_snapshot across equal-ASIN receipts regardless of read order.
     const rank = p => (p.status === 'parsed' ? (p.has_timestamps ? 3 : 2) : 1);
-    if (!prev || rank(parsed) >= rank(prev)) {
+    const priceRichness = p => (p.window_90d?.sampled_days ?? 0) * 1000 + (p.price_series?.price?.observed_count ?? 0);
+    const hasObservedReviews = p => p?.review_trajectory?.review_series_status === 'observed_values';
+    const reviewEventCount = p => Array.isArray(p?.review_trajectory?.events) ? p.review_trajectory.events.length : 0;
+    if (!prev) {
       byAsin.set(parsed.asin, parsed);
+    } else {
+      const parsedWinsPrimary =
+        rank(parsed) > rank(prev) ||
+        (rank(parsed) === rank(prev) && priceRichness(parsed) >= priceRichness(prev));
+      const primary = parsedWinsPrimary ? parsed : prev;
+      const secondary = parsedWinsPrimary ? prev : parsed;
+      const keepSecondaryReviews =
+        hasObservedReviews(secondary) &&
+        (!hasObservedReviews(primary) || reviewEventCount(secondary) > reviewEventCount(primary));
+      const keepSecondaryPkg = !primary.package_snapshot && Boolean(secondary.package_snapshot);
+      byAsin.set(
+        parsed.asin,
+        (keepSecondaryReviews || keepSecondaryPkg)
+          ? {
+            ...primary,
+            ...(keepSecondaryReviews ? { review_trajectory: secondary.review_trajectory } : {}),
+            ...(keepSecondaryPkg ? { package_snapshot: secondary.package_snapshot } : {}),
+          }
+          : primary,
+      );
     }
   };
   for (const entry of rawPayloads) {
@@ -775,7 +799,9 @@ export function mergeKeepaReceiptIntoListingRow(row, parsedKeepa) {
     const coversFull90d = Boolean(
       parsedKeepa.has_timestamps &&
       finite(parsedKeepa.window_90d?.calendar_span_days) &&
-      parsedKeepa.window_90d.calendar_span_days >= BUSINESS_THRESHOLDS.newcomer_max_age_days,
+      parsedKeepa.window_90d.calendar_span_days >= BUSINESS_THRESHOLDS.newcomer_max_age_days &&
+      finite(parsedKeepa.window_90d?.sampled_days) &&
+      parsedKeepa.window_90d.sampled_days >= BUSINESS_THRESHOLDS.newcomer_max_age_days,
     );
     if (!coversFull90d) {
       merged.keepa_90d_steady = false;
@@ -890,6 +916,7 @@ function extractQuantileSupportedPricesFromPayloads(candPayloads = [], {
         const bandRes = analyzeMainstreamPriceBand(items, {
           ...(asOfDate ? { as_of_date: asOfDate } : {}),
           strict_mature_only: strictOpt,
+          require_keepa_steady_evidence: true,
         });
         const hasAnyLaunchAge = items.some(it => nonemptyStr(it?.availableDate ?? it?.available_date ?? it?.launch_date) || finite(it?.age_days));
         const candidateBands = strictOpt && hasAnyLaunchAge
@@ -2203,8 +2230,66 @@ export function ingestTrialSpecification(spec, profile, {
         for (const member of cand.newcomer_cohort.members) {
           const mAsin = nonemptyStr(member?.asin) ? member.asin.trim().toUpperCase() : null;
           const mKeepa = mAsin ? entryKeepaByAsin.get(mAsin) : null;
-          if (mKeepa?.review_trajectory?.has_drop_event && member.keepa_review_drop_detected === undefined) {
+          const revTraj = mKeepa?.review_trajectory ?? null;
+          if (!revTraj) continue;
+          if (revTraj.has_drop_event && member.keepa_review_drop_detected !== true) {
             member.keepa_review_drop_detected = true;
+          }
+          if (revTraj.has_jump_event && member.keepa_review_jump_detected !== true) {
+            member.keepa_review_jump_detected = true;
+          }
+          const rawEvents = Array.isArray(revTraj.events) ? revTraj.events : [];
+          if (rawEvents.length > 0) {
+            const normalizedEvents = rawEvents.map(ev => ({
+              direction: ev.direction ?? (ev.delta < 0 ? 'drop' : 'jump'),
+              delta: ev.delta,
+              from_count: ev.from_count,
+              to_count: ev.to_count,
+              date_from: ev.date_from ?? null,
+              date_to: ev.date_to ?? null,
+              asin: ev.asin ?? mAsin,
+            }));
+            const hasExistingNonEmptyEvents = Array.isArray(member.keepa_review_anomaly_events) && member.keepa_review_anomaly_events.length > 0;
+            if (!hasExistingNonEmptyEvents) {
+              member.keepa_review_anomaly_events = normalizedEvents;
+            }
+            const effectiveEvents = member.keepa_review_anomaly_events;
+            const hasExistingNonEmptySummary = Boolean(
+              member.keepa_review_anomaly_summary &&
+              typeof member.keepa_review_anomaly_summary === 'object' &&
+              Object.keys(member.keepa_review_anomaly_summary).length > 0,
+            );
+            if (!hasExistingNonEmptySummary && Array.isArray(effectiveEvents) && effectiveEvents.length > 0) {
+              const jumpEvents = effectiveEvents.filter(ev => (ev.direction ?? (ev.delta < 0 ? 'drop' : 'jump')) === 'jump');
+              const dropEvents = effectiveEvents.filter(ev => (ev.direction ?? (ev.delta < 0 ? 'drop' : 'jump')) === 'drop');
+              const largestJump = jumpEvents.reduce((best, ev) => (!best || ev.delta > best.delta ? ev : best), null);
+              const largestDrop = dropEvents.reduce((best, ev) => (!best || ev.delta < best.delta ? ev : best), null);
+              const parts = [];
+              if (largestJump) {
+                const datePart = largestJump.date_from && largestJump.date_to
+                  ? `，${largestJump.date_from} 至 ${largestJump.date_to}`
+                  : '';
+                parts.push(`最大单步增评 +${largestJump.delta}（${largestJump.from_count}->${largestJump.to_count}${datePart}）`);
+              }
+              if (largestDrop) {
+                const datePart = largestDrop.date_from && largestDrop.date_to
+                  ? `，${largestDrop.date_from} 至 ${largestDrop.date_to}`
+                  : '';
+                parts.push(`最大单步掉评 ${largestDrop.delta}（${largestDrop.from_count}->${largestDrop.to_count}${datePart}）`);
+              }
+              member.keepa_review_anomaly_summary = {
+                asin: mAsin,
+                parent_asin: nonemptyStr(member?.parent_asin) ? member.parent_asin.trim().toUpperCase() : null,
+                has_jump: jumpEvents.length > 0,
+                has_drop: dropEvents.length > 0,
+                event_count: effectiveEvents.length,
+                max_jump_delta: largestJump ? largestJump.delta : 0,
+                max_drop_delta: largestDrop ? largestDrop.delta : 0,
+                largest_jump: largestJump,
+                largest_drop: largestDrop,
+                note_zh: `Keepa 评论曲线记录到波动（共 ${effectiveEvents.length} 次）：${parts.join('；')}；仅作客观留底，不自动扣分或淘汰。`,
+              };
+            }
           }
         }
       }
@@ -2216,6 +2301,7 @@ export function ingestTrialSpecification(spec, profile, {
       cand.price_band_analysis = analyzeMainstreamPriceBand(mergedPeers, {
         ...(entryAsOfDate ? { as_of_date: entryAsOfDate } : {}),
         ...(entry.price_band_options ?? {}),
+        require_keepa_steady_evidence: true,
       });
     }
     const targetVariantAsin = nonemptyStr(entry.sp_api_calibration_inputs?.asin)

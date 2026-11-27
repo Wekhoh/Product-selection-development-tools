@@ -293,14 +293,16 @@ function parseKeepaPackageSnapshot(node) {
   };
 }
 
-function detectReviewTrajectoryEvents(reviewsSummary, { age_days = null } = {}) {
+function detectReviewTrajectoryEvents(reviewsSummary, { age_days = null, asin = null } = {}) {
   if (!reviewsSummary || reviewsSummary.field_status !== 'observed_values') {
     return {
+      asin,
       review_series_status: reviewsSummary?.field_status ?? 'field_not_returned',
       events: [],
       has_drop_event: false,
       has_jump_event: false,
       max_single_step_increase: 0,
+      max_single_step_drop: 0,
       newcomer_review_anomaly_hint: false,
     };
   }
@@ -309,37 +311,50 @@ function detectReviewTrajectoryEvents(reviewsSummary, { age_days = null } = {}) 
   let hasDrop = false;
   let hasIncrease = false;
   let maxSingleStepIncrease = 0;
+  let maxSingleStepDrop = 0;
   for (let i = 1; i < nonNullRuns.length; i++) {
     const prev = nonNullRuns[i - 1];
     const curr = nonNullRuns[i];
     const delta = curr.value - prev.value;
+    const dateFrom = validIsoDate(prev.end) ? prev.end : null;
+    const dateTo = validIsoDate(curr.start) ? curr.start : null;
     if (delta < 0) {
       hasDrop = true;
+      if (delta < maxSingleStepDrop) maxSingleStepDrop = delta;
       events.push({
         kind: 'review_count_drop',
+        direction: 'drop',
         from_count: prev.value,
         to_count: curr.value,
         delta,
+        date_from: dateFrom,
+        date_to: dateTo,
         at: curr.start,
+        asin,
       });
     } else if (delta > 0) {
       hasIncrease = true;
       if (delta > maxSingleStepIncrease) maxSingleStepIncrease = delta;
       events.push({
         kind: 'review_count_increase',
+        direction: 'jump',
         from_count: prev.value,
         to_count: curr.value,
         delta,
+        date_from: dateFrom,
+        date_to: dateTo,
         at: curr.start,
+        asin,
       });
     }
   }
   const newcomerAnomaly =
     finite(age_days) &&
     age_days <= BUSINESS_THRESHOLDS.newcomer_max_age_days &&
-    hasDrop;
+    (hasDrop || hasIncrease);
 
   return {
+    asin,
     review_series_status: 'observed_values',
     start_reviews: nonNullRuns[0]?.value ?? null,
     end_reviews: nonNullRuns[nonNullRuns.length - 1]?.value ?? null,
@@ -347,6 +362,7 @@ function detectReviewTrajectoryEvents(reviewsSummary, { age_days = null } = {}) 
     has_drop_event: hasDrop,
     has_jump_event: hasIncrease,
     max_single_step_increase: maxSingleStepIncrease,
+    max_single_step_drop: maxSingleStepDrop,
     newcomer_review_anomaly_hint: newcomerAnomaly,
   };
 }
@@ -567,7 +583,10 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
     }
   }
 
-  const coversFull90dWindow = window90dCalendarSpanDays >= BUSINESS_THRESHOLDS.newcomer_max_age_days;
+  const coversFull90dWindow = Boolean(
+    window90dCalendarSpanDays >= BUSINESS_THRESHOLDS.newcomer_max_age_days &&
+    (window90dRange?.sampled_days ?? 0) >= BUSINESS_THRESHOLDS.newcomer_max_age_days,
+  );
   const continuousHeavyCoupon90d = Boolean(heavyCouponDays90d > 0 && nonHeavyDays90dCount === 0);
   const realizedNet90dMedianUsd = realizedNet90dVals.length > 0
     ? (() => {
@@ -596,6 +615,33 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
     nonNullRuns.length >= 2 &&
     latestRun.value < dominantPriceUsd;
   const nonNullRuns90d = window90dPrimary ? window90dPrimary.runs.filter(r => r.value !== null) : [];
+  const window90dTransitions = [];
+  for (let i = 1; i < nonNullRuns90d.length; i++) {
+    const prev = nonNullRuns90d[i - 1];
+    const curr = nonNullRuns90d[i];
+    window90dTransitions.push({
+      from_price_usd: prev.value,
+      to_price_usd: curr.value,
+      delta_usd: round2(curr.value - prev.value),
+      date_from: validIsoDate(prev.end) ? prev.end : null,
+      date_to: validIsoDate(curr.start) ? curr.start : null,
+    });
+  }
+  const window90dPriceDelta = window90dRange && window90dPrimary && finite(window90dPrimary.low) && finite(window90dPrimary.high)
+    ? {
+      observed_price_min_usd: window90dPrimary.low,
+      observed_price_max_usd: window90dPrimary.high,
+      observed_date_start: window90dRange.from,
+      observed_date_end: window90dRange.through,
+      delta_usd: round2(window90dPrimary.high - window90dPrimary.low),
+      first_price_usd: nonNullRuns90d[0]?.value ?? null,
+      latest_price_usd: nonNullRuns90d[nonNullRuns90d.length - 1]?.value ?? null,
+      signed_change_usd: nonNullRuns90d.length >= 2
+        ? round2(nonNullRuns90d[nonNullRuns90d.length - 1].value - nonNullRuns90d[0].value)
+        : 0,
+      transitions: window90dTransitions,
+    }
+    : null;
   const keepaSteadyVerified =
     hasTimestamps &&
     coversFull90dWindow &&
@@ -631,7 +677,7 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
         ? 'heavy_ge_20pct'
         : 'routine_under_20pct');
 
-  const reviewTrajectory = detectReviewTrajectoryEvents(metricSeries.reviews, { age_days });
+  const reviewTrajectory = detectReviewTrajectoryEvents(metricSeries.reviews, { age_days, asin });
 
   return {
     ok: true,
@@ -661,8 +707,10 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
         latest_usd: window90dPrimary.latest,
         observed_count: window90dPrimary.observed_count,
         runs: window90dPrimary.runs,
+        ...(window90dPriceDelta ?? {}),
       }
       : null,
+    window_90d_price_delta: window90dPriceDelta,
     current_price_usd: currentPriceUsd,
     current_price_source: currentPriceSource,
     primary_trajectory_line: primaryLineKey,
@@ -727,6 +775,7 @@ export function buildKeepaPeerFactsForMarketJudge(parsedKeepa) {
     has_timestamps: parsedKeepa.has_timestamps,
     date_window: parsedKeepa.date_window,
     window_90d: parsedKeepa.window_90d ?? null,
+    window_90d_price_delta: parsedKeepa.window_90d_price_delta ?? null,
     current_price_usd: parsedKeepa.current_price_usd,
     current_price_source: parsedKeepa.current_price_source,
     keepa_90d_high_usd: parsedKeepa.window_90d?.high_usd ?? null,

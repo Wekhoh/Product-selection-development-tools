@@ -56,6 +56,7 @@ import {
 } from '../src/price-band.mjs';
 import { evaluateEarlyScreen } from '../src/economics.mjs';
 import { calculateEconomics } from '../src/economics.mjs';
+import { STAGE4_AS_OF_DATE, makeDatedKeepaReceipt } from './helpers/stage4-fixtures.mjs';
 import { resolveEffectivePricing } from '../src/fba-calculator.mjs';
 import * as openaiIndex from '../src/openai/index.mjs';
 import * as openaiClientMod from '../src/openai/client.mjs';
@@ -749,13 +750,14 @@ test('Round 3 & 4 (Age Priority & Price Band): 3-tier age priority (<=90d newcom
   assert.equal(detectKeepaVeteranClearanceOrWar({ keepa_90d_prices: [59.99, 48.00, 36.00, 27.99] }), false);
 
   // Here only 1 veteran (>=365d: B0SYNVET2Y at 400d) is steady -> < 2 veterans triggers 91-364d growth supplement!
+  const dated1124 = (asin, priceUsd) => makeDatedKeepaReceipt({ asin, startDate: '2026-08-27', days: 90, priceUsd }).keepa_trend;
   const pb = analyzeMainstreamPriceBand([
-    { asin: 'B0SYN100D1', price_usd: 50.00, coupon: '18%', fulfillment: 'FBA', monthlySales: 120, age_days: 150, keepa_90d_median_usd: 50.00 }, // 91-364d growth, 18% < 20% -> net $41.00
-    { asin: 'B0SYNVET2Y', price_usd: 60.00, coupon: '25%', fulfillment: 'FBA', monthlySales: 140, age_days: 400, keepa_90d_median_usd: 60.00 }, // >=365d veteran, 25% >= 20% -> Keepa $60.00
+    { asin: 'B0SYN100D1', price_usd: 50.00, coupon: '18%', fulfillment: 'FBA', monthlySales: 120, age_days: 150, keepa_90d_median_usd: 50.00, keepa_trend: dated1124('B0SYN100D1', 50.00) }, // 91-364d growth, 18% < 20% -> net $41.00
+    { asin: 'B0SYNVET2Y', price_usd: 60.00, coupon: '25%', fulfillment: 'FBA', monthlySales: 140, age_days: 400, keepa_90d_median_usd: 60.00, keepa_trend: dated1124('B0SYNVET2Y', 60.00) }, // >=365d veteran, 25% >= 20% -> Keepa $60.00
     { asin: 'B0SYNVETWR', price_usd: 26.99, fulfillment: 'FBA', monthlySales: 300, age_days: 450, keepa_clearance: true, keepa_clearance_reason_zh: '全年稳态 $58 近期清仓跳水至 $26.99' }, // AI qualitative clearance -> isolated!
     { asin: 'B0SYNYNG60', price_usd: 29.99, fulfillment: 'FBA', monthlySales: 90, age_days: 60 }, // <=90d newcomer -> newcomer_launch_band ("新品起盘参考价")
     { asin: 'B0SYNZMB05', price_usd: 19.99, fulfillment: 'FBA', monthlySales: 6, age_days: 420 }, // <10/mo zombie excluded
-    { asin: 'B0SYNHIGH3', price_usd: 68.00, fulfillment: 'FBA', monthlySales: 110, age_days: 240, keepa_90d_median_usd: 68.00 }, // 91-364d growth supplement triggers >1.35x width spread vs $41.00
+    { asin: 'B0SYNHIGH3', price_usd: 68.00, fulfillment: 'FBA', monthlySales: 110, age_days: 240, keepa_90d_median_usd: 68.00, keepa_trend: dated1124('B0SYNHIGH3', 68.00) }, // 91-364d growth supplement triggers >1.35x width spread vs $41.00
   ], { as_of_date: '2026-11-24', strict_mature_only: true });
 
   assert.equal(pb.mature_regular_band.newcomer_cutoff_days, 90);
@@ -1095,11 +1097,12 @@ test('Round 4 & Unshackled Codex Closure: 3-tier age priority + all-<90d blue oc
   const dir = mkdtempSync(join(tmpdir(), 'r59-round4-closure-'));
   try {
     // 1) 3-tier age priority when >= 2 veterans (>= 365d) exist + parent_asin deduplication before P25-P75 + all-<=90d ultra-new blue ocean!
+    const dated1124 = (asin, priceUsd) => makeDatedKeepaReceipt({ asin, startDate: '2026-08-27', days: 90, priceUsd }).keepa_trend;
     const pbVetPriority = analyzeMainstreamPriceBand([
-      { asin: 'B0SYNVETA1', parent_asin: 'P0SYNVETAA', price_usd: 48.00, fulfillment: 'FBA', monthlySales: 200, age_days: 420 },
-      { asin: 'B0SYNVETA2', parent_asin: 'P0SYNVETAA', price_usd: 48.00, fulfillment: 'FBA', monthlySales: 200, age_days: 420 }, // duplicate child of same parent -> deduplicated!
-      { asin: 'B0SYNVETB1', parent_asin: 'P0SYNVETBB', price_usd: 56.00, fulfillment: 'FBA', monthlySales: 180, age_days: 510 },
-      { asin: 'B0SYNGRW18', parent_asin: 'P0SYNGRW18', price_usd: 34.99, fulfillment: 'FBA', monthlySales: 150, age_days: 180 }, // 91-364d growth NOT needed since veterans >= 2!
+      { asin: 'B0SYNVETA1', parent_asin: 'P0SYNVETAA', price_usd: 48.00, fulfillment: 'FBA', monthlySales: 200, age_days: 420, keepa_trend: dated1124('B0SYNVETA1', 48.00) },
+      { asin: 'B0SYNVETA2', parent_asin: 'P0SYNVETAA', price_usd: 48.00, fulfillment: 'FBA', monthlySales: 200, age_days: 420, keepa_trend: dated1124('B0SYNVETA2', 48.00) }, // duplicate child of same parent -> deduplicated!
+      { asin: 'B0SYNVETB1', parent_asin: 'P0SYNVETBB', price_usd: 56.00, fulfillment: 'FBA', monthlySales: 180, age_days: 510, keepa_trend: dated1124('B0SYNVETB1', 56.00) },
+      { asin: 'B0SYNGRW18', parent_asin: 'P0SYNGRW18', price_usd: 34.99, fulfillment: 'FBA', monthlySales: 150, age_days: 180, keepa_trend: dated1124('B0SYNGRW18', 34.99) }, // 91-364d growth NOT needed since veterans >= 2!
     ], { as_of_date: '2026-11-24', strict_mature_only: true });
     assert.equal(pbVetPriority.mature_regular_band.basis, 'veteran_ge_365d_keepa_steady');
     assert.equal(pbVetPriority.mature_regular_band.peer_count, 2, 'Deduplicated parent P0SYNVETAA + P0SYNVETBB = 2 veterans');
@@ -1602,6 +1605,7 @@ test('Astra Full-Capability Audit Round-1 Remediations (B1, H1-H16, M1-M9, L1)',
       fx_cny_per_usd: 7.20,
       order_units: 100,
       goods_cny_per_unit: 118.00,
+      bare_goods_screening: false,
       domestic_freight_cny_total: 180,
       first_order_promotion: false,
       headhaul: { chargeable_kg_per_unit: 0.68, rate_cny_per_kg: 12, bond_cny_per_shipment: 150 },
@@ -1660,11 +1664,12 @@ test('Astra Full-Capability Audit Round-1 Remediations (B1, H1-H16, M1-M9, L1)',
     const uiReadback = { logged_in: true, viewport_width_px: 1440, selected_sku_row_visible: true, settlement_bar_visible: true, applied_quantity_confirmed: true };
     const gateDb = openSelectionStore(':memory:');
     gateDb.upsertCandidateForm({ form_id: 'form-h5-oob', label: 'Out of band check', buyer_task: 'Hold plates', saleable_set_composition: [{ component_id: 'stand', qty_per_saleable_set: 1 }] });
+    const datedOob = (asin, priceUsd) => makeDatedKeepaReceipt({ asin, startDate: '2026-08-30', days: 90, priceUsd }).keepa_trend;
     const pbOob = analyzeMainstreamPriceBand([
-      { asin: 'B0SYNVET01', title: 'Veteran 1', price_usd: 27.99, monthly_units: 120, fulfillment: 'FBA', age_days: 420, keepa_price_steady: true },
-      { asin: 'B0SYNVET02', title: 'Veteran 2', price_usd: 28.99, monthly_units: 110, fulfillment: 'FBA', age_days: 400, keepa_price_steady: true },
+      { asin: 'B0SYNVET01', title: 'Veteran 1', price_usd: 27.99, monthly_units: 120, fulfillment: 'FBA', age_days: 420, keepa_trend: datedOob('B0SYNVET01', 27.99) },
+      { asin: 'B0SYNVET02', title: 'Veteran 2', price_usd: 28.99, monthly_units: 110, fulfillment: 'FBA', age_days: 400, keepa_trend: datedOob('B0SYNVET02', 28.99) },
       { asin: 'B0SYNNEW45', title: 'Newcomer 45', price_usd: 45.00, monthly_units: 60, fulfillment: 'FBA', age_days: 30 },
-    ], { profile_revision: 59 });
+    ], { profile_revision: 59, as_of_date: STAGE4_AS_OF_DATE });
     const g1aOob = runGate1AForForm(gateDb, {
       form_id: 'form-h5-oob',
       profile_revision: 59,
