@@ -1622,6 +1622,219 @@ function extractResponsesContent(sanitizedRaw, { expectsJsonObject = false, json
 // -----------------------------------------------------------------------------
 
 /**
+ * Parse a Batch input `.jsonl` string (e.g. produced by `openai-batch-build` or `buildBatchJsonl`)
+ * into validated structured `requests[]` accepted by `buildBatchJsonl` / `uploadBatchFile` / `submitBatch`.
+ */
+export function parseBatchInputJsonl(jsonlText, {
+  defaultEndpoint = '/v1/responses',
+  maxBytes = DEFAULT_MAX_BATCH_JSONL_BYTES,
+  maxLines = MAX_BATCH_LINES,
+} = {}) {
+  if (typeof jsonlText !== 'string') {
+    throw new OpenAiValidationError('Batch input jsonlText must be a UTF-8 string.');
+  }
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+    throw new OpenAiValidationError('maxBytes must be a positive safe integer.');
+  }
+  if (!Number.isSafeInteger(maxLines) || maxLines < 1) {
+    throw new OpenAiValidationError('maxLines must be a positive safe integer.');
+  }
+  const byteLen = utf8ByteLength(jsonlText);
+  if (byteLen > maxBytes) {
+    throw new OpenAiError(
+      `Batch input JSONL size (${byteLen} bytes) exceeds ${maxBytes}-byte safety ceiling.`,
+      { code: 'REQUEST_BODY_TOO_LARGE' },
+    );
+  }
+
+  const requests = [];
+  let uniformEndpoint = null;
+  let cursor = 0;
+  const totalChars = jsonlText.length;
+  let lineNo = 0;
+  while (cursor < totalChars) {
+    let nlIdx = jsonlText.indexOf('\n', cursor);
+    if (nlIdx === -1) nlIdx = totalChars;
+    let sliceEnd = nlIdx;
+    if (sliceEnd > cursor && jsonlText.charCodeAt(sliceEnd - 1) === 13) {
+      sliceEnd--;
+    }
+    const lineStr = jsonlText.slice(cursor, sliceEnd);
+    lineNo++;
+    if (lineStr.trim().length > 0) {
+      if (requests.length >= maxLines) {
+        throw new OpenAiValidationError(
+          `Batch input JSONL exceeds maximum allowed line count (${maxLines}).`,
+          { code: 'BATCH_INPUT_TOO_MANY_LINES' },
+        );
+      }
+      let parsedLine;
+      try {
+        parsedLine = JSON.parse(lineStr);
+      } catch {
+        throw new OpenAiValidationError(`Batch input JSONL line ${lineNo} is not valid JSON.`);
+      }
+      if (!isPlainObject(parsedLine)) {
+        throw new OpenAiValidationError(`Batch input JSONL line ${lineNo} must be a JSON object.`);
+      }
+      const lineUrl = String(parsedLine.url ?? parsedLine.endpoint ?? defaultEndpoint).trim();
+      if (!ALLOWED_BATCH_ENDPOINTS.has(lineUrl)) {
+        throw new OpenAiValidationError(
+          `Batch input JSONL line ${lineNo} url "${lineUrl}" is not supported for Batch (allowed: /v1/responses).`,
+        );
+      }
+      if (uniformEndpoint === null) {
+        uniformEndpoint = lineUrl;
+      } else if (uniformEndpoint !== lineUrl) {
+        throw new OpenAiValidationError('A single OpenAI Batch submission must target one uniform endpoint.');
+      }
+      requests.push(parsedLine);
+    }
+    cursor = nlIdx + 1;
+  }
+
+  if (requests.length === 0) {
+    throw new OpenAiValidationError('Batch input JSONL is empty.');
+  }
+
+  return {
+    requests,
+    endpoint: uniformEndpoint ?? defaultEndpoint,
+    line_count: requests.length,
+  };
+}
+
+/**
+ * Reconcile parsed Batch `output_file` and `error_file` results by `custom_id`, preserving
+ * submitted manifest order (preventing out-of-order misalignment), surfacing partial successes,
+ * error lines, missing/expired items, duplicates, unexpected IDs, and known vs unknown spend.
+ */
+export function reconcileBatchFilesByCustomId({
+  parsedOutput = null,
+  parsedError = null,
+  manifestCustomIds = null,
+  batchStatus = null,
+} = {}) {
+  const outputById = parsedOutput?.by_custom_id ?? Object.create(null);
+  const errorById = parsedError?.by_custom_id ?? Object.create(null);
+  const outputIds = Object.keys(outputById);
+  const errorIds = Object.keys(errorById);
+  const hasManifest = Array.isArray(manifestCustomIds) && manifestCustomIds.length > 0;
+  const manifestSet = hasManifest ? new Set(manifestCustomIds) : null;
+
+  const duplicateCustomIds = [];
+  const unexpectedCustomIds = [];
+  const missingCustomIds = [];
+  const succeededCustomIds = [];
+  const failedCustomIds = [];
+  const items = [];
+  const byCustomId = Object.create(null);
+
+  const observedUnion = [...new Set([...outputIds, ...errorIds])];
+  for (const cid of observedUnion) {
+    if (Object.hasOwn(outputById, cid) && Object.hasOwn(errorById, cid)) {
+      duplicateCustomIds.push(cid);
+    }
+    if (manifestSet && !manifestSet.has(cid)) {
+      unexpectedCustomIds.push(cid);
+    }
+  }
+
+  const orderedIds = hasManifest ? manifestCustomIds : observedUnion;
+  for (const cid of orderedIds) {
+    const inOut = Object.hasOwn(outputById, cid);
+    const inErr = Object.hasOwn(errorById, cid);
+    let entry;
+    if (inOut && inErr) {
+      entry = {
+        custom_id: cid,
+        ok: false,
+        usable: false,
+        status: 'duplicate_conflict',
+        source_file: 'both',
+        http_status: outputById[cid].http_status ?? errorById[cid].http_status ?? null,
+        content_status: 'invalid',
+        error: `Duplicate custom_id "${cid}" appeared in both output_file and error_file.`,
+        output_entry: outputById[cid],
+        error_entry: errorById[cid],
+        usage: null,
+        usage_cost_micros: null,
+      };
+      failedCustomIds.push(cid);
+    } else if (inOut) {
+      entry = { ...outputById[cid], source_file: 'output_file' };
+      if (entry.usable === true) {
+        succeededCustomIds.push(cid);
+      } else if (entry.status === 'failed' || entry.content_status === 'invalid') {
+        failedCustomIds.push(cid);
+      }
+    } else if (inErr) {
+      entry = { ...errorById[cid], source_file: 'error_file' };
+      failedCustomIds.push(cid);
+    } else {
+      missingCustomIds.push(cid);
+      const missingStatus = batchStatus === 'expired'
+        ? 'expired'
+        : (batchStatus === 'cancelled' ? 'cancelled' : 'missing');
+      entry = {
+        custom_id: cid,
+        ok: false,
+        usable: false,
+        status: missingStatus,
+        source_file: null,
+        http_status: null,
+        content_status: 'missing',
+        error: missingStatus === 'expired'
+          ? 'Batch item did not complete before batch expiry.'
+          : (missingStatus === 'cancelled'
+            ? 'Batch item did not complete before batch cancellation.'
+            : 'Batch item missing from both output_file and error_file.'),
+        usage: null,
+        usage_cost_micros: null,
+      };
+    }
+    items.push(entry);
+    defineSafeProp(byCustomId, cid, entry);
+  }
+
+  const knownUsageMicrosBig =
+    BigInt(parsedOutput?.known_usage_cost_micros ?? 0) +
+    BigInt(parsedError?.known_usage_cost_micros ?? 0);
+  const knownUsageCostMicros = safeMicrosToNumber(knownUsageMicrosBig);
+  const hasUnknownUsage = Boolean(
+    parsedOutput?.has_unknown_usage ||
+    parsedError?.has_unknown_usage ||
+    missingCustomIds.length > 0 ||
+    duplicateCustomIds.length > 0 ||
+    unexpectedCustomIds.length > 0 ||
+    (!parsedOutput && !parsedError && orderedIds.length > 0),
+  );
+  const partialSuccess =
+    succeededCustomIds.length > 0 &&
+    (failedCustomIds.length > 0 || missingCustomIds.length > 0 || Boolean(parsedError));
+
+  return {
+    total_expected: hasManifest ? manifestCustomIds.length : items.length,
+    output_line_count: parsedOutput?.total_lines ?? 0,
+    error_line_count: parsedError?.total_lines ?? 0,
+    succeeded_count: succeededCustomIds.length,
+    failed_count: failedCustomIds.length,
+    missing_count: missingCustomIds.length,
+    partial_success: partialSuccess,
+    known_usage_cost_micros: knownUsageCostMicros,
+    total_usage_cost_micros: hasUnknownUsage ? null : knownUsageCostMicros,
+    has_unknown_usage: hasUnknownUsage,
+    succeeded_custom_ids: succeededCustomIds,
+    failed_custom_ids: failedCustomIds,
+    missing_custom_ids: missingCustomIds,
+    duplicate_custom_ids: duplicateCustomIds,
+    unexpected_custom_ids: unexpectedCustomIds,
+    items,
+    by_custom_id: byCustomId,
+  };
+}
+
+/**
  * Build validated `.jsonl` payload + cryptographic manifest for OpenAI Batch API
  * (`/v1/responses` or `/v1/images/generations`) with 50%-off conservative cent reservation.
  */
@@ -5438,12 +5651,17 @@ export class OpenAiClient {
     }
 
     let parsedOutput = null;
+    let parsedError = null;
+    let reconciliation = null;
     const wasAlreadyCompletedBefore = Boolean(boundAttempt && boundAttempt.status === 'completed');
+    const TERMINAL_BATCH_STATUSES = new Set(['completed', 'failed', 'expired', 'cancelled']);
+    const isTerminalBatchStatus = TERMINAL_BATCH_STATUSES.has(sanitized.status);
+    const hasDownloadableArtifact = Boolean(sanitized.output_file_id || sanitized.error_file_id);
 
-    if (eff.downloadOutput === true && sanitized.status === 'completed' && sanitized.output_file_id) {
+    if (eff.downloadOutput === true && isTerminalBatchStatus && hasDownloadableArtifact) {
       const manifest = boundAttempt?.batch_manifest ?? null;
       if (boundAttempt) {
-        // P0-02 & P1: Validate endpoint and input_file_id BEFORE fetching output_file_id!
+        // P0-02 & P1: Validate endpoint and input_file_id BEFORE fetching output_file_id / error_file_id!
         const expectedEndpoint = manifest?.endpoint ?? null;
         const expectedInputFileId = manifest?.uploaded_file_id ?? manifest?.input_file_id ?? null;
         const endpointMatches = Boolean(expectedEndpoint && sanitized.endpoint === expectedEndpoint);
@@ -5451,8 +5669,8 @@ export class OpenAiClient {
 
         if (!endpointMatches || !inputFileMatches) {
           const mismatchReason = !endpointMatches
-            ? `Batch "${safeId}" returned endpoint "${String(sanitized.endpoint)}" instead of manifest endpoint "${String(expectedEndpoint)}"; refusing output_file_id download.`
-            : `Batch "${safeId}" returned input_file_id "${String(sanitized.input_file_id)}" instead of manifest uploaded_file_id "${String(expectedInputFileId)}"; refusing output_file_id download.`;
+            ? `Batch "${safeId}" returned endpoint "${String(sanitized.endpoint)}" instead of manifest endpoint "${String(expectedEndpoint)}"; refusing artifact download.`
+            : `Batch "${safeId}" returned input_file_id "${String(sanitized.input_file_id)}" instead of manifest uploaded_file_id "${String(expectedInputFileId)}"; refusing artifact download.`;
           if (wasAlreadyCompletedBefore) {
             throw new OpenAiPolicyError(mismatchReason, { code: 'BATCH_MANIFEST_MISMATCH' });
           }
@@ -5473,50 +5691,84 @@ export class OpenAiClient {
             http_status: res.status,
             batch_id: safeId,
             batch_status: sanitized.status,
+            output_file_id: sanitized.output_file_id ?? null,
+            error_file_id: sanitized.error_file_id ?? null,
             batch: sanitized,
             parsed_output: null,
+            parsed_error: null,
+            reconciliation: null,
           };
         }
       }
 
-      const outId = assertSafeResourceId(sanitized.output_file_id, 'output_file_id');
-      if (wasAlreadyCompletedBefore && manifest?.accepted_output_file_id && outId !== manifest.accepted_output_file_id) {
-        throw new OpenAiBudgetError(
-          `Settled Batch "${safeId}" output_file_id changed from "${manifest.accepted_output_file_id}" to "${outId}".`,
-          { code: 'BATCH_OUTPUT_DIGEST_MISMATCH' },
-        );
-      }
+      const downloadBatchFileContent = async (rawFileId, label) => {
+        const safeFileId = assertSafeResourceId(rawFileId, label);
+        const contentRes = await eff.fetchImpl(`${eff.baseUrl}/v1/files/${encodeURIComponent(safeFileId)}/content`, {
+          method: 'GET',
+          redirect: 'error',
+          headers: { Authorization: formatAuthHeader(apiKey) },
+          signal: buildTimeoutSignal(eff.timeoutMs, eff.signal),
+        });
+        if ((contentRes.status >= 300 && contentRes.status < 400) || contentRes.status >= 400) {
+          throw new OpenAiHttpError(`GET /v1/files/${safeFileId}/content failed with HTTP ${contentRes.status}.`, {
+            httpStatus: contentRes.status,
+          });
+        }
+        const jsonlText = await readBoundedUtf8Response(contentRes, DEFAULT_MAX_BATCH_JSONL_BYTES, {
+          requireStreamingOrContentLength: eff.isLiveTransport,
+        });
+        return { safeFileId, jsonlText, fileSha256: sha256Hex(Buffer.from(jsonlText, 'utf8')) };
+      };
 
-      const contentRes = await eff.fetchImpl(`${eff.baseUrl}/v1/files/${encodeURIComponent(outId)}/content`, {
-        method: 'GET',
-        redirect: 'error',
-        headers: { Authorization: formatAuthHeader(apiKey) },
-        signal: buildTimeoutSignal(eff.timeoutMs, eff.signal),
-      });
-      if ((contentRes.status >= 300 && contentRes.status < 400) || contentRes.status >= 400) {
-        throw new OpenAiHttpError(`GET /v1/files/${outId}/content failed with HTTP ${contentRes.status}.`, {
-          httpStatus: contentRes.status,
+      let outId = null;
+      let outputSha256 = null;
+      if (sanitized.output_file_id) {
+        const checkedOutId = assertSafeResourceId(sanitized.output_file_id, 'output_file_id');
+        if (wasAlreadyCompletedBefore && manifest?.accepted_output_file_id && checkedOutId !== manifest.accepted_output_file_id) {
+          throw new OpenAiBudgetError(
+            `Settled Batch "${safeId}" output_file_id changed from "${manifest.accepted_output_file_id}" to "${checkedOutId}".`,
+            { code: 'BATCH_OUTPUT_DIGEST_MISMATCH' },
+          );
+        }
+        const downloadedOut = await downloadBatchFileContent(checkedOutId, 'output_file_id');
+        outId = downloadedOut.safeFileId;
+        outputSha256 = downloadedOut.fileSha256;
+
+        // P1: Verify redownloaded Batch output matches the immutable accepted_output_sha256 recorded at settlement!
+        if (wasAlreadyCompletedBefore && manifest?.accepted_output_sha256 && outputSha256 !== manifest.accepted_output_sha256) {
+          throw new OpenAiBudgetError(
+            `Settled Batch "${safeId}" redownloaded output SHA-256 (${outputSha256}) does not match accepted_output_sha256 (${manifest.accepted_output_sha256}).`,
+            { code: 'BATCH_OUTPUT_DIGEST_MISMATCH' },
+          );
+        }
+
+        parsedOutput = parseBatchOutputJsonl(downloadedOut.jsonlText, {
+          allowAstraApi: eff.allowAstraApi,
+          lineModels: manifest?.line_models ?? null,
+          lineSpecs: manifest?.line_specs ?? null,
+          expectedEndpoint: manifest?.endpoint ?? null,
+          literalSecret: apiKey,
         });
       }
-      const jsonlText = await readBoundedUtf8Response(contentRes, DEFAULT_MAX_BATCH_JSONL_BYTES, {
-        requireStreamingOrContentLength: eff.isLiveTransport,
-      });
-      const outputSha256 = sha256Hex(Buffer.from(jsonlText, 'utf8'));
 
-      // P1: Verify redownloaded Batch output matches the immutable accepted_output_sha256 recorded at settlement!
-      if (wasAlreadyCompletedBefore && manifest?.accepted_output_sha256 && outputSha256 !== manifest.accepted_output_sha256) {
-        throw new OpenAiBudgetError(
-          `Settled Batch "${safeId}" redownloaded output SHA-256 (${outputSha256}) does not match accepted_output_sha256 (${manifest.accepted_output_sha256}).`,
-          { code: 'BATCH_OUTPUT_DIGEST_MISMATCH' },
-        );
+      if (sanitized.error_file_id) {
+        const downloadedErr = await downloadBatchFileContent(sanitized.error_file_id, 'error_file_id');
+        if (downloadedErr.jsonlText.trim().length > 0) {
+          parsedError = parseBatchOutputJsonl(downloadedErr.jsonlText, {
+            allowAstraApi: eff.allowAstraApi,
+            lineModels: manifest?.line_models ?? null,
+            lineSpecs: manifest?.line_specs ?? null,
+            expectedEndpoint: manifest?.endpoint ?? null,
+            literalSecret: apiKey,
+          });
+        }
       }
 
-      parsedOutput = parseBatchOutputJsonl(jsonlText, {
-        allowAstraApi: eff.allowAstraApi,
-        lineModels: manifest?.line_models ?? null,
-        lineSpecs: manifest?.line_specs ?? null,
-        expectedEndpoint: manifest?.endpoint ?? null,
-        literalSecret: apiKey,
+      reconciliation = reconcileBatchFilesByCustomId({
+        parsedOutput,
+        parsedError,
+        manifestCustomIds: Array.isArray(manifest?.custom_ids) ? manifest.custom_ids : null,
+        batchStatus: sanitized.status,
       });
 
       if (boundAttempt) {
@@ -5524,12 +5776,15 @@ export class OpenAiClient {
         const rcTotal = sanitized.request_counts?.total;
         const rcCompleted = sanitized.request_counts?.completed;
         const rcFailed = sanitized.request_counts?.failed;
+        const observedTotalLines = (parsedOutput?.total_lines ?? 0) + (parsedError?.total_lines ?? 0);
+        const observedHttp200 = (parsedOutput?.http_200_count ?? 0) + (parsedError?.http_200_count ?? 0);
+        const observedErrorLines = (parsedOutput?.error_line_count ?? 0) + (parsedError?.error_line_count ?? 0);
 
         const countMatches =
           Number.isSafeInteger(rcTotal) &&
-          rcTotal === parsedOutput.total_lines &&
+          rcTotal === observedTotalLines &&
           manifestIds !== null &&
-          manifestIds.length === parsedOutput.total_lines;
+          manifestIds.length === observedTotalLines;
 
         // P0-02: Verify request_counts.completed + failed === total and match observed HTTP 200 / error line counts!
         const requestCountsParityOk =
@@ -5540,31 +5795,31 @@ export class OpenAiClient {
               Number.isSafeInteger(rcCompleted) &&
               Number.isSafeInteger(rcFailed ?? 0) &&
               rcCompleted + (rcFailed ?? 0) === rcTotal &&
-              rcCompleted === parsedOutput.http_200_count &&
-              (rcFailed ?? 0) === parsedOutput.error_line_count
+              rcCompleted === observedHttp200 &&
+              (rcFailed ?? 0) === observedErrorLines
             )
           );
 
-        let exactCustomIdSetMatch = false;
-        if (countMatches && manifestIds) {
-          const manifestSet = new Set(manifestIds);
-          exactCustomIdSetMatch =
-            manifestSet.size === parsedOutput.results.length &&
-            parsedOutput.results.every(r => manifestSet.has(r.custom_id));
-        }
+        const exactCustomIdSetMatch =
+          countMatches &&
+          reconciliation.duplicate_custom_ids.length === 0 &&
+          reconciliation.unexpected_custom_ids.length === 0 &&
+          reconciliation.missing_custom_ids.length === 0;
 
         if (wasAlreadyCompletedBefore) {
-          if (!countMatches || !requestCountsParityOk || !exactCustomIdSetMatch) {
+          if (!countMatches || !requestCountsParityOk || !exactCustomIdSetMatch || Boolean(sanitized.error_file_id)) {
             throw new OpenAiBudgetError(
               `Settled Batch "${safeId}" redownloaded output failed manifest custom_ids or request_counts parity verification.`,
               { code: 'BATCH_OUTPUT_DIGEST_MISMATCH' },
             );
           }
         } else if (
+          sanitized.status === 'completed' &&
+          parsedOutput !== null &&
+          !sanitized.error_file_id &&
           countMatches &&
           requestCountsParityOk &&
           exactCustomIdSetMatch &&
-          !sanitized.error_file_id &&
           !parsedOutput.has_unknown_usage &&
           parsedOutput.total_usage_cost_micros !== null
         ) {
@@ -5582,12 +5837,16 @@ export class OpenAiClient {
           });
         } else {
           let holdReason;
-          if (!countMatches || !exactCustomIdSetMatch) {
-            holdReason = `Batch "${safeId}" output lines (${parsedOutput.total_lines}) or custom_ids did not match manifest/request_counts.total (${String(rcTotal)}); retaining pending_recovery fence.`;
-          } else if (!requestCountsParityOk) {
-            holdReason = `Batch "${safeId}" request_counts (completed=${String(rcCompleted)}, failed=${String(rcFailed)}, total=${String(rcTotal)}) contradicted observed output lines (http_200=${parsedOutput.http_200_count}, errors=${parsedOutput.error_line_count}); retaining pending_recovery fence.`;
+          if (sanitized.status !== 'completed') {
+            holdReason = `Batch "${safeId}" ended with status "${sanitized.status}" (succeeded=${reconciliation.succeeded_count}, failed=${reconciliation.failed_count}, missing=${reconciliation.missing_count}); preserved partial outputs/errors and retained pending_recovery fence until reconciled.`;
+          } else if (reconciliation.duplicate_custom_ids.length > 0) {
+            holdReason = `Batch "${safeId}" had duplicate custom_ids across output and error files (${reconciliation.duplicate_custom_ids.length}); retaining pending_recovery fence.`;
           } else if (sanitized.error_file_id) {
-            holdReason = `Batch "${safeId}" includes error_file_id "${String(sanitized.error_file_id)}"; retaining pending_recovery fence until reconciled.`;
+            holdReason = `Batch "${safeId}" includes error_file_id "${String(sanitized.error_file_id)}" (succeeded=${reconciliation.succeeded_count}, failed=${reconciliation.failed_count}); reconciled partial output & error items and retained pending_recovery fence until settled.`;
+          } else if (!countMatches || !exactCustomIdSetMatch) {
+            holdReason = `Batch "${safeId}" output lines (${observedTotalLines}) or custom_ids did not match manifest/request_counts.total (${String(rcTotal)}); retaining pending_recovery fence.`;
+          } else if (!requestCountsParityOk) {
+            holdReason = `Batch "${safeId}" request_counts (completed=${String(rcCompleted)}, failed=${String(rcFailed)}, total=${String(rcTotal)}) contradicted observed output lines (http_200=${observedHttp200}, errors=${observedErrorLines}); retaining pending_recovery fence.`;
           } else {
             holdReason = `Batch "${safeId}" output contained nonterminal or unknown per-line usage; retaining pending_recovery fence.`;
           }
@@ -5597,7 +5856,7 @@ export class OpenAiClient {
             eff.ledger.markPendingRecovery(boundAttempt.attempt_id, {
               providerResponseId: safeId,
               httpStatus: 200,
-              provisionalUsageCostMicros: parsedOutput.known_usage_cost_micros > 0 ? parsedOutput.known_usage_cost_micros : null,
+              provisionalUsageCostMicros: reconciliation.known_usage_cost_micros > 0 ? reconciliation.known_usage_cost_micros : null,
               rawReceipt: sanitized,
               originalBodySha256: batchGetOrigSha,
               reason: holdReason,
@@ -5605,16 +5864,27 @@ export class OpenAiClient {
           }
         }
       }
-    } else if (boundAttempt && !wasAlreadyCompletedBefore && eff.downloadOutput === true && sanitized.status === 'completed' && !sanitized.output_file_id) {
-      const latestRow = eff.ledger.getAttemptById(boundAttempt.attempt_id);
-      if (latestRow && (latestRow.status === 'in_progress' || latestRow.status === 'pending_recovery')) {
-        eff.ledger.markPendingRecovery(boundAttempt.attempt_id, {
-          providerResponseId: safeId,
-          httpStatus: 200,
-          rawReceipt: sanitized,
-          originalBodySha256: batchGetOrigSha,
-          reason: `Completed Batch "${safeId}" omitted output_file_id; retaining pending_recovery fence.`,
+    } else if (eff.downloadOutput === true && isTerminalBatchStatus && !hasDownloadableArtifact) {
+      const manifest = boundAttempt?.batch_manifest ?? null;
+      if (Array.isArray(manifest?.custom_ids) && manifest.custom_ids.length > 0) {
+        reconciliation = reconcileBatchFilesByCustomId({
+          parsedOutput: null,
+          parsedError: null,
+          manifestCustomIds: manifest.custom_ids,
+          batchStatus: sanitized.status,
         });
+      }
+      if (boundAttempt && !wasAlreadyCompletedBefore) {
+        const latestRow = eff.ledger.getAttemptById(boundAttempt.attempt_id);
+        if (latestRow && (latestRow.status === 'in_progress' || latestRow.status === 'pending_recovery')) {
+          eff.ledger.markPendingRecovery(boundAttempt.attempt_id, {
+            providerResponseId: safeId,
+            httpStatus: 200,
+            rawReceipt: sanitized,
+            originalBodySha256: batchGetOrigSha,
+            reason: `Terminal Batch "${safeId}" (status=${sanitized.status}) omitted both output_file_id and error_file_id; retaining pending_recovery fence.`,
+          });
+        }
       }
     }
 
@@ -5634,8 +5904,12 @@ export class OpenAiClient {
       http_status: res.status,
       batch_id: safeId,
       batch_status: sanitized.status,
+      output_file_id: sanitized.output_file_id ?? null,
+      error_file_id: sanitized.error_file_id ?? null,
       batch: sanitized,
       parsed_output: parsedOutput,
+      parsed_error: parsedError,
+      reconciliation,
     };
   }
 }

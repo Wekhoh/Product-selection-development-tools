@@ -811,11 +811,6 @@ function computeCanonicalPathSha256(absOrCanonicalPath) {
   };
 }
 
-function computePhysicalIdentityRecord(filePath) {
-  const { canonicalPath, normPathKey, pathSha256 } = computeCanonicalPathSha256(filePath);
-  return { canonicalPath, normPathKey, pathSha256, devStr: null, inoStr: null };
-}
-
 function reverifyLegacySnapshotUnchanged(verified) {
   if (!verified || !verified.canonicalRealPath) return;
   let st;
@@ -1646,8 +1641,6 @@ export function inspectLegacyAutopilotBudget(
       value: Object.freeze({
         canonicalRealPath,
         sourcePathSha256,
-        sourceDev: null,
-        sourceIno: null,
         fileSha256: summary.file_sha256,
         snapshotSha256,
         inspectedAtMs,
@@ -1730,8 +1723,6 @@ export function inspectLegacyAutopilotBudget(
       value: Object.freeze({
         canonicalRealPath,
         sourcePathSha256,
-        sourceDev: null,
-        sourceIno: null,
         fileSha256: summary.file_sha256,
         snapshotSha256,
         inspectedAtMs,
@@ -1996,24 +1987,9 @@ export class OpenAiBudgetLedger {
   }
 
   _matchesPinnedLegacySourceRow(filePath, row) {
-    if (!filePath || !row) return false;
-    const id = computePhysicalIdentityRecord(filePath);
-    if (row.legacy_source_path_sha256 && row.legacy_source_path_sha256 === id.pathSha256) {
-      return true;
-    }
-    if (
-      id.devStr !== null &&
-      id.inoStr !== null &&
-      row.legacy_source_dev !== null &&
-      row.legacy_source_dev !== undefined &&
-      row.legacy_source_ino !== null &&
-      row.legacy_source_ino !== undefined &&
-      row.legacy_source_dev === id.devStr &&
-      row.legacy_source_ino === id.inoStr
-    ) {
-      return true;
-    }
-    return false;
+    if (!filePath || !row || !row.legacy_source_path_sha256) return false;
+    const { pathSha256 } = computeCanonicalPathSha256(filePath);
+    return row.legacy_source_path_sha256 === pathSha256;
   }
 
   _assertPathNotPinnedLegacySource(candidatePath) {
@@ -2023,9 +1999,9 @@ export class OpenAiBudgetLedger {
     );
     if (!cols.has('legacy_source_path_sha256')) return;
     const rows = this.db.prepare(`
-      SELECT legacy_source_path_sha256, legacy_source_dev, legacy_source_ino
+      SELECT legacy_source_path_sha256
       FROM openai_budget_policy
-      WHERE legacy_source_path_sha256 IS NOT NULL OR legacy_source_ino IS NOT NULL
+      WHERE legacy_source_path_sha256 IS NOT NULL
     `).all();
     for (const r of rows) {
       if (this._matchesPinnedLegacySourceRow(candidatePath, r)) {
@@ -2678,7 +2654,7 @@ export class OpenAiBudgetLedger {
           { code: 'LEGACY_SOURCE_DESTINATION_COLLISION', notDispatched: true },
         );
       }
-      pinnedSourceSpec = computePhysicalIdentityRecord(normExpected);
+      pinnedSourceSpec = computeCanonicalPathSha256(normExpected);
     }
     const safeNote = note !== undefined ? sanitizeSafeNote(note, 'policy_note') : undefined;
     const now = this._nowIso();
@@ -2733,8 +2709,8 @@ export class OpenAiBudgetLedger {
       const nextStage4 = false;
       const nextNote = safeNote !== undefined ? safeNote : (existing ? existing.policy_note : null);
       const nextSrcSha = pinnedSourceSpec ? pinnedSourceSpec.pathSha256 : (existing?.legacy_source_path_sha256 ?? null);
-      const nextSrcDev = pinnedSourceSpec ? pinnedSourceSpec.devStr : (existing?.legacy_source_dev ?? null);
-      const nextSrcIno = pinnedSourceSpec ? pinnedSourceSpec.inoStr : (existing?.legacy_source_ino ?? null);
+      const nextSrcDev = pinnedSourceSpec ? null : (existing?.legacy_source_dev ?? null);
+      const nextSrcIno = pinnedSourceSpec ? null : (existing?.legacy_source_ino ?? null);
 
       if (!existing) {
         this.db.prepare(`
@@ -2856,7 +2832,7 @@ export class OpenAiBudgetLedger {
           { code: 'LEGACY_SOURCE_MISMATCH', notDispatched: true },
         );
       }
-      explicitExpectedSourceIdentity = computePhysicalIdentityRecord(normExp);
+      explicitExpectedSourceIdentity = computeCanonicalPathSha256(normExp);
     }
 
     // P0-09: Re-stat and re-hash legacy source (main, -wal, -journal) at activation time!
@@ -2932,8 +2908,8 @@ export class OpenAiBudgetLedger {
         }
         const nextStamp = verified ? verified.inspectedAtMs : (existing?.legacy_inspected_at_ms ?? null);
         const pinnedPathSha = existing?.legacy_source_path_sha256 ?? (verified ? verified.sourcePathSha256 : null);
-        const pinnedDev = existing?.legacy_source_path_sha256 ? existing.legacy_source_dev : (verified ? verified.sourceDev : null);
-        const pinnedIno = existing?.legacy_source_path_sha256 ? existing.legacy_source_ino : (verified ? verified.sourceIno : null);
+        const pinnedDev = existing?.legacy_source_path_sha256 ? existing.legacy_source_dev : null;
+        const pinnedIno = existing?.legacy_source_path_sha256 ? existing.legacy_source_ino : null;
 
         if (!existing) {
           this.db.prepare(`
@@ -3048,36 +3024,18 @@ export class OpenAiBudgetLedger {
       if (verified) {
         if (!existing || !existing.legacy_source_path_sha256) {
           nextSrcPathSha = verified.sourcePathSha256;
-          nextSrcDev = verified.sourceDev;
-          nextSrcIno = verified.sourceIno;
-        } else {
-          const samePath = existing.legacy_source_path_sha256 === verified.sourcePathSha256;
-          const sameInode =
-            existing.legacy_source_ino === null ||
-            existing.legacy_source_ino === undefined ||
-            verified.sourceIno === null ||
-            (existing.legacy_source_dev === verified.sourceDev && existing.legacy_source_ino === verified.sourceIno);
-
-          if (!samePath) {
-            if (!allowLegacySourceSwitch || !explicitExpectedSourceIdentity || !safeNote) {
-              throw new OpenAiBudgetError(
-                `Inspected legacy budget source for "${scope}" does not match the pinned legacy source; switching requires allowLegacySourceSwitch: true, matching expectedLegacySourcePath, and an operator note.`,
-                { code: 'LEGACY_SOURCE_MISMATCH', notDispatched: true },
-              );
-            }
-            nextSrcPathSha = verified.sourcePathSha256;
-            nextSrcDev = verified.sourceDev;
-            nextSrcIno = verified.sourceIno;
-          } else if (!sameInode) {
-            if (!explicitExpectedSourceIdentity || !safeNote) {
-              throw new OpenAiBudgetError(
-                `Pinned legacy budget file for "${scope}" changed physical device/inode at its pathname; supply matching expectedLegacySourcePath and an operator note.`,
-                { code: 'LEGACY_SOURCE_MISMATCH', notDispatched: true },
-              );
-            }
-            nextSrcDev = verified.sourceDev;
-            nextSrcIno = verified.sourceIno;
+          nextSrcDev = null;
+          nextSrcIno = null;
+        } else if (existing.legacy_source_path_sha256 !== verified.sourcePathSha256) {
+          if (!allowLegacySourceSwitch || !explicitExpectedSourceIdentity || !safeNote) {
+            throw new OpenAiBudgetError(
+              `Inspected legacy budget source for "${scope}" does not match the pinned legacy source; switching requires allowLegacySourceSwitch: true, matching expectedLegacySourcePath, and an operator note.`,
+              { code: 'LEGACY_SOURCE_MISMATCH', notDispatched: true },
+            );
           }
+          nextSrcPathSha = verified.sourcePathSha256;
+          nextSrcDev = null;
+          nextSrcIno = null;
         }
       }
 

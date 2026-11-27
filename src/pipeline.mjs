@@ -1269,13 +1269,21 @@ export function runGate1AForForm(store, {
       const vetCutoff = finite(resolvedPriceBand?.mature_regular_band?.veteran_cutoff_days)
         ? resolvedPriceBand.mature_regular_band.veteran_cutoff_days
         : 365;
+      const isPrecomputedRowKeepaSteady = r => {
+        if (!r) return false;
+        if (r.keepa_dated_90d_verified === false || r.keepa_steady_provenance === 'legacy_boolean_unverified') {
+          return false;
+        }
+        if (r.keepa_dated_90d_verified === true) return true;
+        return r.keepa_steady_verified === true;
+      };
       const unverifiedInMainstream = resolvedPriceBand.mainstream_pool.filter(
-        r => r && (r.age_days === null || r.age_days === undefined || r.age_days > preCutoff) && r.keepa_steady_verified !== true,
+        r => r && (r.age_days === null || r.age_days === undefined || r.age_days > preCutoff) && !isPrecomputedRowKeepaSteady(r),
       );
       if (unverifiedInMainstream.length > 0) {
         const cloned = structuredClone(resolvedPriceBand);
         const keptPool = cloned.mainstream_pool.filter(
-          r => !(r && (r.age_days === null || r.age_days === undefined || r.age_days > preCutoff) && r.keepa_steady_verified !== true),
+          r => !(r && (r.age_days === null || r.age_days === undefined || r.age_days > preCutoff) && !isPrecomputedRowKeepaSteady(r)),
         );
         cloned.mainstream_pool = keptPool;
         cloned.mainstream_count = keptPool.length;
@@ -1301,11 +1309,18 @@ export function runGate1AForForm(store, {
           cloned.regular_band_reference = null;
           cloned.band = null;
         } else {
-          const reAnalyzed = analyzeMainstreamPriceBand(keptPool.map(r => ({
-            ...r,
-            price_usd: r.net_price_usd,
-            keepa_price_steady: true,
-          })), effectiveBandOptions);
+          // Forward actual dated Keepa metadata from kept rows rather than fabricating bare keepa_price_steady booleans.
+          const reAnalyzed = analyzeMainstreamPriceBand(keptPool.map(r => {
+            const hasDatedProof = r.keepa_dated_90d_verified === true;
+            return {
+              ...r,
+              price_usd: r.net_price_usd,
+              ...(hasDatedProof ? {
+                keepa_dated_90d_verified: true,
+                keepa_steady_provenance: r.keepa_steady_provenance ?? 'dated_90d_keepa',
+              } : {}),
+            };
+          }), effectiveBandOptions);
           cloned.mature_regular_band = reAnalyzed.mature_regular_band;
           cloned.regular_band_reference = reAnalyzed.regular_band_reference;
           cloned.band = reAnalyzed.band;
@@ -4416,6 +4431,209 @@ export function applyPeerComparabilityRulings(candidate, rulings, { currentSpecS
   return out;
 }
 
+function projectActiveQuotesForResumeHash(usableQuotesPool, requiredQuoteIds, gate1bRecord) {
+  const quotes = [...(Array.isArray(usableQuotesPool) ? usableQuotesPool : [])]
+    .sort((a, b) => String(a?.quote_id ?? '').localeCompare(String(b?.quote_id ?? '')))
+    .map(q => ({
+      quote_id: q.quote_id ?? null,
+      factory_id: q.factory_id ?? null,
+      spec_version: q.spec_version ?? null,
+      quote_status: q.quote_status ?? null,
+      pack_multiple: q.pack_multiple ?? null,
+      moq_sets: q.moq_sets ?? null,
+      actual_sets: q.actual_sets ?? null,
+      actual_complete_sets: q.actual_complete_sets ?? null,
+      goods_cny_total: q.goods_cny_total ?? null,
+      domestic_freight_cny_total: q.domestic_freight_cny_total ?? null,
+      fx_cny_per_usd: q.fx_cny_per_usd ?? null,
+      pkg_json: q.pkg_json ?? null,
+      sku_lines_json: q.sku_lines_json ?? null,
+      order_plan_json: q.order_plan_json ?? null,
+      goods_first_order_promotion: q.goods_first_order_promotion ?? null,
+      freight_first_order_promotion: q.freight_first_order_promotion ?? null,
+      observed_at: q.observed_at ?? null,
+      expires_at: q.expires_at ?? null,
+      raw_readback_ref: q.raw_readback_ref ?? null,
+    }));
+  return {
+    required_quote_ids: [...(Array.isArray(requiredQuoteIds) ? requiredQuoteIds : [])].sort(),
+    usable_quotes: quotes,
+    gate1b_verdict: gate1bRecord ? {
+      status: gate1bRecord.status ?? null,
+      margin_interval_verdict: gate1bRecord.margin_interval_verdict ?? null,
+      quote_id: gate1bRecord.quote_id ?? null,
+      quote_ids: Array.isArray(gate1bRecord.quote_ids) ? [...gate1bRecord.quote_ids].sort() : null,
+      spec_sha256: gate1bRecord.spec_sha256 ?? null,
+    } : null,
+  };
+}
+
+function projectGate1AInputsForResumeHash(gate1aRecord, item) {
+  return {
+    item_gate1a_scenarios: Array.isArray(item?.gate1a_scenarios) ? item.gate1a_scenarios : null,
+    gate1a_summary: gate1aRecord ? {
+      gate_status: gate1aRecord.gate_status ?? null,
+      spec_sha256: gate1aRecord.spec_sha256 ?? null,
+      scenarios: gate1aRecord.scenarios ?? null,
+      minimum_price_usd: gate1aRecord.minimum_price_usd ?? null,
+      forward_price_discovery_only: gate1aRecord.forward_price_discovery_only ?? false,
+      regular_band_reference: gate1aRecord.regular_band_reference ?? null,
+    } : null,
+  };
+}
+
+function resolveEffectiveRulingsForHash(baseRulings, itemRulings, form) {
+  const baseArr = Array.isArray(baseRulings) ? structuredClone(baseRulings) : [];
+  if (!Array.isArray(itemRulings) || itemRulings.length === 0) {
+    return baseArr;
+  }
+  const mergedCand = applyPeerComparabilityRulings(
+    {
+      id: form.form_id,
+      spec_sha256: form.spec_sha256,
+      spec_version: form.spec_version,
+      peer_comparability_rulings: baseArr,
+    },
+    itemRulings,
+    { currentSpecSha: form.spec_sha256, currentSpecVersion: form.spec_version },
+  );
+  return Array.isArray(mergedCand.peer_comparability_rulings) ? mergedCand.peer_comparability_rulings : [];
+}
+
+/**
+ * Compute the deterministic pre-evaluation evidence fingerprint used by `resume_skip_completed`
+ * BEFORE calling `deep_research_executor` or paid Stage-3 hooks, capturing active 1688 quotes,
+ * fee-table snapshot, profile snapshot, Gate 1A scenarios, `#8` `peer_comparability_rulings`,
+ * and exact `computeEvidenceBundleHash` whenever static batch inputs are available on `item`.
+ */
+function computePreEvalResumeFingerprint({
+  form,
+  store,
+  item,
+  profile,
+  effectiveFeeSnapshot,
+  requiredQuoteIds,
+  usableQuotesPool,
+  gate1aRecord,
+  gate1bRecord,
+}) {
+  const staticResearchOut = item?.research_out ?? (item?.scored_batch ? { batch: item.scored_batch } : null);
+  const staticBatch = staticResearchOut?.batch && Array.isArray(staticResearchOut.batch.candidates)
+    ? staticResearchOut.batch
+    : null;
+  const staticCandRaw = staticBatch
+    ? staticBatch.candidates.find(c => c?.id === form.form_id) ?? null
+    : null;
+
+  const effectiveRulings = resolveEffectiveRulingsForHash(
+    staticCandRaw?.peer_comparability_rulings ?? null,
+    item?.peer_comparability_rulings ?? null,
+    form,
+  );
+
+  let staticEvidenceBundleSha = null;
+  if (staticBatch && staticCandRaw && !item?.rights_prescreen_input && !item?.review_judge_input) {
+    try {
+      const clonedBatch = structuredClone(staticBatch);
+      const candIdx = clonedBatch.candidates.findIndex(c => c?.id === form.form_id);
+      if (candIdx >= 0) {
+        let candCopy = clonedBatch.candidates[candIdx];
+        attachGate1APriceCliffStress(candCopy, gate1aRecord);
+        if (form.spec_sha256) candCopy.spec_sha256 = form.spec_sha256;
+        if (Number.isInteger(form.spec_version) && form.spec_version > 0) candCopy.spec_version = form.spec_version;
+        if (Array.isArray(item?.peer_comparability_rulings) && item.peer_comparability_rulings.length > 0) {
+          candCopy = applyPeerComparabilityRulings(candCopy, item.peer_comparability_rulings, {
+            currentSpecSha: form.spec_sha256,
+            currentSpecVersion: form.spec_version,
+          });
+          clonedBatch.candidates[candIdx] = candCopy;
+        }
+        const manifest = staticResearchOut.discovery
+          ? prepareDiscovery(staticResearchOut.discovery.pool, staticResearchOut.discovery.decisions)
+          : null;
+        const withManifest = manifest ? attachDiscovery(clonedBatch, manifest) : clonedBatch;
+        const boundBatch = attachStoreDiscoveryProvenance(withManifest, store);
+        const inputCand = boundBatch.candidates.find(c => c?.id === form.form_id);
+        if (inputCand) {
+          const deterministicCandInput = Object.hasOwn(inputCand, 'evidence_review')
+            ? (() => { const { evidence_review: _advisory, ...rest } = inputCand; return rest; })()
+            : inputCand;
+          staticEvidenceBundleSha = computeEvidenceBundleHash({
+            form_spec_sha256: form.spec_sha256,
+            candidate_input: deterministicCandInput,
+            discovery_manifest: manifest,
+            profile_snapshot: profile,
+            fee_table_snapshot: effectiveFeeSnapshot,
+          });
+        }
+      }
+    } catch {
+      staticEvidenceBundleSha = null;
+    }
+  }
+
+  return {
+    form_spec_sha256: form.spec_sha256,
+    profile_snapshot_sha256: sha256Hex(canonicalJson(profile)),
+    fee_table_snapshot_sha256: sha256Hex(canonicalJson(effectiveFeeSnapshot)),
+    active_quotes_sha256: sha256Hex(canonicalJson(projectActiveQuotesForResumeHash(usableQuotesPool, requiredQuoteIds, gate1bRecord))),
+    gate1a_inputs_sha256: sha256Hex(canonicalJson(projectGate1AInputsForResumeHash(gate1aRecord, item))),
+    peer_comparability_rulings_sha256: sha256Hex(canonicalJson(effectiveRulings)),
+    stage3_optional_inputs_sha256: sha256Hex(canonicalJson({
+      rights_prescreen_input: item?.rights_prescreen_input ?? null,
+      review_judge_input: item?.review_judge_input ?? null,
+    })),
+    static_evidence_bundle_sha256: staticEvidenceBundleSha,
+  };
+}
+
+function findReusableCompletedEvaluations(store, form, profile, preEvalFp) {
+  const matching = store.getEvaluationsForForm(form.form_id).filter(ev => {
+    if (ev.profile_revision !== profile.revision) return false;
+    let rec = null;
+    try {
+      rec = ev.receipt_json ? JSON.parse(ev.receipt_json) : null;
+    } catch {
+      return false;
+    }
+    if (!rec || rec.form_spec_sha256 !== form.spec_sha256) return false;
+
+    const hasDetailedFingerprints = Boolean(
+      rec.profile_snapshot_sha256 &&
+      rec.fee_table_snapshot_sha256 &&
+      rec.active_quotes_sha256 &&
+      rec.gate1a_inputs_sha256 &&
+      rec.peer_comparability_rulings_sha256 &&
+      rec.stage3_optional_inputs_sha256,
+    );
+    if (hasDetailedFingerprints) {
+      if (
+        rec.profile_snapshot_sha256 !== preEvalFp.profile_snapshot_sha256 ||
+        rec.fee_table_snapshot_sha256 !== preEvalFp.fee_table_snapshot_sha256 ||
+        rec.active_quotes_sha256 !== preEvalFp.active_quotes_sha256 ||
+        rec.gate1a_inputs_sha256 !== preEvalFp.gate1a_inputs_sha256 ||
+        rec.peer_comparability_rulings_sha256 !== preEvalFp.peer_comparability_rulings_sha256 ||
+        rec.stage3_optional_inputs_sha256 !== preEvalFp.stage3_optional_inputs_sha256
+      ) {
+        return false;
+      }
+      if (preEvalFp.static_evidence_bundle_sha256 !== null && ev.evidence_bundle_sha256 !== preEvalFp.static_evidence_bundle_sha256) {
+        return false;
+      }
+      return true;
+    }
+
+    // Legacy pre-fix evaluation rows lack per-input receipt hashes: only reuse when exact
+    // computeEvidenceBundleHash matches static inputs (which already covers quotes, fees, profile, and rulings).
+    return preEvalFp.static_evidence_bundle_sha256 !== null &&
+      ev.evidence_bundle_sha256 === preEvalFp.static_evidence_bundle_sha256;
+  });
+
+  if (matching.length === 0) return [];
+  const latestBundleSha = matching[matching.length - 1].evidence_bundle_sha256;
+  return matching.filter(ev => ev.evidence_bundle_sha256 === latestBundleSha);
+}
+
 /**
  * Run a complete multi-item Phase 2 batch with single-controller non-blocking orchestration:
  *  - Rejects duplicate form_ids upfront.
@@ -4753,19 +4971,23 @@ export async function runPhase2Batch(store, {
       });
       continue;
     }
+    const gate1aRecord = form.gate1a_result_json ? JSON.parse(form.gate1a_result_json) : null;
+    const preStage3Gate1bRecord = form.gate1b_result_json ? JSON.parse(form.gate1b_result_json) : null;
+    const preStage3UsableQuotes = store.getQuotesForForm(formId).filter(q => isQuoteUsableForForm(q, form, as_of_date));
+    const preEvalResumeFp = computePreEvalResumeFingerprint({
+      form,
+      store,
+      item,
+      profile,
+      effectiveFeeSnapshot,
+      requiredQuoteIds,
+      usableQuotesPool: preStage3UsableQuotes,
+      gate1aRecord,
+      gate1bRecord: preStage3Gate1bRecord,
+    });
     if (resume_skip_completed === true && item.force_reevaluate !== true && !item.evidence_review_packet) {
-      const existingEvals = store.getEvaluationsForForm(formId).filter(ev => {
-        if (ev.profile_revision !== profile.revision) return false;
-        try {
-          const rec = ev.receipt_json ? JSON.parse(ev.receipt_json) : null;
-          return rec?.form_spec_sha256 === form.spec_sha256;
-        } catch {
-          return false;
-        }
-      });
-      if (existingEvals.length > 0) {
-        const latestBundleSha = existingEvals[existingEvals.length - 1].evidence_bundle_sha256;
-        const reusedRows = existingEvals.filter(ev => ev.evidence_bundle_sha256 === latestBundleSha);
+      const reusedRows = findReusableCompletedEvaluations(store, form, profile, preEvalResumeFp);
+      if (reusedRows.length > 0) {
         for (const ev of reusedRows) report.evaluations.push(ev);
         let parsedQual = null;
         try { parsedQual = JSON.parse(reusedRows[0].qualification_json || 'null'); } catch { parsedQual = null; }
@@ -4782,7 +5004,6 @@ export async function runPhase2Batch(store, {
         continue;
       }
     }
-    const gate1aRecord = form.gate1a_result_json ? JSON.parse(form.gate1a_result_json) : null;
 
     // Require at least one admissible primary_discovery lead (product/context + aligned SocialBridge if applicable).
     const linkedLeads = store.getLeadsForForm(formId);
@@ -5011,6 +5232,19 @@ export async function runPhase2Batch(store, {
       if (Number.isInteger(latestForm.spec_version) && latestForm.spec_version > 0) {
         rawInputCand.spec_version = latestForm.spec_version;
       }
+      if (Array.isArray(item.peer_comparability_rulings) && item.peer_comparability_rulings.length > 0) {
+        const candIdx = clonedBatch.candidates.findIndex(c => c?.id === formId);
+        if (candIdx >= 0) {
+          clonedBatch.candidates[candIdx] = applyPeerComparabilityRulings(
+            rawInputCand,
+            item.peer_comparability_rulings,
+            {
+              currentSpecSha: latestForm.spec_sha256,
+              currentSpecVersion: latestForm.spec_version,
+            },
+          );
+        }
+      }
 
       const manifest = researchOut.discovery
         ? prepareDiscovery(researchOut.discovery.pool, researchOut.discovery.decisions)
@@ -5169,6 +5403,18 @@ export async function runPhase2Batch(store, {
               batch_html_sha256: htmlSha,
               summary: scoredResult.summary,
               fee_table_version: effectiveFeeSnapshot?.metadata?.version ?? effectiveFeeSnapshot?.version ?? null,
+              profile_snapshot_sha256: preEvalResumeFp.profile_snapshot_sha256,
+              fee_table_snapshot_sha256: preEvalResumeFp.fee_table_snapshot_sha256,
+              active_quotes_sha256: sha256Hex(canonicalJson(projectActiveQuotesForResumeHash(
+                store.getQuotesForForm(formId).filter(q => isQuoteUsableForForm(q, recheck, as_of_date)),
+                requiredQuoteIds,
+                recheck.gate1b_result_json ? JSON.parse(recheck.gate1b_result_json) : latestGate1bRecord,
+              ))),
+              gate1a_inputs_sha256: preEvalResumeFp.gate1a_inputs_sha256,
+              peer_comparability_rulings_sha256: sha256Hex(canonicalJson(
+                Array.isArray(inputCand.peer_comparability_rulings) ? inputCand.peer_comparability_rulings : [],
+              )),
+              stage3_optional_inputs_sha256: preEvalResumeFp.stage3_optional_inputs_sha256,
             },
             review_notes: researchOut.review_notes ?? null,
             evidence_review: attachedEvidenceReview ?? null,
