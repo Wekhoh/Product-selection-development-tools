@@ -472,10 +472,12 @@ export function extractSpApiFinalistCalibration({
   }
 
   let restrictions = null;
+  let restrictionsStatus = null;
   if (restBody !== null) {
+    const isArchivedMultiAsinRestrictions = Array.isArray(restBody?.listings_restrictions);
     const resolvedRestArr = Array.isArray(restBody?.restrictions)
       ? restBody.restrictions
-      : (Array.isArray(restBody?.listings_restrictions)
+      : (isArchivedMultiAsinRestrictions
         ? restBody.listings_restrictions
         : (Array.isArray(restBody) ? restBody : null));
     if (!restBody || typeof restBody !== 'object' || !resolvedRestArr) {
@@ -485,17 +487,25 @@ export function extractSpApiFinalistCalibration({
       throw new TypeError(`SP-API listingsRestrictions ASIN ("${restBody.asin.trim().toUpperCase()}") conflicts with target ASIN ("${asin}").`);
     }
     const restArr = resolvedRestArr;
-    const asinFilteredRest = restArr.filter(r => {
-      if (asin && nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() !== asin) return false;
-      if (nonemptyStr(r?.marketplaceId) && r.marketplaceId.trim() !== targetMkt) return false;
-      if (nonemptyStr(r?.conditionType) && r.conditionType.trim().toLowerCase() !== 'new_new') return false;
-      return true;
-    });
-    const allReasons = asinFilteredRest.flatMap(r => Array.isArray(r?.reasons) ? r.reasons : []);
-    restrictions = {
-      restriction_count: asinFilteredRest.length,
-      ...classifySpApiRestrictionReasons(allReasons, { target_is_own_white_label }),
-    };
+    const rowsHaveExplicitAsin = restArr.length > 0 && restArr.some(r => nonemptyStr(r?.asin));
+    const asinMatchedInMultiList = !asin || !rowsHaveExplicitAsin ||
+      restArr.some(r => nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() === asin);
+    if (!asinMatchedInMultiList || (isArchivedMultiAsinRestrictions && asin && restArr.length === 0)) {
+      restrictionsStatus = 'asin_not_found_in_listings_restrictions';
+    } else {
+      const asinFilteredRest = restArr.filter(r => {
+        if (asin && nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() !== asin) return false;
+        if (nonemptyStr(r?.marketplaceId) && r.marketplaceId.trim() !== targetMkt) return false;
+        if (nonemptyStr(r?.conditionType) && r.conditionType.trim().toLowerCase() !== 'new_new') return false;
+        return true;
+      });
+      const allReasons = asinFilteredRest.flatMap(r => Array.isArray(r?.reasons) ? r.reasons : []);
+      restrictions = {
+        restriction_count: asinFilteredRest.length,
+        ...classifySpApiRestrictionReasons(allReasons, { target_is_own_white_label }),
+      };
+      restrictionsStatus = 'verified';
+    }
   }
 
   const calDefaultEvalPrice = finite(feeCalibration?.total_price_usd) && feeCalibration.total_price_usd > 0
@@ -581,6 +591,7 @@ export function extractSpApiFinalistCalibration({
     fee_calibration: feeCalibration,
     ...(feeCalibrationStatus ? { fee_calibration_status: feeCalibrationStatus } : {}),
     restrictions,
+    ...(restrictionsStatus && restrictionsStatus !== 'verified' ? { restrictions_status: restrictionsStatus } : {}),
     stale_sellersprite_audit: staleCacheAudit,
     missing_components: missingComponents,
     finalist_calibration_complete: missingComponents.length === 0,

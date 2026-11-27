@@ -295,6 +295,20 @@ test('Issue #33 (4B SP-API): CatalogItems shapes/units/marketplace/qty parity, f
   assert.equal(genericNotEligible.restriction_scope, 'category_or_product_approval');
   assert.equal(genericNotEligible.hard_category_ban, false);
 
+  // 6b. Multi-ASIN archived listings_restrictions missing target ASIN must NOT report clear
+  const unmatchedRestCal = extractSpApiFinalistCalibration({
+    asin: 'B0SYN4BSP1',
+    restrictionsRaw: {
+      listings_restrictions: [
+        { asin: 'B0SYNOTHER', reasons: [{ reasonCode: 'NOT_ELIGIBLE', message: 'You need approval to list this product.' }] },
+      ],
+    },
+  });
+  assert.equal(unmatchedRestCal.restrictions, null);
+  assert.equal(unmatchedRestCal.restrictions_status, 'asin_not_found_in_listings_restrictions');
+  assert.ok(unmatchedRestCal.missing_components.includes('listings_restrictions'));
+  assert.equal(unmatchedRestCal.finalist_calibration_complete, false);
+
   // 7. End-to-end ingestTrialSpecification: archived fees_estimates[] + listings_restrictions[] triggers missing_catalog_items note,
   //    wrapped payload:[item] auto-discovers official_pkg, and fee-query price_usd NEVER satisfies market price provenance!
   const dir = mkdtempSync(join(tmpdir(), 'issue33-sp-api-'));
@@ -318,12 +332,14 @@ test('Issue #33 (4B SP-API): CatalogItems shapes/units/marketplace/qty parity, f
     const ssMarketFile = '01-ss-market.json';
     const spArchivedSummaryFile = '02-sp-archived-fees-restrictions.json';
     const spCatArrayFile = '03-sp-catalog-array.json';
+    const spCatCaFile = '02b-sp-catalog-ca.json';
     writeFileSync(join(dir, ssMarketFile), JSON.stringify({ code: 'OK', items: [{ asin: 'B0SYN4BSP1', price: 40 }] }));
     writeFileSync(join(dir, spArchivedSummaryFile), JSON.stringify({
       marketplace_id: 'ATVPDKIKX0DER',
       fees_estimates: [{ reference_asin: 'B0SYN4BSP1', price_usd: 40, referral_fee_usd: 6.0, fba_pick_and_pack_usd: 6.5, total_fees_usd: 12.5 }],
       listings_restrictions: [{ asin: 'B0SYN4BSP1', reasons: [{ reasonCode: 'NOT_ELIGIBLE', message: 'You need approval to list in this brand.' }] }],
     }));
+    writeFileSync(join(dir, spCatCaFile), JSON.stringify(caItem));
     writeFileSync(join(dir, spCatArrayFile), JSON.stringify({ payload: [usItem] }));
 
     // (a) Archived fees_estimates + listings_restrictions WITHOUT CatalogItems -> surfaces missing_catalog_items gap note
@@ -341,12 +357,12 @@ test('Issue #33 (4B SP-API): CatalogItems shapes/units/marketplace/qty parity, f
     assert.equal(missingCand.sp_api_calibration.fee_calibration_status, 'verified');
     assert.ok((missingCand.review_notes ?? []).some(n => /CatalogItems|官方包装尺寸/.test(String(n))));
 
-    // (b) Wrapped payload:[item] CatalogItems auto-discovers & calibrates scenario pkg
+    // (b) Multi-file CA CatalogItems before wrapped US payload:[item] auto-discovers US official_pkg (never masked by CA)
     const fullIngestRes = ingestTrialSpecification(
       {
         profile_revision: 59,
-        raw_receipt_files: [ssMarketFile, spArchivedSummaryFile, spCatArrayFile],
-        candidates: [{ candidate: structuredClone(baseCand), raw_receipt_files: [ssMarketFile, spArchivedSummaryFile, spCatArrayFile] }],
+        raw_receipt_files: [ssMarketFile, spArchivedSummaryFile, spCatCaFile, spCatArrayFile],
+        candidates: [{ candidate: structuredClone(baseCand), raw_receipt_files: [ssMarketFile, spArchivedSummaryFile, spCatCaFile, spCatArrayFile] }],
       },
       r59Profile,
       { baseDir: dir },

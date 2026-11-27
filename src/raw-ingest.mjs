@@ -2223,7 +2223,7 @@ export function ingestTrialSpecification(spec, profile, {
       : (nonemptyStr(cand?.screening?.reference_price_usd?.target_variant_asin)
         ? cand.screening.reference_price_usd.target_variant_asin.trim().toUpperCase()
         : null);
-    let autoSpCatalogRaw = null;
+    const autoSpCatalogNodes = [];
     const autoSpFeesCandidates = [];
     let autoSpRestrictionsRaw = null;
     const findSpApiErrorsDeep = (obj, depth = 0) => {
@@ -2268,22 +2268,12 @@ export function ingestTrialSpecification(spec, profile, {
         const unw = unwrapMcpEnvelope(rawP);
         if (!unw || typeof unw !== 'object') continue;
         if (targetVariantAsin) {
-          const targetSpMkt = nonemptyStr(entry.sp_api_calibration_inputs?.marketplace_id)
-            ? entry.sp_api_calibration_inputs.marketplace_id.trim()
-            : 'ATVPDKIKX0DER';
-          if (!autoSpCatalogRaw) {
-            const candidateCatNodes = collectCatalogItemNodes(unw).filter(n =>
-              nonemptyStr(n.asin) &&
-              n.asin.trim().toUpperCase() === targetVariantAsin &&
-              (Array.isArray(n.dimensions) || n.attributes?.item_package_dimensions || n.attributes?.item_package_weight),
-            );
-            const matchedCatNode = candidateCatNodes.find(n =>
-              (Array.isArray(n.dimensions) && n.dimensions.some(d => !d?.marketplaceId || d.marketplaceId === targetSpMkt)) ||
-              (Array.isArray(n.attributes?.item_package_dimensions) && n.attributes.item_package_dimensions.some(d => !d?.marketplace_id || d.marketplace_id === targetSpMkt)) ||
-              (Array.isArray(n.attributes?.item_package_weight) && n.attributes.item_package_weight.some(w => !w?.marketplace_id || w.marketplace_id === targetSpMkt)),
-            ) ?? candidateCatNodes[0] ?? null;
-            if (matchedCatNode) autoSpCatalogRaw = matchedCatNode;
-          }
+          const candidateCatNodes = collectCatalogItemNodes(unw).filter(n =>
+            nonemptyStr(n.asin) &&
+            n.asin.trim().toUpperCase() === targetVariantAsin &&
+            (Array.isArray(n.dimensions) || n.attributes?.item_package_dimensions || n.attributes?.item_package_weight),
+          );
+          if (candidateCatNodes.length > 0) autoSpCatalogNodes.push(...candidateCatNodes);
           const isNativeFeesArray = Array.isArray(unw) && unw.some(x => x && typeof x === 'object' && (x.FeesEstimateResult || x.FeesEstimateIdentifier || x.FeesEstimate));
           const isArchivedFeesSummary = Array.isArray(unw.fees_estimates) && unw.fees_estimates.length > 0;
           if (isNativeFeesArray || isArchivedFeesSummary || unw.FeesEstimateResult || unw.FeesEstimateResultList || unw.payload?.FeesEstimateResult || unw.payload?.FeesEstimateResultList) {
@@ -2297,6 +2287,9 @@ export function ingestTrialSpecification(spec, profile, {
         }
       }
     }
+    const autoSpCatalogRaw = autoSpCatalogNodes.length === 0
+      ? null
+      : (autoSpCatalogNodes.length === 1 ? autoSpCatalogNodes[0] : { items: autoSpCatalogNodes });
     const autoSpFeesRaw = autoSpFeesCandidates.length === 0
       ? null
       : (autoSpFeesCandidates.length === 1
