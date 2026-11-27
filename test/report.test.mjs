@@ -275,13 +275,38 @@ test('r58 curatorial studio gallery embeds offline WOFF2 fonts, Polar Rose SVG, 
 
 test('presentation.summary, presentation.risks, presentation.next_checks, and related presentation free-text scrub raw emails in rendered HTML', () => {
   const batch = structuredClone(fixture);
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFz8AAAAASUVORK5CYII=';
   batch.presentation.title = '批次标题 contact.batch@vendor.org';
   batch.presentation.summary = '批次摘要 owner.batch@example.net';
   batch.presentation.discovery = [{ label: '线索发现', detail: '来自 disc@example.org', source: 'src@example.org' }];
   batch.presentation.timings = [{ label: '耗时阶段', seconds: 12, note: '执行人 timing@example.org' }];
   batch.presentation.limitations = ['边界限制 lim@example.org'];
+  batch.packaging_redesign_shortlist = [
+    {
+      form_id: 'pkg-rescue-probe',
+      label: '改包装候选 pkg.label@vendor.cn',
+      eligible: true,
+      price_usd: 35,
+      overshoot_mm: 4,
+      original_margin: 0.27,
+      redesigned_margin: 0.33,
+      offending_side: 'longest',
+      summary_zh: '压缩包装说明 pkg.note@vendor.cn',
+    },
+  ];
+  batch.candidates[0].label = '候选产品 label@vendor.cn';
+  batch.candidates[0].form = '可售规格 form@vendor.cn';
   batch.candidates[0].presentation.summary = '候选摘要 test.user@supplier.cn 请核对';
   batch.candidates[0].presentation.subtitle_en = 'Subtitle sub@vendor.cn';
+  batch.candidates[0].presentation.one_time_lab_fee_note = '一次性实验室检测费 lab.fee@vendor.cn（不摊进单件）';
+  batch.candidates[0].presentation.concept_images = [
+    {
+      data_uri: png,
+      title: '概念图标题 concept.title@vendor.cn',
+      caption: '概念图说明 concept.caption@vendor.cn',
+      alt: '概念图替代文本 concept.alt@vendor.cn',
+    },
+  ];
   batch.candidates[0].presentation.risks = [
     '风险一：联系 leaked@domain.com 核对报价',
     { label: '结构风险', value: 'objval@domain.com', note: '附注 objnote@domain.com', source: 'objsrc@domain.com' },
@@ -291,13 +316,17 @@ test('presentation.summary, presentation.risks, presentation.next_checks, and re
     { problem: '待查项目 prob@factory.cn', next_step: '跟进 step@factory.cn' },
   ];
   batch.candidates[0].presentation.blockers = [
-    { problem: '阻断问题 blk@factory.cn', next_step: '处置 blkstep@factory.cn' },
+    { problem: '阻断问题 blk@factory.cn（通过旺旺核对）', next_step: '处置 blkstep@factory.cn' },
   ];
   batch.candidates[0].presentation.procurement = [
     { label: '采购联系 proc@factory.cn', value: 'val@factory.cn', note: 'note@factory.cn', source: 'src2@factory.cn' },
   ];
 
-  const html = renderReport(scoreBatch(batch, profile), batch);
+  const scored = scoreBatch(batch, profile);
+  scored.candidates[0].diagnostics.operational_disclosures = [
+    { id: 'ops_probe', label: '核查项 ops.label@vendor.cn', status: 'needs_check', note: '排雷备注 ops.note@vendor.cn' },
+  ];
+  const html = renderReport(scored, batch);
   for (const rawEmail of [
     'contact.batch@vendor.org',
     'owner.batch@example.net',
@@ -305,8 +334,16 @@ test('presentation.summary, presentation.risks, presentation.next_checks, and re
     'src@example.org',
     'timing@example.org',
     'lim@example.org',
+    'pkg.label@vendor.cn',
+    'pkg.note@vendor.cn',
+    'label@vendor.cn',
+    'form@vendor.cn',
     'test.user@supplier.cn',
     'sub@vendor.cn',
+    'lab.fee@vendor.cn',
+    'concept.title@vendor.cn',
+    'concept.caption@vendor.cn',
+    'concept.alt@vendor.cn',
     'leaked@domain.com',
     'objval@domain.com',
     'objnote@domain.com',
@@ -320,9 +357,28 @@ test('presentation.summary, presentation.risks, presentation.next_checks, and re
     'val@factory.cn',
     'note@factory.cn',
     'src2@factory.cn',
+    'ops.label@vendor.cn',
+    'ops.note@vendor.cn',
   ]) {
     assert.equal(html.includes(rawEmail), false, `raw email ${rawEmail} must not leak into rendered HTML`);
   }
   assert.match(html, /\[REDACTED_EMAIL\]/);
+  const matrixRow = html.match(/<th scope="row"><a class="row-jump" href="#candidate-1">[\s\S]*?<\/a><\/th>/)?.[0] ?? '';
+  assert.match(matrixRow, /候选产品 \[REDACTED_EMAIL\]/);
+  const reelSection = html.match(/<section class="exhibition-reel"[\s\S]*?<\/section>/)?.[0] ?? '';
+  assert.match(reelSection, /候选产品 \[REDACTED_EMAIL\]/);
+  const cardHeading = html.match(/<article class="candidate" id="candidate-1"[\s\S]*?<h2>([\s\S]*?)<\/h2>/)?.[1] ?? '';
+  assert.match(cardHeading, /候选产品 \[REDACTED_EMAIL\]/);
+  assert.match(html, /<p class="spec-copy">可售规格 \[REDACTED_EMAIL\]<\/p>/);
+  assert.match(html, /一次性实验室检测费 \[REDACTED_EMAIL\]/);
+  assert.match(html, /概念图标题 \[REDACTED_EMAIL\]/);
+  assert.match(html, /概念图说明 \[REDACTED_EMAIL\]/);
+  assert.match(html, /alt="概念图替代文本 \[REDACTED_EMAIL\]"/);
+  assert.match(html, /核查项 \[REDACTED_EMAIL\]/);
+  assert.match(html, /排雷备注 \[REDACTED_EMAIL\]/);
+  assert.match(html, /改包装候选 \[REDACTED_EMAIL\]/);
+  assert.match(html, /压缩包装说明 \[REDACTED_EMAIL\]/);
+  assert.match(html, /阻断问题 \[REDACTED_EMAIL\]（通过1688 问厂核对）/);
+  assert.doesNotMatch(html, /旺旺/);
 });
 
