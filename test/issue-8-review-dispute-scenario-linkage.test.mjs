@@ -1,8 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { scoreBatch, resolveScenarioComparabilityLinkage } from '../src/scoring.mjs';
-import { applyPeerComparabilityRulings } from '../src/pipeline.mjs';
+import { applyPeerComparabilityRulings, runPhase2Batch } from '../src/pipeline.mjs';
+import { runPhase2Cli } from '../src/phase2-cli.mjs';
+import { openSelectionStore } from '../src/store.mjs';
+import { estimateGate1A2027 } from '../src/fba-calculator.mjs';
+import { freezeEvidenceReviewPacket } from '../src/openai/evidence-review.mjs';
 import { renderReport } from '../src/report.mjs';
 import { makeStage4OrganizerTrayCandidate } from './helpers/stage4-fixtures.mjs';
 
@@ -239,6 +245,13 @@ test('Issue #8 (4C): handles seasonal operating_periods re-pricing, all-excluded
     ],
   };
 
+  const seasonalPeakOnly = applyPeerComparabilityRulings(structuredClone(flatBase), [
+    { peer_asin: 'B0SYN8LOW1', period_id: 'peak_q4', status: 'confirmed_excluded', source: 'owner_check', reason: '仅旺季排除低价' },
+  ]);
+  const sPeakOnlyOff = scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [seasonalPeakOnly] }, r59Profile)
+    .candidates[0].operating_periods.find(p => p.id === 'off_peak');
+  assert.equal(sPeakOnlyOff.screening.conditions.find(c => c.id === 'reference_price').reanchored_from_excluded_ref, undefined, 'peak_q4-scoped ruling must not leak into off_peak');
+
   const seasonalPending = applyPeerComparabilityRulings(flatBase, [
     { peer_asin: 'B0SYN8LOW1', status: 'confirmed_excluded', source: 'owner_check', reason: '无托盘排除' },
     { peer_asin: 'B0SYN8HIG2', status: 'pending_evidence', source: 'owner_check', reason: '待核托盘清单' },
@@ -328,6 +341,38 @@ test('Issue #8 (4C) Astra audit regressions: unified anchors, AND/subject_id/per
   const piiHtml = renderReport(piiPendingScored, piiPendingBatch);
   assert.doesNotMatch(piiHtml, /leak@example\.com|D:\\private\\audit\.txt/i);
   assert.match(piiHtml, /hero-stat-val[^>]*>待补证<\/p>/);
+  assert.match(piiHtml, /单件净留存<\/span>\s*<strong[^>]*>待补证<\/strong>/);
+  assert.match(piiHtml, /美站参照价<\/dt><dd>待补证<\/dd>/);
+  assert.equal(piiHtml.includes('<div class="alloc-strip"'), false);
+
+  // 3b. Period-scoped ruling isolation (peak_q4 must not leak into off_peak or flat), partial scenario_id re-anchoring, and standalone advisory review without root spec_sha256
+  const flatPeriodLeak = applyPeerComparabilityRulings(mkCand(), [
+    { peer_asin: 'B0SYN8LOW1', period_id: 'peak_q4', status: 'confirmed_excluded', source: 'owner', reason: '仅旺季排除' },
+  ]);
+  assert.equal(scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [flatPeriodLeak] }, r59Profile).candidates[0].diagnostics.economics.scenarios[0].excluded_from_active_pricing, undefined);
+
+  const partialScenExcl = applyPeerComparabilityRulings(mkCand(), [
+    { scenario_id: 'sc-low-no-tray', status: 'confirmed_excluded', source: 'owner', reason: '按情景排除低价' },
+  ]);
+  const partialScenRef = scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [partialScenExcl] }, r59Profile)
+    .candidates[0].screening.conditions.find(c => c.id === 'reference_price');
+  assert.deepEqual(partialScenRef.effective_price_range, [48, 48]);
+  assert.equal(partialScenRef.reanchored_from_excluded_ref, true);
+
+  const partialScenPend = applyPeerComparabilityRulings(mkCand(), [
+    { scenario_id: 'sc-low-no-tray', status: 'confirmed_excluded', source: 'owner', reason: '排除低价' },
+    { scenario_id: 'sc-high-parts-unknown', status: 'pending_evidence', source: 'owner', reason: '高价待补证' },
+  ]);
+  assert.equal(
+    scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [partialScenPend] }, r59Profile)
+      .candidates[0].screening.conditions.find(c => c.id === 'reference_price').status,
+    'pending',
+  );
+
+  const noRootShaCand = attachSyntheticAiReview(mkCand());
+  delete noRootShaCand.spec_sha256;
+  delete noRootShaCand.spec_version;
+  assert.equal(resolveScenarioComparabilityLinkage(noRootShaCand.economics.scenarios[0], noRootShaCand)?.status, 'ai_dispute_pending_ruling');
 
   // 4. P1-E2 + P1-E3: Append-only rulings let newest win without erasing history; stale_spec & ruled_by-only bypasses blocked
   const multiHist = mkCand();
@@ -353,4 +398,182 @@ test('Issue #8 (4C) Astra audit regressions: unified anchors, AND/subject_id/per
     { peer_asin: 'B0SYN8LOW1', status: 'pending_evidence', ruled_by: 'owner', reason: '缺显式 source', spec_sha256: SPEC_SHA_V1, spec_version: 1 },
   ];
   assert.equal(scoreBatch({ schema_version: 1, profile_revision: 59, candidates: [ruledByOnly] }, r59Profile).candidates[0].qualification.counts_toward_target, true);
+});
+
+test('Issue #8 (4C) SQLite E2E: runPhase2Batch binds DB spec_sha256 pre-score (enforces v1 ruling, blocks stale v1 ruling on v2) and matches export-report --verify-html with Gate-4 dispute', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'issue8-sqlite-e2e-'));
+  const dbPath = join(dir, 'selection.sqlite');
+  const receiptDir = join(dir, 'receipts');
+  mkdirSync(receiptDir, { recursive: true });
+  let store = openSelectionStore(dbPath);
+  try {
+    const formV1 = {
+      form_id: 'form-issue8-e2e',
+      label: '桌面收纳盒＋可拆托盘',
+      buyer_task: 'Desktop organizer with removable tray',
+      saleable_set_composition: { components: [{ component_id: 'kit', qty_per_saleable_set: 1 }], set_count: 1 },
+    };
+    const { form: f1 } = store.upsertCandidateForm(formV1);
+    const baseCand = makeStage4OrganizerTrayCandidate(syntheticFixture.candidates[0], {
+      id: 'form-issue8-e2e',
+      specSha256: f1.spec_sha256,
+      specVersion: f1.spec_version,
+    });
+    const sc0 = baseCand.economics.scenarios[0];
+    const fx = 7.0;
+    const procUsd = sc0.cost_ledger.lines.find(l => l.id === 'procurement').amount_usd;
+    const domUsd = sc0.cost_ledger.lines.find(l => l.id === 'domestic_freight').amount_usd;
+    const hhUsd = sc0.cost_ledger.lines.find(l => l.id === 'headhaul').amount_usd;
+    const unitGoodsCny = Math.round(procUsd * fx * 10000) / 10000;
+    const totalDomCny = Math.round(domUsd * fx * 100 * 100) / 100;
+    const salesWin = { from: '2027-02-01', through: '2027-10-14' };
+    const storageWin = { from: '2027-02-01', through: '2027-09-30' };
+    const inboundWin = { from: '2027-01-20', through: '2027-02-01' };
+    const g1aScens = baseCand.economics.scenarios.map(sc => ({
+      id: sc.id,
+      pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
+      price_usd: sc.cost_ledger.price_usd,
+      fx_cny_per_usd: fx, refund_fraction: 0.02, physical_return_fraction: 0.02,
+      fee_category: 'Home and Kitchen',
+      referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.0, minimum_referral_usd: 0.30 },
+      headhaul_usd: hhUsd, collection_rate: 0.006,
+      sales_window: salesWin, storage_window: storageWin, inbound_window: inboundWin,
+      is_apparel: false, is_dangerous_goods: false, is_sipp: false,
+    }));
+    const rawEst = estimateGate1A2027(g1aScens[0]);
+    const cachedEst = {
+      fulfillment_usd: rawEst.components.fulfillment.total_usd,
+      placement_usd: rawEst.components.placement.selected_usd,
+      storage_usd: rawEst.components.storage.per_unit_usd,
+    };
+    const alignCand = (cand, qid) => {
+      for (const s of cand.economics.scenarios) {
+        s.quote_id = qid;
+        s.cost_ledger.fee_context = { ...s.cost_ledger.fee_context, sales: salesWin, storage: storageWin, inbound: inboundWin };
+        s.cost_ledger.source_inputs = { ...(s.cost_ledger.source_inputs ?? {}), quote_id: qid, fx_cny_per_usd: fx };
+        for (const l of s.cost_ledger.lines) {
+          if (l.id === 'procurement' || l.id === 'domestic_freight') { l.fx_cny_per_usd = fx; l.order_units = 100; }
+          if (l.id === 'fulfillment') l.amount_usd = cachedEst.fulfillment_usd;
+          if (l.id === 'placement') l.amount_usd = cachedEst.placement_usd;
+          if (l.id === 'storage') l.amount_usd = Math.max(l.amount_usd, cachedEst.storage_usd);
+        }
+        const r = s.cost_ledger.refund_fraction ?? 0.04;
+        const nonCol = ['referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'return_disposition']
+          .reduce((sum, lid) => sum + (s.cost_ledger.lines.find(l => l.id === lid)?.amount_usd ?? 0), 0);
+        const colLine = s.cost_ledger.lines.find(l => l.id === 'collection');
+        if (colLine) colLine.amount_usd = Number((Math.max(0, s.cost_ledger.price_usd * (1 - r) - nonCol) * (s.cost_ledger.collection_rate ?? 0.005)).toFixed(6));
+      }
+      return cand;
+    };
+    const buildItem = (formDef, cand, qid, reviewPacket = null) => ({
+      form: formDef,
+      leads: [{ lead_id: 'lead-i8-1', source_channel: 'reddit', source_ref: 'https://example.com/r/i8', phrase_or_title: 'organizer tray', observed_at: '2026-11-20', disposition: 'product' }],
+      gate1a_scenarios: g1aScens,
+      sourcing_executor: async () => ({
+        status: 'quoted',
+        quote: {
+          quote_id: qid, factory_id: 'factory-syn-1', observed_at: '2026-11-20', expires_at: null,
+          redacted_destination: '广东深圳', raw_readback_ref: `rb-${qid}`,
+          ui_readback: { logged_in: true, viewport_width_px: 1440, selected_sku_row_visible: true, settlement_bar_visible: true, applied_quantity_confirmed: true },
+          goods_first_order_promotion: false, freight_first_order_promotion: false,
+          sku_lines: [{ offer_id: 'syn-offer-1', sku_id: 'kit', component_id: 'kit', qty_per_saleable_set: 1, pack_multiple: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: unitGoodsCny, regular_goods_promo_false: true }],
+          goods_cny_total: Math.round(unitGoodsCny * 100 * 100) / 100, domestic_freight_cny_total: totalDomCny,
+        },
+      }),
+      early_screen_builder: () => g1aScens.map(g => ({
+        profile_revision: 59, id: g.id, saleable_unit: '1 complete set',
+        price_usd: g.price_usd, fx_cny_per_usd: fx, order_units: 100,
+        goods_cny_per_unit: unitGoodsCny, domestic_freight_cny_per_unit: totalDomCny / 100,
+        first_order_promotion: false, goods_first_order_promotion: false,
+        headhaul: { usd_per_unit: hhUsd, bond_included: true },
+        refund_fraction: 0.02, physical_return_fraction: 0.02, return_threshold: 0.08, returns_processing_usd: 0,
+        is_apparel_or_shoes: false, referral_terms: g.referral_terms,
+        fulfillment_usd: cachedEst.fulfillment_usd, placement_usd: cachedEst.placement_usd,
+        storage: { cubic_feet_per_unit: (10 * 6 * 2) / 1728, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+        operating_period: 'off_peak', operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+        fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'pack-1', sales: salesWin, storage: storageWin, inbound: inboundWin },
+        collection_rate: 0.006, other_applicable_usd: 0, specific_rights_conflict: 'unknown', strong_date_dependency: false,
+      })),
+      deep_research_executor: async () => ({
+        batch: { schema_version: 1, profile_revision: 59, candidates: [structuredClone(cand)] },
+        ...(reviewPacket ? { evidence_review_packet: reviewPacket } : {}),
+      }),
+    });
+
+    // 1. Input omits spec_sha256, carries valid v1 pending_evidence ruling -> DB pre-score binding applies ruling & revokes qualification
+    const candV1Ruled = alignCand(applyPeerComparabilityRulings(baseCand, [
+      { peer_asin: 'B0SYN8LOW1', status: 'pending_evidence', source: 'owner_db_check', reason: 'v1 待补证' },
+    ]), 'q1688-i8-v1');
+    delete candV1Ruled.spec_sha256;
+    delete candV1Ruled.spec_version;
+    const rV1 = await runPhase2Batch(store, { items: [buildItem(formV1, candV1Ruled, 'q1688-i8-v1')], profile: r59Profile, as_of_date: '2026-11-27' });
+    assert.equal(rV1.gate2_3[0].status, 'evaluated');
+    assert.equal(rV1.gate2_3[0].qualification.counts_toward_target, false);
+
+    // 2. Bump DB spec to v2; input carries stale v1 SHA + v1 rulings -> DB v2 spec ignores stale rulings & stays qualifying
+    const formV2 = { ...formV1, saleable_set_composition: { components: [{ component_id: 'kit', qty_per_saleable_set: 1 }], set_count: 2 } };
+    const candV2Stale = alignCand(applyPeerComparabilityRulings(baseCand, [
+      { peer_asin: 'B0SYN8LOW1', status: 'confirmed_excluded', source: 'owner_v1', reason: 'v1 excluded' },
+      { peer_asin: 'B0SYN8HIG2', status: 'pending_evidence', source: 'owner_v1', reason: 'v1 pending' },
+    ]), 'q1688-i8-v2');
+    const rV2 = await runPhase2Batch(store, { items: [buildItem(formV2, candV2Stale, 'q1688-i8-v2')], profile: r59Profile, as_of_date: '2026-11-27' });
+    assert.equal(rV2.gate2_3[0].status, 'evaluated');
+    assert.equal(rV2.gate2_3[0].qualification.counts_toward_target, true);
+
+    // 3. Gate-4 AI dispute in runPhase2Batch reproduces exact result & HTML SHA on export-report --verify-html
+    const f2 = store.getCandidateForm('form-issue8-e2e');
+    const pktV2 = {
+      schema_version: 'evidence-review-draft-v1',
+      review_id: 'rev-i8-v2',
+      execution_policy_ref: 'local-authorized-policy',
+      candidate: { subject_id: 'form-issue8-e2e', intended_use: formV2.buyer_task, saleable_spec: formV2.saleable_set_composition, unknown_fields: [] },
+      subjects: [{ subject_id: 'peer-B0SYN8LOW1', spec: { material: 'wood', tray: false } }],
+      criteria: { criteria_version: 'r59-peer-v1', rules: [{ criterion_id: 'c1', description: 'Must include tray', required: true }] },
+      questions: [{ question_id: 'q1', question: 'Does peer include tray?', subject_ids: ['peer-B0SYN8LOW1'], criterion_ids: ['c1'] }],
+      evidence: [{ evidence_id: 'ev-1', subject_ids: ['peer-B0SYN8LOW1'], summary: 'Catalog shows box only without tray.', kind: 'fact', source_ref: 'local-cat-1', observed_at: '2026-11-20', window: '2026-11-01..2026-11-20', grain: 'child_sku', units: 'sets', limitations: null }],
+    };
+    const frozenPkt = freezeEvidenceReviewPacket(pktV2);
+    const candV2Clean = alignCand(structuredClone(baseCand), 'q1688-i8-v2');
+    candV2Clean.spec_sha256 = f2.spec_sha256;
+    candV2Clean.spec_version = f2.spec_version;
+    const rGate4 = await runPhase2Batch(store, {
+      items: [buildItem(formV2, candV2Clean, 'q1688-i8-v2', pktV2)],
+      profile: r59Profile,
+      as_of_date: '2026-11-27',
+      openai_hooks: {
+        evidence_review: {
+          enabled: true, testMode: true, allowTestDoubleReceipt: true, reasoningEffort: 'max', receiptDir,
+          mockExecutor: async ({ outputFilePath }) => {
+            writeFileSync(outputFilePath, JSON.stringify({
+              schema_version: 'evidence-review-draft-v1',
+              review_id: frozenPkt.review_id,
+              packet_sha256: frozenPkt.packet_sha256,
+              subjects: [{ subject_id: 'peer-B0SYN8LOW1', disposition: 'excluded', criterion_ids: ['c1'], evidence_ids: ['ev-1'], reason: '仅含主盒无托盘' }],
+              answers: [{ question_id: 'q1', status: 'answered', basis: 'fact', evidence_ids: ['ev-1'], explanation: '目录无托盘' }],
+              contradictions: [], gaps: [], conclusion: '低价对标疑无托盘。',
+            }));
+            return { exitCode: 0 };
+          },
+        },
+      },
+    });
+    assert.equal(rGate4.gate2_3[0].evidence_review.status, 'ready');
+    assert.equal(rGate4.gate2_3[0].qualification.counts_toward_target, true);
+    store.close();
+    store = null;
+
+    const bPath = join(dir, 'batch.json');
+    const outDir = join(dir, 'report');
+    writeFileSync(bPath, JSON.stringify({ schema_version: 1, profile_revision: 59, candidates: [candV2Clean] }, null, 2));
+    let stderr = '';
+    const exitCode = await runPhase2Cli([
+      'export-report', '--db', dbPath, '--batch', bPath, '--profile', 'docs/design/reference-profile.r59.draft.json',
+      '--output', outDir, '--verify-result', rGate4.gate2_3[0].batch_result_sha256, '--verify-html', rGate4.gate2_3[0].html_sha256,
+    ], { stdout: { write() {} }, stderr: { write(s) { stderr += s; } } }, { codexReceiptDir: receiptDir, allowTestDoubleReceipts: true });
+    assert.equal(exitCode, 0, stderr);
+    assert.match(readFileSync(join(outDir, 'index.html'), 'utf8'), /复核提出异议/);
+  } finally {
+    if (store) store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

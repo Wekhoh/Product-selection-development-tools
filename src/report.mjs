@@ -538,9 +538,15 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
     .filter(s => s?.input?.coherent === true && !(s?.input?.cost_ledger?.sensitivity_only === true))
     .map(s => s?.input?.calculation)
     .filter(Boolean);
-  const prices = minMaxRange(activeLedgers.map(c => c?.price_usd)) ??
-    (bareGoodsBounds ? minMaxRange(nonSensCoherentCalcs.map(c => c?.price_usd)) : null) ??
-    validatedRefPrice;
+  const hasPendingComparability = scenarios.some(s => s?.comparability_linkage?.status === 'pending_evidence');
+  const hasUnresolvedComparability =
+    !Array.isArray(target?.diagnostics?.economics?.margin_range) &&
+    ((allScenarios.length > 0 && scenarios.length === 0) || hasPendingComparability);
+  const prices = hasUnresolvedComparability
+    ? null
+    : (minMaxRange(activeLedgers.map(c => c?.price_usd)) ??
+      (bareGoodsBounds ? minMaxRange(nonSensCoherentCalcs.map(c => c?.price_usd)) : null) ??
+      validatedRefPrice);
   const isBareGoodsCalc = c => {
     const domLine = array(c?.lines).find(l => l?.id === 'domestic_freight');
     return Boolean(c?.cost_basis === 'bare_goods_1688' ||
@@ -585,13 +591,15 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
       marginFloorStatus = margins[0] >= 0.3 ? 'pass' : margins[1] < 0.3 ? 'fail' : 'cross';
     }
   }
-  const adMargins = minMaxRange(activeLedgers.map(c => c?.advertising_scenario_margin));
+  const adMargins = hasUnresolvedComparability ? null : minMaxRange(activeLedgers.map(c => c?.advertising_scenario_margin));
   const eligibleScenarios = scenarios.filter(isScoredSupportedR58);
-  const contributions = minMaxRange(
-    eligibleScenarios.map(s => s?.contribution?.value).filter(finite).length
-      ? eligibleScenarios.map(s => s?.contribution?.value)
-      : activeLedgers.map(c => c?.contribution_usd),
-  );
+  const contributions = hasUnresolvedComparability
+    ? null
+    : minMaxRange(
+      eligibleScenarios.map(s => s?.contribution?.value).filter(finite).length
+        ? eligibleScenarios.map(s => s?.contribution?.value)
+        : activeLedgers.map(c => c?.contribution_usd),
+    );
   const cnyTotals = minMaxRange(activeLedgers.map(c => {
     const si = sInputs(scenarios, c);
     if (isBareGoodsCalc(c) && finite(si?.procurement_cny)) return si.procurement_cny;
@@ -614,8 +622,8 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
       if (validatedRefPrice && finite(c.price_usd) && c.price_usd > validatedRefPrice[1] + 1e-6) return false;
       return true;
     });
-  const landedCapUsd = minMaxRange(capCandidateScenarios.map(s => s?.input?.calculation?.landed_domestic_cap_at_30pct_usd));
-  const landedCapCny = minMaxRange(capCandidateScenarios.map(s => {
+  const landedCapUsd = hasUnresolvedComparability ? null : minMaxRange(capCandidateScenarios.map(s => s?.input?.calculation?.landed_domestic_cap_at_30pct_usd));
+  const landedCapCny = hasUnresolvedComparability ? null : minMaxRange(capCandidateScenarios.map(s => {
     const c = s?.input?.calculation;
     if (finite(c?.landed_domestic_cap_at_30pct_cny)) return c.landed_domestic_cap_at_30pct_cny;
     const si = s?.input?.cost_ledger?.source_inputs;
@@ -910,6 +918,9 @@ function r57NewcomerDetails(result, rev = result?.profile_revision ?? 0) {
 
 function r57RevenueAllocationStrip(scenarios, rev = 57) {
   const r58 = rev >= 58;
+  if (array(scenarios).some(sc => sc?.excluded_from_active_pricing !== true && sc?.comparability_linkage?.status === 'pending_evidence')) {
+    return '';
+  }
   const valid = scenarios
     .filter(sc => !r58 || isScoredSupportedR58(sc))
     .map(sc => ({

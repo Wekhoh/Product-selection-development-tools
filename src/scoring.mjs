@@ -2155,7 +2155,7 @@ function resolveCandidateSpecIdentity(candidate) {
   return { sha, version, candidateId };
 }
 
-function isSpecBoundRecordStale(record, specId) {
+function isSpecBoundRecordStale(record, specId, { allowMissingCandidateSpec = false } = {}) {
   if (!record || typeof record !== 'object') return false;
   if (record.stale_spec === true) return true;
   const recCandId = text(record.candidate_id) ? record.candidate_id.trim() : null;
@@ -2167,7 +2167,7 @@ function isSpecBoundRecordStale(record, specId) {
     ? record.spec_version
     : null;
   if (recSha && specId.sha && recSha !== specId.sha) return true;
-  if (recSha && !specId.sha) return true;
+  if (recSha && !specId.sha && !allowMissingCandidateSpec) return true;
   if (recVer !== null && specId.version !== null && recVer !== specId.version) return true;
   if (specId.sha && !recSha && recVer === null) return true;
   if (specId.version !== null && specId.version > 1 && recVer === null && (!recSha || recSha !== specId.sha)) {
@@ -2237,7 +2237,7 @@ export function resolveScenarioComparabilityLinkage(
   for (const r of rawRulings) {
     if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
     const rPeriodId = text(r.period_id) ? r.period_id.trim() : (text(r.operating_period_id) ? r.operating_period_id.trim() : null);
-    if (rPeriodId && info.periodId && rPeriodId !== info.periodId) continue;
+    if (rPeriodId && rPeriodId !== info.periodId) continue;
 
     const rScenId = text(r.scenario_id) ? r.scenario_id.trim() : null;
     const rPeerVals = [r.peer_asin, r.target_variant_asin, r.subject_id].filter(text).map(s => s.trim());
@@ -2299,7 +2299,8 @@ export function resolveScenarioComparabilityLinkage(
         );
 
       if (evHasReadableSubjects) {
-        const evStale = execStatus === 'stale_packet_mismatch' || isSpecBoundRecordStale(ev, specId);
+        const evStale = execStatus === 'stale_packet_mismatch' ||
+          isSpecBoundRecordStale(ev, specId, { allowMissingCandidateSpec: true });
         for (const subj of evSubjects) {
           if (!subj || typeof subj !== 'object') continue;
           const sId = text(subj.subject_id) ? subj.subject_id.trim() : null;
@@ -2788,7 +2789,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
     screening: { id: 'margin', status: marginStatus, reason: marginReason, range: diagnostics.margin_range }, diagnostics };
 }
 
-function screenCandidate(candidate, ctx, profit, items, profile) {
+function screenCandidate(candidate, ctx, profit, items, profile, periodId = null) {
   const priceInput = candidate.screening?.reference_price_usd;
   const r58Anchor = validateR58PriceAnchor(priceInput, ctx);
   const priceRule = profile.reference_screening.comparable_reference_price;
@@ -2800,16 +2801,39 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
   let reanchoredFromExcludedRef = false;
 
   const refLinkage = text(priceInput?.target_variant_asin)
-    ? resolveScenarioComparabilityLinkage(null, candidate, { includeAdvisoryReview: false, peerAsinOverride: priceInput.target_variant_asin })
+    ? resolveScenarioComparabilityLinkage(null, candidate, { includeAdvisoryReview: false, peerAsinOverride: priceInput.target_variant_asin, periodId })
     : null;
   const allScenarios = profit.diagnostics?.scenarios ?? [];
   const allPrimaryExcluded = allScenarios.length > 0 && activePricingScenarios(allScenarios).length === 0;
-  if (allPrimaryExcluded) {
+  const allPrimaryUnresolved = allScenarios.length > 0 && allScenarios.every(
+    sc => sc.excluded_from_active_pricing === true || sc.comparability_linkage?.status === 'pending_evidence',
+  );
+  const refAsinKeys = text(priceInput?.target_variant_asin) ? normalizePeerKeySet(priceInput.target_variant_asin) : new Set();
+  const refMatchingScenarios = allScenarios.filter(sc => {
+    if (refAsinKeys.size > 0) {
+      return peerKeysOverlap(extractScenarioPeerInfo(sc.input, candidate, periodId).peerKeys, refAsinKeys);
+    }
+    const scPrice = sc.input?.calculation?.price_usd ?? sc.input?.cost_ledger?.price_usd ?? null;
+    return number(r58Anchor.value) && number(scPrice) && Math.abs(r58Anchor.value - scPrice) < 1e-4;
+  });
+  const refScenarioInvalidated = refMatchingScenarios.length > 0 && refMatchingScenarios.every(
+    sc => sc.excluded_from_active_pricing === true || sc.comparability_linkage?.status === 'pending_evidence',
+  );
+  const refEffectiveInvalidStatus =
+    (refLinkage?.status === 'confirmed_excluded' || refLinkage?.status === 'pending_evidence')
+      ? refLinkage.status
+      : (refScenarioInvalidated
+        ? (refMatchingScenarios.some(sc => sc.comparability_linkage?.status === 'pending_evidence') ? 'pending_evidence' : 'confirmed_excluded')
+        : null);
+
+  if (allPrimaryExcluded || allPrimaryUnresolved) {
     priceSupported = false;
     price = { value: null };
     pricePass = false;
-    priceReasonOverride = '所有主售价情景均经正式裁决排除（规格不符），尚缺已确认同规格对标售价。';
-  } else if (refLinkage?.status === 'confirmed_excluded' || refLinkage?.status === 'pending_evidence') {
+    priceReasonOverride = allPrimaryExcluded
+      ? '所有主售价情景均经正式裁决排除（规格不符），尚缺已确认同规格对标售价。'
+      : '所有主售价情景均经正式裁决排除或待补证，尚缺已确认同规格对标售价。';
+  } else if (refEffectiveInvalidStatus === 'confirmed_excluded' || refEffectiveInvalidStatus === 'pending_evidence') {
     const reanchorScenarios = allScenarios.filter(sc =>
       sc.excluded_from_active_pricing !== true &&
       sc.comparability_linkage?.status !== 'pending_evidence' &&
@@ -2833,7 +2857,7 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
       priceSupported = false;
       price = { value: null };
       pricePass = false;
-      priceReasonOverride = refLinkage.status === 'confirmed_excluded'
+      priceReasonOverride = refEffectiveInvalidStatus === 'confirmed_excluded'
         ? '原主参考对标经正式裁决排除（规格不符），尚缺已确认同规格对标售价。'
         : '主参考对标同箱规格待补证，尚缺已确认同规格对标售价。';
     }
@@ -4067,18 +4091,40 @@ export function scoreCandidate(candidate, profile, internal = null) {
   const economicsInput = !isOperatingPeriod && effectiveCandidateEcon && Object.hasOwn(effectiveCandidateEcon, 'operating_months')
     ? (() => { const { operating_months: _ignored, ...rest } = effectiveCandidateEcon; return rest; })()
     : effectiveCandidateEcon;
+  const currentPeriodId = text(economicsInput?.operating_period_id) ? economicsInput.operating_period_id.trim() : null;
   const rawPriceRefR58 = validateR58PriceAnchor(candidate.screening?.reference_price_usd, ctx);
   const screeningRefAsin = candidate.screening?.reference_price_usd?.target_variant_asin;
   const screeningRefFormalLinkage = text(screeningRefAsin)
-    ? resolveScenarioComparabilityLinkage(null, candidate, { includeAdvisoryReview: false, peerAsinOverride: screeningRefAsin })
+    ? resolveScenarioComparabilityLinkage(null, candidate, { includeAdvisoryReview: false, peerAsinOverride: screeningRefAsin, periodId: currentPeriodId })
     : null;
-  const priceRefR58 = (screeningRefFormalLinkage?.status === 'confirmed_excluded' || screeningRefFormalLinkage?.status === 'pending_evidence')
+  const screeningRefKeys = text(screeningRefAsin) ? normalizePeerKeySet(screeningRefAsin) : new Set();
+  const rawEconScenarios = Array.isArray(economicsInput?.scenarios) ? economicsInput.scenarios : [];
+  const refMatchingRawScenarios = rawEconScenarios.filter(sc => {
+    if (screeningRefKeys.size > 0) {
+      return peerKeysOverlap(extractScenarioPeerInfo(sc, candidate, currentPeriodId).peerKeys, screeningRefKeys);
+    }
+    const scPrice = sc?.cost_ledger?.price_usd ?? sc?.price_anchor?.value ?? null;
+    return number(rawPriceRefR58.value) && number(scPrice) && Math.abs(rawPriceRefR58.value - scPrice) < 1e-4;
+  });
+  const refMatchingRawLinks = refMatchingRawScenarios.map(sc =>
+    resolveScenarioComparabilityLinkage(sc, candidate, { includeAdvisoryReview: false, periodId: currentPeriodId }),
+  );
+  const refInvalidatedByScenarioRuling = !screeningRefFormalLinkage &&
+    refMatchingRawScenarios.length > 0 &&
+    refMatchingRawLinks.every(l => l?.status === 'confirmed_excluded' || l?.status === 'pending_evidence');
+  const effectiveScreeningRefStatus =
+    (screeningRefFormalLinkage?.status === 'confirmed_excluded' || screeningRefFormalLinkage?.status === 'pending_evidence')
+      ? screeningRefFormalLinkage.status
+      : (refInvalidatedByScenarioRuling
+        ? (refMatchingRawLinks.some(l => l?.status === 'pending_evidence') ? 'pending_evidence' : 'confirmed_excluded')
+        : null);
+  const priceRefR58 = (effectiveScreeningRefStatus === 'confirmed_excluded' || effectiveScreeningRefStatus === 'pending_evidence')
     ? {
         supported: false,
         value: null,
         min_value: null,
         max_value: null,
-        reason: screeningRefFormalLinkage.status === 'confirmed_excluded'
+        reason: effectiveScreeningRefStatus === 'confirmed_excluded'
           ? '原主参考对标经正式裁决排除（规格不符），未自带独立价格锚点的情景不得继续沿用。'
           : '主参考对标同箱规格待补证，未自带独立价格锚点的情景不得继续沿用。',
       }
@@ -4116,7 +4162,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
     }),
   };
   const totals = aggregate(items, profile.group_budgets, profit);
-  const screening = screenCandidate(candidate, ctx, profit, items, profile);
+  const screening = screenCandidate(candidate, ctx, profit, items, profile, currentPeriodId);
   const coreSummaryR59 = computeR59CoreAndRemainingSummary(items, profit);
 
   const isTopLevelFlatR58 = !isOperatingPeriod;
