@@ -3401,7 +3401,7 @@ const R59_SAMPLE_DEFERRED_ITEM_LABELS = Object.freeze({
   feasible_light_differentiation: '低成本微改可行性（拿样后工厂工艺核对）',
   storage_tolerance: '仓储耐受度（拿样受潮／堆码核对）',
   transport_tolerance: '运输耐受度（拿样跌落／内衬核对）',
-  routine_complexity: '日常运营复杂度（旺旺确认质检／备件细节）',
+  routine_complexity: '日常运营复杂度（1688 问厂确认质检／备件细节）',
   specific_design_rights: '具体外观／结构权利（待拿实物比对 1–2 件近似专利号）',
   applicable_public_requirements: '适用合规与材料申报（如木头拉丁学名／检测报价待问工厂）',
 });

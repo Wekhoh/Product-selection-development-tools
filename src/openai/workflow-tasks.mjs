@@ -27,6 +27,41 @@ import { validEvidenceDate } from '../observations.mjs';
 import { evaluateGate0CategoryBoundary } from '../price-band.mjs';
 import { sha256Hex } from '../store.mjs';
 import { DEFAULT_TERRA_MAX_OUTPUT_TOKENS } from './pricing.mjs';
+import {
+  RETURN_CAUSE_CATEGORIES,
+  RETURN_CAUSE_ACTIONABILITIES,
+  RETURN_CAUSE_CLAIM_BASES,
+  RETURN_CAUSE_EVIDENCE_STATUSES,
+  RETURN_CAUSE_MISSING_FLAGS,
+  FACTORY_INQUIRY_SLOTS,
+  FACTORY_INQUIRY_TOPICS,
+  RETURN_CAUSE_DIAGNOSIS_JSON_SCHEMA,
+  FACTORY_INQUIRY_CHECKLIST_JSON_SCHEMA,
+  buildReturnCauseDiagnosisRequest,
+  parseReturnCauseDiagnosisResult,
+  resolveFactoryInquiryEligibility,
+  resolvePackageCompressionTriggered,
+  buildFactoryInquiryChecklistRequest,
+  parseFactoryInquiryChecklistResult,
+} from './stage5-return-inquiry.mjs';
+
+export {
+  RETURN_CAUSE_CATEGORIES,
+  RETURN_CAUSE_ACTIONABILITIES,
+  RETURN_CAUSE_CLAIM_BASES,
+  RETURN_CAUSE_EVIDENCE_STATUSES,
+  RETURN_CAUSE_MISSING_FLAGS,
+  FACTORY_INQUIRY_SLOTS,
+  FACTORY_INQUIRY_TOPICS,
+  RETURN_CAUSE_DIAGNOSIS_JSON_SCHEMA,
+  FACTORY_INQUIRY_CHECKLIST_JSON_SCHEMA,
+  buildReturnCauseDiagnosisRequest,
+  parseReturnCauseDiagnosisResult,
+  resolveFactoryInquiryEligibility,
+  resolvePackageCompressionTriggered,
+  buildFactoryInquiryChecklistRequest,
+  parseFactoryInquiryChecklistResult,
+};
 
 export const DEFAULT_DECISIONS_MODEL = 'gpt-6-luna';
 export const DEFAULT_RESPONSES_MODEL = 'gpt-6.1-terra';
@@ -4430,6 +4465,10 @@ const WORKFLOW_TASK_ALIASES = Object.freeze({
   PainPointAndRubricJudge: 'review-judge',
   'market-observation': 'market-observation',
   MarketObservationJudge: 'market-observation',
+  'return-cause-diagnosis': 'return-cause-diagnosis',
+  ReturnCauseDiagnosis: 'return-cause-diagnosis',
+  'factory-inquiry-1688': 'factory-inquiry-1688',
+  FactoryInquiryChecklist1688: 'factory-inquiry-1688',
 });
 
 function normalizeEvidenceRefsForContext(rawRefs) {
@@ -4454,7 +4493,7 @@ export function freezeWorkflowTaskContext(taskName, rawInput) {
     : null;
   if (!canonicalTask) {
     throw new TypeError(
-      `Unknown workflow task "${String(taskName)}"; supported tasks: social-bridge, spec-matcher, 1688-vision, rights-prescreen, review-judge.`,
+      `Unknown workflow task "${String(taskName)}"; supported tasks: social-bridge, spec-matcher, 1688-vision, rights-prescreen, review-judge, market-observation, return-cause-diagnosis, factory-inquiry-1688.`,
     );
   }
   assertPlainObject(rawInput, `${canonicalTask} taskInput`);
@@ -4554,6 +4593,31 @@ export function freezeWorkflowTaskContext(taskName, rawInput) {
     });
   }
 
+  if (canonicalTask === 'return-cause-diagnosis') {
+    const rawReviews = Array.isArray(cloned.reviews) ? cloned.reviews : [];
+    const rawQaItems = Array.isArray(cloned.qa_items) ? cloned.qa_items : [];
+    const targetVariantSku = typeof cloned.target_variant_sku === 'string' && cloned.target_variant_sku.trim()
+      ? cloned.target_variant_sku.trim()
+      : null;
+    return deepFreeze({
+      ...cloned,
+      target_variant_sku: targetVariantSku,
+      reviews: rawReviews,
+      qa_items: rawQaItems,
+      evidence_refs: normalizeEvidenceRefsForContext(cloned.evidence_refs),
+    });
+  }
+
+  if (canonicalTask === 'factory-inquiry-1688') {
+    return deepFreeze({
+      ...cloned,
+      sample_check_items: Array.isArray(cloned.sample_check_items) ? cloned.sample_check_items : [],
+      vision_component_gaps: Array.isArray(cloned.vision_component_gaps) ? cloned.vision_component_gaps : [],
+      existing_wangwang_questions: Array.isArray(cloned.existing_wangwang_questions) ? cloned.existing_wangwang_questions : [],
+      evidence_refs: normalizeEvidenceRefsForContext(cloned.evidence_refs),
+    });
+  }
+
   return deepFreeze({
     ...cloned,
     evidence_refs: normalizeEvidenceRefsForContext(cloned.evidence_refs),
@@ -4594,6 +4658,16 @@ export const WORKFLOW_RESPONSES_TASKS = deepFreeze({
     buildRequest: buildMarketObservationRequest,
     parseResult: parseMarketObservationResult,
     schema: MARKET_OBSERVATION_JSON_SCHEMA,
+  },
+  'return-cause-diagnosis': {
+    buildRequest: buildReturnCauseDiagnosisRequest,
+    parseResult: parseReturnCauseDiagnosisResult,
+    schema: RETURN_CAUSE_DIAGNOSIS_JSON_SCHEMA,
+  },
+  'factory-inquiry-1688': {
+    buildRequest: buildFactoryInquiryChecklistRequest,
+    parseResult: parseFactoryInquiryChecklistResult,
+    schema: FACTORY_INQUIRY_CHECKLIST_JSON_SCHEMA,
   },
 });
 

@@ -2699,14 +2699,160 @@ function r59PriceBandBannersAndObservationBar(original, rev = 58) {
 
 function r59SamplePendingBanner(snapshot, rev = 58) {
   if (rev < 59 || !Array.isArray(snapshot?.sampleCheckItems) || snapshot.sampleCheckItems.length === 0) return '';
-  return `<section class="quiet-surface" data-section="sample-pending-checklist" aria-label="拿样与旺旺待核清单">
+  return `<section class="quiet-surface" data-section="sample-pending-checklist" aria-label="拿样与 1688 问厂待核清单">
     <div class="section-head">
-      <h3><span class="state-inline state-pending"><i class="dot" aria-hidden="true"></i>拿样／旺旺待核清单</span></h3>
+      <h3><span class="state-inline state-pending"><i class="dot" aria-hidden="true"></i>拿样／1688 问厂待核清单</span></h3>
       <span class="num"><strong>已得分 ${escape(rangeText(snapshot.supportedRange))} / 已覆盖总权重 ${escape(numberText(snapshot.coveredWeight))}</strong></span>
     </div>
     <ul class="brief-list">${snapshot.sampleCheckItems.map(it =>
       `<li><strong>${escape(string(it.label ?? it.id))}（${escape(numberText(it.weight))} 分留空）</strong> · <span>${escape(r58CleanCopy(string(it.reason)))}</span></li>`
     ).join('')}</ul>
+  </section>`;
+}
+
+const STAGE5_RETURN_CATEGORY_LABELS = Object.freeze({
+  listing_expectation_gap: '页面预期不符',
+  assembly_or_usage_confusion: '安装／使用误解',
+  packaging_or_transit_damage: '运输破损／包装不足',
+  sizing_or_fit_mismatch: '尺寸／适配不合',
+  manufacturing_or_structural_defect: '制造失误／结构性缺陷',
+  missing_or_wrong_parts: '缺件／错件',
+});
+
+const STAGE5_MISSING_FLAG_LABELS = Object.freeze({
+  missing_qa_body_text: '缺可核 Q&A 正文',
+  missing_sku_matched_review_text: '缺可核同变体原文',
+  review_counts_only_no_text: '仅有评论总数、缺可核原文',
+  unverified_variant_attribution: '评论未核实对应目标变体',
+});
+
+const STAGE5_INQUIRY_SLOT_LABELS = Object.freeze({
+  1: '规格配件',
+  2: '100/300 套发深圳报价交期',
+  3: '零售包装与外箱',
+  4: '退货隐患核查',
+  5: '拿样待核缺口',
+});
+
+const STAGE5_COPY_BLOCK_CSS = '.copy-block{margin:0.6rem 0 0;padding:0.85rem 1rem;background:var(--surface,#fafaf8);border:1px solid var(--hairline);font-family:var(--sans);font-size:0.875rem;line-height:1.68;white-space:pre-wrap;word-break:break-word;user-select:all;color:var(--ink)}';
+
+function resolveR59ReturnCauseDiagnosis(result, original) {
+  const raw = result?.return_cause_diagnosis ?? original?.return_cause_diagnosis ?? original?.presentation?.return_cause_diagnosis;
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+}
+
+function resolveR59FactoryInquiryChecklist(result, original) {
+  const raw = result?.factory_inquiry_1688 ?? original?.factory_inquiry_1688 ?? original?.presentation?.factory_inquiry_1688;
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : null;
+}
+
+function r59ReturnCauseDiagnosisSection(result, original, rev = 59) {
+  if (!(rev >= 59)) return '';
+  const diag = resolveR59ReturnCauseDiagnosis(result, original);
+  if (!diag) return '';
+
+  const statusInfo = diag.evidence_status === 'verified_variant_quotes'
+    ? { tone: 'pass', text: '已核同变体原文' }
+    : diag.evidence_status === 'partial_or_unverified_variant'
+      ? { tone: 'pending', text: '部分或未核实变体' }
+      : { tone: 'muted', text: '原文证据不足' };
+
+  const rawFlags = array(diag.missing_evidence_flags).filter(f => typeof f === 'string' && f.trim());
+  const rawNotes = array(diag.missing_evidence_notes_zh).filter(n => typeof n === 'string' && n.trim());
+  const missingTexts = rawNotes.length > 0
+    ? rawNotes.map(n => scrubShareableText(n)).filter(Boolean)
+    : rawFlags.map(f => STAGE5_MISSING_FLAG_LABELS[f] ?? scrubShareableText(f)).filter(Boolean);
+  const missingHtml = missingTexts.length > 0
+    ? `<p class="muted"><strong>证据缺口披露：</strong>${missingTexts.map(t => escape(t)).join('；')}</p>`
+    : '';
+
+  const causes = array(diag.causes).filter(c => c && typeof c === 'object' && !Array.isArray(c));
+  const causesHtml = causes.length > 0
+    ? `<ul class="brief-list">${causes.map(cause => {
+        const actInfo = cause.actionability === 'structural_defect_trap'
+          ? { tone: 'fail', text: '结构性缺陷陷阱' }
+          : cause.actionability === 'fixable_listing_manual_packaging'
+            ? { tone: 'pass', text: '可优化（页面／说明书／包装）' }
+            : { tone: 'pending', text: '待 1688 问厂核实' };
+        const claimLabel = cause.claim_basis === 'explicit_buyer_return'
+          ? '买家明言退货'
+          : '买家抱怨／可能导致退货';
+        const catLabel = STAGE5_RETURN_CATEGORY_LABELS[cause.category] ?? scrubShareableText(string(cause.category, '问题归类'));
+        const summary = scrubShareableText(string(cause.summary_zh));
+        const specNote = scrubShareableText(string(cause.purchased_spec_note));
+        const counterNote = scrubShareableText(string(cause.counter_evidence_zh));
+        const hookNote = scrubShareableText(string(cause.factory_verification_hook_zh));
+        const cits = array(cause.citations).filter(c => c && typeof c === 'object');
+        const citLines = cits.map(c => {
+          const srcTag = c.source_type === 'qa'
+            ? 'Q&A'
+            : (finite(c.stars) ? `${numberText(c.stars)}★` : '低星评');
+          const skuTag = scrubShareableText(string(c.variant_sku));
+          const verTag = c.sku_verified === true ? '已核同变体' : (c.sku_verified === false ? '非目标或未核实变体' : '变体归属未知');
+          const quote = scrubShareableText(string(c.excerpt));
+          return `<p class="muted"><span class="mono-id">[${escape(srcTag)}${skuTag ? ` · ${escape(skuTag)}` : ''} · ${escape(verTag)}]</span> “${escape(quote)}”</p>`;
+        }).join('');
+        return `<li><div><span class="state-inline state-${actInfo.tone}"><i class="dot" aria-hidden="true"></i>${escape(actInfo.text)}</span> · <strong>${escape(catLabel)}</strong> · <span class="muted">${escape(claimLabel)}</span></div>${summary ? `<p>${escape(summary)}</p>` : ''}${specNote ? `<p class="muted">购买规格：${escape(specNote)}</p>` : ''}${citLines}${counterNote ? `<p class="muted">反例与边界：${escape(counterNote)}</p>` : ''}${hookNote ? `<p class="muted">1688 问厂核查点：${escape(hookNote)}</p>` : ''}</li>`;
+      }).join('')}</ul>`
+    : '';
+
+  const execSummary = scrubShareableText(string(diag.summary_zh));
+  const disclaimer = scrubShareableText(string(diag.disclaimer_zh, '仅基于抽查原文诊断，不从差评反推退款率，不改动 21 项评分与 30% 毛利筛线。'));
+  const targetSku = scrubShareableText(string(diag.target_variant_sku));
+
+  return `<section class="quiet-surface" data-section="return-cause-diagnosis" aria-label="退货与差评成因诊断">
+    <div class="section-head">
+      <h3>退货与差评成因诊断（不改动 21 项评分）</h3>
+      <span class="state-inline state-${statusInfo.tone}"><i class="dot" aria-hidden="true"></i>${escape(statusInfo.text)}${targetSku ? ` · ${escape(targetSku)}` : ''}</span>
+    </div>
+    ${missingHtml}
+    ${execSummary ? `<p>${escape(execSummary)}</p>` : ''}
+    ${causesHtml}
+    <p class="muted">${escape(disclaimer)}</p>
+  </section>`;
+}
+
+function r59FactoryInquiryChecklistSection(result, original, rev = 59) {
+  if (!(rev >= 59)) return '';
+  const checklist = resolveR59FactoryInquiryChecklist(result, original);
+  if (!checklist) return '';
+
+  const structured = array(checklist.structured_items).filter(it => it && typeof it === 'object');
+  const rawQuestions = array(checklist.wangwang_questions).filter(q => typeof q === 'string' && q.trim());
+  const bullets = structured.length > 0
+    ? structured.map((it, idx) => ({
+        slot: Number.isInteger(it.slot) ? it.slot : idx + 1,
+        label: STAGE5_INQUIRY_SLOT_LABELS[it.slot] ?? `第 ${idx + 1} 条`,
+        text: scrubShareableText(string(it.question_zh || rawQuestions[idx])),
+        compression: it.includes_package_compression_check === true,
+      })).filter(b => b.text)
+    : rawQuestions.map((q, idx) => ({
+        slot: idx + 1,
+        label: STAGE5_INQUIRY_SLOT_LABELS[idx + 1] ?? `第 ${idx + 1} 条`,
+        text: scrubShareableText(q),
+        compression: false,
+      })).filter(b => b.text);
+  if (bullets.length === 0) return '';
+
+  const modeLabel = checklist.generation_mode === 'owner_on_demand_pending'
+    ? '主人点选按需生成'
+    : '入围卡自动生成';
+  const copyTextRaw = typeof checklist.copy_paste_message_zh === 'string' && checklist.copy_paste_message_zh.trim()
+    ? checklist.copy_paste_message_zh
+    : bullets.map((b, idx) => `${idx + 1}. ${b.text}`).join('\n');
+  const copyText = scrubShareableText(copyTextRaw);
+  const handoffNote = scrubShareableText(string(checklist.manual_handoff_note_zh, '仅限主人审看后手动复制发给 1688 工厂，AI 严禁代发消息。'));
+
+  return `<section class="quiet-surface" data-section="factory-inquiry-1688" aria-label="1688 问厂与拿样 5 条清单">
+    <div class="section-head">
+      <h3>1688 问厂与拿样 5 条清单</h3>
+      <span class="muted">${escape(modeLabel)} · 仅限人工复制发送 · AI 严禁代发消息</span>
+    </div>
+    <ol class="brief-list">${bullets.map(b =>
+      `<li><strong>${escape(b.label)}${b.compression ? '（含 ≤10 mm 压线减尺寸核查）' : ''}：</strong><span>${escape(b.text)}</span></li>`
+    ).join('')}</ol>
+    <details class="quiet-fold" open><summary>一键复制发厂话术（纯文本 · 人工审看后手动粘贴发送）</summary><pre class="copy-block">${escape(copyText)}</pre></details>
+    <p class="muted">${escape(handoffNote)}</p>
   </section>`;
 }
 
@@ -2943,7 +3089,7 @@ function r58SeasonalCard(result, original, index, rev = 58, reportOptions = {}, 
         ${renderR58SculpturalLedger(snapshot, '待补证')}
         <p class="spec-copy">${escape(result.form ?? '具体可售规格尚待明确')}</p>
         ${starReferenceSection(original)}
-        ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与核查清单">
+        ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${r59ReturnCauseDiagnosisSection(result, original, rev)}${r59FactoryInquiryChecklistSection(result, original, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与核查清单">
           ${r57BriefList('风险与边界提示', presentation.risks, rev)}
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
           ${blockers.length ? `<div class="brief-col"><h3>共同问题与后续处理</h3><ul class="brief-list">${blockers.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
@@ -3031,7 +3177,7 @@ function r58SingleCard(result, original, index, rev = 58, reportOptions = {}, im
           ${result.conditional_total_range ? `<p class="muted">满足准入后可能范围 ${escape(rangeText(result.conditional_total_range))}。这是数学界限，不是已获得总分或预测。</p>` : ''}
           ${result.may_exceed_comparable_leader ? '<p class="ink-pass">有效可能上界高于当前完整队列首项的保守端点，值得补证；这不代表已经胜出。</p>' : ''}
         </div>
-        ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与缺口">
+        ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${r59ReturnCauseDiagnosisSection(result, original, rev)}${r59FactoryInquiryChecklistSection(result, original, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与缺口">
           ${r57BriefList('风险与边界提示', presentation.risks, rev)}
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
           ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li><strong>${escape(row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
@@ -3202,6 +3348,9 @@ function renderR58Report(result, batch = {}, reportOptions = {}) {
     return resolveR58EvidenceReview(cand, orig) !== null ||
       (sanitizeR58ConceptImages(resolveR58ConceptImages(cand, orig))?.length ?? 0) > 0;
   });
+  const anyStage5CopyBlock = rev >= 59 && candidates.some(cand =>
+    resolveR59FactoryInquiryChecklist(cand, originals.get(cand?.candidate_id)) !== null,
+  );
   const targetPlinthCss = candidates.length
     ? candidates.map((_, idx) => `.studio-page:has(#candidate-${idx + 1}:target) .exhibition-reel .plinth-item[href="#candidate-${idx + 1}"] .ed-idx{color:var(--vermilion)}\n.studio-page:has(#candidate-${idx + 1}:target) .exhibition-reel .plinth-item[href="#candidate-${idx + 1}"] .pc-active-bar{width:100%}`).join('\n')
     : '';
@@ -3222,6 +3371,7 @@ function renderR58Report(result, batch = {}, reportOptions = {}) {
     reservedFilterCss,
     mobileDomesticHeader ? `@container (width < 42.5rem){.matrix-table{--m4:"${mobileDomesticHeader}"}}` : '',
     anyAiSections ? R58_AI_SECTIONS_CSS.trim() : '',
+    anyStage5CopyBlock ? STAGE5_COPY_BLOCK_CSS : '',
     imagePool.dedupCss(),
   ].filter(Boolean).join('\n');
 

@@ -733,7 +733,7 @@ test('Round 2 (1 & 2): sample_pending_qualifying gate (85-pt core + deferred sam
 
   const html = renderReport(batchScored, batchInput);
   assert.match(html, /已得分\s*[\d.–-]+\s*\/\s*已覆盖总权重\s*91/);
-  assert.match(html, /拿样／旺旺待核清单/);
+  assert.match(html, /拿样／1688 问厂待核清单/);
   assert.match(html, /Top-10\s*评论中位数/);
   assert.match(html, /亚马逊自营（AMZ）销量占比/);
   assert.match(html, /自营超第三方，强烈建议放弃/);
