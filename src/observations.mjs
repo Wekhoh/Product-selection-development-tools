@@ -514,8 +514,10 @@ function hasUpstreamReviewFailure(obj) {
   return false;
 }
 
+const RAW_REVIEW_CHAIN_MAX_DEPTH = 4;
+
 function extractRawReviewRows(source, depth = 0) {
-  if (!source || depth > 4) return { hasRawArray: false, rows: null, failed: false };
+  if (!source || depth > RAW_REVIEW_CHAIN_MAX_DEPTH) return { hasRawArray: false, rows: null, failed: false };
   if (Array.isArray(source)) return { hasRawArray: true, rows: source, failed: false };
   if (typeof source !== 'object') return { hasRawArray: false, rows: null, failed: false };
   if (hasUpstreamReviewFailure(source)) return { hasRawArray: false, rows: null, failed: true };
@@ -752,47 +754,61 @@ export function extractNewcomerReviewOriginBreakdown(raw = {}) {
   };
 }
 
-function hasRawReviewPayloadInObject(obj, depth = 0) {
-  if (!obj || typeof obj !== 'object' || depth > 4) return false;
-  if (Array.isArray(obj)) return true;
-  if (obj.reviews_raw !== undefined && obj.reviews_raw !== null) return true;
-  if (Array.isArray(obj.reviews_list) || Array.isArray(obj.reviews) || Array.isArray(obj.content)) return true;
-  if (obj.structuredContent && typeof obj.structuredContent === 'object') return true;
-  if (obj.data !== undefined && obj.data !== null && typeof obj.data === 'object') {
-    return hasRawReviewPayloadInObject(obj.data, depth + 1);
-  }
-  return false;
-}
-
-function stripRawReviewPayloadFromObject(obj, depth = 0) {
-  if (!obj || typeof obj !== 'object' || Array.isArray(obj) || depth > 4) return obj;
-  const out = { ...obj };
-  if (out.reviews_raw !== undefined && out.reviews_raw !== null) delete out.reviews_raw;
-  if (Array.isArray(out.reviews_list)) delete out.reviews_list;
-  if (Array.isArray(out.reviews)) delete out.reviews;
-  if (Array.isArray(out.content)) delete out.content;
-  if (out.structuredContent && typeof out.structuredContent === 'object') delete out.structuredContent;
-  if (out.data !== undefined && out.data !== null && typeof out.data === 'object') {
-    if (Array.isArray(out.data)) {
-      delete out.data;
-    } else if (hasRawReviewPayloadInObject(out.data, depth + 1)) {
-      out.data = stripRawReviewPayloadFromObject(out.data, depth + 1);
-    }
-  }
-  return out;
+function stripLayerRawReviewFields(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  let clone = null;
+  const drop = key => {
+    if (!clone) clone = { ...obj };
+    delete clone[key];
+  };
+  if (obj.reviews_raw !== undefined && obj.reviews_raw !== null) drop('reviews_raw');
+  if (Array.isArray(obj.reviews_list)) drop('reviews_list');
+  if (Array.isArray(obj.reviews)) drop('reviews');
+  if (Array.isArray(obj.content)) drop('content');
+  if (obj.structuredContent && typeof obj.structuredContent === 'object') drop('structuredContent');
+  if (Array.isArray(obj.data)) drop('data');
+  return clone;
 }
 
 /**
  * Derive a sanitized `review_origin_breakdown` and strip raw reviewer payloads (author names / review text)
- * from a shallow copy of a newcomer cohort member without mutating the caller's object or deleting non-array
- * scalar fields (e.g., numeric `reviews: 84` or plain string `content`).
+ * along `member` and nested `data` layers (`depth <= 4`) without mutating caller input, deleting non-array
+ * scalar fields (e.g., numeric `reviews: 84` or plain string `content`), or wiping sibling `data` diagnostics.
  */
 export function sanitizeNewcomerMemberReviews(member) {
-  if (!member || typeof member !== 'object' || Array.isArray(member)) return member;
-  if (!hasRawReviewPayloadInObject(member)) return member;
+  if (Array.isArray(member)) return [];
+  if (!member || typeof member !== 'object') return member;
+
+  const chain = [];
+  for (let cursor = member, depth = 0;
+    depth <= RAW_REVIEW_CHAIN_MAX_DEPTH && cursor && typeof cursor === 'object' && !Array.isArray(cursor);
+    depth++) {
+    chain.push(cursor);
+    cursor = cursor.data;
+  }
+
+  let childChanged = false;
+  let childValue;
+  for (let i = chain.length - 1; i >= 0; i--) {
+    let layer = stripLayerRawReviewFields(chain[i]);
+    if (childChanged) {
+      if (!layer) layer = { ...chain[i] };
+      if (childValue === undefined) delete layer.data;
+      else layer.data = childValue;
+    }
+    if (!layer) {
+      childChanged = false;
+      childValue = chain[i];
+      continue;
+    }
+    childChanged = true;
+    childValue = i > 0 && Object.keys(layer).length === 0 ? undefined : layer;
+  }
+
+  if (!childChanged) return member;
 
   const originBreakdown = extractNewcomerReviewOriginBreakdown(member);
-  const sanitized = stripRawReviewPayloadFromObject(member);
+  const sanitized = childValue;
   if (originBreakdown) {
     sanitized.review_origin_breakdown = originBreakdown;
   } else {

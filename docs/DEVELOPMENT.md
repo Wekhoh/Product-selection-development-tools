@@ -118,14 +118,47 @@ Keep STATE as the single maintained task/recovery record. Use existing repositor
 
 Use the relevant frontend/design workflow for usability and visual acceptance, and current official documentation for changing platform capabilities. Skills guide the work; their templates do not turn proposals, prototypes or passing tests into owner decisions or business results.
 
-## Adversarial review steering, Three-Tier Independent Ruling Gate, anti-bloat discipline & UI preview conventions
+## Adversarial review steering, Two-Tier Review System, Three-Tier Independent Ruling Gate & UI preview conventions
 
-- **Pre-code blueprint audit & `GPT-6.2 Astra` 4-part prompt contract:** Before opening implementation issues on major scope changes, run a pre-code full-scope `GPT-6.2 Astra` business-logic & workflow blueprint audit passing direct raw file/log/transcript paths. Every fresh-context `codex exec` review (`-m gpt-6.2-astra -c model_reasoning_effort="max" -c service_tier="default"` at **normal/default speed** (explicitly overriding any host `~/.codex/config.toml` `ultrafast` setting per `2026-11-26 21:12 +08:00` owner override unless re-enabled later, `$0` API spend, across ALL routine card/Keepa audits and major core/architecture/final sign-off reviews, passing direct raw file/log paths without second-hand compression) must supply: (1) overall project stage, business goals, and exact file paths; (2) strict focus (`BLOCKER` defects in spending/reservation/recovery, `Product-P3`/`Revision 59` math/gate/data-shape, or PII/secret handling) versus explicit non-goals (stylistic preferences, extra abstractions, redundant tests, or synthetic hostile-in-process edge cases); (3) concrete pass criteria; and (4) self-contained plain-language output under the two hard boundaries (read-only on tracked workspace & SQLite ledgers; zero real Amazon store/ad writes).
-- **Highest engineering discipline — Three-Tier Independent Ruling Gate (anti-bloat barrier):** Never blindly accept all `GPT-6.2` review comments. Before modifying any code after a `GPT-6.2` audit, the primary agent MUST independently judge every single comment from first principles of a **single-person local Amazon FBA product-selection tool**, assign one of three verdicts with a one-sentence rationale, and act strictly accordingly:
+- **Two-Tier Review System (`GPT-6.2 Astra` via local subscription `Codex CLI`, `$0` API spend):**
+  - **Runtime defaults:** Every fresh-context `codex exec` review runs `-m gpt-6.2-astra -c model_reasoning_effort="max" -c service_tier="default"` at **normal/default speed** (explicitly overriding any host `~/.codex/config.toml` `ultrafast` setting per `2026-11-26 21:12 +08:00` owner override unless re-enabled later, `$0` API spend), passing direct raw file/log/transcript paths without second-hand compression.
+  - **Tier 1 — Routine Small PR Focused Review:** Lightweight, fast Standards + Spec dual-axis check on a frozen single-PR diff, capped at **1 remediation round (`<= 2` calls)**. **Mandatory** for ANY PR touching **private-data handling or redaction (including PII, raw reviews, and private business evidence/quotes)**, **OpenAI spending / budget ledgers**, **request recovery**, or **core economics / scoring / gate logic**. Pure typo/non-spec doc hygiene PRs may use ordinary diff and link verification.
+  - **Tier 2 — Major Checkpoint Holistic Business-Logic Audit:** Fixed **1-round** full-context `GPT-6.2 Astra` audit (`serviceTier: 'default'`, `max` reasoning, `web_search: 'live'`, `$0` API spend) passing raw main/sidechat transcripts, living specs (`docs/SPEC.md`, `docs/STATE.md`, `docs/adr/`, `src/business-thresholds.mjs`), and `.local/trials/` real benchmark cards at **Pause Point 1**, **Pause Point 2**, and **before major architectural refactors**, explicitly inviting first-principles business-logic challenge against single-person local Amazon FBA tool reality, followed by primary-agent **Three-Tier Independent Ruling** (`[采纳 · 真洞察]` / `[极简补]` / `[驳回 · 脱离单人卖家现实]`) and explicit owner sign-off before starting implementation work. (Subsequent core/architecture **code remediation** uses its own max **3 rounds** limit below.)
+- **Single-PR `GPT-6.2 Astra` Review Prompt Template (copy-pasteable):**
+  Use the standard **"目标 + 验收标准 + 两条边界 + 自由发挥"** structure for Tier 1 PR reviews:
+
+  ```text
+  【目标】
+  请以“单人本地亚马逊美站 FBA 选品工具”的第一性原理，对本 PR（Issue #<id> / 分支 <branch> / commit <sha>）做 Standards + Spec 双轴独立审查。
+  请直接读取以下原始文件与 diff（禁止依赖二手摘要）：
+  - 当前阶段与原始需求：<current stage / milestone & ORIGINAL_REQUEST.md path>
+  - 规格与约束：docs/SPEC.md、AGENTS.md、src/business-thresholds.mjs
+  - 本次改动文件：<exact changed file paths>
+  - 验证命令与原始输出：<raw test output path or reproducible `node --test` command>
+
+  【验收标准】
+  1. 真实缺陷拦截（BLOCKER）：是否引入资金/毛利算错、误杀蓝海、漏拦 IP/侵权冲突、真实外部 API 载荷崩溃、未确认业务阈值硬编码，或 PII/密钥/原评论泄露。
+  2. 单人本地工具 Non-Goals 检查：明确标出任何违背“单人本地桌面/CLI 工具”前提的过度防御（例如：多租户、分布式锁、防进程内 JS 原型篡改、SSRF 过度防护、重复平台 $200 硬上限的核弹级额度锁、或脱离真实调用链的冗余测试）。
+  3. Fowler 四大坏味道检查（仅针对本次改动及直接耦合边界）：
+     - Divergent Change（发散式变化：一个模块承担过多不相关变化轴）
+     - Shotgun Surgery（霰弹式修改：一个业务规则变动被迫散改多处）
+     - Speculative Generality（臆测性泛化：为假想未来需求提前搭空架子/抽象层）
+     - Duplicated Code（重复代码：同源规则或逻辑在多处各自维护）
+  4. 合规与可独立裁决输出：每条发现必须给出精确文件路径、行号与可复现证据，便于主代理执行独立三档裁决（`[采纳 · 真问题]` / `[极简修]` / `[驳回 · 过度防御]`）；严禁为凑 PASS 建议堆砌防御性代码。
+
+  【两条边界】
+  1. 严禁修改主工作区任何文件或 SQLite 账本（`.local/state/selection.sqlite` 等仅只读）。
+  2. 严禁执行任何亚马逊店铺/广告真实写操作；全程走本地订阅 `Codex CLI`（`service_tier="default"`、`max` 推理），保持 `$0` 付费 API 消耗。
+
+  【自由发挥】
+  除上述检查项外，如发现本次改动存在未覆盖的真实边界失效、回归风险或更极简的结构改法，请直接指出原因、利弊与最小可行方案；禁止阿谀奉承。
+  ```
+
+- **Highest engineering discipline — Three-Tier Independent Ruling Gate (anti-bloat barrier):** Never blindly accept all `GPT-6.2` review comments. Before modifying any code after a `GPT-6.2` audit (Tier 1 or Tier 2), the primary agent MUST independently judge every single comment from first principles of a **single-person local Amazon FBA product-selection tool**, assign one of three verdicts with a one-sentence rationale, and act strictly accordingly:
   1. **`[采纳 · 真问题]`** — genuinely miscalculates money/margin, falsely kills blue oceans, misses IP/counterfeit conflicts, crashes on real provider payload shapes, or leaks PII/secrets -> fix cleanly at the structural seam and apply the Poteto ratchet (structural/interface prevention > deterministic guard test with fix instructions > minimal prose deleted once guarded).
   2. **`[极简修]`** — real defect exists, but GPT's proposed design is over-engineered -> apply the simplest adequate fix without creating complex new subsystems (e.g., flat columns in an existing table instead of event sourcing).
   3. **`[驳回 · 过度防御]`** — extreme hypothetical absent from a single-person local tool (in-process caller JS prototype/`Proxy` tampering, local disk hardlink races, imaginary local attackers, nuclear-grade local settlement locks duplicating platform `Auto-recharge OFF` + `$200` hard cap, heavy shared-Buy-Box attribution/blind-test subsystems for front-end lead sourcing, or redundant tests) -> explicitly reject with rationale and add **zero** defensive lines; never pile up bloat merely to chase a GPT `PASS`.
-  - When genuinely uncertain whether to adopt or reject a comment, present one-sentence arguments from both sides to `主人` for a decision. Enforce a hard ceiling of **1 remediation round (`<= 2` calls) for routine card reviews** and **3 rounds maximum for major core/architecture changes**.
+  - When genuinely uncertain whether to adopt or reject a comment, present one-sentence arguments from both sides to `主人` for a decision. Enforce a hard ceiling of **1 remediation round (`<= 2` calls) for routine small PR / card reviews** and **3 rounds maximum for major core/architecture code remediation** (separate from Tier 2's fixed **1-round** pre-code holistic business-logic audit).
 - **Global check first & sustained disciplined slimming:** Never halt delivery for a full-repo rewrite, and never impose arbitrary "delete X% lines" quotas. Instead, track verified over-defensive bloat (such as abolished lock/tamper/hardlink layers in `src/openai/` and monolithic command routing in `src/phase2-cli.mjs`) on the cleanup roadmap, verify all real callers and test dependencies before removing dead code, and keep core business behavior and `node --test` 100% green.
 - **Curatorial Studio (`01 视觉策展室`) UI invariants & local preview:** Future HTML report or workbench updates must preserve the anti-AI-slop editorial aesthetic (`0` Impeccable warnings), unboxed typographic navigation (zero pill-box tag clutter), and high-contrast CJK ink legibility (`--ink-2: #1c1d22`, `--muted: #383a42`, `>= 11:1` contrast, body weight `>= 460`). Never hand the owner a bare local `.html` file path to click in chat (which opens raw HTML source in the editor); always serve and link a rendered `http://127.0.0.1:<port>/...` local preview URL with refresh instructions.
 
@@ -142,5 +175,5 @@ Adopted 2026-11-26 as permanent stage & `retro` engineering discipline (executed
 3. **Mandatory per-stage `retro` hygiene checklist:**
    - **Single source of truth:** Write each active rule completely in one owning record (`docs/SPEC.md` for active business rules, `docs/DEVELOPMENT.md` for workflow discipline); link from other docs instead of duplicating prose (continuously reducing duplicated rules between `AGENTS.md` and `docs/SPEC.md`).
    - **Condensed rejection memory:** Never retain massive logs of overturned proposals; condense *"why it was rejected so future AIs do not repeat it"* into `docs/SPEC.md` §2 (`Non-Goals`) or `docs/adr/`.
-   - **Planned archival & freezing of overlapping legacy mega-docs:** At an appropriate hygiene checkpoint after auditing for zero uncaptured rules, retire overlapping `docs/PRODUCT.md` into `docs/archive/`, freeze the ~210 KB `docs/design/DECISIONS.md` into `docs/archive/` (read-only historical archaeology — zero new PR appends), and periodically condense settled historical blocks in `docs/STATE.md` into compact milestone anchors.
+   - **Archived legacy mega-docs & periodic STATE compaction:** Overlapping `docs/PRODUCT.md` and `docs/design/DECISIONS.md` are retired/archived into `docs/archive/` as read-only historical archaeology (zero new PR appends; `docs/SPEC.md` is the sole active business spec), while settled historical blocks in `docs/STATE.md` are periodically condensed into compact milestone anchors.
    - **Code / script / branch / local hygiene:** On every stage `retro`, audit and safely remove confirmed unused temporary scripts, obsolete early drafts, and already-merged GitHub/local branches. **Mandatory safety gate:** verify zero repo-wide references before deleting any tracked file or script, and **STRICTLY NEVER delete or modify `.local/secrets/`, SQLite ledgers, or core `.local/state/` files.**
