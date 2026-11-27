@@ -514,8 +514,10 @@ function hasUpstreamReviewFailure(obj) {
   return false;
 }
 
+const RAW_REVIEW_CHAIN_MAX_DEPTH = 4;
+
 function extractRawReviewRows(source, depth = 0) {
-  if (!source || depth > 4) return { hasRawArray: false, rows: null, failed: false };
+  if (!source || depth > RAW_REVIEW_CHAIN_MAX_DEPTH) return { hasRawArray: false, rows: null, failed: false };
   if (Array.isArray(source)) return { hasRawArray: true, rows: source, failed: false };
   if (typeof source !== 'object') return { hasRawArray: false, rows: null, failed: false };
   if (hasUpstreamReviewFailure(source)) return { hasRawArray: false, rows: null, failed: true };
@@ -752,43 +754,61 @@ export function extractNewcomerReviewOriginBreakdown(raw = {}) {
   };
 }
 
-function hasDirectRawReviewFields(obj) {
-  return Boolean(
-    obj && typeof obj === 'object' && (
-      Array.isArray(obj) ||
-      (obj.reviews_raw !== undefined && obj.reviews_raw !== null) ||
-      Array.isArray(obj.reviews_list) ||
-      Array.isArray(obj.reviews) ||
-      Array.isArray(obj.content) ||
-      (obj.structuredContent && typeof obj.structuredContent === 'object')
-    ),
-  );
+function stripLayerRawReviewFields(obj) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+  let clone = null;
+  const drop = key => {
+    if (!clone) clone = { ...obj };
+    delete clone[key];
+  };
+  if (obj.reviews_raw !== undefined && obj.reviews_raw !== null) drop('reviews_raw');
+  if (Array.isArray(obj.reviews_list)) drop('reviews_list');
+  if (Array.isArray(obj.reviews)) drop('reviews');
+  if (Array.isArray(obj.content)) drop('content');
+  if (obj.structuredContent && typeof obj.structuredContent === 'object') drop('structuredContent');
+  if (Array.isArray(obj.data)) drop('data');
+  return clone;
 }
 
 /**
  * Derive a sanitized `review_origin_breakdown` and strip raw reviewer payloads (author names / review text)
- * from a shallow copy of a newcomer cohort member without mutating the caller's object or deleting non-array
- * scalar fields (e.g., numeric `reviews: 84` or plain string `content`).
+ * along `member` and nested `data` layers (`depth <= 4`) without mutating caller input, deleting non-array
+ * scalar fields (e.g., numeric `reviews: 84` or plain string `content`), or wiping sibling `data` diagnostics.
  */
 export function sanitizeNewcomerMemberReviews(member) {
-  if (!member || typeof member !== 'object' || Array.isArray(member)) return member;
-  const hasDirect = hasDirectRawReviewFields(member);
-  const hasNestedData = Boolean(
-    member.data && typeof member.data === 'object' && (
-      hasDirectRawReviewFields(member.data) ||
-      hasDirectRawReviewFields(member.data.data)
-    ),
-  );
-  if (!hasDirect && !hasNestedData) return member;
+  if (Array.isArray(member)) return [];
+  if (!member || typeof member !== 'object') return member;
+
+  const chain = [];
+  for (let cursor = member, depth = 0;
+    depth <= RAW_REVIEW_CHAIN_MAX_DEPTH && cursor && typeof cursor === 'object' && !Array.isArray(cursor);
+    depth++) {
+    chain.push(cursor);
+    cursor = cursor.data;
+  }
+
+  let childChanged = false;
+  let childValue;
+  for (let i = chain.length - 1; i >= 0; i--) {
+    let layer = stripLayerRawReviewFields(chain[i]);
+    if (childChanged) {
+      if (!layer) layer = { ...chain[i] };
+      if (childValue === undefined) delete layer.data;
+      else layer.data = childValue;
+    }
+    if (!layer) {
+      childChanged = false;
+      childValue = chain[i];
+      continue;
+    }
+    childChanged = true;
+    childValue = i > 0 && Object.keys(layer).length === 0 ? undefined : layer;
+  }
+
+  if (!childChanged) return member;
 
   const originBreakdown = extractNewcomerReviewOriginBreakdown(member);
-  const sanitized = { ...member };
-  delete sanitized.reviews_raw;
-  if (Array.isArray(sanitized.reviews_list)) delete sanitized.reviews_list;
-  if (Array.isArray(sanitized.reviews)) delete sanitized.reviews;
-  if (Array.isArray(sanitized.content)) delete sanitized.content;
-  if (sanitized.structuredContent && typeof sanitized.structuredContent === 'object') delete sanitized.structuredContent;
-  if (hasNestedData) delete sanitized.data;
+  const sanitized = childValue;
   if (originBreakdown) {
     sanitized.review_origin_breakdown = originBreakdown;
   } else {
