@@ -517,6 +517,7 @@ function historicalPrices(raw) {
 }
 
 const DEFAULT_VETERAN_MATURE_MIN_AGE_DAYS = BUSINESS_THRESHOLDS.veteran_min_age_days;
+const DEFAULT_MIN_VETERANS_BEFORE_GROWTH_SUPPLEMENT = BUSINESS_THRESHOLDS.min_veterans_before_growth_supplement;
 
 /**
  * Qualitative/structured flag check for veteran clearance / price-war volatility ("老品清仓／恶战波动").
@@ -1282,11 +1283,13 @@ export function analyzeMainstreamPriceBand(listings, options = {}) {
   let primaryBandBasis = 'veteran_ge_365d_keepa_steady';
   let primaryBandLabelZh = '成熟老品主价位带（≥365天）';
 
-  if (veteranEligible.length >= 2) {
+  const minVeteransBeforeGrowthSupplement = DEFAULT_MIN_VETERANS_BEFORE_GROWTH_SUPPLEMENT;
+
+  if (veteranEligible.length >= minVeteransBeforeGrowthSupplement) {
     mainstreamPool = [...veteranEligible];
-    // Hold 91-364d growth peers visibly in the observation bar since >=2 veterans already anchor the band
+    // Hold 91-364d growth peers visibly in the observation bar once eligible veterans reach the registered cutoff
     for (const g of growthSteadyEligible) {
-      const reasonZh = `已有 ${veteranEligible.length} 个满 365 天成熟老品坐镇主价位带，91–364 天成长期链接列于观察栏留底`;
+      const reasonZh = `已有 ${veteranEligible.length} 个满 ${Number(veteran_min_age_days)} 天成熟老品坐镇主价位带，${Number(spiral_max_age_days) + 1}–${Number(veteran_min_age_days) - 1} 天成长期链接列于观察栏留底`;
       observedOutOfBandPeers.push({
         asin: g.asin,
         title: g.title,
