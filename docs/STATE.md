@@ -45,7 +45,7 @@ Updated: 2026-11-27. Single maintained task and recovery record. Active business
 ## Frozen `r57` verification hashes & core business references
 
 - Frozen `r57` hashes under `.local/trials/20261118-r57-closure/` (untouched): `batch.r57.json` `4b902c2aef7a8c84831d6b49420023053066cfea8d465e74103268c0d5819fa4`; `discovery-bundle.json` `2f65c1417d02bf01a5c85d33886ee5b225b39c8e9d2f2086987743d07824b376`; `report/result.json` `bd450fc8e10b7fd3efb8f4ea85f0e52e6b281611f1285f475406d1e38a2d2e4e`; `report/index.html` `8c44f80d99b897a0a90d4e6f2d5163b46d9c6825233c674ea03c2e2fc6fbe81b`.
-- Core specs & immutable boundaries: [SPEC.md](SPEC.md), [ADR-0001..0004](adr/0001-decouple-steady-state-freight-from-100-set-sourcing.md), [PRODUCT.md](PRODUCT.md), [DECISIONS.md](design/DECISIONS.md), [business-thresholds.mjs](../src/business-thresholds.mjs), and archived deep-dive rubrics under [docs/archive/design/](archive/design/PROFITABILITY.draft.md) (`DEMAND`, `SUGGESTED-BID`, `Q31-NORMAL-NEWCOMER`, `PROFITABILITY`, `TRIAL-INPUT`).
+- Core specs & immutable boundaries: [SPEC.md](SPEC.md), [ADR-0001..0004](adr/0001-decouple-steady-state-freight-from-100-set-sourcing.md), [business-thresholds.mjs](../src/business-thresholds.mjs), and frozen historical ledgers/rubrics under [docs/archive/](archive/PRODUCT.md) (`PRODUCT`, `DECISIONS`, and `archive/design/` `DEMAND`, `SUGGESTED-BID`, `Q31-NORMAL-NEWCOMER`, `PROFITABILITY`, `TRIAL-INPUT`).
 
 ## Concrete blockers and next work
 

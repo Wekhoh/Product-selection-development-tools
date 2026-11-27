@@ -1,6 +1,6 @@
 # Pretrial scoring and business-definition review
 
-Date: 2026-11-13. Scope: the current 21 trial items, reference populations, measurement meaning, screening and discovery-to-card handoffs, plus the unadopted total/missingness/ordering proposal. This is a design review, not product, live-data or business acceptance. Recovery remains in [STATE](../../STATE.md); proposed choices remain in [DECISIONS](../../design/DECISIONS.md).
+Date: 2026-11-13. Scope: the current 21 trial items, reference populations, measurement meaning, screening and discovery-to-card handoffs, plus the unadopted total/missingness/ordering proposal. This is a design review, not product, live-data or business acceptance. Recovery remains in [STATE](../../STATE.md); proposed choices remain in [DECISIONS](../DECISIONS.md).
 
 The owner explicitly requested a fresh-context independent challenge. The critic received a frozen 13-document snapshot without the implementation conversation. The initial independent findings preceded the lead's proposed repairs. The owner then clarified that ordinary business scenarios and reference/data semantics matter more than merely checking arithmetic; the same review was extended on that basis. Original snapshots, the full independent report and exact saved-provider evidence remain private under `.local/reviews/20261113-scoring-pretrial-adversarial/` and `.local/reviews/20261113-real-scoring-r49/`.
 
