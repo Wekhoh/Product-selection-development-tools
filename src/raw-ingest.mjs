@@ -53,6 +53,7 @@ import {
   ingestRawCategoryAndDemandMetrics,
   extractSifThreeTierBidPlan,
   classifySpApiRestrictionReasons,
+  collectCatalogItemNodes,
   extractSpApiFinalistCalibration,
   extractSpApiPeerPackagesFromRawPayloads,
   ingestSellerSpriteMonthlyArchiveMarket,
@@ -72,6 +73,7 @@ export {
   ingestRawCategoryAndDemandMetrics,
   extractSifThreeTierBidPlan,
   classifySpApiRestrictionReasons,
+  collectCatalogItemNodes,
   extractSpApiFinalistCalibration,
   extractSpApiPeerPackagesFromRawPayloads,
   ingestSellerSpriteMonthlyArchiveMarket,
@@ -760,21 +762,44 @@ export function extractKeepaFactsByAsinFromPayloads(rawPayloads = [], { asOfDate
 export function mergeKeepaReceiptIntoListingRow(row, parsedKeepa) {
   if (!row || typeof row !== 'object' || !parsedKeepa?.ok) return row;
   const merged = { ...row };
+  merged.keepa_has_timestamps = Boolean(parsedKeepa.has_timestamps);
   if (parsedKeepa.status === 'package_snapshot_only') {
     merged.keepa_package_only = true;
+    merged.keepa_has_timestamps = false;
+    merged.keepa_90d_steady = false;
+    merged.keepa_price_steady = false;
+    delete merged.keepa_90d_median_usd;
     merged.keepa_peer_facts = buildKeepaPeerFactsForMarketJudge(parsedKeepa);
   } else if (parsedKeepa.status === 'parsed') {
-    if (merged.keepa_90d_steady === undefined) {
+    delete merged.keepa_package_only;
+    const coversFull90d = Boolean(
+      parsedKeepa.has_timestamps &&
+      finite(parsedKeepa.window_90d?.calendar_span_days) &&
+      parsedKeepa.window_90d.calendar_span_days >= BUSINESS_THRESHOLDS.newcomer_max_age_days,
+    );
+    if (!coversFull90d) {
+      merged.keepa_90d_steady = false;
+      merged.keepa_price_steady = false;
+      delete merged.keepa_90d_median_usd;
+      if (finite(parsedKeepa.undated_sample_median_usd)) {
+        merged.undated_sample_median_usd = parsedKeepa.undated_sample_median_usd;
+      }
+    } else {
       merged.keepa_90d_steady = parsedKeepa.keepa_90d_steady;
-    }
-    if (merged.keepa_price_steady === undefined) {
       merged.keepa_price_steady = parsedKeepa.keepa_90d_steady;
+      const derivedMedian = finite(parsedKeepa.keepa_90d_median_usd)
+        ? parsedKeepa.keepa_90d_median_usd
+        : (finite(parsedKeepa.window_90d?.median_usd) && !parsedKeepa.continuous_heavy_coupon_90d
+          ? parsedKeepa.window_90d.median_usd
+          : null);
+      if (derivedMedian !== null) {
+        merged.keepa_90d_median_usd = derivedMedian;
+      } else {
+        delete merged.keepa_90d_median_usd;
+      }
     }
     if (merged.sustained_drop_or_clearance_watch === undefined && parsedKeepa.sustained_drop_or_clearance_watch === true) {
       merged.sustained_drop_or_clearance_watch = true;
-    }
-    if (parsedKeepa.has_timestamps && finite(parsedKeepa.keepa_90d_median_usd) && merged.keepa_90d_median_usd === undefined) {
-      merged.keepa_90d_median_usd = parsedKeepa.keepa_90d_median_usd;
     }
     const hasExplicitRowCoupon =
       merged.ongoing_coupon_pct !== undefined ||
@@ -2198,7 +2223,7 @@ export function ingestTrialSpecification(spec, profile, {
       : (nonemptyStr(cand?.screening?.reference_price_usd?.target_variant_asin)
         ? cand.screening.reference_price_usd.target_variant_asin.trim().toUpperCase()
         : null);
-    let autoSpCatalogRaw = null;
+    const autoSpCatalogNodes = [];
     const autoSpFeesCandidates = [];
     let autoSpRestrictionsRaw = null;
     const findSpApiErrorsDeep = (obj, depth = 0) => {
@@ -2243,15 +2268,18 @@ export function ingestTrialSpecification(spec, profile, {
         const unw = unwrapMcpEnvelope(rawP);
         if (!unw || typeof unw !== 'object') continue;
         if (targetVariantAsin) {
-          if (!autoSpCatalogRaw && nonemptyStr(unw.asin) && unw.asin.trim().toUpperCase() === targetVariantAsin &&
-            (Array.isArray(unw.dimensions) || unw.attributes?.item_package_dimensions || unw.attributes?.item_package_weight)) {
-            autoSpCatalogRaw = rawP;
-          }
+          const candidateCatNodes = collectCatalogItemNodes(unw).filter(n =>
+            nonemptyStr(n.asin) &&
+            n.asin.trim().toUpperCase() === targetVariantAsin &&
+            (Array.isArray(n.dimensions) || n.attributes?.item_package_dimensions || n.attributes?.item_package_weight),
+          );
+          if (candidateCatNodes.length > 0) autoSpCatalogNodes.push(...candidateCatNodes);
           const isNativeFeesArray = Array.isArray(unw) && unw.some(x => x && typeof x === 'object' && (x.FeesEstimateResult || x.FeesEstimateIdentifier || x.FeesEstimate));
-          if (isNativeFeesArray || unw.FeesEstimateResult || unw.FeesEstimateResultList || unw.payload?.FeesEstimateResult || unw.payload?.FeesEstimateResultList) {
+          const isArchivedFeesSummary = Array.isArray(unw.fees_estimates) && unw.fees_estimates.length > 0;
+          if (isNativeFeesArray || isArchivedFeesSummary || unw.FeesEstimateResult || unw.FeesEstimateResultList || unw.payload?.FeesEstimateResult || unw.payload?.FeesEstimateResultList) {
             autoSpFeesCandidates.push(rawP);
           }
-          if (!autoSpRestrictionsRaw && Array.isArray(unw.restrictions)) {
+          if (!autoSpRestrictionsRaw && (Array.isArray(unw.restrictions) || Array.isArray(unw.listings_restrictions))) {
             if (!nonemptyStr(unw.asin) || unw.asin.trim().toUpperCase() === targetVariantAsin) {
               autoSpRestrictionsRaw = rawP;
             }
@@ -2259,6 +2287,9 @@ export function ingestTrialSpecification(spec, profile, {
         }
       }
     }
+    const autoSpCatalogRaw = autoSpCatalogNodes.length === 0
+      ? null
+      : (autoSpCatalogNodes.length === 1 ? autoSpCatalogNodes[0] : { items: autoSpCatalogNodes });
     const autoSpFeesRaw = autoSpFeesCandidates.length === 0
       ? null
       : (autoSpFeesCandidates.length === 1
@@ -2269,6 +2300,26 @@ export function ingestTrialSpecification(spec, profile, {
               if (Array.isArray(u)) return u;
               if (Array.isArray(u?.FeesEstimateResultList)) return u.FeesEstimateResultList;
               if (Array.isArray(u?.payload?.FeesEstimateResultList)) return u.payload.FeesEstimateResultList;
+              if (Array.isArray(u?.fees_estimates)) {
+                const mkt = nonemptyStr(u.marketplace_id) ? u.marketplace_id.trim() : 'ATVPDKIKX0DER';
+                return u.fees_estimates.filter(r => r && typeof r === 'object').map(r => ({
+                  Status: 'Success',
+                  FeesEstimateIdentifier: {
+                    MarketplaceId: nonemptyStr(r.marketplace_id) ? r.marketplace_id.trim() : mkt,
+                    IdType: 'ASIN',
+                    ...(nonemptyStr(r.reference_asin ?? r.asin) ? { IdValue: String(r.reference_asin ?? r.asin).trim().toUpperCase() } : {}),
+                    IsAmazonFulfilled: r.is_amazon_fulfilled !== false,
+                    ...(finite(r.price_usd) ? { PriceToEstimateFees: { ListingPrice: { CurrencyCode: 'USD', Amount: r.price_usd } } } : {}),
+                  },
+                  FeesEstimate: {
+                    ...(finite(r.total_fees_usd) ? { TotalFeesEstimate: { CurrencyCode: 'USD', Amount: r.total_fees_usd } } : {}),
+                    FeeDetailList: [
+                      ...(finite(r.referral_fee_usd) ? [{ FeeType: 'ReferralFee', FinalFee: { CurrencyCode: 'USD', Amount: r.referral_fee_usd } }] : []),
+                      ...(finite(r.fba_pick_and_pack_usd ?? r.fba_fee_usd) ? [{ FeeType: 'FBAFees', FinalFee: { CurrencyCode: 'USD', Amount: r.fba_pick_and_pack_usd ?? r.fba_fee_usd } }] : []),
+                    ],
+                  },
+                }));
+              }
               return [u?.FeesEstimateResult ?? u?.payload?.FeesEstimateResult ?? u];
             }),
           });
@@ -2316,6 +2367,10 @@ export function ingestTrialSpecification(spec, profile, {
       }
       if (spCal) {
         cand.sp_api_calibration = spCal;
+      if (spCal.package_calibration_status && spCal.package_calibration_status !== 'verified') {
+        const gapNote = `SP-API 终审校准缺口：缺少 ${spCal.asin ?? '目标对标'} 的 CatalogItems 官方包装尺寸／重量（${spCal.package_calibration_status}），当前未完成官方包规校准。`;
+        cand.review_notes = [...new Set([...(Array.isArray(cand.review_notes) ? cand.review_notes : []), gapNote])];
+      }
       if (spCal.stale_sellersprite_audit?.stale_sellersprite_cache_corrected === true) {
         const noteStr = `SP-API 官方包装尺寸纠偏：${spCal.asin ? `${spCal.asin} ` : ''}卖家精灵旧缓存重 ${spCal.stale_sellersprite_audit.sellersprite_cached_weight_lb} lb（2027 FBA $${spCal.stale_sellersprite_audit.sellersprite_cached_fba_2027_usd}），SP-API 官方库实测为 ${spCal.stale_sellersprite_audit.sp_api_official_weight_lb} lb（2027 FBA $${spCal.stale_sellersprite_audit.sp_api_official_fba_2027_usd}）。`;
         cand.review_notes = [...(Array.isArray(cand.review_notes) ? cand.review_notes : []), noteStr];
@@ -2379,8 +2434,11 @@ export function ingestTrialSpecification(spec, profile, {
       }
     }
 
+    const expectedPkgQtyForPeers = entry.sp_api_calibration_inputs?.expected_package_quantity ?? null;
     const rawAutoSpPeers = entryCandPayloads.length > 0
-      ? extractSpApiPeerPackagesFromRawPayloads(entryCandPayloads)
+      ? extractSpApiPeerPackagesFromRawPayloads(entryCandPayloads, {
+        ...(expectedPkgQtyForPeers !== null ? { expected_package_quantity: expectedPkgQtyForPeers } : {}),
+      })
       : [];
     const combinedPeerList = [
       ...rawAutoSpPeers,

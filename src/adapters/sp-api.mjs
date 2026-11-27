@@ -25,41 +25,188 @@ const round2 = v => Number(v.toFixed(2));
  * is never mistaken for a category ban on a new own-brand white-label listing.
  */
 export function classifySpApiRestrictionReasons(reasons = [], { target_is_own_white_label = true } = {}) {
-  const msgs = (Array.isArray(reasons) ? reasons : []).map(r => String(r?.message || '')).filter(Boolean);
-  const hasBrandGate = msgs.some(m => /approval to list in this brand|brand owner contribution/i.test(m));
-  const hasCategoryOrProductApproval = msgs.some(m =>
-    /approval to list this product|other listing limitations|toys|topical|dietary|medical|hazmat/i.test(m) &&
-    !/in this brand/i.test(m),
-  );
-  const hardBan = msgs.some(m => /prohibited|recalled|banned|not permitted for sale/i.test(m));
+  const entries = (Array.isArray(reasons) ? reasons : []).filter(r => r && typeof r === 'object');
+  let hasBrandGate = false;
+  let hasCategoryOrProductApproval = false;
+  let hasSingleAsinRecall = false;
+  let hardBan = false;
+
+  for (const r of entries) {
+    const m = String(r.message || '').trim();
+    const code = String(r.reasonCode || r.code || '').trim().toUpperCase();
+    const isRecallMsg = /\brecalled\b|safety\s+recall/i.test(m);
+    const isBrandMsg = /approval to list in this brand|brand owner contribution/i.test(m);
+    const isHardBanMsg = !isRecallMsg && /prohibited|banned|not permitted for sale/i.test(m);
+    const isCatApprovalMsg = !isBrandMsg && !isRecallMsg && (
+      /approval to list this product|other listing limitations|toys|topical|dietary|medical|hazmat/i.test(m) ||
+      code === 'NOT_ELIGIBLE' ||
+      code === 'APPROVAL_REQUIRED'
+    );
+    if (isRecallMsg) hasSingleAsinRecall = true;
+    if (isBrandMsg) hasBrandGate = true;
+    if (isHardBanMsg) hardBan = true;
+    if (isCatApprovalMsg) hasCategoryOrProductApproval = true;
+  }
+
+  const restrictionScope = hardBan
+    ? 'hard_category_ban'
+    : hasSingleAsinRecall
+      ? 'single_asin_recall_scope_check'
+      : hasCategoryOrProductApproval
+        ? 'category_or_product_approval'
+        : hasBrandGate
+          ? 'competitor_brand_only'
+          : 'clear';
   return {
     hard_category_ban: hardBan,
     has_competitor_brand_gate: hasBrandGate,
     has_category_or_product_approval_note: hasCategoryOrProductApproval,
-    white_label_note: target_is_own_white_label && hasBrandGate
-      ? 'SP-API 竞品 ASIN 限制含「竞品品牌锁（approval to list in this brand）」，对自有白牌新建链接不构成品牌封锁；类目准入按自有 productType 预检核实。'
-      : '已按 SP-API 准入原因分类核对。',
+    has_single_asin_recall_note: hasSingleAsinRecall,
+    restriction_scope: restrictionScope,
+    white_label_note: hardBan
+      ? 'SP-API 命中禁止销售限制，须确认适用范围后再评估。'
+      : hasSingleAsinRecall
+        ? 'SP-API 竞品单 ASIN 存在召回记录（recalled），须核实属于该品牌单批次缺陷还是品类通病安全风险，不可混同为全类目封禁或直接忽略。'
+        : target_is_own_white_label && hasBrandGate
+          ? 'SP-API 竞品 ASIN 限制含「竞品品牌锁（approval to list in this brand）」，对自有白牌新建链接不构成品牌封锁；类目准入按自有 productType 预检核实。'
+          : hasCategoryOrProductApproval
+            ? 'SP-API 竞品 ASIN 含产品/类目准入或销售限制，须结合自有白牌 productType 预检核实。'
+            : '已按 SP-API 准入原因分类核对。',
   };
 }
 
 function spApiMeasureToInches(measure) {
   if (!measure || typeof measure !== 'object' || !finite(measure.value) || measure.value <= 0) return null;
-  const u = String(measure.unit ?? '').trim().toLowerCase();
+  const u = String(measure.unit ?? '').trim().toLowerCase().replace(/[\s_]+/g, '-');
   if (u === 'inches' || u === 'inch' || u === 'in') return Number(measure.value.toFixed(6));
+  if (u === 'hundredths-inches' || u === 'hundredths-inch') return Number((measure.value / 100).toFixed(6));
   if (u === 'centimeters' || u === 'centimeter' || u === 'cm') return Number((measure.value / 2.54).toFixed(6));
   if (u === 'millimeters' || u === 'millimeter' || u === 'mm') return Number((measure.value / 25.4).toFixed(6));
+  if (u === 'meters' || u === 'meter' || u === 'm') return Number((measure.value * 39.3700787).toFixed(6));
   if (u === 'feet' || u === 'foot' || u === 'ft') return Number((measure.value * 12).toFixed(6));
   return null;
 }
 
 function spApiWeightToPounds(measure) {
   if (!measure || typeof measure !== 'object' || !finite(measure.value) || measure.value <= 0) return null;
-  const u = String(measure.unit ?? '').trim().toLowerCase();
+  const u = String(measure.unit ?? '').trim().toLowerCase().replace(/[\s_]+/g, '-');
   if (u === 'pounds' || u === 'pound' || u === 'lbs' || u === 'lb') return Number(measure.value.toFixed(6));
+  if (u === 'hundredths-pounds' || u === 'hundredths-pound') return Number((measure.value / 100).toFixed(6));
   if (u === 'ounces' || u === 'ounce' || u === 'oz') return Number((measure.value / 16).toFixed(6));
   if (u === 'kilograms' || u === 'kilogram' || u === 'kg') return Number((measure.value / 0.45359237).toFixed(6));
   if (u === 'grams' || u === 'gram' || u === 'g') return Number((measure.value / 453.59237).toFixed(6));
   return null;
+}
+
+export function collectCatalogItemNodes(rawBody, depth = 0) {
+  if (!rawBody || typeof rawBody !== 'object' || depth > 5) return [];
+  if (Array.isArray(rawBody)) {
+    return rawBody.flatMap(el => collectCatalogItemNodes(el, depth + 1));
+  }
+  const hasDirectCatalogShape =
+    Array.isArray(rawBody.dimensions) ||
+    Boolean(rawBody.attributes?.item_package_dimensions) ||
+    Boolean(rawBody.attributes?.item_package_weight);
+  if (hasDirectCatalogShape) return [rawBody];
+  const collected = [];
+  for (const listKey of ['items', 'catalogItems', 'catalog_items']) {
+    const val = rawBody[listKey];
+    if (Array.isArray(val)) {
+      collected.push(...val.flatMap(el => collectCatalogItemNodes(el, depth + 1)));
+    } else if (val && typeof val === 'object') {
+      for (const [k, v] of Object.entries(val)) {
+        if (v && typeof v === 'object') {
+          collected.push(...collectCatalogItemNodes(nonemptyStr(v.asin) ? v : { asin: k, ...v }, depth + 1));
+        }
+      }
+    }
+  }
+  if (collected.length > 0) return collected;
+  for (const wrapKey of ['payload', 'data', 'result', 'response', 'catalogItem', 'catalog_item']) {
+    if (rawBody[wrapKey] && typeof rawBody[wrapKey] === 'object') {
+      const nested = collectCatalogItemNodes(rawBody[wrapKey], depth + 1);
+      if (nested.length > 0) return nested;
+    }
+  }
+  if (nonemptyStr(rawBody.asin)) return [rawBody];
+  return [];
+}
+
+function isCatalogListEnvelope(rawBody) {
+  if (!rawBody || typeof rawBody !== 'object') return false;
+  if (Array.isArray(rawBody)) return true;
+  if (Array.isArray(rawBody.items) || Array.isArray(rawBody.catalogItems) || Array.isArray(rawBody.catalog_items)) return true;
+  if (rawBody.catalog_items && typeof rawBody.catalog_items === 'object') return true;
+  for (const wrapKey of ['payload', 'data', 'result', 'response']) {
+    if (rawBody[wrapKey] && typeof rawBody[wrapKey] === 'object' && isCatalogListEnvelope(rawBody[wrapKey])) return true;
+  }
+  return false;
+}
+
+function catalogNodeMatchesMarketplace(node, targetMkt) {
+  if (!node || typeof node !== 'object') return false;
+  const dimArr = Array.isArray(node.dimensions) ? node.dimensions : [];
+  if (dimArr.some(d => !d?.marketplaceId || d.marketplaceId === targetMkt)) return true;
+  const attrDim = Array.isArray(node.attributes?.item_package_dimensions) ? node.attributes.item_package_dimensions : [];
+  if (attrDim.some(d => !d?.marketplace_id || d.marketplace_id === targetMkt)) return true;
+  const attrWt = Array.isArray(node.attributes?.item_package_weight) ? node.attributes.item_package_weight : [];
+  if (attrWt.some(w => !w?.marketplace_id || w.marketplace_id === targetMkt)) return true;
+  return false;
+}
+
+function normalizeArchivedFeeEstimateRows(feesBody, defaultMkt = 'ATVPDKIKX0DER', defaultCur = 'USD') {
+  const rows = Array.isArray(feesBody?.fees_estimates) ? feesBody.fees_estimates : null;
+  if (!rows) return null;
+  const mkt = nonemptyStr(feesBody.marketplace_id) ? feesBody.marketplace_id.trim() : defaultMkt;
+  const cur = nonemptyStr(feesBody.currency) ? feesBody.currency.trim().toUpperCase() : defaultCur;
+  return rows
+    .filter(r => r && typeof r === 'object')
+    .map(r => {
+      const idVal = nonemptyStr(r.reference_asin ?? r.asin) ? String(r.reference_asin ?? r.asin).trim().toUpperCase() : null;
+      const priceAmt = finite(r.price_usd) ? r.price_usd : null;
+      const refAmt = finite(r.referral_fee_usd) ? r.referral_fee_usd : null;
+      const fbaAmt = finite(r.fba_pick_and_pack_usd ?? r.fba_fee_usd ?? r.live_fba_fulfillment_usd)
+        ? (r.fba_pick_and_pack_usd ?? r.fba_fee_usd ?? r.live_fba_fulfillment_usd)
+        : null;
+      const totalAmt = finite(r.total_fees_usd) ? r.total_fees_usd : (refAmt !== null && fbaAmt !== null ? round2(refAmt + fbaAmt) : null);
+      const feeDetails = [];
+      if (refAmt !== null) feeDetails.push({ FeeType: 'ReferralFee', FinalFee: { CurrencyCode: cur, Amount: refAmt } });
+      if (fbaAmt !== null) feeDetails.push({ FeeType: 'FBAFees', FinalFee: { CurrencyCode: cur, Amount: fbaAmt } });
+      return {
+        Status: 'Success',
+        FeesEstimateIdentifier: {
+          MarketplaceId: nonemptyStr(r.marketplace_id) ? r.marketplace_id.trim() : mkt,
+          IdType: 'ASIN',
+          ...(idVal ? { IdValue: idVal } : {}),
+          IsAmazonFulfilled: r.is_amazon_fulfilled !== false,
+          ...(priceAmt !== null ? { PriceToEstimateFees: { ListingPrice: { CurrencyCode: cur, Amount: priceAmt } } } : {}),
+        },
+        FeesEstimate: {
+          ...(totalAmt !== null ? { TotalFeesEstimate: { CurrencyCode: cur, Amount: totalAmt } } : {}),
+          FeeDetailList: feeDetails,
+        },
+      };
+    });
+}
+
+function extractCatalogPackageQuantity(catNode, targetMkt) {
+  const pickPositiveInt = list => {
+    if (!Array.isArray(list)) return null;
+    const matched = list.find(e => !e?.marketplace_id || e.marketplace_id === targetMkt) ?? null;
+    const rawVal = matched?.value ?? matched?.packageQuantity;
+    const n = typeof rawVal === 'number' ? rawVal : (typeof rawVal === 'string' && /^\d+$/.test(rawVal.trim()) ? Number(rawVal.trim()) : NaN);
+    return Number.isSafeInteger(n) && n > 0 ? n : null;
+  };
+  const fromSummary = Array.isArray(catNode?.summaries)
+    ? (() => {
+      const m = catNode.summaries.find(s => !s?.marketplaceId || s.marketplaceId === targetMkt);
+      return Number.isSafeInteger(m?.packageQuantity) && m.packageQuantity > 0 ? m.packageQuantity : null;
+    })()
+    : null;
+  return fromSummary ??
+    pickPositiveInt(catNode?.attributes?.item_package_quantity) ??
+    pickPositiveInt(catNode?.attributes?.number_of_items) ??
+    null;
 }
 
 /**
@@ -77,6 +224,7 @@ export function extractSpApiFinalistCalibration({
   restrictionsRaw = null,
   sellerSpriteCachedRow = null,
   price_usd = null,
+  expected_package_quantity = null,
   target_is_own_white_label = true,
   is_apparel = undefined,
   is_shoes = undefined,
@@ -98,6 +246,9 @@ export function extractSpApiFinalistCalibration({
   const reqAsin = nonemptyStr(requestedAsin) ? requestedAsin.trim().toUpperCase() : null;
   const targetMkt = nonemptyStr(marketplace_id) ? marketplace_id.trim() : 'ATVPDKIKX0DER';
   const targetCur = nonemptyStr(currency) ? currency.trim().toUpperCase() : 'USD';
+  const expectedPkgQty = Number.isSafeInteger(expected_package_quantity) && expected_package_quantity > 0
+    ? expected_package_quantity
+    : null;
 
   const catBody = catalogItemRaw ? unwrapMcpEnvelope(catalogItemRaw) : null;
   const feesBody = feesEstimateRaw ? unwrapMcpEnvelope(feesEstimateRaw) : null;
@@ -105,45 +256,89 @@ export function extractSpApiFinalistCalibration({
 
   let asin = reqAsin;
   let officialPkg = null;
+  let packageCalibrationStatus = catalogItemRaw ? 'incomplete_package_dimensions' : 'missing_catalog_items';
+  let missingPackageFields = [];
+  let observedPackageQuantity = null;
   if (catBody && typeof catBody === 'object') {
-    const catAsin = nonemptyStr(catBody.asin) ? catBody.asin.trim().toUpperCase() : null;
-    if (reqAsin && catAsin && catAsin !== reqAsin) {
-      throw new TypeError(`SP-API catalogItems ASIN ("${catAsin}") conflicts with requested ASIN ("${reqAsin}").`);
+    const catNodes = collectCatalogItemNodes(catBody);
+    const fromListEnvelope = isCatalogListEnvelope(catBody);
+    let selectedCatNode = null;
+    if (catNodes.length === 1 && !fromListEnvelope) {
+      const single = catNodes[0];
+      const catAsin = nonemptyStr(single.asin) ? single.asin.trim().toUpperCase() : null;
+      if (reqAsin && catAsin && catAsin !== reqAsin) {
+        throw new TypeError(`SP-API catalogItems ASIN ("${catAsin}") conflicts with requested ASIN ("${reqAsin}").`);
+      }
+      selectedCatNode = single;
+    } else if (catNodes.length > 0) {
+      const asinMatches = reqAsin
+        ? catNodes.filter(n => nonemptyStr(n.asin) && n.asin.trim().toUpperCase() === reqAsin)
+        : (catNodes.length === 1 ? catNodes : []);
+      selectedCatNode = asinMatches.find(n => catalogNodeMatchesMarketplace(n, targetMkt)) ?? asinMatches[0] ?? null;
+      if (!selectedCatNode) {
+        packageCalibrationStatus = 'asin_not_found_in_catalog_items';
+      }
     }
-    if (catAsin) asin = catAsin;
-    const dimArr = Array.isArray(catBody.dimensions) ? catBody.dimensions : [];
-    const matchedDimRow = dimArr.find(d => !d?.marketplaceId || d.marketplaceId === targetMkt)
-      ?? (dimArr.length === 1 && !dimArr[0]?.marketplaceId ? dimArr[0] : null);
-    const dimEntry = matchedDimRow?.package ?? null;
-    const attrPkgDimArr = Array.isArray(catBody.attributes?.item_package_dimensions)
-      ? catBody.attributes.item_package_dimensions
-      : [];
-    const attrPkgDim = attrPkgDimArr.find(d => !d?.marketplace_id || d.marketplace_id === targetMkt) ?? null;
-    const attrPkgWtArr = Array.isArray(catBody.attributes?.item_package_weight)
-      ? catBody.attributes.item_package_weight
-      : [];
-    const attrPkgWt = attrPkgWtArr.find(w => !w?.marketplace_id || w.marketplace_id === targetMkt) ?? null;
-    const lengthIn = spApiMeasureToInches(dimEntry?.length ?? attrPkgDim?.length);
-    const widthIn = spApiMeasureToInches(dimEntry?.width ?? attrPkgDim?.width);
-    const heightIn = spApiMeasureToInches(dimEntry?.height ?? attrPkgDim?.height);
-    const weightLb = spApiWeightToPounds(dimEntry?.weight ?? attrPkgWt);
-    if (lengthIn !== null && widthIn !== null && heightIn !== null && weightLb !== null) {
-      officialPkg = {
-        ...(asin ? { asin } : {}),
-        length_in: lengthIn,
-        width_in: widthIn,
-        height_in: heightIn,
-        unit_weight_lb: weightLb,
-        is_sp_api_official: true,
-        source: 'sp_api_catalog_items',
-      };
+
+    if (selectedCatNode) {
+      const catAsin = nonemptyStr(selectedCatNode.asin) ? selectedCatNode.asin.trim().toUpperCase() : null;
+      if (catAsin) asin = catAsin;
+      const dimArr = Array.isArray(selectedCatNode.dimensions) ? selectedCatNode.dimensions : [];
+      const matchedDimRow = dimArr.find(d => !d?.marketplaceId || d.marketplaceId === targetMkt)
+        ?? (dimArr.length === 1 && !dimArr[0]?.marketplaceId ? dimArr[0] : null);
+      const dimEntry = matchedDimRow?.package ?? null;
+      const attrPkgDimArr = Array.isArray(selectedCatNode.attributes?.item_package_dimensions)
+        ? selectedCatNode.attributes.item_package_dimensions
+        : [];
+      const attrPkgDim = attrPkgDimArr.find(d => !d?.marketplace_id || d.marketplace_id === targetMkt) ?? null;
+      const attrPkgWtArr = Array.isArray(selectedCatNode.attributes?.item_package_weight)
+        ? selectedCatNode.attributes.item_package_weight
+        : [];
+      const attrPkgWt = attrPkgWtArr.find(w => !w?.marketplace_id || w.marketplace_id === targetMkt) ?? null;
+      const hasAnyMktRows = dimArr.length > 0 || attrPkgDimArr.length > 0 || attrPkgWtArr.length > 0;
+      const hasAnyMatchedMktRow = Boolean(matchedDimRow || attrPkgDim || attrPkgWt);
+      observedPackageQuantity = extractCatalogPackageQuantity(selectedCatNode, targetMkt);
+
+      if (hasAnyMktRows && !hasAnyMatchedMktRow) {
+        packageCalibrationStatus = 'marketplace_mismatch';
+      } else {
+        const lengthIn = spApiMeasureToInches(dimEntry?.length ?? attrPkgDim?.length);
+        const widthIn = spApiMeasureToInches(dimEntry?.width ?? attrPkgDim?.width);
+        const heightIn = spApiMeasureToInches(dimEntry?.height ?? attrPkgDim?.height);
+        const weightLb = spApiWeightToPounds(dimEntry?.weight ?? attrPkgWt);
+        if (lengthIn === null) missingPackageFields.push('length');
+        if (widthIn === null) missingPackageFields.push('width');
+        if (heightIn === null) missingPackageFields.push('height');
+        if (weightLb === null) missingPackageFields.push('weight');
+        if (missingPackageFields.length === 0) {
+          if (expectedPkgQty !== null && observedPackageQuantity !== null && observedPackageQuantity !== expectedPkgQty) {
+            packageCalibrationStatus = 'saleable_unit_mismatch';
+          } else if (expectedPkgQty !== null && observedPackageQuantity === null) {
+            packageCalibrationStatus = 'unverified_package_quantity';
+          } else {
+            packageCalibrationStatus = 'verified';
+            officialPkg = {
+              ...(asin ? { asin } : {}),
+              length_in: lengthIn,
+              width_in: widthIn,
+              height_in: heightIn,
+              unit_weight_lb: weightLb,
+              ...(observedPackageQuantity !== null ? { package_quantity: observedPackageQuantity } : {}),
+              marketplace_id: targetMkt,
+              is_sp_api_official: true,
+              source: 'sp_api_catalog_items',
+            };
+          }
+        }
+      }
     }
   }
 
   let feeCalibration = null;
   let feeCalibrationStatus = null;
   if (feesBody && typeof feesBody === 'object') {
-    const rawList = Array.isArray(feesBody)
+    const archivedRows = normalizeArchivedFeeEstimateRows(feesBody, targetMkt, targetCur);
+    const rawList = archivedRows ?? (Array.isArray(feesBody)
       ? feesBody
       : (Array.isArray(feesBody.FeesEstimateResultList)
         ? feesBody.FeesEstimateResultList
@@ -151,7 +346,7 @@ export function extractSpApiFinalistCalibration({
           ? feesBody.payload.FeesEstimateResultList
           : (Array.isArray(feesBody.payload)
             ? feesBody.payload
-            : [feesBody.FeesEstimateResult ?? feesBody.payload?.FeesEstimateResult ?? feesBody])));
+            : [feesBody.FeesEstimateResult ?? feesBody.payload?.FeesEstimateResult ?? feesBody]))));
     const candidateNodes = rawList
       .map(n => (n && typeof n === 'object' ? (n.FeesEstimateResult ?? n) : null))
       .filter(Boolean);
@@ -258,6 +453,7 @@ export function extractSpApiFinalistCalibration({
       const referralFraction = (referralUsd !== null && finite(totalPriceAmt) && totalPriceAmt > 0)
         ? Number((referralUsd / totalPriceAmt).toFixed(6))
         : null;
+      const hasCompleteFeeDetails = referralFraction !== null && fbaLiveUsd !== null;
       feeCalibration = {
         listing_price_usd: listingPriceAmt,
         shipping_usd: shippingAmt,
@@ -269,32 +465,47 @@ export function extractSpApiFinalistCalibration({
         total_fees_estimate_usd: totalFeesUsd,
         source: 'sp_api_product_fees',
       };
-      feeCalibrationStatus = 'verified';
+      feeCalibrationStatus = hasCompleteFeeDetails ? 'verified' : 'incomplete_fee_details';
     } else {
       feeCalibrationStatus = matchedNodes.length === 0 ? 'unmatched' : 'ambiguous_multiple_estimates';
     }
   }
 
   let restrictions = null;
+  let restrictionsStatus = null;
   if (restBody !== null) {
-    if (!restBody || typeof restBody !== 'object' || (!Array.isArray(restBody.restrictions) && !Array.isArray(restBody))) {
+    const isArchivedMultiAsinRestrictions = Array.isArray(restBody?.listings_restrictions);
+    const resolvedRestArr = Array.isArray(restBody?.restrictions)
+      ? restBody.restrictions
+      : (isArchivedMultiAsinRestrictions
+        ? restBody.listings_restrictions
+        : (Array.isArray(restBody) ? restBody : null));
+    if (!restBody || typeof restBody !== 'object' || !resolvedRestArr) {
       throw new TypeError('SP-API listingsRestrictions payload is missing a valid restrictions[] array.');
     }
     if (asin && nonemptyStr(restBody.asin) && restBody.asin.trim().toUpperCase() !== asin) {
       throw new TypeError(`SP-API listingsRestrictions ASIN ("${restBody.asin.trim().toUpperCase()}") conflicts with target ASIN ("${asin}").`);
     }
-    const restArr = Array.isArray(restBody.restrictions) ? restBody.restrictions : restBody;
-    const asinFilteredRest = restArr.filter(r => {
-      if (asin && nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() !== asin) return false;
-      if (nonemptyStr(r?.marketplaceId) && r.marketplaceId.trim() !== targetMkt) return false;
-      if (nonemptyStr(r?.conditionType) && r.conditionType.trim().toLowerCase() !== 'new_new') return false;
-      return true;
-    });
-    const allReasons = asinFilteredRest.flatMap(r => Array.isArray(r?.reasons) ? r.reasons : []);
-    restrictions = {
-      restriction_count: asinFilteredRest.length,
-      ...classifySpApiRestrictionReasons(allReasons, { target_is_own_white_label }),
-    };
+    const restArr = resolvedRestArr;
+    const rowsHaveExplicitAsin = restArr.length > 0 && restArr.some(r => nonemptyStr(r?.asin));
+    const asinMatchedInMultiList = !asin || !rowsHaveExplicitAsin ||
+      restArr.some(r => nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() === asin);
+    if (!asinMatchedInMultiList || (isArchivedMultiAsinRestrictions && asin && restArr.length === 0)) {
+      restrictionsStatus = 'asin_not_found_in_listings_restrictions';
+    } else {
+      const asinFilteredRest = restArr.filter(r => {
+        if (asin && nonemptyStr(r?.asin) && r.asin.trim().toUpperCase() !== asin) return false;
+        if (nonemptyStr(r?.marketplaceId) && r.marketplaceId.trim() !== targetMkt) return false;
+        if (nonemptyStr(r?.conditionType) && r.conditionType.trim().toLowerCase() !== 'new_new') return false;
+        return true;
+      });
+      const allReasons = asinFilteredRest.flatMap(r => Array.isArray(r?.reasons) ? r.reasons : []);
+      restrictions = {
+        restriction_count: asinFilteredRest.length,
+        ...classifySpApiRestrictionReasons(allReasons, { target_is_own_white_label }),
+      };
+      restrictionsStatus = 'verified';
+    }
   }
 
   const calDefaultEvalPrice = finite(feeCalibration?.total_price_usd) && feeCalibration.total_price_usd > 0
@@ -363,30 +574,62 @@ export function extractSpApiFinalistCalibration({
     }
   }
 
+  const missingComponents = [];
+  if (packageCalibrationStatus !== 'verified') missingComponents.push('catalog_items_package');
+  if (feeCalibrationStatus !== 'verified') missingComponents.push('product_fees_estimate');
+  if (restrictions === null) missingComponents.push('listings_restrictions');
+
   return {
     asin,
+    marketplace_id: targetMkt,
+    package_calibration_status: packageCalibrationStatus,
+    ...(missingPackageFields.length > 0 ? { missing_package_fields: missingPackageFields } : {}),
+    ...(observedPackageQuantity !== null ? { observed_package_quantity: observedPackageQuantity } : {}),
+    ...(expectedPkgQty !== null ? { expected_package_quantity: expectedPkgQty } : {}),
     official_pkg: officialPkg,
     local_2027_off_peak_fulfillment: local2027?.status === 'verified' ? local2027 : null,
     fee_calibration: feeCalibration,
     ...(feeCalibrationStatus ? { fee_calibration_status: feeCalibrationStatus } : {}),
     restrictions,
+    ...(restrictionsStatus && restrictionsStatus !== 'verified' ? { restrictions_status: restrictionsStatus } : {}),
     stale_sellersprite_audit: staleCacheAudit,
+    missing_components: missingComponents,
+    finalist_calibration_complete: missingComponents.length === 0,
     calibration_source: 'sp_api_readonly_finalist',
   };
 }
 
 /**
- * Scan raw payloads for SP-API `catalogItems_getCatalogItem` receipts and return official peer package specs.
+ * Scan raw payloads for SP-API `catalogItems_getCatalogItem` receipts (single or wrapped `payload`/`items[]`/`catalog_items`)
+ * and return official peer package specs.
  */
-export function extractSpApiPeerPackagesFromRawPayloads(rawPayloads = []) {
+export function extractSpApiPeerPackagesFromRawPayloads(rawPayloads = [], {
+  marketplace_id = 'ATVPDKIKX0DER',
+  expected_package_quantity = null,
+} = {}) {
   const peers = [];
+  const seenAsins = new Set();
   for (const entry of rawPayloads) {
     const raw = entry?.payload ?? entry;
     if (isFailedOrEmptyRawReceipt(raw)) continue;
-    try {
-      const cal = extractSpApiFinalistCalibration({ catalogItemRaw: raw });
-      if (cal.official_pkg) peers.push(cal.official_pkg);
-    } catch { /* ignore non-catalog payloads */ }
+    const unwrapped = unwrapMcpEnvelope(raw);
+    const nodes = collectCatalogItemNodes(unwrapped);
+    for (const node of nodes) {
+      try {
+        const cal = extractSpApiFinalistCalibration({
+          catalogItemRaw: node,
+          marketplace_id,
+          ...(expected_package_quantity !== null ? { expected_package_quantity } : {}),
+        });
+        if (cal.official_pkg) {
+          const key = cal.official_pkg.asin ?? '';
+          if (!key || !seenAsins.has(key)) {
+            if (key) seenAsins.add(key);
+            peers.push(cal.official_pkg);
+          }
+        }
+      } catch { /* ignore non-catalog payloads */ }
+    }
   }
   return peers;
 }
