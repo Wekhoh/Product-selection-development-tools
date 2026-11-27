@@ -140,6 +140,11 @@ test('business-thresholds: guard check blocks re-introduction of purged AI-inven
     'Purged 120d newcomer / 12pp spread cutoffs must never reappear in src/price-band.mjs; use BUSINESS_THRESHOLDS.',
   );
   assert.equal(
+    /veteranEligible\.length\s*>=\s*\d+/.test(priceBandSrc),
+    false,
+    'src/price-band.mjs must read min_veterans_before_growth_supplement from BUSINESS_THRESHOLDS instead of hardcoding veteranEligible.length >= 2 (Issue #11).',
+  );
+  assert.equal(
     /prohibitedThreshold\s*=\s*0\.5\b/.test(wtSrc),
     false,
     'Luna prohibitedThreshold must use BUSINESS_THRESHOLDS.luna_prohibited_threshold (0.70), never 0.5.',
