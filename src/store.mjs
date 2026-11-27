@@ -536,12 +536,17 @@ CREATE TABLE IF NOT EXISTS calibration_tracking (
   form_spec_sha256 TEXT,
   batch_id TEXT,
   system_verdict TEXT NOT NULL,
+  system_suggested_at TEXT,
   core_85_range_json TEXT,
   supported_range_json TEXT,
   pre_ad_margin_range_json TEXT,
   owner_decision TEXT CHECK(owner_decision IS NULL OR owner_decision IN ('keep', 'drop', 'sample_check', 'hold', 'pending_owner_review')),
+  owner_decision_source TEXT CHECK(owner_decision_source IS NULL OR owner_decision_source IN ('owner_confirmed', 'legacy_unknown', 'script_demo_excluded')),
+  owner_decision_confirmed_at TEXT,
   owner_reason TEXT,
   sample_measured_pkg_json TEXT,
+  sample_measured_at TEXT,
+  sample_spec_ref TEXT,
   recalculated_margin_json TEXT,
   calibration_note TEXT,
   near_miss_spot_check_json TEXT,
@@ -1049,12 +1054,17 @@ export class SelectionStore {
         form_spec_sha256 TEXT,
         batch_id TEXT,
         system_verdict TEXT NOT NULL,
+        system_suggested_at TEXT,
         core_85_range_json TEXT,
         supported_range_json TEXT,
         pre_ad_margin_range_json TEXT,
         owner_decision TEXT CHECK(owner_decision IS NULL OR owner_decision IN ('keep', 'drop', 'sample_check', 'hold', 'pending_owner_review')),
+        owner_decision_source TEXT CHECK(owner_decision_source IS NULL OR owner_decision_source IN ('owner_confirmed', 'legacy_unknown', 'script_demo_excluded')),
+        owner_decision_confirmed_at TEXT,
         owner_reason TEXT,
         sample_measured_pkg_json TEXT,
+        sample_measured_at TEXT,
+        sample_spec_ref TEXT,
         recalculated_margin_json TEXT,
         calibration_note TEXT,
         near_miss_spot_check_json TEXT,
@@ -1064,6 +1074,42 @@ export class SelectionStore {
       );
       CREATE INDEX IF NOT EXISTS idx_calibration_batch ON calibration_tracking(batch_id);
     `);
+    ensureColumns('calibration_tracking', [
+      ['system_suggested_at', 'TEXT'],
+      ['owner_decision_source', "TEXT CHECK(owner_decision_source IS NULL OR owner_decision_source IN ('owner_confirmed', 'legacy_unknown', 'script_demo_excluded'))"],
+      ['owner_decision_confirmed_at', 'TEXT'],
+      ['sample_measured_at', 'TEXT'],
+      ['sample_spec_ref', 'TEXT'],
+    ]);
+    // Idempotent backfill for pre-Issue-#9 rows: preserve original suggestion time from created_at,
+    // classify unattributed legacy owner_decision rows as 'legacy_unknown' (never 'owner_confirmed'),
+    // and backfill sample_measured_at only when realized sample measurements actually exist.
+    this.db.exec(`
+      UPDATE calibration_tracking
+      SET system_suggested_at = created_at
+      WHERE system_suggested_at IS NULL AND system_verdict IS NOT NULL;
+      UPDATE calibration_tracking
+      SET owner_decision_source = 'legacy_unknown'
+      WHERE owner_decision IS NOT NULL AND owner_decision_source IS NULL;
+    `);
+    const unbackfilledSamples = this.db.prepare(`
+      SELECT tracking_id, sample_measured_pkg_json, recalculated_margin_json, updated_at
+      FROM calibration_tracking
+      WHERE sample_measured_at IS NULL
+        AND (sample_measured_pkg_json IS NOT NULL OR recalculated_margin_json IS NOT NULL)
+    `).all();
+    const updSampleTs = this.db.prepare(
+      'UPDATE calibration_tracking SET sample_measured_at = ? WHERE tracking_id = ?',
+    );
+    for (const sRow of unbackfilledSamples) {
+      let pkgObj = null;
+      let recObj = null;
+      try { pkgObj = sRow.sample_measured_pkg_json ? JSON.parse(sRow.sample_measured_pkg_json) : null; } catch { pkgObj = null; }
+      try { recObj = sRow.recalculated_margin_json ? JSON.parse(sRow.recalculated_margin_json) : null; } catch { recObj = null; }
+      if (this._hasRealizedSamplePkg(pkgObj) || this._hasRealizedRecalcMargin(recObj)) {
+        updSampleTs.run(sRow.updated_at, sRow.tracking_id);
+      }
+    }
     // Lane-accurate, idempotent backfill for unresolved unknown rows with zero billed AND zero reserved units.
     // Never adds an ss_mcp reserve to an ss_web row, and never changes totals when reopening the database.
     const unreservedUnknowns = this.db.prepare(`
@@ -3618,6 +3664,11 @@ export class SelectionStore {
       if (!s) return null;
       try { return JSON.parse(s); } catch { return null; }
     };
+    const ownerDecision = row.owner_decision ?? null;
+    const ownerDecisionSource = row.owner_decision_source ?? (ownerDecision !== null ? 'legacy_unknown' : null);
+    const sampleMeasuredPkg = parseOpt(row.sample_measured_pkg_json);
+    const recalculatedMargin = parseOpt(row.recalculated_margin_json);
+    const hasSampleFact = this._hasRealizedSamplePkg(sampleMeasuredPkg) || this._hasRealizedRecalcMargin(recalculatedMargin);
     return {
       tracking_id: row.tracking_id,
       form_id: row.form_id,
@@ -3625,13 +3676,20 @@ export class SelectionStore {
       form_spec_sha256: row.form_spec_sha256 ?? null,
       batch_id: row.batch_id ?? null,
       system_verdict: row.system_verdict,
+      system_suggested_at: row.system_suggested_at ?? row.created_at ?? null,
       core_85_range: parseOpt(row.core_85_range_json),
       supported_range: parseOpt(row.supported_range_json),
       pre_ad_margin_range: parseOpt(row.pre_ad_margin_range_json),
-      owner_decision: row.owner_decision ?? null,
+      owner_decision: ownerDecision,
+      owner_decision_source: ownerDecisionSource,
+      owner_decision_confirmed_at: ownerDecisionSource === 'owner_confirmed'
+        ? (row.owner_decision_confirmed_at ?? null)
+        : null,
       owner_reason: row.owner_reason ?? null,
-      sample_measured_pkg: parseOpt(row.sample_measured_pkg_json),
-      recalculated_margin: parseOpt(row.recalculated_margin_json),
+      sample_measured_pkg: sampleMeasuredPkg,
+      sample_measured_at: row.sample_measured_at ?? (hasSampleFact ? (row.updated_at ?? null) : null),
+      sample_spec_ref: row.sample_spec_ref ?? null,
+      recalculated_margin: recalculatedMargin,
       calibration_note: row.calibration_note ?? null,
       near_miss_spot_check: parseOpt(row.near_miss_spot_check_json),
       created_at: row.created_at,
@@ -3639,12 +3697,54 @@ export class SelectionStore {
     };
   }
 
+  _normalizeOptionalIsoTimestamp(raw, fieldName) {
+    if (raw === undefined || raw === null) return null;
+    if (typeof raw !== 'string' || !raw.trim()) {
+      throw new TypeError(`${fieldName} must be a valid ISO-8601 date or timestamp string.`);
+    }
+    const trimmed = raw.trim();
+    const isoRe = /^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2}))?$/;
+    if (!isoRe.test(trimmed)) {
+      throw new TypeError(`${fieldName} must be a valid ISO-8601 date or timestamp (got "${trimmed}").`);
+    }
+    const parsed = Date.parse(trimmed.length === 10 ? `${trimmed}T00:00:00Z` : trimmed);
+    if (!Number.isFinite(parsed)) {
+      throw new TypeError(`${fieldName} is not a valid calendar date/timestamp (got "${trimmed}").`);
+    }
+    // Reject calendar rollovers such as 2026-02-30.
+    const ymd = trimmed.slice(0, 10);
+    const [y, m, d] = ymd.split('-').map(Number);
+    const check = new Date(Date.UTC(y, m - 1, d));
+    if (check.getUTCFullYear() !== y || check.getUTCMonth() + 1 !== m || check.getUTCDate() !== d) {
+      throw new TypeError(`${fieldName} is not a valid calendar date (got "${trimmed}").`);
+    }
+    return trimmed;
+  }
+
+  _hasRealizedSamplePkg(pkg) {
+    if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) return false;
+    const numericKeys = ['length_in', 'width_in', 'height_in', 'weight_lb', 'unit_weight_lb', 'length_cm', 'width_cm', 'height_cm', 'weight_g', 'weight_kg'];
+    return numericKeys.some(k => typeof pkg[k] === 'number' && Number.isFinite(pkg[k]) && pkg[k] > 0);
+  }
+
+  _hasRealizedRecalcMargin(recalc) {
+    if (!recalc || typeof recalc !== 'object' || Array.isArray(recalc)) return false;
+    return (
+      (typeof recalc.margin === 'number' && Number.isFinite(recalc.margin)) ||
+      (typeof recalc.margin_pct === 'number' && Number.isFinite(recalc.margin_pct)) ||
+      (typeof recalc.pre_ad_margin === 'number' && Number.isFinite(recalc.pre_ad_margin)) ||
+      (Array.isArray(recalc.pre_ad_margin_range) && recalc.pre_ad_margin_range.some(v => typeof v === 'number' && Number.isFinite(v)))
+    );
+  }
+
   /**
-   * Persist or update the 4 owner calibration tracking items per candidate form:
-   *  1) system_verdict (+ core_85_range, supported_range, pre_ad_margin_range, form_spec_sha256)
-   *  2) owner_decision ('keep' | 'drop' | 'sample_check' | 'hold' | 'pending_owner_review') + owner_reason
-   *  3) sample_measured_pkg + recalculated_margin
-   *  4) batch_id + calibration_note + near_miss_spot_check (soft-hold / near-miss & Terra-vs-Astra Keepa audit)
+   * Persist or update calibration tracking per candidate form with strict separation of 3 facts:
+   *  1) System suggestion: `system_verdict` + `system_suggested_at` (plus baseline score/margin ranges)
+   *  2) Owner decision & provenance: `owner_decision`, `owner_decision_source`
+   *     ('owner_confirmed' | 'legacy_unknown' | 'script_demo_excluded' | null),
+   *     `owner_decision_confirmed_at`, `owner_reason`
+   *  3) Physical sample measurement & recalculation: `sample_measured_pkg`, `sample_measured_at`,
+   *     `sample_spec_ref`, `recalculated_margin` (preserving original baseline ranges)
    */
   upsertCalibrationTracking(record) {
     this._assertWritable();
@@ -3662,7 +3762,11 @@ export class SelectionStore {
     const specVersion = Number.isInteger(record.spec_version) && record.spec_version >= 1
       ? record.spec_version
       : (existingForm?.spec_version ?? 1);
+
     const allowedDecisions = new Set(['keep', 'drop', 'sample_check', 'hold', 'pending_owner_review']);
+    const allowedConfirmedDecisions = new Set(['keep', 'drop', 'sample_check', 'hold']);
+    const allowedDecisionSources = new Set(['owner_confirmed', 'legacy_unknown', 'script_demo_excluded']);
+
     const rawDecision = record.owner_decision === undefined || record.owner_decision === null
       ? undefined
       : String(record.owner_decision).trim();
@@ -3671,6 +3775,37 @@ export class SelectionStore {
         `owner_decision must be one of [${[...allowedDecisions].join(', ')}] or null.`,
       );
     }
+
+    const rawDecisionSource = record.owner_decision_source === undefined || record.owner_decision_source === null
+      ? undefined
+      : String(record.owner_decision_source).trim();
+    if (rawDecisionSource !== undefined && !allowedDecisionSources.has(rawDecisionSource)) {
+      throw new TypeError(
+        `owner_decision_source must be one of [${[...allowedDecisionSources].join(', ')}] or null.`,
+      );
+    }
+
+    const explicitSystemSuggestedAt = record.system_suggested_at !== undefined
+      ? this._normalizeOptionalIsoTimestamp(record.system_suggested_at, 'system_suggested_at')
+      : undefined;
+    const explicitOwnerConfirmedAt = record.owner_decision_confirmed_at !== undefined
+      ? this._normalizeOptionalIsoTimestamp(record.owner_decision_confirmed_at, 'owner_decision_confirmed_at')
+      : undefined;
+    const explicitSampleMeasuredAt = record.sample_measured_at !== undefined
+      ? this._normalizeOptionalIsoTimestamp(record.sample_measured_at, 'sample_measured_at')
+      : undefined;
+
+    if (record.sample_measured_pkg !== undefined && record.sample_measured_pkg !== null) {
+      if (!this._hasRealizedSamplePkg(record.sample_measured_pkg)) {
+        throw new TypeError('sample_measured_pkg must be an object containing at least one positive finite dimension or weight.');
+      }
+    }
+    if (record.recalculated_margin !== undefined && record.recalculated_margin !== null) {
+      if (!this._hasRealizedRecalcMargin(record.recalculated_margin)) {
+        throw new TypeError('recalculated_margin must be an object containing a finite recalculated margin value.');
+      }
+    }
+
     const now = this._now();
 
     return this._withImmediateTx(() => {
@@ -3686,6 +3821,12 @@ export class SelectionStore {
       if (!systemVerdict) {
         throw new TypeError('calibration_tracking requires a nonempty system_verdict on initial insert.');
       }
+      const systemVerdictChanged = Boolean(prior && nonemptyStr(record.system_verdict) && record.system_verdict.trim() !== prior.system_verdict);
+      const systemSuggestedAt = explicitSystemSuggestedAt !== undefined
+        ? (explicitSystemSuggestedAt ?? (prior?.system_suggested_at ?? prior?.created_at ?? now))
+        : (prior
+            ? (systemVerdictChanged ? now : (prior.system_suggested_at ?? prior.created_at ?? now))
+            : now);
 
       const formSpecSha = nonemptyStr(record.form_spec_sha256)
         ? record.form_spec_sha256.trim()
@@ -3702,18 +3843,121 @@ export class SelectionStore {
       const marginJson = record.pre_ad_margin_range !== undefined
         ? (record.pre_ad_margin_range === null ? null : canonicalJson(record.pre_ad_margin_range))
         : (prior?.pre_ad_margin_range_json ?? null);
-      const ownerDecision = record.owner_decision !== undefined
-        ? (record.owner_decision === null ? null : rawDecision)
-        : (prior?.owner_decision ?? null);
-      const ownerReason = record.owner_reason !== undefined
+
+      const priorOwnerDecision = prior?.owner_decision ?? null;
+      const priorOwnerSource = prior?.owner_decision_source ?? (priorOwnerDecision !== null ? 'legacy_unknown' : null);
+      const priorOwnerConfirmedAt = priorOwnerSource === 'owner_confirmed'
+        ? (prior?.owner_decision_confirmed_at ?? null)
+        : null;
+
+      const decisionTouched = record.owner_decision !== undefined || record.owner_decision_source !== undefined;
+      let ownerDecision = priorOwnerDecision;
+      let ownerDecisionSource = priorOwnerSource;
+      let ownerDecisionConfirmedAt = priorOwnerConfirmedAt;
+
+      if (decisionTouched) {
+        const nextDecision = record.owner_decision !== undefined
+          ? (record.owner_decision === null ? null : rawDecision)
+          : priorOwnerDecision;
+        const nextSource = record.owner_decision_source !== undefined
+          ? (record.owner_decision_source === null ? null : rawDecisionSource)
+          : (nextDecision !== null ? 'legacy_unknown' : null);
+
+        // Anti-pollution guard: unconfirmed/legacy/demo imports may NEVER overwrite a real owner_confirmed decision.
+        if (priorOwnerSource === 'owner_confirmed' && nextSource !== 'owner_confirmed') {
+          throw new TypeError(
+            `Cannot overwrite an existing owner_confirmed decision for "${formId}" with "${String(nextSource ?? 'null')}"; pass explicit owner_decision_source: "owner_confirmed" to revise.`,
+          );
+        }
+
+        if (nextSource === 'owner_confirmed') {
+          if (!nextDecision || !allowedConfirmedDecisions.has(nextDecision)) {
+            throw new TypeError(
+              `owner_decision_source="owner_confirmed" requires owner_decision in [${[...allowedConfirmedDecisions].join(', ')}] (got "${String(nextDecision)}").`,
+            );
+          }
+          const sameConfirmedDecision = priorOwnerSource === 'owner_confirmed' && priorOwnerDecision === nextDecision;
+          ownerDecision = nextDecision;
+          ownerDecisionSource = 'owner_confirmed';
+          ownerDecisionConfirmedAt = explicitOwnerConfirmedAt !== undefined
+            ? (explicitOwnerConfirmedAt ?? (sameConfirmedDecision ? (priorOwnerConfirmedAt ?? now) : now))
+            : (sameConfirmedDecision ? (priorOwnerConfirmedAt ?? now) : now);
+        } else if (nextDecision === null) {
+          if (nextSource !== null) {
+            throw new TypeError(`owner_decision_source="${nextSource}" cannot be set when owner_decision is null.`);
+          }
+          if (explicitOwnerConfirmedAt) {
+            throw new TypeError('owner_decision_confirmed_at cannot be set when owner_decision is null.');
+          }
+          ownerDecision = null;
+          ownerDecisionSource = null;
+          ownerDecisionConfirmedAt = null;
+        } else {
+          if (explicitOwnerConfirmedAt) {
+            throw new TypeError(
+              `owner_decision_confirmed_at is only valid when owner_decision_source="owner_confirmed" (got "${String(nextSource)}").`,
+            );
+          }
+          ownerDecision = nextDecision;
+          ownerDecisionSource = nextSource ?? 'legacy_unknown';
+          ownerDecisionConfirmedAt = null;
+        }
+      } else if (explicitOwnerConfirmedAt !== undefined) {
+        if (ownerDecisionSource !== 'owner_confirmed') {
+          throw new TypeError('owner_decision_confirmed_at is only valid when owner_decision_source="owner_confirmed".');
+        }
+        ownerDecisionConfirmedAt = explicitOwnerConfirmedAt ?? priorOwnerConfirmedAt ?? now;
+      }
+
+      const incomingOwnerReason = record.owner_reason !== undefined
         ? (nonemptyStr(record.owner_reason) ? record.owner_reason.trim() : null)
+        : undefined;
+      if (
+        incomingOwnerReason !== undefined &&
+        priorOwnerSource === 'owner_confirmed' &&
+        record.owner_decision_source !== 'owner_confirmed' &&
+        incomingOwnerReason !== (prior?.owner_reason ?? null)
+      ) {
+        throw new TypeError(
+          `Cannot overwrite owner_reason on an existing owner_confirmed decision for "${formId}" without owner_decision_source: "owner_confirmed".`,
+        );
+      }
+      const ownerReason = incomingOwnerReason !== undefined
+        ? incomingOwnerReason
         : (prior?.owner_reason ?? null);
-      const samplePkgJson = record.sample_measured_pkg !== undefined
+
+      const samplePkgTouched = record.sample_measured_pkg !== undefined;
+      const recalcMarginTouched = record.recalculated_margin !== undefined;
+      const samplePkgJson = samplePkgTouched
         ? (record.sample_measured_pkg === null ? null : canonicalJson(record.sample_measured_pkg))
         : (prior?.sample_measured_pkg_json ?? null);
-      const recalcMarginJson = record.recalculated_margin !== undefined
+      const recalcMarginJson = recalcMarginTouched
         ? (record.recalculated_margin === null ? null : canonicalJson(record.recalculated_margin))
         : (prior?.recalculated_margin_json ?? null);
+      const hasAnySampleFact = samplePkgJson !== null || recalcMarginJson !== null;
+
+      let sampleMeasuredAt;
+      let sampleSpecRef;
+      if (!hasAnySampleFact) {
+        if (explicitSampleMeasuredAt) {
+          throw new TypeError('sample_measured_at cannot be set while sample_measured_pkg and recalculated_margin are both null.');
+        }
+        sampleMeasuredAt = null;
+        sampleSpecRef = record.sample_spec_ref !== undefined
+          ? (nonemptyStr(record.sample_spec_ref) ? record.sample_spec_ref.trim() : null)
+          : null;
+      } else {
+        const sampleChangedNow =
+          (samplePkgTouched && samplePkgJson !== (prior?.sample_measured_pkg_json ?? null)) ||
+          (recalcMarginTouched && recalcMarginJson !== (prior?.recalculated_margin_json ?? null));
+        sampleMeasuredAt = explicitSampleMeasuredAt !== undefined
+          ? (explicitSampleMeasuredAt ?? (prior?.sample_measured_at ?? now))
+          : (sampleChangedNow ? now : (prior?.sample_measured_at ?? now));
+        sampleSpecRef = record.sample_spec_ref !== undefined
+          ? (nonemptyStr(record.sample_spec_ref) ? record.sample_spec_ref.trim() : null)
+          : (prior?.sample_spec_ref ?? formSpecSha ?? null);
+      }
+
       const calNote = record.calibration_note !== undefined
         ? (nonemptyStr(record.calibration_note) ? record.calibration_note.trim() : null)
         : (prior?.calibration_note ?? null);
@@ -3727,34 +3971,42 @@ export class SelectionStore {
           SET form_spec_sha256 = ?,
               batch_id = ?,
               system_verdict = ?,
+              system_suggested_at = ?,
               core_85_range_json = ?,
               supported_range_json = ?,
               pre_ad_margin_range_json = ?,
               owner_decision = ?,
+              owner_decision_source = ?,
+              owner_decision_confirmed_at = ?,
               owner_reason = ?,
               sample_measured_pkg_json = ?,
+              sample_measured_at = ?,
+              sample_spec_ref = ?,
               recalculated_margin_json = ?,
               calibration_note = ?,
               near_miss_spot_check_json = ?,
               updated_at = ?
           WHERE tracking_id = ?
         `).run(
-          formSpecSha, batchId, systemVerdict, core85Json, suppJson, marginJson,
-          ownerDecision, ownerReason, samplePkgJson, recalcMarginJson, calNote, spotCheckJson,
+          formSpecSha, batchId, systemVerdict, systemSuggestedAt, core85Json, suppJson, marginJson,
+          ownerDecision, ownerDecisionSource, ownerDecisionConfirmedAt, ownerReason,
+          samplePkgJson, sampleMeasuredAt, sampleSpecRef, recalcMarginJson, calNote, spotCheckJson,
           now, trackingId,
         );
       } else {
         this.db.prepare(`
           INSERT INTO calibration_tracking (
             tracking_id, form_id, spec_version, form_spec_sha256, batch_id,
-            system_verdict, core_85_range_json, supported_range_json, pre_ad_margin_range_json,
-            owner_decision, owner_reason, sample_measured_pkg_json, recalculated_margin_json,
+            system_verdict, system_suggested_at, core_85_range_json, supported_range_json, pre_ad_margin_range_json,
+            owner_decision, owner_decision_source, owner_decision_confirmed_at, owner_reason,
+            sample_measured_pkg_json, sample_measured_at, sample_spec_ref, recalculated_margin_json,
             calibration_note, near_miss_spot_check_json, created_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           trackingId, formId, specVersion, formSpecSha, batchId,
-          systemVerdict, core85Json, suppJson, marginJson,
-          ownerDecision, ownerReason, samplePkgJson, recalcMarginJson,
+          systemVerdict, systemSuggestedAt, core85Json, suppJson, marginJson,
+          ownerDecision, ownerDecisionSource, ownerDecisionConfirmedAt, ownerReason,
+          samplePkgJson, sampleMeasuredAt, sampleSpecRef, recalcMarginJson,
           calNote, spotCheckJson, now, now,
         );
       }
@@ -3784,6 +4036,113 @@ export class SelectionStore {
       rows = this.db.prepare('SELECT * FROM calibration_tracking ORDER BY updated_at DESC, form_id ASC').all();
     }
     return rows.map(r => this._deserializeCalibrationRow(r));
+  }
+
+  /**
+   * Owner-facing retrospective calibration summary separating:
+   *  - System suggestions (`system_suggested_count`)
+   *  - Strictly owner-confirmed decisions (`owner_confirmed_count`, `owner_acceptance_rate`)
+   *  - Unconfirmed / legacy-unknown rows (`unconfirmed_or_legacy_unknown_count`)
+   *  - Script/demo excluded rows (`script_demo_excluded_count`)
+   *  - Realized physical sample measurements / recalculations (`sample_measured_realized_count`)
+   */
+  getCalibrationRetrospectiveSummary({ batch_id = null, form_id = null } = {}) {
+    const rows = this.listCalibrationTracking({ batch_id, form_id });
+    const confirmedDecisionsSet = new Set(['keep', 'drop', 'sample_check', 'hold']);
+    const ownerConfirmedByDecision = { keep: 0, sample_check: 0, hold: 0, drop: 0 };
+
+    let systemSuggestedCount = 0;
+    let ownerConfirmedCount = 0;
+    let ownerAcceptedCount = 0;
+    let unconfirmedOrLegacyUnknownCount = 0;
+    let awaitingOwnerDecisionCount = 0;
+    let legacyUnknownCount = 0;
+    let scriptDemoExcludedCount = 0;
+    let sampleMeasuredRealizedCount = 0;
+    let sampleRecalcMeets30PctCount = 0;
+
+    const recordsTimeline = [];
+    for (const row of rows) {
+      if (nonemptyStr(row.system_verdict)) systemSuggestedCount += 1;
+
+      const src = row.owner_decision_source ?? (row.owner_decision !== null ? 'legacy_unknown' : null);
+      if (src === 'script_demo_excluded') {
+        scriptDemoExcludedCount += 1;
+      } else if (src === 'owner_confirmed' && row.owner_decision && confirmedDecisionsSet.has(row.owner_decision)) {
+        ownerConfirmedCount += 1;
+        ownerConfirmedByDecision[row.owner_decision] += 1;
+        if (row.owner_decision === 'keep' || row.owner_decision === 'sample_check') {
+          ownerAcceptedCount += 1;
+        }
+      } else {
+        unconfirmedOrLegacyUnknownCount += 1;
+        if (row.owner_decision === null || row.owner_decision === 'pending_owner_review') {
+          awaitingOwnerDecisionCount += 1;
+        } else {
+          legacyUnknownCount += 1;
+        }
+      }
+
+      const hasSampleMeasurement = this._hasRealizedSamplePkg(row.sample_measured_pkg) ||
+        this._hasRealizedRecalcMargin(row.recalculated_margin);
+      if (hasSampleMeasurement) {
+        sampleMeasuredRealizedCount += 1;
+        const meets30 = typeof row.recalculated_margin?.meets_30pct_floor === 'boolean'
+          ? row.recalculated_margin.meets_30pct_floor
+          : (typeof row.recalculated_margin?.margin === 'number' && Number.isFinite(row.recalculated_margin.margin)
+              ? row.recalculated_margin.margin >= 0.30
+              : (typeof row.recalculated_margin?.margin_pct === 'number' && Number.isFinite(row.recalculated_margin.margin_pct)
+                  ? row.recalculated_margin.margin_pct >= 30
+                  : false));
+        if (meets30) {
+          sampleRecalcMeets30PctCount += 1;
+        }
+      }
+
+      recordsTimeline.push({
+        tracking_id: row.tracking_id,
+        form_id: row.form_id,
+        spec_version: row.spec_version,
+        batch_id: row.batch_id,
+        system_verdict: row.system_verdict,
+        system_suggested_at: row.system_suggested_at,
+        owner_decision: row.owner_decision,
+        owner_decision_source: src,
+        owner_decision_confirmed_at: row.owner_decision_confirmed_at,
+        owner_reason: row.owner_reason,
+        has_sample_measurement: hasSampleMeasurement,
+        sample_measured_pkg: row.sample_measured_pkg,
+        sample_measured_at: row.sample_measured_at,
+        sample_spec_ref: row.sample_spec_ref,
+        baseline_pre_ad_margin_range: row.pre_ad_margin_range,
+        recalculated_margin: row.recalculated_margin,
+      });
+    }
+
+    const ownerAcceptanceRate = ownerConfirmedCount > 0
+      ? Number((ownerAcceptedCount / ownerConfirmedCount).toFixed(4))
+      : null;
+
+    return {
+      scope: {
+        batch_id: nonemptyStr(batch_id) ? batch_id.trim() : null,
+        form_id: nonemptyStr(form_id) ? form_id.trim() : null,
+      },
+      total_records: rows.length,
+      system_suggested_count: systemSuggestedCount,
+      owner_confirmed_count: ownerConfirmedCount,
+      owner_accepted_count: ownerAcceptedCount,
+      owner_acceptance_rate: ownerAcceptanceRate,
+      owner_confirmed_by_decision: ownerConfirmedByDecision,
+      unconfirmed_or_legacy_unknown_count: unconfirmedOrLegacyUnknownCount,
+      awaiting_owner_decision_count: awaitingOwnerDecisionCount,
+      legacy_unknown_count: legacyUnknownCount,
+      script_demo_excluded_count: scriptDemoExcludedCount,
+      sample_measured_realized_count: sampleMeasuredRealizedCount,
+      sample_pending_measurement_count: rows.length - sampleMeasuredRealizedCount,
+      sample_recalculated_meets_30pct_count: sampleRecalcMeets30PctCount,
+      records_timeline: recordsTimeline,
+    };
   }
 
   getSummary() {

@@ -118,7 +118,7 @@ const USAGE = [
   '  openai-recover     --db <sqlite> --credential-file <json> --attempt <id> [--output <out.json>]  (零重复 POST 读取 GET /v1/responses/{id} 断点恢复并补记新用量)',
   '  openai-batch-poll  --db <sqlite> --credential-file <json> (--batch-id <id> | --submit-jsonl <batch.jsonl>) [--attempt <id>] [--download-output] [--output <out.json>]  (Batch API 提交/轮询)',
   '  rate-lookup        --input <rate-spec.json> [--persist-file <supplemental-rates.json>] [--output <out.json>]  (无状态，表外官网费率查证指令与落库助手)',
-  '  calibration-track  --db <sqlite> [--input <tracking.json>] [--list] [--batch-id <id>] [--form <form-id>] [--output <out.json>]  (记录/查询四项校准追踪)',
+  '  calibration-track  --db <sqlite> [--input <tracking.json>] [--confirm-owner | --exclude-demo] [--list] [--summary] [--batch-id <id>] [--form <form-id>] [--output <out.json>]  (记录/查询校准追踪与主人回顾摘要)',
   '',
 ].join('\n');
 
@@ -1172,6 +1172,9 @@ export async function runPhase2Cli(
           'persist-file': { type: 'string' },
           'report-dir': { type: 'string' },
           list: { type: 'boolean' },
+          summary: { type: 'boolean' },
+          'confirm-owner': { type: 'boolean' },
+          'exclude-demo': { type: 'boolean' },
         },
       });
     } catch {
@@ -2037,7 +2040,7 @@ export async function runPhase2Cli(
       }
     }
     const isReadOnlyCmd = READ_ONLY_DB_COMMANDS.has(command) ||
-      (command === 'calibration-track' && values.list === true && !values.input);
+      (command === 'calibration-track' && (values.list === true || values.summary === true) && !values.input);
     const openReadOnly = (isReadOnlyCmd || (command === 'export-report' && existsSync(dbPath))) && dbPath !== ':memory:';
     const reconcileOnOpen = command === 'init' && values['reconcile-crashed'] === true;
 
@@ -2475,8 +2478,18 @@ export async function runPhase2Cli(
 
       if (command === 'calibration-track') {
         const inputPath = values.input ? resolve(values.input) : null;
-        if (!inputPath && values.list !== true) {
-          throw new Phase2CliError('calibration-track 需要传入 --input <tracking.json> 写入，或传入 --list 查询。');
+        const wantList = values.list === true;
+        const wantSummary = values.summary === true;
+        const confirmOwnerFlag = values['confirm-owner'] === true;
+        const excludeDemoFlag = values['exclude-demo'] === true;
+        if (confirmOwnerFlag && excludeDemoFlag) {
+          throw new Phase2CliError('--confirm-owner 与 --exclude-demo 不能同时传入。');
+        }
+        if ((confirmOwnerFlag || excludeDemoFlag) && !inputPath) {
+          throw new Phase2CliError('--confirm-owner / --exclude-demo 必须与 --input <tracking.json> 一起使用。');
+        }
+        if (!inputPath && !wantList && !wantSummary) {
+          throw new Phase2CliError('calibration-track 需要传入 --input <tracking.json> 写入，或传入 --list / --summary 查询。');
         }
         let saved = [];
         if (inputPath) {
@@ -2485,42 +2498,89 @@ export async function runPhase2Cli(
           const rawRows = Array.isArray(payload)
             ? payload
             : (Array.isArray(payload?.records) ? payload.records : [payload]);
-          for (const rawRow of rawRows) {
-            if (!rawRow || typeof rawRow !== 'object') continue;
-            let computedMargin = rawRow.recalculated_margin;
-            if (computedMargin === undefined && rawRow.sample_measured_pkg && rawRow.recalculate_profit_spec) {
-              const hc = runFastProfitHealthcheck2027({
-                ...rawRow.recalculate_profit_spec,
-                pkg: rawRow.sample_measured_pkg,
-              });
-              computedMargin = {
-                margin: hc.realized_2027_off_peak?.margin ?? null,
-                margin_pct: hc.realized_2027_off_peak?.margin_pct ?? null,
-                meets_30pct_floor: hc.realized_2027_off_peak?.meets_30pct_floor ?? null,
-                size_tier: hc.size_tier_2027?.size_tier ?? null,
-                fulfillment_usd: hc.advisory_gate1a_cap?.fulfillment_usd ?? null,
-                recalculated_at: values['as-of'] ? values['as-of'].trim() : new Date().toISOString().slice(0, 10),
-              };
-            }
-            const { recalculate_profit_spec: _ignoredSpec, ...cleanRow } = rawRow;
-            saved.push(store.upsertCalibrationTracking({
-              ...cleanRow,
-              ...(values['batch-id'] && cleanRow.batch_id === undefined ? { batch_id: values['batch-id'].trim() } : {}),
-              ...(computedMargin !== undefined ? { recalculated_margin: computedMargin } : {}),
-            }));
+          const objectRows = rawRows.filter(r => r && typeof r === 'object' && !Array.isArray(r));
+          if (confirmOwnerFlag && !objectRows.some(r => r.owner_decision !== undefined && r.owner_decision !== null)) {
+            throw new Phase2CliError('--confirm-owner 要求输入记录中至少包含一条非空 owner_decision（keep / sample_check / hold / drop）。');
           }
+          store.runInTransaction(() => {
+            for (const rawRow of objectRows) {
+              if (confirmOwnerFlag && rawRow.owner_decision_source && rawRow.owner_decision_source !== 'owner_confirmed') {
+                throw new Phase2CliError(
+                  `输入记录 "${sanitizeDiagnosticText(String(rawRow.form_id ?? ''))}" 显式声明了 owner_decision_source="${sanitizeDiagnosticText(String(rawRow.owner_decision_source))}"，与 --confirm-owner 冲突。`,
+                );
+              }
+              if (excludeDemoFlag && rawRow.owner_decision_source && rawRow.owner_decision_source !== 'script_demo_excluded') {
+                throw new Phase2CliError(
+                  `输入记录 "${sanitizeDiagnosticText(String(rawRow.form_id ?? ''))}" 显式声明了 owner_decision_source="${sanitizeDiagnosticText(String(rawRow.owner_decision_source))}"，与 --exclude-demo 冲突。`,
+                );
+              }
+              let computedMargin = rawRow.recalculated_margin;
+              if (computedMargin === undefined && rawRow.sample_measured_pkg && rawRow.recalculate_profit_spec) {
+                const hc = runFastProfitHealthcheck2027({
+                  ...rawRow.recalculate_profit_spec,
+                  pkg: rawRow.sample_measured_pkg,
+                });
+                const hasRealizedHc = Number.isFinite(hc.realized_2027_off_peak?.margin) ||
+                  Number.isFinite(hc.realized_2027_off_peak?.margin_pct);
+                if (hasRealizedHc) {
+                  const priorCal = typeof rawRow.form_id === 'string' && rawRow.form_id.trim()
+                    ? store.getCalibrationTrackingForForm(
+                        rawRow.form_id.trim(),
+                        Number.isInteger(rawRow.spec_version) ? rawRow.spec_version : null,
+                      )
+                    : null;
+                  const baselineMarginRange = rawRow.pre_ad_margin_range ?? priorCal?.pre_ad_margin_range ?? null;
+                  computedMargin = {
+                    margin: hc.realized_2027_off_peak?.margin ?? null,
+                    margin_pct: hc.realized_2027_off_peak?.margin_pct ?? null,
+                    meets_30pct_floor: hc.realized_2027_off_peak?.meets_30pct_floor ?? null,
+                    size_tier: hc.size_tier_2027?.size_tier ?? null,
+                    fulfillment_usd: hc.advisory_gate1a_cap?.fulfillment_usd ?? null,
+                    ...(baselineMarginRange ? { baseline_pre_ad_margin_range: baselineMarginRange } : {}),
+                    recalculated_at: values['as-of'] ? values['as-of'].trim() : new Date().toISOString().slice(0, 10),
+                  };
+                }
+              }
+              const { recalculate_profit_spec: _ignoredSpec, ...cleanRow } = rawRow;
+              const priorForExclude = excludeDemoFlag && cleanRow.owner_decision === undefined && typeof cleanRow.form_id === 'string' && cleanRow.form_id.trim()
+                ? store.getCalibrationTrackingForForm(
+                    cleanRow.form_id.trim(),
+                    Number.isInteger(cleanRow.spec_version) ? cleanRow.spec_version : null,
+                  )
+                : null;
+              const hasDecisionForExclude =
+                (cleanRow.owner_decision !== undefined && cleanRow.owner_decision !== null) ||
+                Boolean(priorForExclude?.owner_decision);
+              const flagSourceOverride = confirmOwnerFlag && cleanRow.owner_decision !== undefined && cleanRow.owner_decision !== null
+                ? { owner_decision_source: 'owner_confirmed' }
+                : (excludeDemoFlag && hasDecisionForExclude
+                    ? { owner_decision_source: 'script_demo_excluded' }
+                    : {});
+              saved.push(store.upsertCalibrationTracking({
+                ...cleanRow,
+                ...flagSourceOverride,
+                ...(values['batch-id'] && cleanRow.batch_id === undefined ? { batch_id: values['batch-id'].trim() } : {}),
+                ...(computedMargin !== undefined ? { recalculated_margin: computedMargin } : {}),
+              }));
+            }
+          });
         }
-        const listed = values.list === true || !inputPath
-          ? store.listCalibrationTracking({
-              batch_id: values['batch-id'] ? values['batch-id'].trim() : null,
-              form_id: values.form ? values.form.trim() : null,
-            })
+        const filterOpts = {
+          batch_id: values['batch-id'] ? values['batch-id'].trim() : null,
+          form_id: values.form ? values.form.trim() : null,
+        };
+        const listed = wantList || (!inputPath && !wantSummary)
+          ? store.listCalibrationTracking(filterOpts)
+          : null;
+        const summary = wantSummary
+          ? store.getCalibrationRetrospectiveSummary(filterOpts)
           : null;
         const out = {
           ok: true,
           command,
           ...(saved.length > 0 ? { saved_count: saved.length, saved } : {}),
           ...(listed ? { count: listed.length, records: listed } : {}),
+          ...(summary ? { retrospective_summary: summary } : {}),
         };
         checkOperatorPayload(out);
         const json = `${JSON.stringify(out, null, 2)}\n`;
