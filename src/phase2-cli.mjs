@@ -2039,6 +2039,34 @@ export async function runPhase2Cli(
         }
       }
     }
+    if (command === 'calibration-track') {
+      const hasInput = Boolean(values.input);
+      const wantList = values.list === true;
+      const wantSummary = values.summary === true;
+      const confirmOwnerFlag = values['confirm-owner'] === true;
+      const excludeDemoFlag = values['exclude-demo'] === true;
+      if (confirmOwnerFlag && excludeDemoFlag) {
+        throw new Phase2CliError('--confirm-owner 与 --exclude-demo 不能同时传入。');
+      }
+      if ((confirmOwnerFlag || excludeDemoFlag) && !hasInput) {
+        throw new Phase2CliError('--confirm-owner / --exclude-demo 必须与 --input <tracking.json> 一起使用。');
+      }
+      if (!hasInput && !wantList && !wantSummary) {
+        throw new Phase2CliError('calibration-track 需要传入 --input <tracking.json> 写入，或传入 --list / --summary 查询。');
+      }
+      if (values['as-of'] !== undefined) {
+        const rawAsOf = String(values['as-of'] ?? '').trim();
+        let validAsOf = /^\d{4}-\d{2}-\d{2}$/.test(rawAsOf);
+        if (validAsOf) {
+          const [y, m, d] = rawAsOf.split('-').map(Number);
+          const dt = new Date(Date.UTC(y, m - 1, d));
+          validAsOf = dt.getUTCFullYear() === y && dt.getUTCMonth() + 1 === m && dt.getUTCDate() === d;
+        }
+        if (!validAsOf) {
+          throw new Phase2CliError('--as-of 必须为有效 YYYY-MM-DD 日期。');
+        }
+      }
+    }
     const isReadOnlyCmd = READ_ONLY_DB_COMMANDS.has(command) ||
       (command === 'calibration-track' && (values.list === true || values.summary === true) && !values.input);
     const openReadOnly = (isReadOnlyCmd || (command === 'export-report' && existsSync(dbPath))) && dbPath !== ':memory:';
@@ -2482,92 +2510,142 @@ export async function runPhase2Cli(
         const wantSummary = values.summary === true;
         const confirmOwnerFlag = values['confirm-owner'] === true;
         const excludeDemoFlag = values['exclude-demo'] === true;
-        if (confirmOwnerFlag && excludeDemoFlag) {
-          throw new Phase2CliError('--confirm-owner 与 --exclude-demo 不能同时传入。');
-        }
-        if ((confirmOwnerFlag || excludeDemoFlag) && !inputPath) {
-          throw new Phase2CliError('--confirm-owner / --exclude-demo 必须与 --input <tracking.json> 一起使用。');
-        }
-        if (!inputPath && !wantList && !wantSummary) {
-          throw new Phase2CliError('calibration-track 需要传入 --input <tracking.json> 写入，或传入 --list / --summary 查询。');
-        }
+        const scopedFormId = values.form ? values.form.trim() : null;
+        const scopedBatchId = values['batch-id'] ? values['batch-id'].trim() : null;
         let saved = [];
+        const recalculationPending = [];
         if (inputPath) {
           const payload = await readJsonFileSafe(inputPath, '校准追踪输入文件');
           checkOperatorPayload(payload);
           const rawRows = Array.isArray(payload)
             ? payload
             : (Array.isArray(payload?.records) ? payload.records : [payload]);
-          const objectRows = rawRows.filter(r => r && typeof r === 'object' && !Array.isArray(r));
-          if (confirmOwnerFlag && !objectRows.some(r => r.owner_decision !== undefined && r.owner_decision !== null)) {
+          if (rawRows.length === 0) {
+            throw new Phase2CliError('校准追踪输入文件不包含任何记录。');
+          }
+          for (let i = 0; i < rawRows.length; i++) {
+            if (!rawRows[i] || typeof rawRows[i] !== 'object' || Array.isArray(rawRows[i])) {
+              throw new Phase2CliError(`校准追踪输入记录第 ${i + 1} 项不是有效的 JSON 对象。`);
+            }
+          }
+          if (confirmOwnerFlag && !rawRows.some(r => r.owner_decision !== undefined && r.owner_decision !== null)) {
             throw new Phase2CliError('--confirm-owner 要求输入记录中至少包含一条非空 owner_decision（keep / sample_check / hold / drop）。');
           }
+          const normalizePkgUnitsForHealthcheck = pkg => {
+            if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) return pkg;
+            const outPkg = { ...pkg };
+            if (typeof outPkg.weight_g === 'number' && Number.isFinite(outPkg.weight_g) &&
+                outPkg.weight_kg === undefined && outPkg.weight_lb === undefined && outPkg.unit_weight_lb === undefined) {
+              outPkg.weight_kg = outPkg.weight_g / 1000;
+            }
+            if (typeof outPkg.weight_oz === 'number' && Number.isFinite(outPkg.weight_oz) &&
+                outPkg.weight_lb === undefined && outPkg.unit_weight_lb === undefined && outPkg.weight_kg === undefined) {
+              outPkg.weight_lb = outPkg.weight_oz / 16;
+            }
+            if (typeof outPkg.unit_weight_oz === 'number' && Number.isFinite(outPkg.unit_weight_oz) &&
+                outPkg.weight_lb === undefined && outPkg.unit_weight_lb === undefined && outPkg.weight_kg === undefined) {
+              outPkg.weight_lb = outPkg.unit_weight_oz / 16;
+            }
+            return outPkg;
+          };
           store.runInTransaction(() => {
-            for (const rawRow of objectRows) {
+            for (const rawRow of rawRows) {
+              const target = store.resolveCalibrationTarget(rawRow.form_id, rawRow.spec_version);
+              const priorCal = store.getCalibrationTrackingForForm(target.formId, target.specVersion);
+
+              // Enforce --form / --batch-id scope BEFORE mutating when --confirm-owner or --exclude-demo is active.
+              if (confirmOwnerFlag || excludeDemoFlag) {
+                if (scopedFormId && target.formId !== scopedFormId) {
+                  throw new Phase2CliError(
+                    `输入记录 "${sanitizeDiagnosticText(target.formId)}" 超出 --form "${sanitizeDiagnosticText(scopedFormId)}" 作用域，已拒绝写入。`,
+                  );
+                }
+                if (scopedBatchId) {
+                  const rowBatch = rawRow.batch_id !== undefined
+                    ? (typeof rawRow.batch_id === 'string' && rawRow.batch_id.trim() ? rawRow.batch_id.trim() : null)
+                    : (priorCal?.batch_id ?? scopedBatchId);
+                  if (rowBatch !== scopedBatchId) {
+                    throw new Phase2CliError(
+                      `输入记录 "${sanitizeDiagnosticText(target.formId)}" 所属批次 "${sanitizeDiagnosticText(String(rowBatch ?? ''))}" 超出 --batch-id "${sanitizeDiagnosticText(scopedBatchId)}" 作用域，已拒绝写入。`,
+                    );
+                  }
+                }
+              }
+
               if (confirmOwnerFlag && rawRow.owner_decision_source && rawRow.owner_decision_source !== 'owner_confirmed') {
                 throw new Phase2CliError(
-                  `输入记录 "${sanitizeDiagnosticText(String(rawRow.form_id ?? ''))}" 显式声明了 owner_decision_source="${sanitizeDiagnosticText(String(rawRow.owner_decision_source))}"，与 --confirm-owner 冲突。`,
+                  `输入记录 "${sanitizeDiagnosticText(target.formId)}" 显式声明了 owner_decision_source="${sanitizeDiagnosticText(String(rawRow.owner_decision_source))}"，与 --confirm-owner 冲突。`,
                 );
               }
               if (excludeDemoFlag && rawRow.owner_decision_source && rawRow.owner_decision_source !== 'script_demo_excluded') {
                 throw new Phase2CliError(
-                  `输入记录 "${sanitizeDiagnosticText(String(rawRow.form_id ?? ''))}" 显式声明了 owner_decision_source="${sanitizeDiagnosticText(String(rawRow.owner_decision_source))}"，与 --exclude-demo 冲突。`,
+                  `输入记录 "${sanitizeDiagnosticText(target.formId)}" 显式声明了 owner_decision_source="${sanitizeDiagnosticText(String(rawRow.owner_decision_source))}"，与 --exclude-demo 冲突。`,
                 );
               }
+
               let computedMargin = rawRow.recalculated_margin;
-              if (computedMargin === undefined && rawRow.sample_measured_pkg && rawRow.recalculate_profit_spec) {
-                const hc = runFastProfitHealthcheck2027({
-                  ...rawRow.recalculate_profit_spec,
-                  pkg: rawRow.sample_measured_pkg,
-                });
-                const hasRealizedHc = Number.isFinite(hc.realized_2027_off_peak?.margin) ||
-                  Number.isFinite(hc.realized_2027_off_peak?.margin_pct);
-                if (hasRealizedHc) {
-                  const priorCal = typeof rawRow.form_id === 'string' && rawRow.form_id.trim()
-                    ? store.getCalibrationTrackingForForm(
-                        rawRow.form_id.trim(),
-                        Number.isInteger(rawRow.spec_version) ? rawRow.spec_version : null,
-                      )
-                    : null;
-                  const baselineMarginRange = rawRow.pre_ad_margin_range ?? priorCal?.pre_ad_margin_range ?? null;
-                  computedMargin = {
-                    margin: hc.realized_2027_off_peak?.margin ?? null,
-                    margin_pct: hc.realized_2027_off_peak?.margin_pct ?? null,
-                    meets_30pct_floor: hc.realized_2027_off_peak?.meets_30pct_floor ?? null,
-                    size_tier: hc.size_tier_2027?.size_tier ?? null,
-                    fulfillment_usd: hc.advisory_gate1a_cap?.fulfillment_usd ?? null,
-                    ...(baselineMarginRange ? { baseline_pre_ad_margin_range: baselineMarginRange } : {}),
-                    recalculated_at: values['as-of'] ? values['as-of'].trim() : new Date().toISOString().slice(0, 10),
-                  };
+              const shouldAutoRecalc = rawRow.recalculate_profit_spec &&
+                (rawRow.recalculated_margin === undefined || rawRow.recalculated_margin === null);
+              if (shouldAutoRecalc) {
+                const effectivePkg = rawRow.sample_measured_pkg !== undefined
+                  ? rawRow.sample_measured_pkg
+                  : (priorCal?.sample_measured_pkg ?? null);
+                if (!effectivePkg) {
+                  computedMargin = null;
+                  recalculationPending.push({
+                    form_id: target.formId,
+                    spec_version: target.specVersion,
+                    reason: 'missing_sample_measured_pkg',
+                  });
+                } else {
+                  const hc = runFastProfitHealthcheck2027({
+                    ...rawRow.recalculate_profit_spec,
+                    pkg: normalizePkgUnitsForHealthcheck(effectivePkg),
+                  });
+                  const hasRealizedHc = Number.isFinite(hc.realized_2027_off_peak?.margin) ||
+                    Number.isFinite(hc.realized_2027_off_peak?.margin_pct);
+                  if (hasRealizedHc) {
+                    const baselineMarginRange = rawRow.pre_ad_margin_range !== undefined
+                      ? rawRow.pre_ad_margin_range
+                      : (priorCal?.pre_ad_margin_range ?? null);
+                    computedMargin = {
+                      margin: hc.realized_2027_off_peak?.margin ?? null,
+                      margin_pct: hc.realized_2027_off_peak?.margin_pct ?? null,
+                      meets_30pct_floor: hc.realized_2027_off_peak?.meets_30pct_floor ?? null,
+                      size_tier: hc.size_tier_2027?.size_tier ?? null,
+                      fulfillment_usd: hc.advisory_gate1a_cap?.fulfillment_usd ?? null,
+                      ...(baselineMarginRange ? { baseline_pre_ad_margin_range: baselineMarginRange } : {}),
+                      recalculated_at: values['as-of'] ? values['as-of'].trim() : new Date().toISOString().slice(0, 10),
+                    };
+                  } else {
+                    computedMargin = null;
+                    recalculationPending.push({
+                      form_id: target.formId,
+                      spec_version: target.specVersion,
+                      reason: 'incomplete_recalculate_profit_spec',
+                      ...(Array.isArray(hc.missing_inputs) && hc.missing_inputs.length > 0 ? { missing_inputs: hc.missing_inputs } : {}),
+                    });
+                  }
                 }
               }
+
               const { recalculate_profit_spec: _ignoredSpec, ...cleanRow } = rawRow;
-              const priorForExclude = excludeDemoFlag && cleanRow.owner_decision === undefined && typeof cleanRow.form_id === 'string' && cleanRow.form_id.trim()
-                ? store.getCalibrationTrackingForForm(
-                    cleanRow.form_id.trim(),
-                    Number.isInteger(cleanRow.spec_version) ? cleanRow.spec_version : null,
-                  )
-                : null;
-              const hasDecisionForExclude =
-                (cleanRow.owner_decision !== undefined && cleanRow.owner_decision !== null) ||
-                Boolean(priorForExclude?.owner_decision);
               const flagSourceOverride = confirmOwnerFlag && cleanRow.owner_decision !== undefined && cleanRow.owner_decision !== null
                 ? { owner_decision_source: 'owner_confirmed' }
-                : (excludeDemoFlag && hasDecisionForExclude
-                    ? { owner_decision_source: 'script_demo_excluded' }
-                    : {});
+                : (excludeDemoFlag ? { owner_decision_source: 'script_demo_excluded' } : {});
               saved.push(store.upsertCalibrationTracking({
                 ...cleanRow,
+                spec_version: target.specVersion,
                 ...flagSourceOverride,
-                ...(values['batch-id'] && cleanRow.batch_id === undefined ? { batch_id: values['batch-id'].trim() } : {}),
+                ...(scopedBatchId && cleanRow.batch_id === undefined ? { batch_id: scopedBatchId } : {}),
                 ...(computedMargin !== undefined ? { recalculated_margin: computedMargin } : {}),
               }));
             }
           });
         }
         const filterOpts = {
-          batch_id: values['batch-id'] ? values['batch-id'].trim() : null,
-          form_id: values.form ? values.form.trim() : null,
+          batch_id: scopedBatchId,
+          form_id: scopedFormId,
         };
         const listed = wantList || (!inputPath && !wantSummary)
           ? store.listCalibrationTracking(filterOpts)
@@ -2579,6 +2657,7 @@ export async function runPhase2Cli(
           ok: true,
           command,
           ...(saved.length > 0 ? { saved_count: saved.length, saved } : {}),
+          ...(recalculationPending.length > 0 ? { recalculation_pending: recalculationPending } : {}),
           ...(listed ? { count: listed.length, records: listed } : {}),
           ...(summary ? { retrospective_summary: summary } : {}),
         };

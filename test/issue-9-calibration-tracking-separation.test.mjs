@@ -1,12 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { runPhase2Cli } from '../src/phase2-cli.mjs';
 import { openSelectionStore } from '../src/store.mjs';
-import { STAGE4_AS_OF_DATE } from './helpers/stage4-fixtures.mjs';
 
 async function runCliMem(args) {
   let stdout = '';
@@ -126,7 +125,7 @@ test('Issue #9 acceptance: separates system suggestion, owner-confirmed decision
       }],
     }, null, 2));
 
-    const r3 = await runCliMem(['calibration-track', '--db', dbPath, '--input', step3Path, '--as-of', STAGE4_AS_OF_DATE, '--summary']);
+    const r3 = await runCliMem(['calibration-track', '--db', dbPath, '--input', step3Path, '--as-of', '2026-11-28', '--summary']);
     assert.equal(r3.code, 0, r3.stderr);
     const j3 = JSON.parse(r3.stdout);
     const rec3 = j3.saved[0];
@@ -202,13 +201,15 @@ test('Issue #9 anti-pollution: legacy_unknown & script_demo_excluded never infla
     assert.equal(rConf.code, 0, rConf.stderr);
     const sum = JSON.parse(rConf.stdout).retrospective_summary;
     assert.equal(sum.total_records, 5);
-    assert.equal(sum.system_suggested_count, 5);
+    assert.equal(sum.business_records_count, 4, 'Demo rows must be excluded before business counts');
+    assert.equal(sum.system_suggested_count, 4);
     assert.equal(sum.owner_confirmed_count, 2);
     assert.equal(sum.owner_accepted_count, 1);
     assert.equal(sum.owner_acceptance_rate, 0.5);
     assert.equal(sum.unconfirmed_or_legacy_unknown_count, 2);
     assert.equal(sum.awaiting_owner_decision_count, 1);
-    assert.equal(sum.legacy_unknown_count, 1);
+    assert.equal(sum.legacy_unknown_decided_count, 1);
+    assert.equal(sum.legacy_unknown_source_count, 1);
     assert.equal(sum.script_demo_excluded_count, 1);
     assert.equal(sum.owner_confirmed_count + sum.unconfirmed_or_legacy_unknown_count + sum.script_demo_excluded_count, sum.total_records);
     assert.equal(sum.sample_measured_realized_count, 0);
@@ -273,7 +274,9 @@ test('Issue #9 anti-pollution: legacy_unknown & script_demo_excluded never infla
     assert.equal(rReclass.code, 0, rReclass.stderr);
     const sumAfterReclass = JSON.parse(rReclass.stdout).retrospective_summary;
     assert.equal(sumAfterReclass.script_demo_excluded_count, 2);
-    assert.equal(sumAfterReclass.legacy_unknown_count, 0);
+    assert.equal(sumAfterReclass.legacy_unknown_decided_count, 0);
+    assert.equal(sumAfterReclass.legacy_unknown_source_count, 0);
+    assert.equal(sumAfterReclass.system_suggested_count, 3);
     assert.equal(sumAfterReclass.owner_confirmed_count, 2);
     assert.equal(sumAfterReclass.owner_acceptance_rate, 0.5);
   } finally {
@@ -332,20 +335,25 @@ test('Issue #9 migration: pre-PR SQLite DB reads safely read-only and migrates i
     assert.equal(jRo.retrospective_summary.owner_confirmed_count, 0);
     assert.equal(jRo.retrospective_summary.owner_acceptance_rate, null);
     assert.equal(jRo.retrospective_summary.unconfirmed_or_legacy_unknown_count, 3);
+    assert.equal(jRo.retrospective_summary.legacy_unknown_source_count, 3);
+    assert.equal(jRo.retrospective_summary.legacy_unknown_decided_count, 2);
+    assert.equal(jRo.retrospective_summary.awaiting_owner_decision_count, 1);
     assert.equal(jRo.retrospective_summary.sample_measured_realized_count, 1);
+    assert.equal(jRo.records.find(r => r.form_id === 'form-leg-1').system_suggested_at, null, 'Pre-PR unknown suggestion timestamp must stay null');
+    assert.equal(jRo.records.find(r => r.form_id === 'form-leg-3').sample_measured_at, null, 'Pre-PR unknown measurement timestamp must stay null');
 
-    // 2) Writable open runs idempotent ALTER TABLE + backfill; second open preserves exact values
+    // 2) Writable open runs idempotent ALTER TABLE + backfill (without fabricating timestamps); second open preserves exact values
     const stMig1 = openSelectionStore(dbPath);
     const s1 = stMig1.getCalibrationRetrospectiveSummary({ batch_id: 'b-old' });
     const row1 = stMig1.getCalibrationTrackingForForm('form-leg-1');
     const row3 = stMig1.getCalibrationTrackingForForm('form-leg-3');
     stMig1.close();
 
-    assert.equal(row1.system_suggested_at, '2026-11-25T08:00:00Z');
+    assert.equal(row1.system_suggested_at, null);
     assert.equal(row1.owner_decision_source, 'legacy_unknown');
     assert.equal(row1.owner_decision_confirmed_at, null);
     assert.equal(row1.sample_measured_at, null);
-    assert.equal(row3.sample_measured_at, '2026-11-25T09:00:00Z');
+    assert.equal(row3.sample_measured_at, null);
     assert.equal(s1.owner_confirmed_count, 0);
     assert.equal(s1.sample_measured_realized_count, 1);
 
@@ -353,6 +361,150 @@ test('Issue #9 migration: pre-PR SQLite DB reads safely read-only and migrates i
     const s2 = stMig2.getCalibrationRetrospectiveSummary({ batch_id: 'b-old' });
     stMig2.close();
     assert.deepEqual(s2, s1, 'Repeated migration opens must be strictly idempotent');
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* Windows WAL cleanup */ }
+  }
+});
+
+test('Issue #9 Round-1 Astra regressions (#1-#12): margin SSOT, email PII, stale margin invalidation, verdict-aware acceptance, demo/scope/baseline isolation & legacy compat', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'issue9-r1-reg-'));
+  try {
+    // (#11 S-2 + #10 S-1) Pre-open flag & --as-of validation must fail BEFORE creating SQLite DB
+    const ghostDb = join(dir, 'should-not-exist.sqlite');
+    assert.notEqual((await runCliMem(['calibration-track', '--db', ghostDb, '--confirm-owner', '--exclude-demo'])).code, 0);
+    assert.notEqual((await runCliMem(['calibration-track', '--db', ghostDb, '--list', '--as-of', 'not-a-date'])).code, 0);
+    assert.equal(existsSync(ghostDb), false, 'Invalid calibration-track flags must fail before creating SQLite file');
+
+    const dbPath = join(dir, 'reg.sqlite');
+    assert.equal((await runCliMem(['init', '--db', dbPath])).code, 0);
+
+    // (#1 STD-1 + #6 SPEC-4 + #2 STD-2) Numeric margin priority over stale boolean, email block/scrub, recalc-without-pkg separation
+    const st = openSelectionStore(dbPath);
+    try {
+      const pkg = { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.2 };
+      st.upsertCalibrationTracking({ form_id: 'f-m1', batch_id: 'b-m', system_verdict: 'sample', sample_measured_pkg: pkg, recalculated_margin: { margin: 0.18, meets_30pct_floor: true } });
+      st.upsertCalibrationTracking({ form_id: 'f-m2', batch_id: 'b-m', system_verdict: 'sample', sample_measured_pkg: pkg, recalculated_margin: { pre_ad_margin: 0.36 } });
+      st.upsertCalibrationTracking({ form_id: 'f-m3', batch_id: 'b-m', system_verdict: 'sample', sample_measured_pkg: pkg, recalculated_margin: { pre_ad_margin_range: [0.35, 0.40] } });
+      st.upsertCalibrationTracking({ form_id: 'f-recalc-only', batch_id: 'b-m', system_verdict: 'sample', recalculated_margin: { margin: 0.38 } });
+      const sumM = st.getCalibrationRetrospectiveSummary({ batch_id: 'b-m' });
+      assert.equal(sumM.sample_recalculated_meets_30pct_count, 2, 'Numeric margin must override stale meets_30pct_floor=true and honor pre_ad_margin + range');
+      assert.equal(sumM.sample_physical_measured_count, 3);
+      assert.equal(sumM.sample_recalculated_count, 4);
+      const roRec = sumM.records_timeline.find(r => r.form_id === 'f-recalc-only');
+      assert.equal(roRec.has_sample_measurement, false);
+      assert.equal(roRec.has_recalculated_margin, true);
+      assert.equal(roRec.sample_measured_at, null);
+
+      // Raw email rejected on write; legacy SQLite email scrubbed on read/summary
+      assert.throws(() => st.upsertCalibrationTracking({
+        form_id: 'f-email',
+        system_verdict: 'sample',
+        sample_spec_ref: 'contact: supplier@example-factory.com',
+      }), /email/i);
+      st.db.prepare("UPDATE calibration_tracking SET sample_spec_ref = 'legacy supplier@example-factory.com' WHERE form_id = 'f-m1'").run();
+      const scrubbed = st.getCalibrationRetrospectiveSummary({ form_id: 'f-m1' });
+      assert.equal(JSON.stringify(scrubbed).includes('supplier@example-factory.com'), false);
+      assert.match(scrubbed.records_timeline[0].sample_spec_ref, /\[REDACTED_EMAIL\]/);
+
+      // (#4 SPEC-2) Verdict-aware acceptance rate + verdict_x_decision + verdict-change staleness
+      st.upsertCalibrationTracking({ form_id: 'f-excl', batch_id: 'b-v', system_verdict: 'hard_excluded', owner_decision: 'keep', owner_decision_source: 'owner_confirmed' });
+      st.upsertCalibrationTracking({ form_id: 'f-chg', batch_id: 'b-v', system_verdict: 'sample', owner_decision: 'sample_check', owner_decision_source: 'owner_confirmed' });
+      st.upsertCalibrationTracking({ form_id: 'f-chg', batch_id: 'b-v', system_verdict: 'hard_excluded' }); // verdict changed after confirmation
+      const sumV = st.getCalibrationRetrospectiveSummary({ batch_id: 'b-v' });
+      assert.equal(sumV.owner_acceptance_rate, null, 'keep on hard_excluded & stale verdict confirmation must never inflate acceptance rate');
+      assert.equal(sumV.verdict_x_decision.hard_excluded.keep, 1);
+      assert.equal(sumV.owner_confirmed_stale_verdict_count, 1);
+
+      // (#5 SPEC-3) Decision-less demo row excluded completely & sourceless re-import preserves script_demo_excluded
+      st.upsertCalibrationTracking({ form_id: 'f-demo-null', batch_id: 'b-d', system_verdict: 'sample', owner_decision_source: 'script_demo_excluded', sample_measured_pkg: pkg, recalculated_margin: { margin: 0.42 } });
+      st.upsertCalibrationTracking({ form_id: 'f-demo-null', batch_id: 'b-d', system_verdict: 'sample', owner_decision: 'sample_check' }); // sourceless replay
+      assert.equal(st.getCalibrationTrackingForForm('f-demo-null').owner_decision_source, 'script_demo_excluded');
+      const sumD = st.getCalibrationRetrospectiveSummary({ batch_id: 'b-d' });
+      assert.equal(sumD.script_demo_excluded_count, 1);
+      assert.equal(sumD.system_suggested_count, 0);
+      assert.equal(sumD.sample_measured_realized_count, 0);
+      assert.equal(sumD.sample_recalculated_meets_30pct_count, 0);
+
+      // (#7 SPEC-5) Changing decision/source without owner_reason clears stale script reason; confirmed_at requires owner_confirmed
+      st.upsertCalibrationTracking({ form_id: 'f-demo-null', owner_decision: 'hold', owner_decision_source: 'owner_confirmed' });
+      assert.equal(st.getCalibrationTrackingForForm('f-demo-null').owner_reason, null);
+      assert.throws(() => st.upsertCalibrationTracking({ form_id: 'f-demo-null', owner_decision_confirmed_at: '2026-11-27T12:00:00Z' }), /owner_confirmed/);
+
+      // (#8 SPEC-6) v1 vs v2 spec_version baseline & spec_sha256 isolation
+      const { form: fV1 } = st.upsertCandidateForm({ form_id: 'f-ver', label: 'V1', buyer_task: 'Task', saleable_set_composition: [{ component_id: 'a', qty_per_saleable_set: 1 }] });
+      st.upsertCalibrationTracking({ form_id: 'f-ver', spec_version: 1, system_verdict: 'sample', pre_ad_margin_range: [0.70, 0.72] });
+      const { form: fV2 } = st.upsertCandidateForm({ form_id: 'f-ver', label: 'V2', buyer_task: 'Task', saleable_set_composition: [{ component_id: 'a', qty_per_saleable_set: 2 }] });
+      assert.equal(fV2.spec_version, 2);
+      const backV1 = st.upsertCalibrationTracking({ form_id: 'f-ver', spec_version: 1, sample_measured_pkg: pkg });
+      assert.notEqual(backV1.sample_spec_ref, fV2.spec_sha256, 'v1 backfill must not stamp v2 spec_sha256');
+      assert.equal(backV1.form_spec_sha256, fV1.spec_sha256);
+    } finally {
+      st.close();
+    }
+
+    // (#3 SPEC-1 + #9 SPEC-7 + #7 SPEC-5 + #8 SPEC-6 + #11 S-2) Real CLI checks
+    // 1) Initial 1.25 lb sample -> 32.90%+; then pkg changes to 4.25 lb with missing FX -> stale margin invalidated + recalculation_pending!
+    const fPkg1 = join(dir, 'pkg1.json');
+    writeFileSync(fPkg1, JSON.stringify({
+      records: [{
+        form_id: 'f-ver', spec_version: 2, batch_id: 'b-cli', system_verdict: 'sample', pre_ad_margin_range: null,
+        sample_measured_pkg: { length_in: 10, width_in: 6, height_in: 2, weight_oz: 20 },
+        recalculate_profit_spec: { price_usd: 45, goods_cny_per_unit: 60, domestic_freight_cny_per_unit: 2, fx_cny_per_usd: 7.2, headhaul_usd: 2.0 },
+      }],
+    }));
+    const rPkg1 = await runCliMem(['calibration-track', '--db', dbPath, '--input', fPkg1, '--as-of', '2026-11-27']);
+    assert.equal(rPkg1.code, 0, rPkg1.stderr);
+    const jPkg1 = JSON.parse(rPkg1.stdout);
+    assert.equal(jPkg1.saved[0].recalculated_margin.baseline_pre_ad_margin_range, undefined, 'v2 must not inherit v1 70-72% baseline');
+    assert.equal(jPkg1.saved[0].recalculated_margin.meets_30pct_floor, true);
+
+    const fPkg2 = join(dir, 'pkg2-missing-fx.json');
+    writeFileSync(fPkg2, JSON.stringify({
+      records: [{
+        form_id: 'f-ver', spec_version: 2,
+        sample_measured_pkg: { length_in: 12, width_in: 9, height_in: 5, weight_g: 1928 },
+        recalculate_profit_spec: { price_usd: 45, goods_cny_per_unit: 60, headhaul_usd: 2.0 }, // missing fx_cny_per_usd
+      }],
+    }));
+    const rPkg2 = await runCliMem(['calibration-track', '--db', dbPath, '--input', fPkg2]);
+    assert.equal(rPkg2.code, 0, rPkg2.stderr);
+    const jPkg2 = JSON.parse(rPkg2.stdout);
+    assert.equal(jPkg2.saved[0].recalculated_margin, null, 'Changed pkg with failed recalc must invalidate stale margin');
+    assert.equal(jPkg2.recalculation_pending[0].reason, 'incomplete_recalculate_profit_spec');
+
+    // Supplying cost spec later with recalculated_margin: null reuses stored 1928g pkg!
+    const fPkg3 = join(dir, 'pkg3-fill-fx.json');
+    writeFileSync(fPkg3, JSON.stringify({
+      records: [{
+        form_id: 'f-ver', spec_version: 2, recalculated_margin: null,
+        recalculate_profit_spec: { price_usd: 45, goods_cny_per_unit: 60, domestic_freight_cny_per_unit: 2, fx_cny_per_usd: 7.2, headhaul_usd: 2.0 },
+      }],
+    }));
+    const rPkg3 = await runCliMem(['calibration-track', '--db', dbPath, '--input', fPkg3]);
+    assert.equal(rPkg3.code, 0, rPkg3.stderr);
+    assert.ok(typeof JSON.parse(rPkg3.stdout).saved[0].recalculated_margin.margin === 'number');
+
+    // Legacy parent-CLI null-margin placeholder accepted compatibly as pending (null)
+    const fLegPh = join(dir, 'legacy-placeholder.json');
+    writeFileSync(fLegPh, JSON.stringify({
+      records: [{ form_id: 'f-leg-ph', batch_id: 'b-cli', system_verdict: 'sample', recalculated_margin: { size_tier: 'Small Standard', margin: null, margin_pct: null, meets_30pct_floor: null } }],
+    }));
+    const rLegPh = await runCliMem(['calibration-track', '--db', dbPath, '--input', fLegPh]);
+    assert.equal(rLegPh.code, 0, rLegPh.stderr);
+    assert.equal(JSON.parse(rLegPh.stdout).saved[0].recalculated_margin, null);
+
+    // (#7 SPEC-5) --confirm-owner --form A rejects batch containing Form B before mutating anything; malformed entry rejected
+    const fScope = join(dir, 'scope-mixed.json');
+    writeFileSync(fScope, JSON.stringify({
+      records: [
+        { form_id: 'f-scope-a', batch_id: 'b-a', system_verdict: 'sample', owner_decision: 'sample_check' },
+        { form_id: 'f-scope-b', batch_id: 'b-b', system_verdict: 'sample', owner_decision: 'sample_check' },
+      ],
+    }));
+    assert.notEqual((await runCliMem(['calibration-track', '--db', dbPath, '--input', fScope, '--confirm-owner', '--form', 'f-scope-a', '--batch-id', 'b-a'])).code, 0);
+    const fMalformed = join(dir, 'malformed.json');
+    writeFileSync(fMalformed, JSON.stringify({ records: [{ form_id: 'f-ok', system_verdict: 'sample' }, 'not-an-object'] }));
+    assert.notEqual((await runCliMem(['calibration-track', '--db', dbPath, '--input', fMalformed])).code, 0);
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* Windows WAL cleanup */ }
   }
