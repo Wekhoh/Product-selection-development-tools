@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   validateSocialBridgeOutput,
@@ -12,7 +11,6 @@ import {
   validateRedactedDestination,
 } from '../src/contracts.mjs';
 import {
-  openSelectionStore as rawOpenSelectionStore,
   computeEvidenceBundleHash,
   sha256Hex,
 } from '../src/store.mjs';
@@ -28,57 +26,17 @@ import {
 } from '../src/pipeline.mjs';
 import { runPhase2Cli } from '../src/phase2-cli.mjs';
 import { FBA_2027_METADATA, getFba2027RateTableSnapshot } from '../src/fba-calculator.mjs';
-
-const DEFAULT_R59_UI_READBACK = {
-  logged_in: true,
-  viewport_width_px: 1440,
-  selected_sku_row_visible: true,
-  settlement_bar_visible: true,
-  applied_quantity_confirmed: true,
-};
-function openSelectionStore(dbPath, opts) {
-  const s = rawOpenSelectionStore(dbPath, opts);
-  const orig = s.recordSourcingQuote1688.bind(s);
-  s.recordSourcingQuote1688 = q => orig(q && typeof q === 'object' && q.ui_readback === undefined ? { ...q, ui_readback: DEFAULT_R59_UI_READBACK } : q);
-  return s;
-}
+import {
+  openSelectionStoreWithDefaultUiReadback as openSelectionStore,
+  withTempDir as _withTempDir,
+  withTempDirAsync as _withTempDirAsync,
+} from './helpers/test-fixtures.mjs';
 
 const profile = JSON.parse(readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'));
 const fixture = JSON.parse(readFileSync(new URL('../fixtures/synthetic-batch.json', import.meta.url), 'utf8'));
 
-function withTempDir(fn) {
-  const dir = mkdtempSync(join(tmpdir(), 'phase2-test-'));
-  let primaryErr = null;
-  try {
-    return fn(dir);
-  } catch (err) {
-    primaryErr = err;
-    throw err;
-  } finally {
-    try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 25 });
-    } catch (rmErr) {
-      if (!primaryErr) throw rmErr;
-    }
-  }
-}
-
-async function withTempDirAsync(fn) {
-  const dir = mkdtempSync(join(tmpdir(), 'phase2-test-'));
-  let primaryErr = null;
-  try {
-    return await fn(dir);
-  } catch (err) {
-    primaryErr = err;
-    throw err;
-  } finally {
-    try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 25 });
-    } catch (rmErr) {
-      if (!primaryErr) throw rmErr;
-    }
-  }
-}
+const withTempDir = fn => _withTempDir('phase2-test-', fn);
+const withTempDirAsync = fn => _withTempDirAsync('phase2-test-', fn);
 
 function makeStandardGate1AScenario(overrides = {}) {
   return {

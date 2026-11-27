@@ -38,27 +38,18 @@ import {
   auditDiscoveryCoverage,
   planDiscoveryBatch,
 } from '../src/discovery-channels.mjs';
-import { openSelectionStore as rawOpenSelectionStore } from '../src/store.mjs';
 import { replayBatchIntoStore } from '../src/history-import.mjs';
 import { attachGate1APriceCliffStress, runGate1AForForm, runGate1BForForm, runPhase2Batch } from '../src/pipeline.mjs';
 import { attachStoreDiscoveryProvenance } from '../src/discovery.mjs';
 import { scoreBatch, scoreCandidate } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
-import { makeDatedKeepaReceipt } from './helpers/stage4-fixtures.mjs';
-
-const DEFAULT_R59_UI_READBACK = {
-  logged_in: true,
-  viewport_width_px: 1440,
-  selected_sku_row_visible: true,
-  settlement_bar_visible: true,
-  applied_quantity_confirmed: true,
-};
-function openSelectionStore(dbPath, opts) {
-  const s = rawOpenSelectionStore(dbPath, opts);
-  const orig = s.recordSourcingQuote1688.bind(s);
-  s.recordSourcingQuote1688 = q => orig(q && typeof q === 'object' && q.ui_readback === undefined ? { ...q, ui_readback: DEFAULT_R59_UI_READBACK } : q);
-  return s;
-}
+import {
+  DEFAULT_R59_UI_READBACK,
+  makeDatedKeepaReceipt,
+  openSelectionStoreWithDefaultUiReadback as openSelectionStore,
+  withTempDir as _withTempDir,
+  withTempDirAsync as _withTempDirAsync,
+} from './helpers/test-fixtures.mjs';
 
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const PROFILE_PATH = join(REPO_ROOT, 'docs', 'design', 'reference-profile.r59.draft.json');
@@ -68,23 +59,8 @@ const CLI_PATH = join(REPO_ROOT, 'src', 'phase2-cli.mjs');
 const profile = JSON.parse(readFileSync(PROFILE_PATH, 'utf8'));
 const fixture = JSON.parse(readFileSync(FIXTURE_PATH, 'utf8'));
 
-function withTempDir(fn) {
-  const dir = mkdtempSync(join(tmpdir(), 'sprint-ab-'));
-  try {
-    return fn(dir);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-async function withTempDirAsync(fn) {
-  const dir = mkdtempSync(join(tmpdir(), 'sprint-ab-'));
-  try {
-    return await fn(dir);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-}
+const withTempDir = fn => _withTempDir('sprint-ab-', fn);
+const withTempDirAsync = fn => _withTempDirAsync('sprint-ab-', fn);
 
 function makeGate1AScenario(overrides = {}) {
   return {

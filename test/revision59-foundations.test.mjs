@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { makeOversizeScreeningInputs } from './helpers/test-fixtures.mjs';
 import {
   VERIFIED_2027_RETURN_THRESHOLDS,
   lookupVerified2027ReturnThreshold,
@@ -768,19 +769,10 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
   assert.equal(stdLegacyOk.status, 'verified', `Standard-size legacy override must NOT hit $7.47 Bulky floor: ${stdLegacyOk.reason}`);
 
   const largeBulkyPkg = { length_in: 40, width_in: 12, height_in: 8, weight_lb: 10 }; // longest 40 > 37, dim 27.6 lb <= 50 lb => large_bulky ($9.88 * 1.035 = $10.2258 floor)
+  const oversizeScreeningInputs = makeOversizeScreeningInputs();
   const largeBulkyUnder = estimateGate1A2027({
     pkg: largeBulkyPkg,
-    price_usd: 45,
-    fx_cny_per_usd: 7.2,
-    headhaul_usd: 4.0,
-    refund_fraction: 0.04,
-    physical_return_fraction: 0.04,
-    fee_category: 'Home and Kitchen',
-    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-    collection_rate: 0.005,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
-    storage_window: { from: '2027-02-01', through: '2027-09-30' },
-    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+    ...oversizeScreeningInputs,
     calculator_verified_override: {
       verified_by: 'amazon_fba_revenue_calculator',
       observed_at: '2026-11-22',
@@ -801,17 +793,7 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
   const oversizePkg = { length_in: 40, width_in: 20, height_in: 12, weight_lb: 10 }; // dim 69.06 lb > 50 lb => oversize_beyond_bulky ($10.09 * 1.035 = $10.4432 floor)
   const oversizeUnder = estimateGate1A2027({
     pkg: oversizePkg,
-    price_usd: 45,
-    fx_cny_per_usd: 7.2,
-    headhaul_usd: 4.0,
-    refund_fraction: 0.04,
-    physical_return_fraction: 0.04,
-    fee_category: 'Home and Kitchen',
-    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-    collection_rate: 0.005,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
-    storage_window: { from: '2027-02-01', through: '2027-09-30' },
-    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+    ...oversizeScreeningInputs,
     calculator_verified_override: {
       verified_by: 'amazon_fba_revenue_calculator',
       observed_at: '2026-11-22',
@@ -874,17 +856,7 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
   // Round-4 HIGH 1: 6-tier 2027 Oversize weight-stepped + 3.5% fuel-surcharge floor rejects $11.00 and $28.15 on Medium Oversize (40x20x12 in, dim 69.06 lb -> floor $40.14765)
   const medOversizeReject11 = estimateGate1A2027({
     pkg: oversizePkg,
-    price_usd: 45,
-    fx_cny_per_usd: 7.2,
-    headhaul_usd: 4.0,
-    refund_fraction: 0.04,
-    physical_return_fraction: 0.04,
-    fee_category: 'Home and Kitchen',
-    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-    collection_rate: 0.005,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
-    storage_window: { from: '2027-02-01', through: '2027-09-30' },
-    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+    ...oversizeScreeningInputs,
     calculator_verified_override: {
       verified_by: 'amazon_fba_revenue_calculator',
       observed_at: '2026-11-22',
@@ -904,17 +876,7 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
 
   const medOversizeAcceptFull = estimateGate1A2027({
     pkg: oversizePkg,
-    price_usd: 45,
-    fx_cny_per_usd: 7.2,
-    headhaul_usd: 4.0,
-    refund_fraction: 0.04,
-    physical_return_fraction: 0.04,
-    fee_category: 'Home and Kitchen',
-    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-    collection_rate: 0.005,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
-    storage_window: { from: '2027-02-01', through: '2027-09-30' },
-    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+    ...oversizeScreeningInputs,
     calculator_verified_override: {
       verified_by: 'amazon_fba_revenue_calculator',
       observed_at: '2026-11-22',
@@ -934,17 +896,7 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
   // Dangerous-goods and Holiday-Peak non-SIPP overrides MUST ALSO enforce the 2027 non-peak Oversize/Bulky floor!
   const medOversizeDgReject = estimateGate1A2027({
     pkg: { ...oversizePkg, is_dangerous_goods: true },
-    price_usd: 45,
-    fx_cny_per_usd: 7.2,
-    headhaul_usd: 4.0,
-    refund_fraction: 0.04,
-    physical_return_fraction: 0.04,
-    fee_category: 'Home and Kitchen',
-    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-    collection_rate: 0.005,
-    sales_window: { from: '2027-02-01', through: '2027-09-30' },
-    storage_window: { from: '2027-02-01', through: '2027-09-30' },
-    inbound_window: { from: '2027-01-15', through: '2027-01-25' },
+    ...oversizeScreeningInputs,
     calculator_verified_override: {
       verified_by: 'amazon_fba_revenue_calculator',
       observed_at: '2026-11-22',
@@ -965,14 +917,7 @@ test('Astra Round-1 Regressions (Foundations): Bulky 2-inch min dim weight + Gat
 
   const medOversizePeakReject = estimateGate1A2027({
     pkg: oversizePkg,
-    price_usd: 45,
-    fx_cny_per_usd: 7.2,
-    headhaul_usd: 4.0,
-    refund_fraction: 0.04,
-    physical_return_fraction: 0.04,
-    fee_category: 'Home and Kitchen',
-    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-    collection_rate: 0.005,
+    ...oversizeScreeningInputs,
     sales_window: { from: '2027-10-15', through: '2027-12-31' },
     storage_window: { from: '2027-10-15', through: '2027-12-31' },
     inbound_window: { from: '2027-10-01', through: '2027-10-10' },

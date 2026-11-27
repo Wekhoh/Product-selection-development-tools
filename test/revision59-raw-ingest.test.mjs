@@ -14,10 +14,14 @@ import {
   classifySpApiRestrictionReasons,
   resolveStage1QualitativeJudgments,
   buildPairedSeasonalOperatingPeriods,
+  ingestSellerSpriteMonthlyArchiveMarket,
   ingestTrialSpecification,
 } from '../src/raw-ingest.mjs';
+import { extractNewcomerReviewOriginBreakdown } from '../src/observations.mjs';
 import { scoreBatch, scoreCandidate } from '../src/scoring.mjs';
 import { openSelectionStore } from '../src/store.mjs';
+import { parseSellerSpriteKeepaPayload } from '../src/adapters/keepa.mjs';
+import { STAGE4_AS_OF_DATE, makeDatedKeepaReceipt, withTempDir } from './helpers/test-fixtures.mjs';
 
 const REPO_ROOT = resolve(new URL('..', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 const CLI_PATH = join(REPO_ROOT, 'src', 'phase2-cli.mjs');
@@ -1105,4 +1109,275 @@ test('Astra Round-1 & Round-2 Regressions (Raw Ingest): BLOCKER 4 cross-product 
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('Batch A1 Req 4 & Astra #2/#11: Keepa newcomer review jump/drop provenance, multi-receipt merge, and strict quantile raw-ingest', () => {
+  const ts = ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05'];
+  const jumpDropPayload = {
+    asin: 'B0SYNREV01',
+    keepa_trend: { ts, series: { price: [45, 45, 45, 45, 45], reviews: [2, 3, 35, 32, 36] } },
+  };
+  const parsed = parseSellerSpriteKeepaPayload(jumpDropPayload, { age_days: 45, as_of_date: STAGE4_AS_OF_DATE });
+  assert.equal(parsed.review_trajectory.has_jump_event, true);
+  assert.equal(parsed.review_trajectory.has_drop_event, true);
+  assert.equal(parsed.review_trajectory.newcomer_review_anomaly_hint, true);
+  const bigJump = parsed.review_trajectory.events.find(e => e.direction === 'jump' && e.delta === 32);
+  assert.deepEqual(
+    {
+      direction: bigJump?.direction, delta: bigJump?.delta, from_count: bigJump?.from_count, to_count: bigJump?.to_count,
+      date_from: bigJump?.date_from, date_to: bigJump?.date_to, asin: bigJump?.asin,
+    },
+    { direction: 'jump', delta: 32, from_count: 3, to_count: 35, date_from: '2026-10-02', date_to: '2026-10-03', asin: 'B0SYNREV01' },
+  );
+  const dropEv = parsed.review_trajectory.events.find(e => e.direction === 'drop' && e.delta === -3);
+  assert.equal(dropEv?.from_count, 35);
+  assert.equal(dropEv?.to_count, 32);
+  assert.equal(dropEv?.date_from, '2026-10-03');
+  assert.equal(dropEv?.date_to, '2026-10-04');
+  assert.equal(dropEv?.asin, 'B0SYNREV01');
+
+  const undatedJump = parseSellerSpriteKeepaPayload({
+    asin: 'B0SYNREV02', series: { price: [45, 45, 45], reviews: [2, 3, 35] },
+  }, { age_days: 30 });
+  assert.equal(undatedJump.review_trajectory.has_jump_event, true);
+  assert.equal(undatedJump.review_trajectory.newcomer_review_anomaly_hint, true);
+  assert.equal(undatedJump.review_trajectory.events[0].date_from, null);
+  assert.equal(undatedJump.review_trajectory.events[0].date_to, null);
+
+  const jumpOnlyPayload = {
+    asin: 'B0SYNREV03',
+    keepa_trend: { ts: ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04'], series: { price: [45, 45, 45, 45], reviews: [2, 3, 35, 36] } },
+  };
+  withTempDir('batch-a1-rev-', tmpDir => {
+    writeFileSync(join(tmpDir, 'keepa-jump-drop.json'), JSON.stringify(jumpDropPayload), 'utf8');
+    writeFileSync(join(tmpDir, 'keepa-jump-only.json'), JSON.stringify(jumpOnlyPayload), 'utf8');
+    const ingested = ingestTrialSpecification({
+      profile_revision: 59,
+      as_of_date: STAGE4_AS_OF_DATE,
+      raw_receipt_files: ['keepa-jump-drop.json', 'keepa-jump-only.json'],
+      candidates: [{
+        id: 'cand-syn-rev-jump',
+        label: 'Synthetic Review Jump Candidate',
+        newcomer_cohort: {
+          members: [
+            { asin: 'B0SYNREV01', parent_asin: 'P0SYNREV01', age_days: 45, monthly_units: 95, rating: 4.5, reviews: 36 },
+            { asin: 'B0SYNREV03', parent_asin: 'P0SYNREV03', age_days: 40, monthly_units: 80, rating: 4.6, reviews: 36 },
+          ],
+        },
+        peer_listings: [
+          { asin: 'B0SYNLEG99', title: 'Bare Legacy Peer', fulfillment: 'FBA', price_usd: 49.00, monthly_units: 120, age_days: 400, keepa_90d_steady: true },
+        ],
+      }],
+    }, r59Profile, { baseDir: tmpDir });
+    const member = ingested.batch.candidates[0].newcomer_cohort.members[0];
+    assert.equal(member.keepa_review_jump_detected, true);
+    assert.equal(member.keepa_review_drop_detected, true);
+    assert.ok(Array.isArray(member.keepa_review_anomaly_events) && member.keepa_review_anomaly_events.length === 4);
+    assert.equal(member.keepa_review_anomaly_summary?.asin, 'B0SYNREV01');
+    assert.equal(member.keepa_review_anomaly_summary?.parent_asin, 'P0SYNREV01');
+    assert.equal(member.keepa_review_anomaly_summary?.has_jump, true);
+    assert.equal(member.keepa_review_anomaly_summary?.has_drop, true);
+    assert.equal(member.keepa_review_anomaly_summary?.max_jump_delta, 32);
+    assert.equal(member.keepa_review_anomaly_summary?.max_drop_delta, -3);
+    assert.equal(member.keepa_review_anomaly_summary?.largest_jump?.delta, 32);
+    assert.equal(member.keepa_review_anomaly_summary?.largest_drop?.delta, -3);
+    assert.match(member.keepa_review_anomaly_summary?.note_zh ?? '', /\+32/);
+    assert.match(member.keepa_review_anomaly_summary?.note_zh ?? '', /-3/);
+
+    const jumpOnlyMember = ingested.batch.candidates[0].newcomer_cohort.members[1];
+    assert.equal(jumpOnlyMember.keepa_review_jump_detected, true);
+    assert.equal(jumpOnlyMember.keepa_review_drop_detected, undefined);
+    assert.equal(jumpOnlyMember.keepa_review_anomaly_summary?.has_jump, true);
+    assert.equal(jumpOnlyMember.keepa_review_anomaly_summary?.has_drop, false);
+    assert.equal(jumpOnlyMember.keepa_review_anomaly_summary?.max_jump_delta, 32);
+    assert.equal(jumpOnlyMember.keepa_review_anomaly_summary?.max_drop_delta, 0);
+    assert.equal(jumpOnlyMember.keepa_review_anomaly_summary?.largest_drop, null);
+    assert.equal(ingested.batch.candidates[0].price_band_analysis?.mature_regular_band, null);
+
+    // Equal-ASIN multi-receipt review merge (order-invariant) & strict quantile
+    const revOnly = { asin: 'B0SYNMRG01', keepa_trend: { ts: ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04'], series: { price: [45, 45, 45, 45], reviews: [0, null, 5, 1] } } };
+    const priceOnly = makeDatedKeepaReceipt({ asin: 'B0SYNMRG01', startDate: '2026-08-30', days: 90, priceUsd: 45.00 });
+    writeFileSync(join(tmpDir, 'rev-only.json'), JSON.stringify(revOnly), 'utf8');
+    writeFileSync(join(tmpDir, 'price-only.json'), JSON.stringify(priceOnly), 'utf8');
+    const makeSpec = files => ({
+      profile_revision: 59, as_of_date: STAGE4_AS_OF_DATE, raw_receipt_files: files,
+      candidates: [{
+        id: 'cand-mrg', label: 'Multi Receipt Merge',
+        newcomer_cohort: {
+          members: [
+            { asin: 'B0SYNMRG01', parent_asin: 'P0SYNMRG01', age_days: 45, monthly_units: 80, rating: 4.5, reviews: 1, keepa_review_drop_detected: false, keepa_review_jump_detected: false, keepa_review_anomaly_events: [], keepa_review_anomaly_summary: {} },
+            { asin: 'B0SYNMRG01', parent_asin: 'P0SYNMRG01', age_days: 45, monthly_units: 80, rating: 4.5, reviews: 1, keepa_review_anomaly_events: [{ direction: 'jump', delta: 1, from_count: 0, to_count: 1, date_from: '2026-10-01', date_to: '2026-10-02', asin: 'B0SYNMRG01' }] },
+          ],
+        },
+      }],
+    });
+    const orderAB = ingestTrialSpecification(makeSpec(['rev-only.json', 'price-only.json']), r59Profile, { baseDir: tmpDir });
+    const orderBA = ingestTrialSpecification(makeSpec(['price-only.json', 'rev-only.json']), r59Profile, { baseDir: tmpDir });
+    for (const run of [orderAB, orderBA]) {
+      const m0 = run.batch.candidates[0].newcomer_cohort.members[0];
+      assert.equal(m0.keepa_review_jump_detected, true);
+      assert.equal(m0.keepa_review_drop_detected, true);
+      assert.equal(m0.keepa_review_anomaly_events.length, 2);
+      assert.equal(m0.keepa_review_anomaly_summary.max_jump_delta, 5);
+      assert.equal(m0.keepa_review_anomaly_summary.max_drop_delta, -4);
+      const m1 = run.batch.candidates[0].newcomer_cohort.members[1];
+      assert.equal(m1.keepa_review_anomaly_summary.event_count, 1);
+      assert.equal(m1.keepa_review_anomaly_summary.max_jump_delta, 1);
+    }
+
+    writeFileSync(join(tmpDir, 'search-legacy-bool.json'), JSON.stringify({
+      items: [
+        { asin: 'B0SYNLQ001', title: 'Desk Tray A', fulfillment: 'FBA', price_usd: 49.00, monthlySales: 120, age_days: 400, keepa_90d_steady: true },
+        { asin: 'B0SYNLQ002', title: 'Desk Tray B', fulfillment: 'FBA', price_usd: 59.00, monthlySales: 120, age_days: 400, keepa_90d_steady: true },
+      ],
+    }), 'utf8');
+    assert.throws(
+      () => ingestTrialSpecification({
+        profile_revision: 59, as_of_date: STAGE4_AS_OF_DATE, raw_receipt_files: ['search-legacy-bool.json'],
+        evidence: [{ id: 'ev-lq', source_type: 'sellersprite', observed_at: STAGE4_AS_OF_DATE, summary: 'Raw search' }],
+        candidates: [{
+          id: 'cand-lq-strict', label: 'Legacy Quantile Reject',
+          screening: { reference_price_usd: { value: 59.00, supported_price_range: [49.00, 59.00], unit: 'USD', matched_spec: true, evidence: ['ev-lq'] } },
+          economics: {
+            saleable_unit: '1 unit',
+            scenarios: [{
+              id: 'sc-59', label: 'Unverified 59',
+              price_anchor: { value: 59.00, unit: 'USD', matched_spec: true, fulfillment_channel: 'FBA', evidence: ['ev-lq'] },
+              cost_ledger: {
+                id: 'sc-59', saleable_unit: '1 unit', price_usd: 59.00, refund_fraction: 0.04,
+                lines: [{ id: 'procurement', amount_usd: 15, status: 'estimated', basis: 'goods' }, { id: 'domestic_freight', amount_usd: 0, status: 'not_applicable', basis: 'bare' }],
+              },
+            }],
+          },
+        }],
+      }, r59Profile, { baseDir: tmpDir }),
+      /not backed by any referenced comparable ASIN or denoised P25\/P50\/P75 quantile/i,
+    );
+  });
+});
+
+test('Per-candidate fault isolation in ingestTrialSpecification, unlogged SP-API/browser SHA tag, empty archive isolation, and avgReviews/aliased origins', () => {
+  const m7Mkt = ingestSellerSpriteMonthlyArchiveMarket({ items: [{ dataMonth: '202610', avgReviews: 312, sellers: 12 }] }, { evidence: ['ev-m7'] });
+  assert.equal(m7Mkt.top10_median_reviews, undefined);
+  assert.equal(m7Mkt.category_avg_reviews, 312);
+  const m7Origin = extractNewcomerReviewOriginBreakdown({ vineCount: 3, verified_purchase_count: 8, direct_review_count: 2 });
+  assert.deepEqual({ vine: m7Origin.vine_count, vp: m7Origin.vp_count, direct: m7Origin.direct_count }, { vine: 3, vp: 8, direct: 2 });
+
+  const m6IsoSpec = ingestTrialSpecification({
+    profile_revision: 59,
+    allow_synthetic_without_receipts: true,
+    evidence: fixture.evidence,
+    candidates: [
+      {
+        candidate: { ...structuredClone(fixture.candidates[0]), id: 'cand-m6-empty-archive' },
+        monthly_archive_market_raw: { items: [] },
+      },
+      {
+        candidate: { ...structuredClone(fixture.candidates[0]), id: 'cand-m6-healthy' },
+      },
+    ],
+  }, r59Profile);
+  assert.equal(m6IsoSpec.isolated_candidates.length, 1);
+  assert.equal(m6IsoSpec.batch.candidates[1].id, 'cand-m6-healthy');
+
+  withTempDir('raw-ingest-iso-', dir => {
+    const dbPath = join(dir, 'selection.sqlite');
+    const store = openSelectionStore(dbPath);
+    const goodCand = structuredClone(fixture.candidates[0]);
+    goodCand.id = 'form-good-sibling';
+    goodCand.screening.reference_price_usd.target_variant_asin = 'B000000099';
+    goodCand.economics.scenarios[0].quote_id = 'q1688-good-1';
+    const expiredCand = structuredClone(fixture.candidates[0]);
+    expiredCand.id = 'form-expired-sibling';
+    expiredCand.screening.reference_price_usd.target_variant_asin = 'B000000099';
+    expiredCand.economics.scenarios[0].quote_id = 'q1688-expired-1';
+
+    const expSc = expiredCand.economics.scenarios[0];
+    const expProcUsd = expSc.cost_ledger.lines.find(l => l.id === 'procurement').amount_usd;
+    const expDomUsd = expSc.cost_ledger.lines.find(l => l.id === 'domestic_freight').amount_usd;
+    const expUnitCny = Number((expProcUsd * 7.2).toFixed(4));
+    const expDomTotalCny = Number((expDomUsd * 7.2 * 100).toFixed(4));
+    const uiOk = { logged_in: true, viewport_width_px: 1440, selected_sku_row_visible: true, settlement_bar_visible: true, applied_quantity_confirmed: true };
+
+    try {
+      store.upsertCandidateForm({
+        form_id: 'form-good-sibling',
+        product_family_key: 'form-good-sibling',
+        label: 'Good Sibling',
+        buyer_task: 'Organize desk',
+        saleable_set_composition: [{ component_id: 'item', qty_per_saleable_set: 1 }],
+      });
+      store.upsertCandidateForm({
+        form_id: 'form-expired-sibling',
+        product_family_key: 'form-expired-sibling',
+        label: 'Expired Sibling',
+        buyer_task: 'Organize desk',
+        saleable_set_composition: [{ component_id: 'item', qty_per_saleable_set: 1 }],
+      });
+      store.recordSourcingQuote1688({
+        quote_id: 'q1688-good-1',
+        form_id: 'form-good-sibling',
+        spec_version: 1,
+        observed_at: '2026-11-20T10:00:00Z',
+        expires_at: '2026-12-31',
+        redacted_destination: '广东深圳',
+        raw_readback_ref: 'ev-good-1',
+        goods_first_order_promotion: false,
+        freight_first_order_promotion: false,
+        fx_cny_per_usd: 7.2,
+        sku_lines: [{ component_id: 'item', offer_id: 'off-good', sku_id: 'sku-good', pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 10, ordered_qty: 100, unit_price_cny: expUnitCny, regular_goods_promo_false: true }],
+        goods_cny_total: Number((expUnitCny * 100).toFixed(4)),
+        domestic_freight_cny_total: expDomTotalCny,
+        ui_readback: uiOk,
+      });
+      store.recordSourcingQuote1688({
+        quote_id: 'q1688-expired-1',
+        form_id: 'form-expired-sibling',
+        spec_version: 1,
+        observed_at: '2026-10-01T10:00:00Z',
+        expires_at: '2026-10-15',
+        redacted_destination: '广东深圳',
+        raw_readback_ref: 'ev-exp-1',
+        goods_first_order_promotion: false,
+        freight_first_order_promotion: false,
+        fx_cny_per_usd: 7.2,
+        sku_lines: [{ component_id: 'item', offer_id: 'off-exp', sku_id: 'sku-exp', pack_multiple: 1, qty_per_saleable_set: 1, moq_qty: 10, ordered_qty: 100, unit_price_cny: expUnitCny, regular_goods_promo_false: true }],
+        goods_cny_total: Number((expUnitCny * 100).toFixed(4)),
+        domestic_freight_cny_total: expDomTotalCny,
+        ui_readback: uiOk,
+      });
+    } finally {
+      store.close();
+    }
+
+    const browserReceiptPath = join(dir, 'sp-api-or-browser-receipt.json');
+    const goodRefPrice = goodCand.screening.reference_price_usd.value;
+    writeFileSync(browserReceiptPath, JSON.stringify({
+      asin: 'B000000099',
+      price: goodRefPrice,
+      items: [{ asin: 'B000000099', price: goodRefPrice, monthlySales: 180 }],
+    }, null, 2), 'utf8');
+
+    const ingestOut = ingestTrialSpecification({
+      profile_revision: 59,
+      allow_synthetic_fixture_ids: true,
+      as_of_date: '2026-11-24',
+      raw_receipt_files: [browserReceiptPath],
+      candidates: [
+        { candidate: goodCand, raw_receipt_files: [browserReceiptPath] },
+        { candidate: expiredCand, raw_receipt_files: [browserReceiptPath] },
+      ],
+    }, r59Profile, {
+      baseDir: dir,
+      ledgerDbPath: dbPath,
+    });
+    assert.equal(ingestOut.ledger_provenance_verified, false);
+    assert.equal(ingestOut.isolated_candidates.length, 1);
+    assert.equal(ingestOut.isolated_candidates[0].candidate_id, 'form-expired-sibling');
+    const scoredGood = ingestOut.scored.candidates.find(c => c.candidate_id === 'form-good-sibling');
+    const scoredExp = ingestOut.scored.candidates.find(c => c.candidate_id === 'form-expired-sibling');
+    assert.equal(scoredGood.qualification.counts_toward_target, true);
+    assert.equal(scoredExp.qualification.counts_toward_target, false);
+    assert.equal(scoredExp.queue, 'pending');
+  });
 });

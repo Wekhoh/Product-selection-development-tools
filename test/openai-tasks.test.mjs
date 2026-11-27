@@ -17,11 +17,23 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { assertNoRawPii, containsSecretToken, detectRawPii } from '../src/contracts.mjs';
-import { sha256Hex } from '../src/store.mjs';
+import { assertNoRawPii, containsSecretToken, detectRawPii, sanitizeDiagnosticText } from '../src/contracts.mjs';
+import { openSelectionStore, sha256Hex } from '../src/store.mjs';
+import { replayBatchIntoStore } from '../src/history-import.mjs';
+import { resolveStage1QualitativeJudgments } from '../src/raw-ingest.mjs';
+import {
+  attachCandidateEvidenceReview,
+  doesReviewPacketMatchDbFormSpec,
+  runOptionalGate4EvidenceReview,
+  runPhase2Batch,
+} from '../src/pipeline.mjs';
+import { estimateGate1A2027 } from '../src/fba-calculator.mjs';
+import { scoreBatch } from '../src/scoring.mjs';
+import { renderReport } from '../src/report.mjs';
 import {
   EVIDENCE_REVIEW_JSON_SCHEMA,
   SCHEMA_VERSION,
+  buildEvidenceReviewPrompt,
   buildEvidenceReviewResponseRequest,
   freezeEvidenceReviewPacket,
   isEvidenceReviewStale,
@@ -33,6 +45,7 @@ import {
   resolveCodexCommand,
   runCodexEvidenceReview,
   runCodexExecJson,
+  runCodexExecMarkdown,
   stageAndHashReviewAttachments,
   validateImageAttachments,
   validateJsonAgainstStrictSchema,
@@ -50,6 +63,7 @@ import {
   VISUAL_CLUSTER_CHOICES,
   build1688VisionInspectRequest,
   build1688VisionRequest,
+  buildMarketObservationRequest,
   buildReviewJudgeRequest,
   buildRightsPreScreenRequest,
   buildSocialBridgeRequest,
@@ -62,13 +76,22 @@ import {
   getStage1DecisionQuestionIds,
   parse1688VisionInspectResult,
   parse1688VisionResult,
+  parseMarketObservationResult,
   parseReviewJudgeResult,
   parseRightsPreScreenResult,
   parseSocialBridgeResult,
   parseSpecMatcherResult,
   parseStage1DecisionsResponses,
   parseWorkflowTaskResult,
+  resolveRelevantRegulatoryFrameworks,
 } from '../src/openai/workflow-tasks.mjs';
+import {
+  DEFAULT_R59_UI_READBACK,
+  loadR59Profile,
+  loadSyntheticBatch,
+  runCliMem,
+  withTempDirAsync as _withTempDirAsync,
+} from './helpers/test-fixtures.mjs';
 
 const SYNTH_PNG_DATA_URI =
   'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -82,22 +105,7 @@ const SYNTH_WEBP_BYTES = Buffer.concat([
   Buffer.from('VP8 ', 'ascii'),
 ]);
 
-async function withTempDirAsync(fn) {
-  const dir = mkdtempSync(join(tmpdir(), 'openai-tasks-test-'));
-  let primaryErr = null;
-  try {
-    return await fn(dir);
-  } catch (err) {
-    primaryErr = err;
-    throw err;
-  } finally {
-    try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 4, retryDelay: 25 });
-    } catch (rmErr) {
-      if (!primaryErr) throw rmErr;
-    }
-  }
-}
+const withTempDirAsync = fn => _withTempDirAsync('openai-tasks-test-', fn);
 
 function assertStrictAndDeepFrozenSchema(node, path = 'root') {
   assert.ok(node && typeof node === 'object', `${path} must be an object`);
@@ -3553,4 +3561,939 @@ test('Owned source files pass strict raw-PII and secret-token scans', () => {
     assert.equal(detectRawPii(srcText), null, `${relPath} must have detectRawPii === null`);
     assert.equal(containsSecretToken(srcText), false, `${relPath} must have containsSecretToken === false`);
   }
+});
+
+test('R3 closure (openai-tasks): pre-score Terra rights veto, Luna soft-avoid split, rights citation/scope/expiry guards, #17 curly-quote/SKU, MarketObservationJudge, M4 replay/redteam-review, M5 legacy tool cache, and codex config inheritance', async () => {
+  const r59Profile = loadR59Profile();
+  const synthBatch = loadSyntheticBatch();
+
+  // 1) Pre-score Terra rights_prescreen hook executes BEFORE scoreBatch so proven patent conflict vetoes card!
+  const candPreTerra = structuredClone(synthBatch.candidates[0]);
+  const formIdPre = candPreTerra.id;
+  const primScen = candPreTerra.economics.scenarios[0];
+  const pricePre = primScen.cost_ledger.price_usd;
+  const fxPre = 7.0;
+  const procUsd = primScen.cost_ledger.lines.find(l => l.id === 'procurement').amount_usd;
+  const domUsd = primScen.cost_ledger.lines.find(l => l.id === 'domestic_freight').amount_usd;
+  const hhUsd = primScen.cost_ledger.lines.find(l => l.id === 'headhaul').amount_usd;
+  const unitGoodsPre = Math.round(procUsd * fxPre * 10000) / 10000;
+  const totalDomPre = Math.round(domUsd * fxPre * 100 * 100) / 100;
+  const salesWinPre = { from: '2027-02-01', through: '2027-10-14' };
+  const storageWinPre = { from: '2027-02-01', through: '2027-09-30' };
+  const inboundWinPre = { from: '2027-01-15', through: '2027-10-14' };
+  const g1aSpecPre = {
+    id: primScen.id,
+    pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
+    price_usd: pricePre, fx_cny_per_usd: fxPre, refund_fraction: 0.02, physical_return_fraction: 0.02,
+    fee_category: 'Home and Kitchen',
+    referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.0, minimum_referral_usd: 0.30 },
+    headhaul_usd: hhUsd, collection_rate: 0.006,
+    sales_window: salesWinPre, storage_window: storageWinPre, inbound_window: inboundWinPre,
+    is_apparel: false, is_dangerous_goods: false, is_sipp: false,
+  };
+  const estPre = estimateGate1A2027(g1aSpecPre);
+  const store = openSelectionStore(':memory:');
+  try {
+    const validRightsConflict = {
+      schema_version: 1,
+      contract: 'RightsAndCompliancePreScreener',
+      specific_design_rights: {
+        status: 'proven_conflict',
+        summary: 'Matched active ornamental design patent on identical housing.',
+        citations: [{ title: 'USPTO Design Patent', url: 'https://ppubs.uspto.gov/pubwebapp/', identifier: 'USD1000001S1', applies_to_target_spec: true, legal_status: 'active' }],
+      },
+      trademark_conflicts: { status: 'no_public_hit_observed', summary: 'Checked.', citations: [] },
+      applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['CPSC'], summary: 'Checked.', citations: [] },
+      trade_duty_alerts: { status: 'unknown', summary: 'Deferred.', citations: [] },
+      disclaimer: 'Initial public pre-screen only; this is not final legal clearance or legal advice.',
+    };
+    const batchRes = await runPhase2Batch(store, {
+      profile: r59Profile,
+      as_of_date: '2026-11-24',
+      openai_hooks: {
+        rights_prescreen: {
+          enabled: true,
+          responseExecutor: async () => ({
+            status: 'completed', usable: true, content_status: 'usable',
+            attempt_id: 'att-pre-terra-1', output_text: JSON.stringify(validRightsConflict),
+          }),
+        },
+      },
+      items: [{
+        form: { form_id: formIdPre, label: candPreTerra.label, buyer_task: 'Organize desktop items', saleable_set_composition: { components: [{ component_id: 'main', qty_per_saleable_set: 1 }] } },
+        leads: [{ lead_id: 'lead-pre-terra-1', source_channel: 'reddit', source_ref: 'https://example.com/r/synth/1', phrase_or_title: 'desktop organizer', observed_at: '2026-11-24', disposition: 'product' }],
+        gate1a_scenarios: [g1aSpecPre],
+        sourcing_executor: async () => ({
+          status: 'quoted',
+          quote: {
+            quote_id: 'q-pre-terra-1', factory_id: 'fac-pre-1', observed_at: '2026-11-24',
+            redacted_destination: '广东深圳', raw_readback_ref: 'ref-pre-1',
+            goods_first_order_promotion: false, freight_first_order_promotion: false,
+            ui_readback: DEFAULT_R59_UI_READBACK,
+            sku_lines: [{ offer_id: 'off-1', sku_id: 'main', component_id: 'main', qty_per_saleable_set: 1, pack_multiple: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: unitGoodsPre, regular_goods_promo_false: true }],
+            goods_cny_total: Math.round(unitGoodsPre * 100 * 100) / 100,
+            domestic_freight_cny_total: totalDomPre,
+          },
+        }),
+        early_screen_builder: () => ([{
+          profile_revision: 59, id: primScen.id, saleable_unit: '1 complete set',
+          price_usd: pricePre, fx_cny_per_usd: fxPre, order_units: 100,
+          goods_cny_per_unit: unitGoodsPre, domestic_freight_cny_per_unit: totalDomPre / 100,
+          first_order_promotion: false, goods_first_order_promotion: false,
+          headhaul: { usd_per_unit: hhUsd, bond_included: true },
+          refund_fraction: 0.02, physical_return_fraction: 0.02, return_threshold: 0.081, returns_processing_usd: 0,
+          is_apparel_or_shoes: false,
+          referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.0, minimum_referral_usd: 0.30 },
+          fulfillment_usd: estPre.components.fulfillment.total_usd,
+          placement_usd: estPre.components.placement.selected_usd,
+          storage: { cubic_feet_per_unit: (10 * 6 * 2) / 1728, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+          operating_period: 'off_peak', operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+          fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'pack-1', sales: salesWinPre, storage: storageWinPre, inbound: inboundWinPre },
+          collection_rate: 0.006, other_applicable_usd: 0, specific_rights_conflict: 'unknown', strong_date_dependency: false,
+        }]),
+        rights_prescreen_input: { form_id: formIdPre, label: candPreTerra.label, buyer_task: 'Organize desktop items' },
+        deep_research_executor: async () => {
+          const aligned = structuredClone(candPreTerra);
+          const led = aligned.economics.scenarios[0].cost_ledger;
+          led.fee_context.sales = salesWinPre;
+          led.fee_context.storage = storageWinPre;
+          led.fee_context.inbound = inboundWinPre;
+          for (const l of led.lines) {
+            if (l.id === 'procurement' || l.id === 'domestic_freight') { l.fx_cny_per_usd = fxPre; l.order_units = 100; }
+            if (l.id === 'fulfillment') l.amount_usd = estPre.components.fulfillment.total_usd;
+            if (l.id === 'placement' || l.id === 'inbound_placement') l.amount_usd = estPre.components.placement.selected_usd;
+            if (l.id === 'storage') l.amount_usd = Math.max(l.amount_usd, estPre.components.storage.per_unit_usd);
+          }
+          return { batch: { ...structuredClone(synthBatch), profile_revision: 59, candidates: [aligned] } };
+        },
+      }],
+    });
+    assert.equal(batchRes.evaluations[0].queue_bucket, 'excluded', 'Terra rights_prescreen ran before scoreBatch and vetoed proven conflict');
+  } finally {
+    store.close();
+  }
+
+  // 2) Luna adult footwear split & rights citations / #17 / MarketObservationJudge guards
+  const lunaReqs = buildStage1DecisionsRequests({
+    candidates: [{ candidate_id: 'ADULT-SHOE-1', title: "Men's Leather Chelsea Boots Size 10", department: 'Clothing, Shoes & Jewelry', price_usd: 69.99 }],
+  });
+  assert.match(lunaReqs[0].questions[0].instructions, /hard-prohibited statutory <=12y/i);
+  const lunaParsed = parseStage1DecisionsResponses(
+    [{ candidate_id: 'ADULT-SHOE-1', title: "Men's Leather Chelsea Boots Size 10", department: 'Clothing, Shoes & Jewelry', price_usd: 69.99 }],
+    [{ status: 'completed', usable: true, content_status: 'usable', decisions: [
+      { id: 'gate0_prohibited_ADULT-SHOE-1', type: 'predicate', probability: 0.85 },
+      { id: 'visual_peer_ADULT-SHOE-1', type: 'choice', value: 'exact_peer' },
+    ] }],
+  );
+  assert.equal(lunaParsed.items[0].gate0_status, 'allowed');
+  assert.equal(lunaParsed.items[0].triage_disposition, 'amber_manual_review', 'Adult footwear soft-avoid category is routed to amber_manual_review, never auto-excluded');
+
+  assert.throws(
+    () => parseRightsPreScreenResult({
+      schema_version: 1, contract: 'RightsAndCompliancePreScreener',
+      specific_design_rights: {
+        status: 'proven_conflict', summary: 'Found an expired design patent.',
+        citations: [{ title: 'Expired Patent', url: 'https://ppubs.uspto.gov/pubwebapp/', identifier: 'USD400000S', applies_to_target_spec: true, legal_status: 'expired' }],
+      },
+      trademark_conflicts: { status: 'no_public_hit_observed', summary: 'Checked.', citations: [] },
+      applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['CPSC'], summary: 'Checked.', citations: [] },
+      trade_duty_alerts: { status: 'unknown', summary: 'Deferred.', citations: [] },
+      disclaimer: 'Initial public pre-screen only; this is not final legal clearance or legal advice.',
+    }),
+    /expired|proven_conflict/i,
+  );
+  const cnPublicFail = resolveStage1QualitativeJudgments({
+    rights_prescreen: {
+      specific_design_rights: { status: 'no_public_hit_observed', summary: 'Checked.' },
+      applicable_public_requirements: { status: 'needs_verification', frameworks_checked: ['CPSC'], summary: 'CPSC 登记库查询未完成，暂时不可用。' },
+    },
+  });
+  assert.equal(cnPublicFail.judgments.applicable_public_requirements.prescreen_completed, false);
+
+  const parsedRev = parseReviewJudgeResult({
+    schema_version: 1, contract: 'PainPointAndRubricJudge', item_id: 'feasible_light_differentiation',
+    status: 'supported', support_level: 'strong', reason: 'Upgrade thin latch.', evidence_refs: ['rev-1'], counter_evidence: [],
+    review_citations: [{ review_id: 'rev-1', sku_verified: true, variant_sku: 'SKU-2PC-WALNUT', excerpt: "it doesn't latch cleanly after repeated use" }],
+  }, {
+    item_id: 'feasible_light_differentiation', target_variant_sku: 'SKU-2PC-WALNUT',
+    reviews: [{ review_id: 'rev-1', sku_verified: true, variant_sku: 'SKU-2PC-WALNUT', text: 'Buyer note: it doesn\u2019t   latch\ncleanly after repeated use!' }],
+  });
+  assert.equal(parsedRev.target_variant_sku, 'SKU-2PC-WALNUT');
+
+  assert.throws(
+    () => parseMarketObservationResult({
+      schema_version: 1, contract: 'MarketObservationJudge', form_id: 'tray', market_summary_zh: '测试券篡改拦截。',
+      peer_observations: [{
+        asin: 'B0MKTSTR01',
+        mandatory_facts: { observed_price_usd: 39.99, keepa_high_usd: null, keepa_low_usd: null, review_count: null, keepa_90d_trend: null, coupon_status: '40% OFF', review_curve_change: null, key_appearance_and_dims: null },
+        qualitative_judgment: { bucket: 'temporary_promo', include_in_primary_band: false, keep_in_observation_bar: true, reason_zh: '短期促销。' },
+      }],
+    }, { form_id: 'tray', peers: [{ asin: 'B0MKTSTR01', price_usd: 39.99, coupon_text: '5% OFF' }] }),
+    /distorted coupon_status percentage/i,
+  );
+  assert.throws(
+    () => parseMarketObservationResult({
+      schema_version: 1, contract: 'MarketObservationJudge', form_id: 'tray', market_summary_zh: '测试无尺寸编造拦截。',
+      peer_observations: [{
+        asin: 'B0MKTDIM01',
+        mandatory_facts: { observed_price_usd: 39.99, keepa_high_usd: null, keepa_low_usd: null, review_count: null, keepa_90d_trend: null, coupon_status: null, review_curve_change: null, key_appearance_and_dims: '18x12x4 in' },
+        qualitative_judgment: { bucket: 'primary_comparable', include_in_primary_band: true, keep_in_observation_bar: false, reason_zh: '同款。' },
+      }],
+    }, { form_id: 'tray', peers: [{ asin: 'B0MKTDIM01', price_usd: 39.99, title: 'Reversible modular desk tray' }] }),
+    /fabricated numeric dimensions/i,
+  );
+
+  assert.deepEqual(
+    RIGHTS_PRESCREEN_JSON_SCHEMA.properties.specific_design_rights.properties.citations.items.required,
+    ['title', 'url', 'identifier', 'applies_to_target_spec', 'legal_status'],
+  );
+  const j429 = resolveStage1QualitativeJudgments({
+    rights_prescreen: {
+      specific_design_rights: { status: 'needs_verification', summary: '公开登记库返回 429，请稍后重试。', citations: [] },
+      applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['CPSC'], summary: 'Checked.' },
+    },
+  });
+  assert.equal(j429.judgments.specific_design_rights.prescreen_completed, false);
+  const jTmFail = resolveStage1QualitativeJudgments({
+    rights_prescreen: {
+      specific_design_rights: { status: 'no_public_hit_observed', summary: 'Checked.' },
+      trademark_conflicts: { status: 'needs_verification', summary: '公开登记库连接失败，未能查验。', citations: [] },
+      applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['CPSC'], summary: 'Checked.' },
+    },
+  });
+  assert.equal(jTmFail.judgments.specific_design_rights.anchor, null);
+  assert.equal(jTmFail.judgments.specific_design_rights.prescreen_completed, false);
+  assert.throws(() => parseRightsPreScreenResult({
+    schema_version: 1, contract: 'RightsAndCompliancePreScreener',
+    specific_design_rights: {
+      status: 'proven_conflict', summary: '唯一命中的专利登记页标记 expired。',
+      citations: [{ title: 'USPTO Patent', url: 'https://ppubs.uspto.gov/pubwebapp/', identifier: 'USD400001S', applies_to_target_spec: null, legal_status: null }],
+    },
+    trademark_conflicts: { status: 'no_public_hit_observed', summary: 'Checked.', citations: [] },
+    applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['CPSC'], summary: 'Checked.', citations: [] },
+    trade_duty_alerts: { status: 'unknown', summary: 'Deferred.', citations: [] },
+    disclaimer: 'Initial public pre-screen only; this is not final legal clearance or legal advice.',
+  }), /expired|proven_conflict/i);
+
+  const parsedTwoPc = parseReviewJudgeResult({
+    schema_version: 1, contract: 'PainPointAndRubricJudge', item_id: 'feasible_light_differentiation',
+    status: 'supported', support_level: 'strong', reason: 'Locking washer fix.', evidence_refs: ['rev-2pc'], counter_evidence: [],
+    review_citations: [{ review_id: 'rev-2pc', sku_verified: true, variant_sku: 'TRAY-2PC-RED', excerpt: 'fastener loosens' }],
+  }, {
+    item_id: 'feasible_light_differentiation', target_variant_sku: 'TRAY-2PC-RED',
+    reviews: [{ review_id: 'rev-2pc', sku_verified: true, variant_sku: 'TRAY-2PC-RED', text: 'The fastener loosens after use.' }],
+  });
+  const crossSkuQual = resolveStage1QualitativeJudgments({ default_target_variant_sku: 'TRAY-1PC-RED', review_judge: parsedTwoPc });
+  assert.equal(crossSkuQual.judgments.feasible_light_differentiation.anchor, null);
+
+  const baseCit = { title: 'Reg', url: 'https://example.org/reg', identifier: 'id-0', applies_to_target_spec: null, legal_status: null };
+  const actCit = { ...baseCit, identifier: 'id-act', applies_to_target_spec: true, legal_status: 'active' };
+  const expCit = { ...baseCit, identifier: 'id-exp', applies_to_target_spec: false, legal_status: 'expired' };
+  const cleanSec = { status: 'no_public_hit_observed', summary: 'Searched.', citations: [baseCit] };
+  const parsedMixedTm = parseRightsPreScreenResult({
+    schema_version: 1, contract: 'RightsAndCompliancePreScreener',
+    specific_design_rights: cleanSec,
+    trademark_conflicts: { status: 'proven_conflict', summary: 'An earlier entry expired. The other registration is active and matches target.', citations: [actCit, expCit] },
+    applicable_public_requirements: { ...cleanSec, frameworks_checked: ['Other'] },
+    trade_duty_alerts: { status: 'unknown', summary: 'N/A', citations: [] },
+    disclaimer: 'Not legal advice.',
+  });
+  const jMixedTm = resolveStage1QualitativeJudgments({ evidence: ['ev-1'], rights_prescreen: parsedMixedTm });
+  assert.equal(jMixedTm.judgments.specific_design_rights.anchor, 0);
+  assert.equal(jMixedTm.judgments.specific_design_rights.proven_conflict, true);
+
+  const parsedUnknownTm = parseRightsPreScreenResult({
+    schema_version: 1, contract: 'RightsAndCompliancePreScreener',
+    specific_design_rights: cleanSec,
+    trademark_conflicts: { status: 'unknown', summary: '本次尚未检索商标登记记录，商标状态未知。', citations: [] },
+    applicable_public_requirements: { ...cleanSec, frameworks_checked: ['Other'] },
+    trade_duty_alerts: { status: 'unknown', summary: 'N/A', citations: [] },
+    disclaimer: 'Not legal advice.',
+  });
+  const jUnknownTm = resolveStage1QualitativeJudgments({ evidence: ['ev-1'], rights_prescreen: parsedUnknownTm });
+  assert.equal(jUnknownTm.judgments.specific_design_rights.anchor, null);
+  assert.equal(jUnknownTm.judgments.specific_design_rights.prescreen_completed, false);
+
+  assert.throws(
+    () => parseRightsPreScreenResult({
+      schema_version: 1, contract: 'RightsAndCompliancePreScreener',
+      specific_design_rights: cleanSec,
+      trademark_conflicts: { status: 'proven_conflict', summary: 'A similar mark appears in the registration index. Goods coverage and current legal status require a further register search.', citations: [baseCit] },
+      applicable_public_requirements: { ...cleanSec, frameworks_checked: ['Other'] },
+      trade_duty_alerts: { status: 'unknown', summary: 'N/A', citations: [] },
+      disclaimer: 'Not legal advice.',
+    }),
+    /lack positive active target-spec confirmation/i,
+  );
+  const jScopeIncomplete = resolveStage1QualitativeJudgments({
+    evidence: ['ev-1'],
+    rights_prescreen: parseRightsPreScreenResult({
+      schema_version: 1, contract: 'RightsAndCompliancePreScreener',
+      specific_design_rights: cleanSec,
+      trademark_conflicts: { status: 'needs_verification', summary: '只查到近似商标的登记索引。公开注册商品服务清单未返回，是否覆盖本款须补查官方登记页。', citations: [{ ...actCit, applies_to_target_spec: null }] },
+      applicable_public_requirements: { ...cleanSec, frameworks_checked: ['Other'] },
+      trade_duty_alerts: { status: 'unknown', summary: 'N/A', citations: [] },
+      disclaimer: 'Not legal advice.',
+    }),
+  });
+  assert.equal(jScopeIncomplete.judgments.specific_design_rights.prescreen_completed, false);
+
+  await withTempDirAsync(async dir => {
+    const marker = 'fictional_refresh_secret_987654';
+    const receiptPath = join(dir, 'codex-inherit-receipt.json');
+    let observedArgs = null;
+    const mdRes = await runCodexExecMarkdown({
+      prompt: 'Inspect synthetic fixture.',
+      testMode: true,
+      cwd: dir,
+      receiptPath,
+      mockExecutor: async ({ args, outputFilePath }) => {
+        observedArgs = args;
+        writeFileSync(outputFilePath, 'Clean review output.\n', 'utf8');
+        return { exitCode: 0, stderr: JSON.stringify({ refresh_token: marker }) };
+      },
+    });
+    assert.equal(observedArgs.includes('-m'), false, 'Omitting model inherits ~/.codex/config.toml without -m');
+    assert.equal(observedArgs.includes('model_reasoning_effort="max"'), true, 'Omitting reasoningEffort enforces approved default max');
+    assert.equal(mdRes.model, null);
+
+    let explicitNullEffortArgs = null;
+    await runCodexExecMarkdown({
+      prompt: 'Inspect synthetic fixture with explicit null effort.',
+      reasoningEffort: null,
+      testMode: true,
+      cwd: dir,
+      receiptPath: join(dir, 'markdown-null-effort-receipt.json'),
+      mockExecutor: async ({ args, outputFilePath }) => {
+        explicitNullEffortArgs = args;
+        writeFileSync(outputFilePath, 'Clean review output.\n', 'utf8');
+        return { exitCode: 0 };
+      },
+    });
+    assert.equal(explicitNullEffortArgs.some(a => a.startsWith('model_reasoning_effort=')), false, 'Explicit reasoningEffort: null inherits ~/.codex/config.toml');
+    const savedRec = JSON.parse(readFileSync(receiptPath, 'utf8'));
+    assert.equal(String(savedRec.stderr_scrubbed).includes(marker), false, 'JSON refresh_token in stderr_scrubbed is scrubbed');
+    assert.equal(containsSecretToken(JSON.stringify({ refresh_token: marker })), true);
+    assert.equal(sanitizeDiagnosticText(JSON.stringify({ refresh_token: marker })).includes(marker), false);
+
+    // Gate-4 omitted model inheritance
+    let gate4Args = null;
+    const pktInherit = {
+      schema_version: 'evidence-review-draft-v1',
+      review_id: 'rev-inherit-01',
+      execution_policy_ref: 'local-policy-only',
+      candidate: { subject_id: synthBatch.candidates[0].id, intended_use: 'Store tools', saleable_spec: { pcs: 2, material: 'steel' }, unknown_fields: [] },
+      subjects: [{ subject_id: 'box', spec: { pcs: 2 } }],
+      criteria: { criteria_version: '1.0', rules: [{ criterion_id: 'fit', description: 'Fit', required: true }] },
+      questions: [{ question_id: 'q1', question: 'Fit?', subject_ids: ['box'], criterion_ids: ['fit'] }],
+      evidence: [{ evidence_id: 'e1', subject_ids: ['box'], summary: 'Catalog control.', kind: 'fact', source_ref: 'r1', observed_at: '2026-11-24', window: '30d', grain: 'sku', units: 'pc', limitations: null }],
+    };
+    const frozenInh = freezeEvidenceReviewPacket(pktInherit);
+    const recDirInh = join(dir, 'inh-receipts');
+    const g4Out = await runOptionalGate4EvidenceReview(pktInherit, {
+      enabled: true, testMode: true, receiptDir: recDirInh,
+      candidateId: synthBatch.candidates[0].id, candidateQualification: { counts_toward_target: true },
+      mockExecutor: async ({ args, outputFilePath }) => {
+        gate4Args = args;
+        writeFileSync(outputFilePath, JSON.stringify({
+          schema_version: frozenInh.schema_version, review_id: frozenInh.review_id, packet_sha256: frozenInh.packet_sha256,
+          subjects: [{ subject_id: 'box', disposition: 'included', criterion_ids: ['fit'], evidence_ids: ['e1'], reason: 'Clean.' }],
+          answers: [{ question_id: 'q1', status: 'answered', basis: 'fact', evidence_ids: ['e1'], explanation: 'Clean.' }],
+          contradictions: [], gaps: [], conclusion: 'Verified.',
+        }), 'utf8');
+        return { exitCode: 0 };
+      },
+    });
+    assert.equal(gate4Args.includes('-m'), false);
+    assert.equal(gate4Args.includes('model_reasoning_effort="max"'), true);
+    assert.equal(g4Out.model, null);
+    assert.equal(verifySavedCodexReceipt(g4Out, { receiptStoreDir: recDirInh, allowTestDouble: true }).model, null);
+
+    // M4: Historical 1-piece replay & stale packet skip
+    const dbPath = join(dir, 'm4.sqlite');
+    const stM4 = openSelectionStore(dbPath);
+    try {
+      stM4.upsertCandidateForm({
+        form_id: 'form-m4-box', label: 'Two-piece storage box', buyer_task: 'Store items',
+        saleable_set_composition: [{ component_id: 'box', qty_per_saleable_set: 2 }],
+      });
+      stM4.updateFormLifecycle('form-m4-box', 'evaluated');
+      const oldCand = structuredClone(synthBatch.candidates[0]);
+      oldCand.id = 'form-m4-box';
+      oldCand.economics.scenarios[0].saleable_unit = 'One-piece storage box';
+      replayBatchIntoStore(stM4, { batch: { ...structuredClone(synthBatch), profile_revision: 59, candidates: [oldCand] }, profile: r59Profile });
+      const evals = stM4.getEvaluationsForForm('form-m4-box');
+      const currentDbForm = stM4.getCandidateForm('form-m4-box');
+      const parsedRec = JSON.parse(evals[0].receipt_json);
+      assert.notEqual(parsedRec.form_spec_sha256, currentDbForm.spec_sha256, 'Historical 1-piece replay must not stamp current 2-piece spec_sha256');
+    } finally {
+      stM4.close();
+    }
+
+    const stalePktPath = join(dir, 'stale-pkt.json');
+    const staleOutPath = join(dir, 'stale-out.json');
+    writeFileSync(stalePktPath, JSON.stringify({
+      schema_version: 'evidence-review-draft-v1', review_id: 'rev-m4-stale', execution_policy_ref: 'local-policy-only',
+      candidate: { subject_id: 'form-m4-box', intended_use: 'Store items', saleable_spec: { pcs: 1 }, unknown_fields: [] },
+      subjects: [{ subject_id: 'box', spec: { pcs: 1 } }],
+      criteria: { criteria_version: '1.0', rules: [{ criterion_id: 'fit', description: 'Fit', required: true }] },
+      questions: [{ question_id: 'q1', question: 'Fit?', subject_ids: ['box'], criterion_ids: ['fit'] }],
+      evidence: [{ evidence_id: 'e1', subject_ids: ['box'], summary: '1pc listing', kind: 'fact', source_ref: 'r1', observed_at: '2026-11-24', window: '30d', grain: 'sku', units: 'pc', limitations: null }],
+    }), 'utf8');
+    let mockCalls = 0;
+    const rcM4 = await runCliMem(
+      ['redteam-review', '--db', dbPath, '--packet', stalePktPath, '--output', staleOutPath],
+      { codexReceiptDir: join(dir, 'receipts'), codexMockExecutor: async () => { mockCalls++; return { exitCode: 0 }; } },
+    );
+    assert.equal(rcM4.code, 0);
+    assert.equal(mockCalls, 0, 'Stale 1-piece packet against 2-piece DB form is skipped without stamping current spec_sha256');
+    assert.equal(JSON.parse(rcM4.stdout).skipped_non_qualifying, true);
+
+    // Replay idempotence, M4 component composition & saleable_unit stem, and M5 legacy amz_spapi_sp_api_execute reuse
+    const stComp = openSelectionStore(':memory:');
+    try {
+      const b59 = { ...structuredClone(synthBatch), profile_revision: 59 };
+      replayBatchIntoStore(stComp, { batch: b59, profile: r59Profile });
+      const c1 = stComp.db.prepare('SELECT COUNT(*) AS n FROM evaluations').get().n;
+      replayBatchIntoStore(stComp, { batch: b59, profile: r59Profile });
+      const c2 = stComp.db.prepare('SELECT COUNT(*) AS n FROM evaluations').get().n;
+      assert.equal(c1, c2);
+
+      const currForm = stComp.upsertCandidateForm({
+        form_id: 'f-comp-check', label: 'Two-piece organizer', buyer_task: 'Store tools', grade_or_material: 'steel',
+        saleable_set_composition: { components: [{ component_id: 'box', qty_per_saleable_set: 1 }, { component_id: 'lid', qty_per_saleable_set: 1 }] },
+      }).form;
+      assert.equal(doesReviewPacketMatchDbFormSpec({ candidate: { saleable_spec: { components: [{ component_id: 'box', qty_per_saleable_set: 1 }, { component_id: 'divider', qty_per_saleable_set: 1 }], material: 'steel' } } }, currForm).matches, false);
+      assert.equal(doesReviewPacketMatchDbFormSpec({ candidate: { saleable_specification: { pcs: 1, material: 'steel' } } }, currForm).matches, false);
+      assert.equal(doesReviewPacketMatchDbFormSpec({ candidate: { saleable_spec: 'One-piece steel organizer' } }, currForm).matches, false);
+      assert.equal(doesReviewPacketMatchDbFormSpec({ candidate: { saleable_spec: { pcs: 2, material: 'steel', saleable_unit: 'Two-piece steel set: one organizer box and one divider' } } }, currForm).matches, false);
+      assert.equal(doesReviewPacketMatchDbFormSpec({ candidate: { saleable_spec: { pcs: 2, material: 'steel', saleable_unit: 'Two-piece steel set: one organizer box and one lid' } } }, currForm).matches, true);
+      assert.equal(doesReviewPacketMatchDbFormSpec({ candidate: { saleable_specification: 'Set of three individual steel organizer boxes and lids' } }, currForm).matches, false);
+
+      const legacyParams = { method: 'GET', path: '/catalog/2022-04-01/items/B0SYNTH001' };
+      const legacyLk = sha256Hex(JSON.stringify({
+        account_scope: 'acct-synth', canonical_tool: 'amz_spapi_sp_api_execute', marketplace: 'US', mode: 'fresh_observation',
+        normalized_params: { method: 'GET', path: '/catalog/2022-04-01/items/B0SYNTH001' }, observation_cutoff_date: '2026-11-24', page_or_cursor: '', provider: 'other', tool_version: 'v1',
+      }));
+      stComp.db.prepare(`
+        INSERT INTO api_request_ledger (
+          attempt_id, logical_request_key, semantic_lock_key, account_scope,
+          provider, tool_name, canonical_tool, tool_version, marketplace, mode,
+          observation_cutoff_date, page_or_cursor, normalized_params_json,
+          status, repeat_submission_allowed, billing_status, response_payload_json,
+          created_at, updated_at, finished_at
+        ) VALUES (?, ?, ?, 'acct-synth', 'other', 'amz_spapi_sp_api_execute', 'amz_spapi_sp_api_execute', 'v1', 'US', 'fresh_observation', '2026-11-24', '', ?, 'completed', 1, 'known', ?, '2026-11-24T00:00:00Z', '2026-11-24T00:00:00Z', '2026-11-24T00:00:00Z')
+      `).run('att-legacy-sp', legacyLk, sha256Hex('sem-legacy'), JSON.stringify(legacyParams), JSON.stringify({ asin: 'B0SYNTH001' }));
+      const newLookup = stComp.reserveRequestAttempt({
+        account_scope: 'acct-synth', provider: 'sp_api', tool_name: 'sp_api_execute', observation_cutoff_date: '2026-11-24', params: legacyParams,
+      });
+      assert.equal(newLookup.reused, true);
+    } finally {
+      stComp.close();
+    }
+  });
+});
+
+test('Step 4 Sign-Off (#13 & R2-B): Codex startup banner + 6.8KB echoed prompt ultrafast fallback and thinking/tokens guard', async () => {
+  await withTempDirAsync(async dir => {
+    let attempts = 0;
+    const tierSeen = [];
+    const fallbackOut = await runCodexExecMarkdown({
+      prompt: 'Synthetic fallback test.',
+      serviceTier: 'ultrafast',
+      testMode: true,
+      cwd: dir,
+      receiptDir: join(dir, 'codex-fb-receipts'),
+      mockExecutor: async ({ args, outputFilePath }) => {
+        attempts += 1;
+        const tierArg = args.find(a => a.startsWith('service_tier='));
+        tierSeen.push(tierArg ?? 'default');
+        if (attempts === 1) {
+          return {
+            exitCode: 1,
+            stderr: [
+              'OpenAI Codex v0.62.0 (research preview)',
+              '--------',
+              'workdir: .',
+              'model: gpt-6.2-astra',
+              'session id: 019a0500-0502-7000-8000-000000000503',
+              'ERROR: service_tier "ultrafast" is not supported on your current plan (requires Pro-500).',
+            ].join('\n'),
+          };
+        }
+        writeFileSync(outputFilePath, 'Fallback review succeeded.\n', 'utf8');
+        return { exitCode: 0, stderr: '' };
+      },
+    });
+    assert.equal(attempts, 2, 'Startup banner with session id must not block ultrafast -> default fallback');
+    assert.equal(fallbackOut.tier_fallback_used, true);
+    assert.deepEqual(tierSeen, ['service_tier="ultrafast"', 'service_tier="default"']);
+
+    let genAttempts = 0;
+    await assert.rejects(async () => {
+      await runCodexExecMarkdown({
+        prompt: 'Synthetic post-generation error.',
+        serviceTier: 'ultrafast',
+        testMode: true,
+        cwd: dir,
+        receiptDir: join(dir, 'codex-noblock-receipts'),
+        mockExecutor: async () => {
+          genAttempts += 1;
+          return {
+            exitCode: 1,
+            stderr: 'session id: 019a0000-0000-7000-8000-000000000002\nthinking\nERROR: service_tier "ultrafast" is not supported.',
+          };
+        },
+      });
+    });
+    assert.equal(genAttempts, 1, 'Once thinking/generation starts, retry must remain blocked');
+
+    const longEchoPrompt = `# Audit Prompt\nCheck timeout handling, HTTP 429 guards, streaming recovery, thinking budgets, and tokens used accounting.\n${'Line of detailed file paths and pass criteria. '.repeat(140)}`;
+    const realisticLongStderr = [
+      'OpenAI Codex v0.172.0',
+      '--------',
+      'workdir: C:\\repo',
+      'model: gpt-6.2-astra',
+      'provider: openai',
+      'approval: never',
+      'sandbox: danger-full-access',
+      'reasoning effort: max',
+      'reasoning summaries: none',
+      'session id: 00000000-0000-7000-8000-000000000099',
+      '--------',
+      'user',
+      longEchoPrompt,
+      'warning: Codex is ignoring 1 unrecognized configuration setting. Check for typos or deprecated settings.',
+      '  user (C:\\config.toml): `computer_use.windows.always_allowed_app_ids` is ignored.',
+      'hook: SessionStart',
+      'hook: SessionStart Completed',
+      'ERROR: service_tier "ultrafast" is not supported on your current plan (requires Pro-500).',
+    ].join('\n');
+    assert.ok(Buffer.byteLength(realisticLongStderr, 'utf8') > 6700);
+    let longAttempts = 0;
+    const longFallback = await runCodexExecMarkdown({
+      prompt: 'Short caller prompt while mock uses full 6.8KB receipt prefix.',
+      serviceTier: 'ultrafast',
+      testMode: true,
+      cwd: dir,
+      receiptDir: join(dir, 'codex-long-fb'),
+      mockExecutor: async ({ outputFilePath }) => {
+        longAttempts += 1;
+        if (longAttempts === 1) return { exitCode: 1, stderr: realisticLongStderr };
+        writeFileSync(outputFilePath, 'Recovered on fallback tier.\n', 'utf8');
+        return { exitCode: 0, stderr: '' };
+      },
+    });
+    assert.equal(longAttempts, 2, '6.8KB startup banner + echoed user prompt must fall back cleanly');
+    assert.equal(longFallback.tier_fallback_used, true);
+  });
+});
+
+test('Stage-1 regulatory pre-screen, #17/#21 null & registry-failure guards, MarketObservationJudge anti-hallucination, Luna 0.7 threshold, and 0..5 Wangwang', () => {
+  const jNulls = resolveStage1QualitativeJudgments({
+    evidence: ['synthetic-evidence'],
+    review_judge: null,
+    rights_prescreen: {
+      specific_design_rights: { status: 'needs_sample_comparison', summary: '1件近似专利待拿样比对' },
+      applicable_public_requirements: { status: 'needs_verification', frameworks_checked: ['USDA_APHIS_Lacey_Act'], summary: '木头拉丁学名待核实' },
+    },
+  });
+  assert.equal(jNulls.judgments.feasible_light_differentiation.anchor, null);
+  assert.equal(jNulls.judgments.specific_design_rights.anchor, null);
+  assert.equal(jNulls.judgments.applicable_public_requirements.anchor, null);
+
+  const buttonCellRegs = resolveRelevantRegulatoryFrameworks({
+    label: 'LED Magnifier Desk Stand (includes CR2032 coin cell battery)',
+  });
+  assert.ok(buttonCellRegs.applicable.includes('Reeses_Law_16_CFR_1263'));
+  const negatedPassiveRegs = resolveRelevantRegulatoryFrameworks({
+    label: 'Solid Walnut Organizer Tray (不含纽扣电池, no battery, non-electric)',
+  });
+  assert.ok(!negatedPassiveRegs.applicable.includes('Reeses_Law_16_CFR_1263'));
+  assert.ok(negatedPassiveRegs.applicable.some(f => /Lacey/i.test(f)));
+  const foodContactRegs = resolveRelevantRegulatoryFrameworks({
+    label: 'Stainless Espresso Knock Box & Food Contact Tamping Mat',
+  });
+  assert.ok(foodContactRegs.applicable.some(f => /FDA/i.test(f)));
+  const pestClaimRegs = resolveRelevantRegulatoryFrameworks({
+    label: 'Plastic Closet Blocks with Antibacterial Moth Repellent Claim',
+  });
+  assert.ok(pestClaimRegs.applicable.includes('EPA'));
+
+  const mktInput = {
+    form_id: 'form-walnut-knockbox',
+    buyer_task: 'Knock spent espresso puck cleanly',
+    target_spec: { label: 'Walnut Espresso Knock Box', pieces: 1 },
+    peers: [{
+      asin: 'B0SYNMKT01',
+      observed_price_usd: 59.99,
+      keepa_high_usd: 64.99,
+      keepa_low_usd: 29.99,
+      review_count: 84,
+      review_curve_change: 'Steady +4/mo',
+      key_appearance_and_dims: 'Walnut 24x23x9 cm',
+    }],
+  };
+  const mktReq = buildMarketObservationRequest(mktInput);
+  assert.equal(mktReq.model, 'gpt-6.1-terra');
+  assert.equal(mktReq.reasoning.effort, 'xhigh');
+  assert.throws(() => parseMarketObservationResult({
+    schema_version: 1,
+    contract: 'MarketObservationJudge',
+    form_id: 'form-walnut-knockbox',
+    peer_observations: [{
+      asin: 'B0SYNMKT01',
+      mandatory_facts: {
+        observed_price_usd: 59.99,
+        keepa_high_usd: 99.99,
+        keepa_low_usd: 29.99,
+        review_count: 84,
+        keepa_90d_trend: 'Dropped from $64.99 to $29.99 clearance',
+        coupon_status: 'none',
+        review_curve_change: 'Steady +4/mo',
+        key_appearance_and_dims: 'Walnut 24x23x9 cm',
+      },
+      qualitative_judgment: {
+        bucket: 'veteran_clearance_or_war',
+        include_in_primary_band: false,
+        keep_in_observation_bar: true,
+        reason_zh: '老品清仓跳水，移出主力带保留观察。',
+      },
+    }],
+    market_summary_zh: '主力老品稳态，1 款清仓跳水单列观察。',
+  }, mktInput), /keepa_high_usd/i);
+
+  const validMktJudge = parseMarketObservationResult({
+    schema_version: 1,
+    contract: 'MarketObservationJudge',
+    form_id: 'form-walnut-knockbox',
+    peer_observations: [{
+      asin: 'B0SYNMKT01',
+      mandatory_facts: {
+        observed_price_usd: 59.99,
+        keepa_high_usd: 64.99,
+        keepa_low_usd: 29.99,
+        review_count: 84,
+        keepa_90d_trend: 'Dropped from $64.99 to $29.99 clearance',
+        coupon_status: 'none',
+        review_curve_change: 'Steady +4/mo',
+        key_appearance_and_dims: 'Walnut 24x23x9 cm',
+      },
+      qualitative_judgment: {
+        bucket: 'veteran_clearance_or_war',
+        include_in_primary_band: false,
+        keep_in_observation_bar: true,
+        reason_zh: '老品清仓跳水，移出主力带保留观察。',
+      },
+    }],
+    market_summary_zh: '主力老品稳态，1 款清仓跳水单列观察。',
+  }, mktInput);
+  assert.equal(validMktJudge.peer_observations[0].qualitative_judgment.bucket, 'veteran_clearance_or_war');
+
+  const parsedLuna = parseStage1DecisionsResponses([
+    { candidate_id: 'C-MID-060', title: 'Borderline Insulated Bottle', price_usd: 35.99 },
+    { candidate_id: 'C-HIGH-075', title: 'Prescription Medical Inhaler', price_usd: 39.99 },
+  ], [{
+    status: 'completed',
+    usable: true,
+    content_status: 'usable',
+    decisions: [
+      { id: 'gate0_prohibited_C-MID-060', type: 'predicate', probability: 0.60 },
+      { id: 'visual_peer_C-MID-060', type: 'choice', value: 'exact_peer' },
+      { id: 'gate0_prohibited_C-HIGH-075', type: 'predicate', probability: 0.75 },
+      { id: 'visual_peer_C-HIGH-075', type: 'choice', value: 'exact_peer' },
+    ],
+  }]);
+  assert.equal(parsedLuna.items[0].gate0_status, 'allowed');
+  assert.equal(parsedLuna.items[0].gate0_review_watch, true);
+  assert.equal(parsedLuna.items[0].triage_disposition, 'amber_manual_review');
+  assert.equal(parsedLuna.items[1].gate0_status, 'prohibited');
+  assert.equal(parsedLuna.items[1].triage_disposition, 'prohibited_auto_excluded');
+
+  const zeroGap1688 = parse1688VisionInspectResult({
+    schema_version: 1,
+    contract: 'VisionInspector1688',
+    spec_match_verdict: 'exact_match',
+    dimension_weight_findings: {
+      product_dimensions_mm: '240x230x90',
+      package_dimensions_mm: '260x250x110',
+      unit_weight_g: 1950,
+      package_weight_g: 2100,
+      carton_pack_qty: 6,
+      evidence_notes: 'CAD callout on Thumbnail 4 confirms walnut + 304 liner.',
+    },
+    sensitive_freebie_flags: { oil_or_glue: 'none', battery_type: 'none', strong_magnet: 'none', notes: 'No sensitive freebies.' },
+    component_gaps: [],
+    wangwang_questions: [],
+  });
+  assert.deepEqual(zeroGap1688.wangwang_questions, []);
+
+  const rightsReq = buildRightsPreScreenRequest({
+    form_id: 'form-walnut-tray',
+    label: 'Walnut Espresso Knock Box',
+    buyer_task: 'Knock espresso puck',
+  });
+  assert.match(rightsReq.input[0].content[0].text, /trade_duty_alerts.*deferred|do NOT spend extra web_search/i);
+
+  const regFailResolved = resolveStage1QualitativeJudgments({
+    rights_prescreen: {
+      specific_design_rights: { status: 'needs_verification', summary: 'USPTO registry unavailable (HTTP 503); public search incomplete.' },
+      applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['NONE_IDENTIFIED'], summary: 'Checked.' },
+    },
+  });
+  assert.equal(regFailResolved.judgments.specific_design_rights.prescreen_completed, false);
+
+  const tmConflictResolved = resolveStage1QualitativeJudgments({
+    rights_prescreen: {
+      specific_design_rights: { status: 'no_public_hit_observed', summary: 'No patent hit.' },
+      trademark_conflicts: { status: 'proven_conflict', summary: 'Target shape/term infringes active registered trademark.' },
+      applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['NONE_IDENTIFIED'], summary: 'Clean.' },
+    },
+  });
+  assert.equal(tmConflictResolved.judgments.specific_design_rights.proven_conflict, true);
+
+  const cnFailRes = resolveStage1QualitativeJudgments({
+    rights_prescreen: {
+      specific_design_rights: { status: 'needs_verification', summary: 'USPTO 专利库连接失败，暂不可用，未能查验公开外观专利。' },
+      applicable_public_requirements: { status: 'no_public_hit_observed', frameworks_checked: ['NONE_IDENTIFIED'], summary: 'Checked.' },
+    },
+  });
+  assert.equal(cnFailRes.judgments.specific_design_rights.prescreen_completed, false);
+});
+
+test('Unshackled Codex runner, stale-spec amber badge, Gate-4 skip, CODEX_API_KEY strip, stdout/stderr secret quarantine, and >2MiB guard', async () => {
+  const r59Profile = loadR59Profile();
+  const synthBatch = loadSyntheticBatch();
+  await withTempDirAsync(async dir => {
+    const args = buildCodexExecArgs({
+      schemaPath: join(dir, 'schema.json'),
+      outputPath: join(dir, 'out.json'),
+      model: 'gpt-6.2-astra',
+      reasoningEffort: 'max',
+      serviceTier: 'ultrafast',
+      platform: 'win32',
+    });
+    assert.equal(args.includes('--ephemeral'), true);
+    assert.equal(args.includes('-s'), false);
+    assert.equal(args.includes('--ignore-rules'), false);
+    assert.equal(args.includes('--ignore-user-config'), false);
+    assert.equal(args.some(a => a.includes('windows.sandbox')), false);
+    assert.equal(args.some(a => a.includes('mcp_servers=')), false);
+    assert.ok(args.some(a => a.includes('service_tier="ultrafast"')));
+    assert.ok(args.some(a => a.includes('web_search="live"')));
+    assert.equal(args.some(a => /shell_tool=false|tools\.view_image=false/.test(a)), false);
+
+    const receiptDir = join(dir, 'codex-receipts');
+    const rawPkt = {
+      schema_version: 'evidence-review-draft-v1',
+      review_id: 'rev-stale-spec-demo',
+      execution_policy_ref: 'local-authorized-policy',
+      candidate: {
+        subject_id: 'form-good-sibling',
+        intended_use: 'Organize desk stationery',
+        saleable_spec: { pcs: 1 },
+        unknown_fields: [],
+      },
+      subjects: [{ subject_id: 'sub-peer-1', spec: { pcs: 1 } }],
+      criteria: { criteria_version: 'r59-v1', rules: [{ criterion_id: 'c1', description: 'Spec match', required: true }] },
+      questions: [{ question_id: 'q1', question: 'Does peer match?', subject_ids: ['sub-peer-1'], criterion_ids: ['c1'] }],
+      evidence: [{ evidence_id: 'ev1', subject_ids: ['sub-peer-1'], summary: 'Verified 100-set Shenzhen quote', kind: 'fact', source_ref: 's1', observed_at: '2026-11-22', window: '2026-10-24..2026-11-22', grain: 'sku', units: 'pc', limitations: null }],
+    };
+    const frozenPkt = freezeEvidenceReviewPacket(rawPkt);
+    const oldSpecSha = '1'.repeat(64);
+    const newSpecSha = '2'.repeat(64);
+    const reviewEnv = await runCodexEvidenceReview(rawPkt, {
+      enabled: true,
+      reasoningEffort: 'max',
+      serviceTier: 'ultrafast',
+      candidateId: 'form-good-sibling',
+      formSpecSha256: oldSpecSha,
+      receiptDir,
+      testMode: true,
+      mockExecutor: async ({ outputFilePath }) => {
+        writeFileSync(outputFilePath, JSON.stringify({
+          schema_version: 'evidence-review-draft-v1',
+          review_id: 'rev-stale-spec-demo',
+          packet_sha256: frozenPkt.packet_sha256,
+          subjects: [{ subject_id: 'sub-peer-1', disposition: 'included', criterion_ids: ['c1'], evidence_ids: ['ev1'], reason: 'Matches spec.' }],
+          answers: [{ question_id: 'q1', status: 'answered', basis: 'fact', evidence_ids: ['ev1'], explanation: 'Supported.' }],
+          contradictions: [],
+          gaps: [],
+          conclusion: 'Checked files via read-only tools; assumptions hold.',
+        }), 'utf8');
+        return { exitCode: 0, stderr: 'tool_call: read_file("src/fba-rates-2027.mjs")\n' };
+      },
+    });
+    assert.equal(reviewEnv.status, 'ready', `reason=${reviewEnv.reason}`);
+    assert.ok(typeof reviewEnv.reviewed_at === 'string' && reviewEnv.reviewed_at.length > 0);
+    assert.equal(reviewEnv.spec_sha256, oldSpecSha);
+
+    const staleCheck = verifySavedCodexReceipt(reviewEnv, {
+      receiptStoreDir: receiptDir,
+      allowTestDouble: true,
+      allowStaleSpec: true,
+      expectedCandidateId: 'form-good-sibling',
+      expectedFormSpecSha256: newSpecSha,
+    });
+    assert.equal(staleCheck.verified, true);
+    assert.equal(staleCheck.stale_spec, true);
+
+    const candWithStaleReview = structuredClone(synthBatch.candidates[0]);
+    candWithStaleReview.id = 'form-good-sibling';
+    candWithStaleReview.spec_sha256 = oldSpecSha;
+    attachCandidateEvidenceReview(candWithStaleReview, reviewEnv, frozenPkt, {
+      receiptStoreDir: receiptDir,
+      allowTestDoubleReceipt: true,
+    });
+    candWithStaleReview.spec_sha256 = newSpecSha;
+    const batchStale = { schema_version: 1, profile_revision: 59, candidates: [candWithStaleReview] };
+    const htmlStale = renderReport(scoreBatch(batchStale, r59Profile), batchStale, {
+      receiptStoreDir: receiptDir,
+      allowTestDoubleReceipts: true,
+    });
+    assert.match(htmlStale, /已复核 · 基于旧版参数复核/);
+
+    const nonQualSkip = await runOptionalGate4EvidenceReview(
+      { review_id: 'rev-skip-nonqual', execution_policy_ref: 'local-authorized-policy' },
+      {
+        enabled: true,
+        candidateQualification: { counts_toward_target: false },
+        testMode: true,
+        mockExecutor: async () => { throw new Error('Must NOT run Gate-4 on non-qualifying card'); },
+      },
+    );
+    assert.equal(nonQualSkip.status, 'skipped_non_qualifying');
+    assert.equal(nonQualSkip.execution_status, 'not_submitted');
+
+    const promptPreview = buildEvidenceReviewPrompt(
+      freezeEvidenceReviewPacket({
+        schema_version: 'evidence-review-draft-v1',
+        review_id: 'rev-prompt-preview',
+        candidate: { subject_id: 'cand-1', intended_use: 'Hold tools', saleable_spec: { pcs: 1 }, unknown_fields: [] },
+        subjects: [{ subject_id: 'sub-1', spec: { pcs: 1 } }],
+        criteria: { criteria_version: 'v1', rules: [{ criterion_id: 'c1', description: 'Match', required: true }] },
+        questions: [{ question_id: 'q1', question: 'Match?', subject_ids: ['sub-1'], criterion_ids: ['c1'] }],
+        evidence: [{ evidence_id: 'e1', subject_ids: ['sub-1'], summary: 'https://sellercentral.amazon.com/gp/help/external/G2027', kind: 'fact', source_ref: 'https://sellercentral.amazon.com', observed_at: '2026-11-24', window: '30d', grain: 'sku', units: 'pc', limitations: null }],
+      }),
+    );
+    assert.doesNotMatch(promptPreview, /Closed-evidence rule/i);
+    assert.match(promptPreview, /No Concurrent Workspace.*NEVER modify, overwrite, or write into the primary repository/i);
+    assert.match(promptPreview, /Amazon Seller Central/i);
+    assert.match(promptPreview, /OPEN INVESTIGATION AUTONOMY/i);
+
+    const mdStoreDir = join(dir, 'md-receipts');
+    const synthWinPath = ['C:', 'Users', 'synth_reviewer', 'repos', 'src', 'fba-rates-2027.mjs'].join('\\');
+    const mdRes = await runCodexExecMarkdown({
+      prompt: '目标：深度红队排查本轮修改。\n验收标准：核对 2027 费率与 r58 回放。\n两条边界：禁写主工作区、禁改真实店铺。',
+      model: 'gpt-6.2-astra',
+      reasoningEffort: 'max',
+      serviceTier: 'ultrafast',
+      receiptStoreDir: mdStoreDir,
+      useContentAddressedReceipt: true,
+      testMode: true,
+      mockExecutor: async ({ args: execArgs, outputFilePath }) => {
+        assert.equal(execArgs.includes('--output-schema'), false);
+        assert.equal(execArgs.includes('--ephemeral'), true);
+        assert.equal(execArgs.includes('-s'), false);
+        writeFileSync(
+          outputFilePath,
+          `# 深度审查结论\n\n- 核验文件：\`${synthWinPath}\`\n- 官方来源：https://sellercentral.amazon.com/gp/help/external/GFGVB6C7ZF38285W\n- 结果：未发现阻断性 Bug。\n`,
+          'utf8',
+        );
+        return { exitCode: 0 };
+      },
+    });
+    assert.match(mdRes.markdown, /https:\/\/sellercentral\.amazon\.com/);
+    assert.ok(mdRes.markdown.includes(synthWinPath));
+    assert.equal(mdRes.receipt_persisted, true);
+    assert.match(mdRes.receipt_sha256, /^[0-9a-f]{64}$/);
+
+    const fakeCodexKey = ['s' + 'k', 'synthCodexPaidBillingKey99'].join('-');
+    const stdoutMdDir = join(dir, 'stdout-md-receipts');
+    const codexHomeDir = join(dir, '.codex');
+    mkdirSync(codexHomeDir, { recursive: true });
+    writeFileSync(join(codexHomeDir, 'auth.json'), JSON.stringify({ tokens: { access_token: 'oauth-sub-tok' } }), 'utf8');
+    let observedChildCodexKey = 'UNCHECKED';
+    const stdoutMdRes = await runCodexExecMarkdown({
+      prompt: 'Stdout markdown fallback test.',
+      env: { ...process.env, CODEX_HOME: codexHomeDir, CODEX_API_KEY: fakeCodexKey },
+      receiptStoreDir: stdoutMdDir,
+      useContentAddressedReceipt: true,
+      testMode: true,
+      mockExecutor: async ({ env: childEnv }) => {
+        observedChildCodexKey = childEnv.CODEX_API_KEY;
+        return { exitCode: 0, stdout: '# Stdout Review\n\nVerified clean.\n' };
+      },
+    });
+    assert.equal(observedChildCodexKey, undefined);
+    assert.match(stdoutMdRes.raw_output_sha256, /^[0-9a-f]{64}$/);
+    const savedReceiptFiles = readdirSync(stdoutMdDir).filter(f => f.endsWith('.json'));
+    assert.equal(savedReceiptFiles.length, 1);
+    const savedStdoutReceipt = JSON.parse(readFileSync(join(stdoutMdDir, savedReceiptFiles[0]), 'utf8'));
+    assert.equal(savedStdoutReceipt.raw_output_sha256, stdoutMdRes.raw_output_sha256);
+
+    const fakeSecretVal = ['sk', 'proj', 'SyntheticSecretToken1234567890ABCDEF'].join('-');
+    const secReceiptDir = join(dir, 'sec-receipts');
+    await assert.rejects(
+      () => runCodexExecMarkdown({
+        prompt: 'Return test markdown',
+        cwd: dir,
+        receiptDir: secReceiptDir,
+        testMode: true,
+        mockExecutor: async () => ({ exitCode: 0, stdout: `Report leaked token ${fakeSecretVal} inline.`, stdoutBytes: 64 }),
+      }),
+      /CODEX_OUTPUT_SECRET_BLOCKED|secret/i,
+    );
+    const secReceiptFiles = readdirSync(secReceiptDir).filter(f => f.endsWith('.json'));
+    assert.equal(secReceiptFiles.length, 1);
+    assert.equal(readFileSync(join(secReceiptDir, secReceiptFiles[0]), 'utf8').includes(fakeSecretVal), false);
+
+    await assert.rejects(
+      () => runCodexExecMarkdown({
+        prompt: 'Oversize stdout test',
+        cwd: dir,
+        testMode: true,
+        mockExecutor: async () => ({ exitCode: 0, stdout: '# Header\n' + 'a'.repeat(2 * 1024 * 1024), stdoutBytes: 2 * 1024 * 1024 + 20 }),
+      }),
+      /exceeded.*capture limit/i,
+    );
+
+    const fakeSec = ['sk', 'proj', 'SyntheticStderrSecret9876543210ZYXWVU'].join('-');
+    const r3SecDir = join(dir, 'r3-sec-receipts');
+    const mdCleanOut = await runCodexExecMarkdown({
+      prompt: 'Stderr secret test ok',
+      cwd: dir,
+      receiptDir: r3SecDir,
+      testMode: true,
+      mockExecutor: async () => ({
+        exitCode: 0,
+        stdout: '# Clean Markdown Output\nAll good.',
+        stderr: `MCP debug header Authorization: Bearer ${fakeSec}`,
+        stdoutBytes: 34,
+        stderrBytes: 80,
+      }),
+    });
+    assert.match(mdCleanOut.markdown, /Clean Markdown Output/);
+    await assert.rejects(
+      () => runCodexExecMarkdown({
+        prompt: 'Stderr secret test fail',
+        cwd: dir,
+        receiptDir: r3SecDir,
+        testMode: true,
+        mockExecutor: async () => ({
+          exitCode: 1,
+          stdout: '',
+          stderr: `Fatal transport header Authorization: Bearer ${fakeSec}`,
+          stdoutBytes: 0,
+          stderrBytes: 80,
+        }),
+      }),
+      /exited with code 1/i,
+    );
+    const r3ReceiptFiles = readdirSync(r3SecDir).filter(f => f.endsWith('.json'));
+    assert.equal(r3ReceiptFiles.length, 2);
+    for (const rf of r3ReceiptFiles) {
+      assert.equal(readFileSync(join(r3SecDir, rf), 'utf8').includes(fakeSec), false);
+    }
+  });
 });

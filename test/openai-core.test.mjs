@@ -1,20 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
-import {
-  existsSync,
-  linkSync,
-  mkdirSync,
-  mkdtempSync,
-  readdirSync,
-  readFileSync,
-  rmSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { openSelectionStore, sha256Hex } from '../src/store.mjs';
+import { containsSecretToken, sanitizeDiagnosticText } from '../src/contracts.mjs';
+import * as openaiIndex from '../src/openai/index.mjs';
+import * as openaiClientMod from '../src/openai/client.mjs';
+import * as openaiPricingMod from '../src/openai/pricing.mjs';
 import {
   MICROS_PER_CENT,
   MICROS_PER_DOLLAR,
@@ -29,6 +24,7 @@ import {
   MAX_MONTHLY_LIMIT_CENTS,
   OpenAiBudgetError,
   OpenAiBudgetLedger,
+  openOpenAiBudgetLedger,
   areSamePhysicalSqliteFile,
   extractMonthPrefix,
   inspectLegacyAutopilotBudget,
@@ -42,20 +38,14 @@ import {
   loadOpenAiApiKey,
   parseBatchOutputJsonl,
 } from '../src/openai/client.mjs';
+import { makeJsonResponse, withTempDirAsync as _withTempDirAsync } from './helpers/test-fixtures.mjs';
 
 const SYNTHETIC_API_KEY = ['s' + 'k', 'proj', 'unitTestMockCredential000001'].join('-');
 const SYNTHETIC_CUSTOM_SECRET = ['custom', 'opaque', 'secret', 'token987654'].join('_');
 const VALID_1X1_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=';
 
-async function withTempDirAsync(fn) {
-  const dir = mkdtempSync(join(tmpdir(), 'openai-core-test-'));
-  try {
-    return await fn(dir);
-  } finally {
-    rmSync(dir, { recursive: true, force: true, maxRetries: 6, retryDelay: 25 });
-  }
-}
+const withTempDirAsync = fn => _withTempDirAsync('openai-core-test-', fn);
 
 function createActivatedMemoryLedger({
   accountScope = 'openai-default',
@@ -1217,4 +1207,343 @@ test('Live-API parity: /v1/decisions accepts answers[] with array probabilities,
   } finally {
     ledger.close();
   }
+});
+
+test('Batch A3.3: budget-ledger preserves legacy path pinning, historical dev/ino DB compatibility, and core guardrails', async () => {
+  await withTempDirAsync(async dir => {
+    const legacyPath = join(dir, 'legacy-budget.sqlite3');
+    const legacyAltPath = join(dir, 'legacy-alt.sqlite3');
+    for (const lp of [legacyPath, legacyAltPath]) {
+      const db = new DatabaseSync(lp);
+      db.exec(`
+        CREATE TABLE reservations (
+          request_id TEXT PRIMARY KEY,
+          status TEXT NOT NULL,
+          reserved_cents INTEGER NOT NULL,
+          confirmed_zero_charge INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+        );
+      `);
+      db.close();
+    }
+
+    const ledgerPath = join(dir, 'selection.sqlite');
+    const ledger = openOpenAiBudgetLedger(ledgerPath, { testMode: true });
+    try {
+      const monthUtc = new Date().toISOString().slice(0, 7);
+      const summary = inspectLegacyAutopilotBudget(legacyPath, { monthUtc });
+      ledger.reconcileLegacySummary(summary, {
+        accountScope: 'openai-default',
+        enable: true,
+        monthlyLimitCents: 20_000,
+        autoRechargeOffConfirmed: true,
+        hardMonthlyLimitConfirmed: true,
+      });
+
+      ledger.db.prepare(
+        "UPDATE openai_budget_policy SET legacy_source_dev = '12345', legacy_source_ino = '67890' WHERE account_scope = 'openai-default'",
+      ).run();
+      const reopened = openOpenAiBudgetLedger(ledgerPath, { testMode: true });
+      try {
+        await new Promise(r => setTimeout(r, 15));
+        const freshSummary = inspectLegacyAutopilotBudget(legacyPath, { monthUtc });
+        reopened.reconcileLegacySummary(freshSummary, { accountScope: 'openai-default' });
+        const pol = reopened.getPolicy('openai-default');
+        assert.equal(pol.monthly_limit_cents, 20_000);
+        assert.equal(pol.legacy_reconciled, true);
+
+        const altSummary = inspectLegacyAutopilotBudget(legacyAltPath, { monthUtc });
+        assert.throws(
+          () => reopened.reconcileLegacySummary(altSummary, { accountScope: 'openai-default' }),
+          err => err instanceof OpenAiBudgetError && err.code === 'LEGACY_SOURCE_MISMATCH',
+        );
+      } finally {
+        reopened.close();
+      }
+
+      const client = new OpenAiClient({
+        ledger,
+        testMode: true,
+        allowEnvKey: true,
+        apiKeyEnvVar: 'BATCH_A3_KEY',
+        env: { BATCH_A3_KEY: SYNTHETIC_API_KEY },
+        fetchImpl: async () => makeJsonResponse(200, {}),
+      });
+      await assert.rejects(
+        () => client.createResponse({ model: 'gpt-6.2-astra', input: 'blocked' }),
+        err => err instanceof OpenAiPolicyError && err.code === 'ASTRA_API_BLOCKED',
+      );
+    } finally {
+      ledger.close();
+    }
+  });
+});
+
+test('R3 closure (openai-core): M2 enriched GET usage + two-GET DELETE recovery and Basic/Cookie/escaped-JSON diagnostic scrubbing', async () => {
+  await withTempDirAsync(async dir => {
+    const clock = () => new Date('2026-11-25T02:00:00Z');
+    const ledger = new OpenAiBudgetLedger(':memory:', { nowFn: clock, testMode: true });
+    try {
+      ledger.reconcileLegacySummary(
+        { recognized_schema: true, month_utc: '2026-11', file_sha256: 'c'.repeat(64), total_rows: 0, unresolved_count: 0, same_month_reserved_cents: 0 },
+        { allowSyntheticSummaryForTests: true, enable: true, hardMonthlyLimitConfirmed: true, autoRechargeOffConfirmed: true, monthlyLimitCents: 3 },
+      );
+      let deleted = false;
+      const client = new OpenAiClient({
+        ledger, testMode: true, nowFn: clock, allowEnvKey: true, apiKeyEnvVar: 'SYNTH_M2_KEY',
+        env: { SYNTH_M2_KEY: ['synth', 'm2', 'cred'].join('_') },
+        fetchImpl: async (_url, opts) => {
+          if (opts.method === 'POST') {
+            return Response.json({ id: 'resp_m2_1', status: 'completed', model: 'gpt-6.1-terra', usage: null, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Done.' }] }] });
+          }
+          if (opts.method === 'DELETE') {
+            deleted = true;
+            return Response.json({ id: 'resp_m2_1', deleted: true });
+          }
+          if (deleted) return Response.json({ error: { message: 'Not found' } }, { status: 404 });
+          return Response.json({ id: 'resp_m2_1', status: 'completed', model: 'gpt-6.1-terra', usage: { input_tokens: 25000, output_tokens: 200 }, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Done.' }] }] });
+        },
+      });
+      const first = await client.createResponse({ model: 'gpt-6.1-terra', input: 'Check A', max_output_tokens: 4096 }, { logicalRequestId: 'm2-job-1', deleteAfterPersist: true });
+      ledger.reconcileAttempt(first.attempt_id, { status: 'completed', note: 'Posted 2c', postedBilledCents: 2 });
+      await client.recoverPendingResponse(first.attempt_id);
+      const after = ledger.getAttemptById(first.attempt_id);
+      assert.equal(after.usage_cost_micros, 26000);
+      assert.equal(after.cleanup_status, 'deleted_verified_404');
+      assert.equal(ledger.getMonthlySummary().effective_committed_cents, 3, 'ceil(26000 micros) = 3c > 2c posted');
+      await assert.rejects(
+        () => client.createResponse({ model: 'gpt-6.1-terra', input: 'Check B', max_output_tokens: 4096 }, { logicalRequestId: 'm2-job-2' }),
+        err => err.code === 'MONTHLY_BUDGET_EXCEEDED',
+      );
+    } finally {
+      ledger.close();
+    }
+
+    const ledgerDb = join(dir, 'two-get.sqlite');
+    const ledger2 = new OpenAiBudgetLedger(ledgerDb, { nowFn: clock, testMode: true });
+    try {
+      ledger2.reconcileLegacySummary({
+        recognized_schema: true, month_utc: '2026-11', file_sha256: 'c'.repeat(64),
+        total_rows: 0, unresolved_count: 0, same_month_reserved_cents: 0,
+      }, { allowSyntheticSummaryForTests: true, enable: true, hardMonthlyLimitConfirmed: true, autoRechargeOffConfirmed: true, monthlyLimitCents: 3 });
+      let getCount = 0;
+      let deleted2 = false;
+      const client2 = new OpenAiClient({
+        ledger: ledger2, testMode: true, allowEnvKey: true, apiKeyEnvVar: 'SYNTH_KEY', env: { SYNTH_KEY: 'nonsecret-test-key' },
+        fetchImpl: async (_url, opts) => {
+          if (opts.method === 'POST') {
+            return Response.json({ id: 'resp_twoget', model: 'gpt-6.1-terra', status: 'completed', usage: null, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] }] });
+          }
+          if (opts.method === 'DELETE') {
+            deleted2 = true;
+            return Response.json({ id: 'resp_twoget', deleted: true });
+          }
+          if (deleted2) return Response.json({ error: { message: 'not found' } }, { status: 404 });
+          getCount++;
+          const usage = getCount === 1 ? null : { input_tokens: 25000, output_tokens: 200 };
+          return Response.json({ id: 'resp_twoget', model: 'gpt-6.1-terra', status: 'completed', usage, output: [{ type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'ok' }] }] });
+        },
+      });
+      const first2 = await client2.createResponse({ model: 'gpt-6.1-terra', input: 'test', max_output_tokens: 4096 }, { logicalRequestId: 'req-twoget', deleteAfterPersist: true });
+      const rec1 = await client2.recoverPendingResponse(first2.attempt_id);
+      assert.equal(rec1.status, 'pending_recovery');
+      ledger2.reconcileAttempt(first2.attempt_id, { status: 'completed', postedBilledCents: 2, note: 'manual settle' });
+      const rec2 = await client2.recoverPendingResponse(first2.attempt_id);
+      assert.equal(rec2.response?.cleanup?.verified_404, true);
+      assert.equal(ledger2.getAttemptById(first2.attempt_id).cleanup_status, 'deleted_verified_404');
+      assert.equal(ledger2.getMonthlySummary({ monthUtc: '2026-11' }).effective_committed_cents, 3);
+    } finally {
+      ledger2.close();
+    }
+
+    const nestedErrLog = JSON.stringify({ level: 'warn', message: 'Upstream reply: ' + JSON.stringify({ refresh_token: 'fixture_opaque_nested_token_9911' }) });
+    assert.equal(containsSecretToken(nestedErrLog), true);
+    assert.equal(sanitizeDiagnosticText(nestedErrLog).includes('fixture_opaque_nested_token_9911'), false);
+
+    const b64Basic = Buffer.from('synth-user:synth-pass-001').toString('base64');
+    assert.equal(containsSecretToken(`Authorization: Basic ${b64Basic}`), true);
+    assert.equal(sanitizeDiagnosticText(`Authorization: Basic ${b64Basic}`).includes(b64Basic), false);
+    assert.equal(containsSecretToken('Cookie: theme=compact; session=synth_session_val_0099'), true);
+    assert.equal(sanitizeDiagnosticText('Cookie: theme=compact; session=synth_session_val_0099').includes('synth_session_val_0099'), false);
+    assert.equal(sanitizeDiagnosticText('Cookie: theme="compact"; __Host-app_session=synth_quoted_cookie_7788').includes('synth_quoted_cookie_7788'), false);
+  });
+});
+
+test('Step 4 Sign-Off (#14): NTFS hardlink collision leaves legacy SQLite bytes untouched', async () => {
+  await withTempDirAsync(async dir => {
+    const legacyPath = join(dir, 'legacy-budget.sqlite');
+    const initDb = new DatabaseSync(legacyPath);
+    initDb.exec(`
+      CREATE TABLE requests (
+        request_id TEXT PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reserved_cents INTEGER NOT NULL DEFAULT 0,
+        actual_cents INTEGER
+      );
+      INSERT INTO requests (request_id, created_at, status, reserved_cents, actual_cents)
+      VALUES ('r-1', '2026-11-10T00:00:00Z', 'completed', 100, 100);
+    `);
+    initDb.close();
+    const origBytes = readFileSync(legacyPath);
+
+    const cleanSummary = inspectLegacyAutopilotBudget(legacyPath, { monthUtc: '2026-11' });
+    const hardlinkAlias = join(dir, 'hardlink-alias.sqlite');
+    linkSync(legacyPath, hardlinkAlias);
+
+    assert.throws(
+      () => reconcileLegacyBudgetIntoStore(hardlinkAlias, cleanSummary, { testMode: true }),
+      err => err instanceof OpenAiBudgetError && err.code === 'LEGACY_SOURCE_DESTINATION_COLLISION',
+    );
+    assert.equal(Buffer.compare(readFileSync(legacyPath), origBytes), 0, 'Legacy SQLite bytes must remain 100% untouched before hardlink collision error');
+  });
+});
+
+test('OpenAI bloat removal, home-dir lock absence, non-blocking DELETE cleanup, M2 pending_recovery unlock, and R2-3 cross-month duplicate payload guard', async () => {
+  assert.equal('createSpeechBriefing' in openaiIndex, false);
+  assert.equal('createConceptImage' in openaiIndex, false);
+  assert.equal('createSpeechBriefing' in openaiClientMod, false);
+  assert.equal('createConceptImage' in openaiClientMod, false);
+  assert.equal('computeTtsCostMicros' in openaiPricingMod, false);
+
+  const homeLockPath = join(homedir(), '.local-selection-openai-ledger-registry.sqlite');
+  const existedBefore = existsSync(homeLockPath);
+  await withTempDirAsync(async dir => {
+    const dbPath = join(dir, 'selection.sqlite');
+    const fileLedger = openOpenAiBudgetLedger(dbPath, { readOnly: false });
+    fileLedger.close();
+    if (!existedBefore) {
+      assert.equal(existsSync(homeLockPath), false, 'Must NEVER create hidden home-directory inode registry SQLite');
+    }
+
+    const ledger = new OpenAiBudgetLedger(':memory:', {
+      nowFn: () => new Date('2026-11-15T12:00:00Z'),
+    });
+    try {
+      reconcileLegacyBudgetIntoStore(
+        ledger,
+        {
+          recognized_schema: true,
+          file_sha256: '0'.repeat(64),
+          month_utc: '2026-11',
+          total_rows: 0,
+          status_counts: {},
+          unresolved_count: 0,
+          blocking_reasons: [],
+          has_unresolved_holds: false,
+          same_month_reserved_cents: 0,
+        },
+        {
+          accountScope: 'openai-default',
+          enable: true,
+          autoRechargeOffConfirmed: true,
+          hardMonthlyLimitConfirmed: true,
+          monthlyLimitCents: 20_000,
+        },
+      );
+      const res1 = ledger.reserveBillableRequest({
+        logicalRequestId: 'req-del-fail-1',
+        endpoint: '/v1/responses',
+        model: 'gpt-6.1-terra',
+        payloadSha256: 'a'.repeat(64),
+      });
+      ledger.recordTerminalOutcome(res1.attempt_id, {
+        status: 'completed',
+        providerResponseId: 'resp_synth_del_1',
+        usage: { input_tokens: 1000, output_tokens: 200 },
+        usageCostMicros: 5_000,
+        rawReceipt: { id: 'resp_synth_del_1', status: 'completed' },
+        cleanupRequired: true,
+      });
+      ledger.updateCleanupStatus(res1.attempt_id, {
+        cleanupStatus: 'delete_failed',
+        reason: 'Simulated HTTP 502 on DELETE',
+      });
+      assert.equal(ledger.getMonthlySummary().fenced, false, 'Remote DELETE cleanup failure must NEVER lock out the account');
+      const res2 = ledger.reserveBillableRequest({
+        logicalRequestId: 'req-after-del-fail-2',
+        endpoint: '/v1/responses',
+        model: 'gpt-6.1-terra',
+        payloadSha256: 'b'.repeat(64),
+      });
+      assert.equal(res2.status, 'in_progress');
+    } finally {
+      ledger.close();
+    }
+
+    const curMonth = new Date().toISOString().slice(0, 7);
+    const m2Fp = 'd'.repeat(64);
+    const m2Ledger = openOpenAiBudgetLedger(':memory:', { testMode: true });
+    try {
+      m2Ledger.reconcileLegacySummary(
+        { recognized_schema: true, month_utc: curMonth, file_sha256: 'b'.repeat(64), total_rows: 0, unresolved_count: 0, same_month_reserved_cents: 0 },
+        { allowSyntheticSummaryForTests: true, enable: true, hardMonthlyLimitConfirmed: true, autoRechargeOffConfirmed: true },
+      );
+      const m2Adm = m2Ledger.reserveBillableRequest({
+        logicalRequestId: 'm2-deadlock-check',
+        endpoint: '/v1/responses',
+        model: 'gpt-6.1-terra',
+        reservedCents: 10,
+        payloadSha256: 'c'.repeat(64),
+        cleanupRequired: true,
+        apiBaseUrl: 'https://api.openai.com/v1',
+        origin: 'https://api.openai.com',
+        credentialFingerprintSha256: m2Fp,
+      });
+      const rawRespBytes = Buffer.from('{"id":"resp_m2_123","status":"incomplete"}', 'utf8');
+      const rawRespSha = createHash('sha256').update(rawRespBytes).digest('hex');
+      m2Ledger.savePrivatePayload(m2Adm.attempt_id, 'response_post', rawRespBytes);
+      m2Ledger.recordTerminalOutcome(m2Adm.attempt_id, {
+        status: 'pending_recovery',
+        providerResponseId: 'resp_m2_123',
+        httpStatus: 200,
+        rawReceipt: { id: 'resp_m2_123', status: 'incomplete' },
+        rawBodySha256: rawRespSha,
+        originalBodySha256: rawRespSha,
+        usageCostMicros: null,
+      });
+      const m2Rec = m2Ledger.reconcileAttempt(m2Adm.attempt_id, {
+        status: 'completed',
+        postedBilledCents: 2,
+        note: 'Verified 2c billed on platform invoice while remote response awaits DELETE.',
+      });
+      assert.equal(m2Rec.status, 'completed');
+      assert.equal(m2Rec.cleanup_status, 'pending_cleanup');
+      const m2Cleanup = m2Ledger.beginBoundResponseCleanup(m2Adm.attempt_id, {
+        providerResponseId: 'resp_m2_123',
+        apiBaseUrl: 'https://api.openai.com/v1',
+        origin: 'https://api.openai.com',
+        credentialFingerprintSha256: m2Fp,
+      });
+      assert.equal((m2Cleanup.attempt ?? m2Cleanup).cleanup_status, 'pending_cleanup');
+    } finally {
+      m2Ledger.close();
+    }
+
+    let fakeNowIso = '2026-11-30T23:59:58.000Z';
+    const rollLedger = openOpenAiBudgetLedger(':memory:', { testMode: true, nowFn: () => new Date(fakeNowIso) });
+    try {
+      rollLedger.reconcileLegacySummary(
+        { recognized_schema: true, month_utc: '2026-11', file_sha256: 'e'.repeat(64), total_rows: 0, unresolved_count: 0, same_month_reserved_cents: 0 },
+        { allowSyntheticSummaryForTests: true, enable: true, hardMonthlyLimitConfirmed: true, autoRechargeOffConfirmed: true },
+      );
+      const rollAtt1 = rollLedger.reserveBillableRequest({
+        logicalRequestId: 'roll-req-1', endpoint: '/v1/responses', model: 'gpt-6.1-terra', reservedCents: 5, payloadSha256: '1'.repeat(64),
+      });
+      rollLedger.markPendingRecovery(rollAtt1.attempt_id, { reason: 'Client timeout at month end.' });
+      fakeNowIso = '2026-12-01T00:00:03.000Z';
+      assert.throws(
+        () => rollLedger.reserveBillableRequest({
+          logicalRequestId: 'roll-req-2-same-payload', endpoint: '/v1/responses', model: 'gpt-6.1-terra', reservedCents: 5, payloadSha256: '1'.repeat(64),
+        }),
+        { code: 'DUPLICATE_PENDING_PAYLOAD' },
+      );
+      const rollDistinct = rollLedger.reserveBillableRequest({
+        logicalRequestId: 'roll-req-3-distinct', endpoint: '/v1/responses', model: 'gpt-6.1-terra', reservedCents: 5, payloadSha256: '2'.repeat(64),
+      });
+      assert.ok(rollDistinct.attempt_id);
+    } finally {
+      rollLedger.close();
+    }
+  });
 });
