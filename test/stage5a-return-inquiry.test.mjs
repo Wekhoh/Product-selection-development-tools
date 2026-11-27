@@ -1,22 +1,32 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { BUSINESS_THRESHOLDS } from '../src/business-thresholds.mjs';
+import { detectRawPii, sanitizeDiagnosticText } from '../src/contracts.mjs';
+import { openSelectionStore } from '../src/store.mjs';
+import { runPhase2Batch } from '../src/pipeline.mjs';
 import { scoreBatch, scoreCandidate } from '../src/scoring.mjs';
 import { renderReport } from '../src/report.mjs';
 import {
   buildBatchJsonl,
+  parseBatchOutputJsonl,
   buildWorkflowTaskRequest,
   parseWorkflowTaskResult,
   freezeWorkflowTaskContext,
+  extractStructuredResponsePayload,
   RETURN_CAUSE_DIAGNOSIS_JSON_SCHEMA,
   FACTORY_INQUIRY_CHECKLIST_JSON_SCHEMA,
   buildReturnCauseDiagnosisRequest,
   parseReturnCauseDiagnosisResult,
+  resolveFactoryInquiryEligibility,
+  resolvePackageCompressionTriggered,
   buildFactoryInquiryChecklistRequest,
   parseFactoryInquiryChecklistResult,
 } from '../src/openai/index.mjs';
-import { makeStage4OrganizerTrayCandidate } from './helpers/stage4-fixtures.mjs';
+import { makeGate1AScenario, makeStage4OrganizerTrayCandidate } from './helpers/stage4-fixtures.mjs';
 
 const r59Profile = JSON.parse(
   readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'),
@@ -596,6 +606,7 @@ test('Stage 5A HTML Rendering: renders ② Return-Cause & ③ 5-Bullet 1688 Chec
     summary_zh: '缺可核同变体原文与 Q&A 正文，暂不推断退货根因。',
     disclaimer_zh: '不从差评反推退款率，不改动 21 项评分。',
   };
+  onDemandCard.factory_inquiry_1688.form_id = onDemandCard.id;
   onDemandCard.factory_inquiry_1688.generation_mode = 'owner_on_demand_pending';
   onDemandCard.factory_inquiry_1688.structured_items[3].includes_package_compression_check = true;
   const odBatch = { schema_version: 1, profile_revision: 59, candidates: [onDemandCard] };
@@ -606,4 +617,600 @@ test('Stage 5A HTML Rendering: renders ② Return-Cause & ③ 5-Bullet 1688 Chec
   assert.match(odHtml, /含 ≤10 mm 压线减尺寸核查/);
   assert.doesNotMatch(odHtml, /旺旺/);
   assert.doesNotMatch(odHtml, /—/);
+});
+
+test('Stage 5A Round 1 Astra Regressions (STD-1..3, SPEC-2..5): provider normalization, PII/path whitelist, Chinese product-tier regex, shared envelope refusal, strict quote/return/no-text guards', () => {
+  const ctx = {
+    form_id: 'form-syn-r1-audit',
+    product_label: '合成木质收纳架',
+    target_spec: '4-piece wooden organizer rack set',
+    target_variant_sku: 'WOOD',
+  };
+
+  // STD-1 & SPEC-2: SellerSprite provider shape (`reviewId`, `star`, `skus`, `author`, `content`, `source_file`) + detail `questions`
+  const providerReview = {
+    reviewId: 'r-ss-1',
+    star: 2,
+    skus: ['Wood'],
+    author: 'Fixture Reviewer Name',
+    content: 'Outer box split. Call 202-555-0147.',
+    source_file: 'D:/fixture/packing.pdf',
+  };
+  const req = buildReturnCauseDiagnosisRequest({
+    ...ctx,
+    questions: 12,
+    reviews: [providerReview],
+  });
+  const batchLine = buildBatchJsonl([{ custom_id: 'r1-p2', method: 'POST', url: '/v1/responses', body: req }]);
+  assert.equal(batchLine.jsonl.includes('Fixture Reviewer Name'), false, 'author must be stripped before outbound dispatch');
+  assert.equal(batchLine.jsonl.includes('202-555-0147'), false, 'US phone must be redacted before outbound dispatch');
+  assert.equal(batchLine.jsonl.includes('D:/fixture/packing.pdf'), false, 'source_file local path must be stripped');
+  const wireUserPayload = JSON.parse(req.input[1].content[0].text);
+  assert.equal(wireUserPayload.qa_total_count, 12);
+  assert.equal(wireUserPayload.qa_count_only, true);
+  assert.equal(wireUserPayload.reviews[0].review_id, 'r-ss-1');
+  assert.equal(wireUserPayload.reviews[0].stars, 2);
+  assert.equal(wireUserPayload.reviews[0].sku_verified, 'unknown');
+  assert.equal(wireUserPayload.reviews[0].variant_sku, null);
+
+  // Provider review parses cleanly as partial_or_unverified_variant with missing_qa_body_text & missing_sku_matched_review_text
+  const providerOut = {
+    schema_version: 1,
+    contract: 'ReturnCauseDiagnosis',
+    form_id: ctx.form_id,
+    target_variant_sku: 'WOOD',
+    evidence_status: 'partial_or_unverified_variant',
+    missing_evidence_flags: ['missing_qa_body_text', 'missing_sku_matched_review_text'],
+    missing_evidence_notes_zh: ['缺可核 Q&A 正文（仅返回 12 条计数）。'],
+    causes: [
+      {
+        cause_id: 'c-box',
+        category: 'packaging_or_transit_damage',
+        actionability: 'needs_factory_verification',
+        claim_basis: 'buyer_complaint_possible_return',
+        summary_zh: '外盒破损抱怨，变体未核实。',
+        purchased_spec_note: null,
+        counter_evidence_zh: null,
+        factory_verification_hook_zh: '核查外箱防摔。',
+        citations: [
+          {
+            source_type: 'review',
+            source_id: 'r-ss-1',
+            stars: 2,
+            variant_sku: null,
+            sku_verified: 'unknown',
+            mentions_return_explicitly: false,
+            excerpt: 'Outer box split.',
+          },
+        ],
+      },
+    ],
+    summary_zh: '外盒存在运输破损抱怨，尚缺同变体核验。',
+    disclaimer_zh: '不从差评反推退款率，不改动评分。',
+  };
+  const parsedProvider = parseReturnCauseDiagnosisResult(wrapResponsesEnvelope(providerOut), {
+    ...ctx,
+    questions: 12,
+    reviews: [providerReview],
+  });
+  assert.equal(parsedProvider.valid, true);
+
+  // Missing `missing_qa_body_text` when `questions: 12` was supplied must throw
+  assert.throws(
+    () => parseReturnCauseDiagnosisResult(
+      wrapResponsesEnvelope({ ...providerOut, missing_evidence_flags: ['missing_sku_matched_review_text'] }),
+      { ...ctx, questions: 12, reviews: [providerReview] },
+    ),
+    /missing_qa_body_text/,
+  );
+
+  // STD-2: Chinese product-tier reviews pass detectRawPii AND Batch output round-trip verbatim without rewriting "三层瓦楞"
+  assert.equal(detectRawPii('It jammed. 第二层卡住了。'), null);
+  assert.equal(detectRawPii('三层瓦楞外箱开裂。'), null);
+  assert.equal(sanitizeDiagnosticText('三层瓦楞外箱开裂。'), '三层瓦楞外箱开裂。');
+  assert.equal(detectRawPii('收件地址：科技路88号3栋5层'), 'detailed_street_address');
+  assert.equal(detectRawPii('科技大厦5层办公区'), 'detailed_street_address');
+
+  const zhBody = '三层瓦楞外箱开裂。';
+  const zhInput = { ...ctx, reviews: [{ review_id: 'r-zh', stars: 2, variant_sku: 'WOOD', sku_verified: true, text: zhBody }] };
+  const zhOut = {
+    ...providerOut,
+    evidence_status: 'verified_variant_quotes',
+    missing_evidence_flags: [],
+    missing_evidence_notes_zh: [],
+    causes: [{
+      ...providerOut.causes[0],
+      citations: [{ source_type: 'review', source_id: 'r-zh', stars: 2, variant_sku: 'WOOD', sku_verified: true, mentions_return_explicitly: false, excerpt: zhBody }],
+    }],
+  };
+  const zhBatchReq = buildBatchJsonl([{ custom_id: 'r1-zh', method: 'POST', url: '/v1/responses', body: buildReturnCauseDiagnosisRequest(zhInput) }]);
+  const zhBatchRaw = JSON.stringify({
+    custom_id: 'r1-zh',
+    response: { status_code: 200, body: { ...wrapResponsesEnvelope(zhOut), model: 'gpt-6.1-terra', usage: { input_tokens: 40, output_tokens: 40, total_tokens: 80 } } },
+    error: null,
+  });
+  const zhBatchRow = parseBatchOutputJsonl(zhBatchRaw, {
+    expectedEndpoint: '/v1/responses',
+    lineModels: zhBatchReq.line_models,
+    lineSpecs: zhBatchReq.line_specs,
+  }).by_custom_id['r1-zh'];
+  assert.equal(zhBatchRow.usable, true);
+  assert.equal(parseReturnCauseDiagnosisResult(zhBatchRow, zhInput).valid, true);
+
+  // STD-3: Shared response-envelope rejects object-shaped `content[0].refusal` identically everywhere
+  const refusalEnv = wrapResponsesEnvelope(zhOut);
+  refusalEnv.output[0].content[0].refusal = { reason: 'Synthetic refusal' };
+  assert.throws(() => extractStructuredResponsePayload(refusalEnv, 'return-cause-diagnosis'), /refused/i);
+  assert.throws(() => parseReturnCauseDiagnosisResult(refusalEnv, zhInput), /refused/i);
+
+  // SPEC-3: Missing star, missing taskInput for verified_variant_quotes, mixed other-variant cause, curly-quote literal snapping
+  const noStarInput = { ...ctx, reviews: [{ review_id: 'r-zh', variant_sku: 'WOOD', sku_verified: true, text: zhBody }] };
+  assert.throws(() => parseReturnCauseDiagnosisResult(wrapResponsesEnvelope(zhOut), noStarInput), /1–3★|verified_variant_quotes/i);
+  assert.throws(() => parseReturnCauseDiagnosisResult(wrapResponsesEnvelope(zhOut)), /taskInput/i);
+
+  const mixedVariantOut = structuredClone(zhOut);
+  mixedVariantOut.causes.push({
+    ...zhOut.causes[0],
+    cause_id: 'c-acrylic',
+    citations: [{ source_type: 'review', source_id: 'r-acr', stars: 2, variant_sku: 'ACRYLIC', sku_verified: false, mentions_return_explicitly: false, excerpt: 'Acrylic cracked.' }],
+  });
+  assert.throws(
+    () => parseReturnCauseDiagnosisResult(wrapResponsesEnvelope(mixedVariantOut), {
+      ...ctx,
+      reviews: [
+        { review_id: 'r-zh', stars: 2, variant_sku: 'WOOD', sku_verified: true, text: zhBody },
+        { review_id: 'r-acr', stars: 2, variant_sku: 'ACRYLIC', sku_verified: false, text: 'Acrylic cracked.' },
+      ],
+    }),
+    /every cause/i,
+  );
+
+  const curlyParsed = parseReturnCauseDiagnosisResult(
+    wrapResponsesEnvelope({
+      ...zhOut,
+      causes: [{ ...zhOut.causes[0], citations: [{ ...zhOut.causes[0].citations[0], excerpt: "It didn't fit." }] }],
+    }),
+    { ...ctx, reviews: [{ review_id: 'r-zh', stars: 2, variant_sku: 'WOOD', sku_verified: true, text: 'It didn’t fit.' }] },
+  );
+  assert.equal(curlyParsed.causes[0].citations[0].excerpt, 'It didn’t fit.');
+
+  // SPEC-4: Honest return vs complaint labeling (return window, question, negated full sentence, Q&A vs affirmative return)
+  const runExplicitReturn = (body, excerpt = body) => parseReturnCauseDiagnosisResult(
+    wrapResponsesEnvelope({
+      ...zhOut,
+      causes: [{
+        ...zhOut.causes[0],
+        claim_basis: 'explicit_buyer_return',
+        citations: [{ ...zhOut.causes[0].citations[0], mentions_return_explicitly: true, excerpt }],
+      }],
+    }),
+    { ...ctx, reviews: [{ review_id: 'r-zh', stars: 2, variant_sku: 'WOOD', sku_verified: true, text: body }] },
+  );
+  assert.throws(() => runExplicitReturn('I kept it because the return window closed.'), /affirmative buyer return/i);
+  assert.throws(() => runExplicitReturn('Can I get a refund?'), /affirmative buyer return/i);
+  assert.throws(() => runExplicitReturn('I did not return it.', 'return it'), /affirmative buyer return/i);
+  assert.equal(runExplicitReturn('I returned it.').causes[0].claim_basis_label_zh, '买家明言退货');
+
+  // SPEC-5: No-text deterministic summary synthesis + all-prose refund back-calc + private path rejection
+  const emptyParsed = parseReturnCauseDiagnosisResult(
+    wrapResponsesEnvelope({
+      ...zhOut,
+      evidence_status: 'insufficient_evidence',
+      missing_evidence_flags: ['missing_qa_body_text', 'missing_sku_matched_review_text', 'review_counts_only_no_text'],
+      missing_evidence_notes_zh: ['缺可核 Q&A 正文'],
+      causes: [],
+      summary_zh: '退货主因是护角开裂。',
+    }),
+    { ...ctx, reviews: [], qa_items: [], review_count_only: true, qa_count_only: true },
+  );
+  assert.doesNotMatch(emptyParsed.summary_zh, /护角开裂/);
+  assert.match(emptyParsed.summary_zh, /暂不推断退货根因/);
+  assert.throws(
+    () => parseReturnCauseDiagnosisResult(wrapResponsesEnvelope({ ...zhOut, summary_zh: '据差评判断，退款率约为18%。' }), zhInput),
+    /refund|return rate/i,
+  );
+  assert.throws(
+    () => parseReturnCauseDiagnosisResult(wrapResponsesEnvelope({ ...zhOut, disclaimer_zh: '根据差评推算退款率约为18%。' }), zhInput),
+    /refund|return rate/i,
+  );
+  assert.throws(
+    () => parseReturnCauseDiagnosisResult(wrapResponsesEnvelope({ ...zhOut, summary_zh: '查验记录在 .local/trials/fixture/private-comments.json。' }), zhInput),
+    /local file path/i,
+  );
+});
+
+test('Stage 5A Round 1 Astra Regressions (SPEC-6..10c): threshold SSOT, slot 1-5 & copy-block SSOT, eligibility/cross-card/vision/scored-card guards, and HTML legacy wording & unvalidated attachment rejection', () => {
+  const ctx = {
+    form_id: 'form-syn-r1-inq',
+    product_label: '合成木质架',
+    target_spec: 'Four-piece wooden organizer rack',
+    counts_toward_target: true,
+  };
+  const baseBullets = [
+    '请列完整规格、材质、配件，附套装合照。',
+    '请按常规复购价分别报100套、300套到深圳含运总价和大货交期。',
+    '请报零售包装及外箱尺寸、重量、每箱套数和原箱直发资格。',
+    '如何核查买家反映的包装开裂？',
+    '样品和大货是否同规格，如何拿样核实？',
+  ];
+  const makeInquiry = (bullets = baseBullets, compression = false, copyTail = '') => ({
+    schema_version: 1,
+    contract: 'FactoryInquiryChecklist1688',
+    form_id: ctx.form_id,
+    auto_send_prohibited: true,
+    wangwang_questions: bullets,
+    structured_items: bullets.map((question_zh, i) => ({
+      slot: i + 1,
+      topic: ['spec_parts_material_accessories', 'regular_100_300_shenzhen_quote_lead_time', 'retail_packaging_master_carton_own_box', 'return_cause_and_quality_checks', 'post_sample_verification_and_gaps'][i],
+      question_zh,
+      includes_package_compression_check: i === 3 && compression,
+    })),
+    copy_paste_message_zh: bullets.map((q, i) => `${i + 1}. ${q}`).join('\n') + copyTail,
+    manual_handoff_note_zh: '仅限人工审看并手动发送。',
+  });
+
+  // SPEC-6: Registered threshold SSOT (10 mm), batch array shortlist, no spurious triggers
+  assert.equal(BUSINESS_THRESHOLDS.borderline_package_rescue_max_mm, 10);
+  const entry = { eligible: true, overshoot_mm: 1.8, form_id: ctx.form_id };
+  assert.equal(resolvePackageCompressionTriggered({ ...ctx, packaging_redesign_shortlist: entry }), true);
+  assert.equal(resolvePackageCompressionTriggered({ ...ctx, packaging_redesign_shortlist: [entry] }), true);
+  assert.equal(resolvePackageCompressionTriggered({ package_compression_triggered: true, packaging_redesign_shortlist: { eligible: false, overshoot_mm: 14 } }), false);
+  assert.equal(resolvePackageCompressionTriggered({ borderline_overshoot_mm: 10.00005 }), false);
+  assert.equal(resolvePackageCompressionTriggered({ packaging_redesign_shortlist: { eligible: false }, borderline_overshoot_mm: 1.8 }), false);
+
+  // Slot 4 compression precision: reject untriggered box-thinning, allow component 10 mm wood, reject triggered 10 mm board
+  assert.throws(
+    () => parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(baseBullets.with(3, '能否把外盒减薄2毫米并保留保护强度？'))), ctx),
+    /package-compression/i,
+  );
+  assert.equal(
+    parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(baseBullets.with(3, '10 mm厚的木条如何防止开裂？'))), ctx).valid,
+    true,
+  );
+  assert.throws(
+    () => parseFactoryInquiryChecklistResult(
+      wrapResponsesEnvelope(makeInquiry(baseBullets.with(3, '请确认10 mm板材的强度。'), true)),
+      { ...ctx, packaging_redesign_shortlist: entry },
+    ),
+    /trimming packaging dimensions/i,
+  );
+
+  // SPEC-7: Slot 2 natural Chinese vs first-order/freight-excluded, substantive Slot 1/3/4/5, single copy-block SSOT
+  assert.throws(
+    () => parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(baseBullets.with(1, '请报首单100套和300套的深圳出厂单价及交期，运费另算。'))), ctx),
+    /first-order|首单/i,
+  );
+  assert.equal(
+    parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(baseBullets.with(1, '常规复购100套和300套各自包邮到深圳多少钱，多久能发货？'))), ctx).valid,
+    true,
+  );
+  assert.throws(
+    () => parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(['你好。', baseBullets[1], '包装外箱尺寸多少？', '你好。', '样品？'])), ctx),
+    /slot 1/i,
+  );
+  assert.throws(
+    () => parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(baseBullets, false, '\n6. 请直接安排300套生产。')), ctx),
+    /strictly 5 lines/i,
+  );
+
+  // SPEC-8 & SPEC-10a-c: Unselected parse rejection, cross-card diagnosis rejection, rights-excluded block, stale flag override, Vision & scored-card direct build
+  assert.throws(() => parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry()), { ...ctx, counts_toward_target: false }), /counts_toward_target|allow_on_demand_pending/i);
+  assert.throws(
+    () => buildFactoryInquiryChecklistRequest({ ...ctx, return_cause_diagnosis: { form_id: 'other-form' } }),
+    /does not match input\.form_id/i,
+  );
+  const rightsExcluded = { ...ctx, effective_disposition: 'hard_excluded', specific_rights_conflict: true, qualification: { counts_toward_target: false } };
+  assert.throws(() => buildFactoryInquiryChecklistRequest({ ...rightsExcluded, allow_on_demand_pending: true }), /rights-conflict/i);
+  assert.equal(resolveFactoryInquiryEligibility({ ...rightsExcluded, counts_toward_target: true }).generation_mode, null);
+
+  const visionReq = buildFactoryInquiryChecklistRequest({
+    ...ctx,
+    component_gaps: ['缺内衬护角'],
+    wangwang_questions: ['请提供外箱尺寸与毛重'],
+  });
+  const visionWire = JSON.parse(visionReq.input[1].content[0].text);
+  assert.deepEqual(visionWire.vision_component_gaps, ['缺内衬护角']);
+  assert.deepEqual(visionWire.existing_wangwang_questions, ['请提供外箱尺寸与毛重']);
+
+  // Direct scored candidate accepted by buildFactoryInquiryChecklistRequest + HTML refuses unvalidated/cross-card attachments & normalizes legacy "旺旺"
+  const cand = makeStage4OrganizerTrayCandidate(syntheticFixture.candidates[0], { specSha256: '3'.repeat(64), specVersion: 1 });
+  cand.judgments.routine_complexity = {
+    anchor: null,
+    sample_check_required: true,
+    reason: '随箱英文说明书与装箱率留待拿样/旺旺核对。',
+    evidence: [cand.evidence[0].id],
+  };
+  const baseBatch = { schema_version: 1, profile_revision: 59, candidates: [cand] };
+  const baseScored = scoreBatch(baseBatch, r59Profile);
+  assert.equal(buildFactoryInquiryChecklistRequest(baseScored.candidates[0]).model, 'gpt-6.1-terra');
+
+  // Inject malformed/cross-card attachments + relative .local/ path + single-note missing flags
+  cand.factory_inquiry_1688 = {
+    contract: 'FactoryInquiryChecklist1688',
+    form_id: 'other-form',
+    auto_send_prohibited: false,
+    wangwang_questions: ['用旺旺联系合成示例。'],
+  };
+  cand.return_cause_diagnosis = {
+    contract: 'ReturnCauseDiagnosis',
+    form_id: 'other-form',
+    evidence_status: 'insufficient_evidence',
+    missing_evidence_flags: ['missing_qa_body_text', 'missing_sku_matched_review_text'],
+    missing_evidence_notes_zh: ['缺可核 Q&A 正文'],
+    causes: [],
+    summary_zh: '跨卡不应渲染。',
+    disclaimer_zh: '仅供人工核实。',
+  };
+  const rejectedHtml = renderReport(scoreBatch(baseBatch, r59Profile), baseBatch);
+  assert.equal(rejectedHtml.includes('data-section="return-cause-diagnosis"'), false, 'cross-card diagnosis must not render');
+  assert.equal(rejectedHtml.includes('data-section="factory-inquiry-1688"'), false, 'invalid/cross-card inquiry must not render');
+  assert.doesNotMatch(rejectedHtml, /旺旺/, 'legacy card judgment/gap wording must render as 1688 问厂');
+
+  // Valid same-card diagnosis with relative `.local/...` path & single note still exposes ALL missing_evidence_flags and scrubs `.local/...`
+  cand.return_cause_diagnosis.form_id = cand.id;
+  cand.return_cause_diagnosis.summary_zh = '查验记录在 .local/trials/fixture/private-comments.json。';
+  const validHtml = renderReport(scoreBatch(baseBatch, r59Profile), baseBatch);
+  assert.equal(validHtml.includes('.local/trials/fixture/private-comments.json'), false, 'relative .local path must be scrubbed');
+  assert.match(validHtml, /缺可核同变体原文/, 'missing_sku_matched_review_text must never be masked by a single Q&A note');
+  assert.match(validHtml, /缺可核 Q&amp;A 正文/);
+});
+
+test('Stage 5A Pipeline Wiring (SPEC-1 & STD-4): runPhase2Batch attaches optional ②/③ post-scoring without altering scores or evidence_bundle_sha256', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'stage5a-pipeline-'));
+  const dbPath = join(dir, 'selection.sqlite');
+  const store = openSelectionStore(dbPath);
+  try {
+    const baseCand = makeStage4OrganizerTrayCandidate(syntheticFixture.candidates[0], {
+      specSha256: '4'.repeat(64),
+      specVersion: 1,
+    });
+    const formId = baseCand.id;
+
+    const makeValidDiag = (id) => ({
+      schema_version: 1,
+      contract: 'ReturnCauseDiagnosis',
+      form_id: id,
+      target_variant_sku: 'TRAY-STD-1PK',
+      evidence_status: 'verified_variant_quotes',
+      missing_evidence_flags: [],
+      missing_evidence_notes_zh: [],
+      causes: [
+        {
+          cause_id: 'c-corner',
+          category: 'packaging_or_transit_damage',
+          actionability: 'fixable_listing_manual_packaging',
+          claim_basis: 'explicit_buyer_return',
+          summary_zh: '薄彩盒缺护角致磕损退货，可补强包装。',
+          purchased_spec_note: 'TRAY-STD-1PK',
+          counter_evidence_zh: null,
+          factory_verification_hook_zh: '确认彩盒护角缓冲。',
+          citations: [
+            {
+              source_type: 'review',
+              source_id: 'r-pipe-1',
+              stars: 2,
+              variant_sku: 'TRAY-STD-1PK',
+              sku_verified: true,
+              mentions_return_explicitly: true,
+              excerpt: 'Corner crushed, returned it.',
+            },
+          ],
+        },
+      ],
+      summary_zh: '薄彩盒护角不足引发退货，不从差评反推退款率。',
+      disclaimer_zh: '仅基于抽查原文诊断，不改动评分。',
+    });
+
+    const makeValidInq = (id, firstBullet) => {
+      const bullets = [
+        firstBullet,
+        '请按常规复购价分别报100套、300套到深圳含运总价和大货交期。',
+        '请报零售包装及外箱尺寸、重量、每箱套数和原箱直发资格。',
+        '针对买家反馈的护角磕损退货，请说明护角防护与质检标准。',
+        '样品与大货是否同规格同材质，能否寄1套核实防摔与清单？',
+      ];
+      return {
+        schema_version: 1,
+        contract: 'FactoryInquiryChecklist1688',
+        form_id: id,
+        auto_send_prohibited: true,
+        wangwang_questions: bullets,
+        structured_items: bullets.map((question_zh, i) => ({
+          slot: i + 1,
+          topic: ['spec_parts_material_accessories', 'regular_100_300_shenzhen_quote_lead_time', 'retail_packaging_master_carton_own_box', 'return_cause_and_quality_checks', 'post_sample_verification_and_gaps'][i],
+          question_zh,
+          includes_package_compression_check: false,
+        })),
+        copy_paste_message_zh: bullets.map((q, i) => `${i + 1}. ${q}`).join('\n'),
+        manual_handoff_note_zh: '仅限主人审看后手动复制发送，AI 严禁代发消息。',
+      };
+    };
+
+    const runWithFirstBullet = async (firstBullet) => {
+      const subDir = mkdtempSync(join(dir, 'run-'));
+      const subStore = openSelectionStore(join(subDir, 'sub.sqlite'));
+      try {
+        const formDef = {
+          form_id: formId,
+          product_family_key: formId,
+          label: baseCand.label,
+          buyer_task: 'Organize desktop items with removable tray',
+          saleable_set_composition: [{ component_id: 'tray-set', qty_per_saleable_set: 1 }],
+        };
+        const upserted = subStore.upsertCandidateForm({
+          ...formDef,
+          lifecycle_status: 'gate1b_queued',
+        });
+        const candClone = makeStage4OrganizerTrayCandidate(syntheticFixture.candidates[0], {
+          id: formId,
+          specSha256: upserted.form.spec_sha256,
+          specVersion: upserted.form.spec_version,
+          lowPrice: 48.00,
+          highPrice: 48.00,
+        });
+        candClone.economics.expected_primary_scenarios = [{ id: 'sc-high-parts-unknown', status: 'active' }];
+        candClone.economics.scenarios = [candClone.economics.scenarios[1]];
+        const sc0 = candClone.economics.scenarios[0];
+        const fx = 7.2;
+        const orderUnits = 100;
+        const prodLine = sc0.cost_ledger.lines.find(l => l.id === 'procurement' || l.components?.includes('procurement'));
+        const domLine = sc0.cost_ledger.lines.find(l => l.id === 'domestic_freight');
+        const goodsCny = Number(((prodLine?.amount_usd ?? 8.317) * fx * orderUnits).toFixed(2));
+        const domCny = Number(((domLine?.amount_usd ?? 0) * fx * orderUnits).toFixed(2));
+        const quoteRec = subStore.recordSourcingQuote1688({
+          quote_id: 'q1688-syn-kit-100',
+          form_id: formId,
+          observed_at: '2026-11-27',
+          redacted_destination: '广东深圳',
+          raw_readback_ref: 'readback:stage5a-syn-quote',
+          goods_first_order_promotion: false,
+          freight_first_order_promotion: false,
+          ui_readback: {
+            logged_in: true,
+            viewport_width_px: 1440,
+            selected_sku_row_visible: true,
+            settlement_bar_visible: true,
+            applied_quantity_confirmed: true,
+          },
+          sku_lines: [{
+            offer_id: 'o-stage5a',
+            sku_id: 's-stage5a',
+            component_id: 'tray-set',
+            qty_per_saleable_set: 1,
+            pack_multiple: 1,
+            moq_qty: orderUnits,
+            ordered_qty: orderUnits,
+            unit_price_cny: Number((goodsCny / orderUnits).toFixed(4)),
+            regular_goods_promo_false: true,
+          }],
+          actual_sets: orderUnits,
+          actual_complete_sets: orderUnits,
+          goods_cny_total: goodsCny,
+          domestic_freight_cny_total: domCny,
+        });
+        for (const sc of candClone.economics.scenarios) {
+          sc.quote_id = quoteRec.quote.quote_id;
+          sc.cost_ledger.fx_cny_per_usd = fx;
+          const setLine = (lid, amt) => {
+            const line = sc.cost_ledger.lines.find(l => l.id === lid);
+            if (line) line.amount_usd = amt;
+          };
+          setLine('headhaul', 2.5);
+          setLine('fulfillment', 6.4791);
+          setLine('placement', 0.6);
+          setLine('storage', 0.219375);
+          const r = sc.cost_ledger.refund_fraction ?? 0.04;
+          const nonColAmz = ['referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'return_disposition']
+            .reduce((s, lid) => s + (sc.cost_ledger.lines.find(l => l.id === lid)?.amount_usd ?? 0), 0);
+          setLine('collection', Number((Math.max(0, 48 * (1 - r) - nonColAmz) * (sc.cost_ledger.collection_rate ?? 0.005)).toFixed(6)));
+        }
+        candClone.factory_inquiry_1688 = makeValidInq(formId, firstBullet);
+        const batchOut = await runPhase2Batch(subStore, {
+          profile: r59Profile,
+          as_of_date: '2026-11-27',
+          deep_research_executor: async () => ({
+            batch: { schema_version: 1, profile_revision: 59, candidates: [candClone] },
+          }),
+          items: [
+            {
+              leads: [{
+                lead_id: 'lead-syn-stage5a',
+                event_dedup_key: 'reddit:syn-stage5a-tray',
+                source_channel: 'reddit',
+                entry_group: 'social',
+                source_ref: 'https://www.reddit.com/r/organization/comments/stage5asyn',
+                phrase_or_title: 'desktop organizer removable tray',
+                observed_at: '2026-11-27',
+                disposition: 'product',
+              }],
+              form: formDef,
+              gate1a_scenarios: [
+                makeGate1AScenario({ id: 'sc-high-parts-unknown', priceUsd: 48.00, fx_cny_per_usd: fx }),
+              ],
+              early_screen_builder: () => ({
+                profile_revision: 59,
+                id: 'stage5a-screen',
+                saleable_unit: '1 complete tray set',
+                price_usd: 48.00,
+                fx_cny_per_usd: fx,
+                order_units: orderUnits,
+                goods_cny_per_unit: Number((goodsCny / orderUnits).toFixed(4)),
+                domestic_freight_cny_per_unit: Number((domCny / orderUnits).toFixed(4)),
+                first_order_promotion: false,
+                goods_first_order_promotion: false,
+                headhaul: { usd_per_unit: 2.5, bond_included: true },
+                refund_fraction: 0.04,
+                physical_return_fraction: 0.04,
+                return_threshold: 0.081,
+                returns_processing_usd: 0,
+                is_apparel_or_shoes: false,
+                referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.0, minimum_referral_usd: 0.30 },
+                fulfillment_usd: 6.4791,
+                placement_usd: 0.34,
+                storage: { cubic_feet_per_unit: 0.1875, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+                operating_period: 'off_peak',
+                operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+                fee_context: {
+                  marketplace: 'US',
+                  currency: 'USD',
+                  package_ref: 'pack-1',
+                  sales: { from: '2027-02-01', through: '2027-10-14' },
+                  storage: { from: '2027-02-01', through: '2027-09-30' },
+                  inbound: { from: '2027-01-15', through: '2027-02-01' },
+                },
+                collection_rate: 0.006,
+                other_applicable_usd: 0,
+                specific_rights_conflict: 'unknown',
+                strong_date_dependency: false,
+              }),
+              return_cause_diagnosis_input: {
+                target_variant_sku: 'TRAY-STD-1PK',
+                reviews: [{ review_id: 'r-pipe-1', stars: 2, variant_sku: 'TRAY-STD-1PK', sku_verified: true, text: 'Corner crushed, returned it.' }],
+              },
+            },
+          ],
+          openai_hooks: {
+            return_cause_diagnosis: {
+              enabled: true,
+              responseExecutor: async () => wrapResponsesEnvelope(makeValidDiag(formId)),
+            },
+            factory_inquiry_1688: {
+              enabled: true,
+              responseExecutor: async () => wrapResponsesEnvelope(makeValidInq(formId, firstBullet)),
+            },
+          },
+        });
+        return { batchOut, evals: subStore.getEvaluationsForForm(formId) };
+      } finally {
+        subStore.close();
+      }
+    };
+
+    const r1 = await runWithFirstBullet('请列完整规格、材质、配件，附套装合照。');
+    const r2 = await runWithFirstBullet('请列完整规格、材质与所有配件，并附当前套装实物合照。');
+
+    assert.equal(r1.batchOut.gate2_3[0]?.status, 'evaluated', JSON.stringify(r1.batchOut.gate2_3[0]));
+    assert.equal(r1.batchOut.gate2_3[0].return_cause_diagnosis?.status, 'ready', JSON.stringify(r1.batchOut.gate2_3[0].return_cause_diagnosis));
+    assert.equal(r1.batchOut.gate2_3[0].factory_inquiry_1688?.status, 'ready', JSON.stringify(r1.batchOut.gate2_3[0].factory_inquiry_1688));
+    assert.equal(r1.evals.length, r2.evals.length);
+    assert.ok(r1.evals.length >= 1);
+    assert.equal(
+      r1.evals[0].evidence_bundle_sha256,
+      r2.evals[0].evidence_bundle_sha256,
+      'STD-4: rewording Stage 5A 1688 inquiry bullets must NOT mutate evidence_bundle_sha256',
+    );
+    assert.equal(
+      r1.evals[0].result_sha256,
+      r2.evals[0].result_sha256,
+      'Stage 5A must NOT mutate deterministic scoring result_sha256',
+    );
+    assert.notEqual(
+      r1.evals[0].html_sha256,
+      r2.evals[0].html_sha256,
+      'updated Stage 5A inquiry text must render into the generated report HTML',
+    );
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
