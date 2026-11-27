@@ -566,6 +566,12 @@ function enrichBatchAndResultFromStore(boundBatch, store, options = {}) {
     for (const cand of boundBatch.candidates) {
       if (!cand?.id) continue;
       const form = store.getCandidateForm(cand.id);
+      if (form?.spec_sha256) {
+        cand.spec_sha256 = form.spec_sha256;
+      }
+      if (Number.isInteger(form?.spec_version) && form.spec_version > 0) {
+        cand.spec_version = form.spec_version;
+      }
       if (form?.lifecycle_status === 'deferred' && !expectedHtmlSha256 && effectiveRevForSnap >= 59) {
         if (!Array.isArray(cand.evidence) || cand.evidence.length === 0) {
           cand.evidence = [{

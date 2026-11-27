@@ -2119,7 +2119,262 @@ function validateR58PriceAnchor(anchor, ctx, minFloor = 29.99) {
   };
 }
 
-function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expectedComponents = null) {
+const FORMAL_COMPARABILITY_STATUSES = new Set([
+  'confirmed_excluded',
+  'pending_evidence',
+  'confirmed_comparable',
+]);
+
+function normalizePeerKeySet(raw) {
+  if (!text(raw)) return new Set();
+  const upper = raw.trim().toUpperCase();
+  const keys = new Set([upper]);
+  const stripped = upper.replace(/^(?:PEER|ASIN|COMPETITOR)[-_:\s]+/, '');
+  if (stripped && stripped !== upper) keys.add(stripped);
+  return keys;
+}
+
+function peerKeysOverlap(setA, setB) {
+  if (!setA?.size || !setB?.size) return false;
+  for (const k of setA) {
+    if (setB.has(k)) return true;
+  }
+  return false;
+}
+
+function resolveCandidateSpecIdentity(candidate) {
+  const sha = text(candidate?.spec_sha256)
+    ? candidate.spec_sha256.trim().toLowerCase()
+    : (text(candidate?.form_spec_sha256) ? candidate.form_spec_sha256.trim().toLowerCase() : null);
+  const version = Number.isInteger(candidate?.spec_version) && candidate.spec_version > 0
+    ? candidate.spec_version
+    : null;
+  const candidateId = text(candidate?.id)
+    ? candidate.id.trim()
+    : (text(candidate?.candidate_id) ? candidate.candidate_id.trim() : null);
+  return { sha, version, candidateId };
+}
+
+function isSpecBoundRecordStale(record, specId) {
+  if (!record || typeof record !== 'object') return false;
+  if (record.stale_spec === true) return true;
+  const recCandId = text(record.candidate_id) ? record.candidate_id.trim() : null;
+  if (recCandId && specId.candidateId && recCandId !== specId.candidateId) return true;
+  const recSha = text(record.spec_sha256)
+    ? record.spec_sha256.trim().toLowerCase()
+    : (text(record.form_spec_sha256) ? record.form_spec_sha256.trim().toLowerCase() : null);
+  const recVer = Number.isInteger(record.spec_version) && record.spec_version > 0
+    ? record.spec_version
+    : null;
+  if (recSha && specId.sha && recSha !== specId.sha) return true;
+  if (recSha && !specId.sha) return true;
+  if (recVer !== null && specId.version !== null && recVer !== specId.version) return true;
+  if (specId.sha && !recSha && recVer === null) return true;
+  if (specId.version !== null && specId.version > 1 && recVer === null && (!recSha || recSha !== specId.sha)) {
+    return true;
+  }
+  return false;
+}
+
+function extractScenarioPeerInfo(scenario, candidate = null, periodId = null) {
+  const rawIdentifiers = [
+    scenario?.price_anchor?.target_variant_asin,
+    scenario?.target_variant_asin,
+    scenario?.peer_asin,
+    scenario?.cost_ledger?.source_inputs?.target_variant_asin,
+    scenario?.cost_ledger?.source_inputs?.peer_asin,
+    scenario?.subject_id,
+    scenario?.price_anchor?.subject_id,
+  ].filter(text).map(s => s.trim());
+
+  let peerAsin = rawIdentifiers[0] ?? null;
+  const peerKeys = new Set();
+  for (const idVal of rawIdentifiers) {
+    for (const k of normalizePeerKeySet(idVal)) peerKeys.add(k);
+  }
+  if (!peerAsin && candidate) {
+    const ref = candidate?.screening?.reference_price_usd;
+    const refAsin = text(ref?.target_variant_asin) ? ref.target_variant_asin.trim() : null;
+    const scPrice = scenario?.cost_ledger?.price_usd ?? scenario?.price_anchor?.value ?? null;
+    if (refAsin && (!number(ref?.value) || !number(scPrice) || Math.abs(ref.value - scPrice) < 1e-4)) {
+      peerAsin = refAsin;
+      for (const k of normalizePeerKeySet(refAsin)) peerKeys.add(k);
+    }
+  }
+  const scenarioId = text(scenario?.id) ? scenario.id.trim() : null;
+  const resolvedPeriodId = text(periodId)
+    ? periodId.trim()
+    : (text(scenario?.operating_period_id) ? scenario.operating_period_id.trim() : null);
+  return { peerAsin, peerKeys, scenarioId, periodId: resolvedPeriodId };
+}
+
+export function resolveScenarioComparabilityLinkage(
+  scenario,
+  candidate,
+  { peerAsinOverride = null, includeAdvisoryReview = true, periodId = null } = {},
+) {
+  const specId = resolveCandidateSpecIdentity(candidate);
+  const info = peerAsinOverride
+    ? {
+        peerAsin: String(peerAsinOverride).trim(),
+        peerKeys: normalizePeerKeySet(peerAsinOverride),
+        scenarioId: null,
+        periodId: text(periodId) ? periodId.trim() : null,
+      }
+    : extractScenarioPeerInfo(scenario, candidate, periodId);
+  if (!info.peerKeys.size && !info.scenarioId) return null;
+
+  const rawRulings = [
+    ...(Array.isArray(candidate?.peer_comparability_rulings) ? candidate.peer_comparability_rulings : []),
+    ...(Array.isArray(candidate?.comparability_rulings) ? candidate.comparability_rulings : []),
+    ...(scenario?.comparability_ruling && typeof scenario.comparability_ruling === 'object' ? [scenario.comparability_ruling] : []),
+  ];
+
+  let staleIgnoredCount = 0;
+  let invalidRulingIgnoredCount = 0;
+  let matchedFormal = null;
+
+  for (const r of rawRulings) {
+    if (!r || typeof r !== 'object' || Array.isArray(r)) continue;
+    const rPeriodId = text(r.period_id) ? r.period_id.trim() : (text(r.operating_period_id) ? r.operating_period_id.trim() : null);
+    if (rPeriodId && info.periodId && rPeriodId !== info.periodId) continue;
+
+    const rScenId = text(r.scenario_id) ? r.scenario_id.trim() : null;
+    const rPeerVals = [r.peer_asin, r.target_variant_asin, r.subject_id].filter(text).map(s => s.trim());
+    const rPeerKeys = new Set();
+    for (const v of rPeerVals) {
+      for (const k of normalizePeerKeySet(v)) rPeerKeys.add(k);
+    }
+    const hasScen = Boolean(rScenId);
+    const hasPeer = rPeerKeys.size > 0;
+    if (!hasScen && !hasPeer) continue;
+    // AND semantics when a ruling declares BOTH scenario_id and peer_asin/subject_id
+    const scenMatches = !hasScen || (Boolean(info.scenarioId) && rScenId === info.scenarioId);
+    const peerMatches = !hasPeer || peerKeysOverlap(info.peerKeys, rPeerKeys);
+    if (!scenMatches || !peerMatches) continue;
+
+    if (isSpecBoundRecordStale(r, specId)) {
+      staleIgnoredCount += 1;
+      continue;
+    }
+
+    const rStatus = text(r.status) ? r.status.trim() : '';
+    const rSource = text(r.source) ? r.source.trim() : '';
+    const rReason = text(r.reason) ? r.reason.trim() : '';
+    if (!FORMAL_COMPARABILITY_STATUSES.has(rStatus) || !rSource || !rReason) {
+      invalidRulingIgnoredCount += 1;
+      continue;
+    }
+
+    matchedFormal = {
+      status: rStatus,
+      source: rSource,
+      reason: rReason,
+      evidence: Array.isArray(r.evidence) ? r.evidence.filter(text).map(s => s.trim()) : [],
+      ruled_at: text(r.ruled_at) ? r.ruled_at.trim() : null,
+      matched_peer_key: rPeerVals[0] ?? (info.peerAsin ?? null),
+    };
+  }
+
+  let matchedAi = null;
+  if (includeAdvisoryReview) {
+    const ev = candidate?.evidence_review;
+    if (ev && typeof ev === 'object' && !Array.isArray(ev)) {
+      const evStatus = text(ev.status) ? ev.status.trim().toLowerCase() : '';
+      const execStatus = text(ev.execution_status) ? ev.execution_status.trim().toLowerCase() : '';
+      const contentStatus = text(ev.content_status) ? ev.content_status.trim().toLowerCase() : '';
+      const evSubjects = Array.isArray(ev.review?.subjects)
+        ? ev.review.subjects
+        : (Array.isArray(ev.subjects) ? ev.subjects : []);
+      const evHasReadableSubjects = evSubjects.length > 0 &&
+        contentStatus !== 'invalid' &&
+        contentStatus !== 'refused' &&
+        execStatus !== 'failed_known' &&
+        execStatus !== 'rejected' &&
+        execStatus !== 'error' &&
+        (
+          (evStatus === 'ready' && (!execStatus || execStatus === 'completed') && (!contentStatus || contentStatus === 'usable')) ||
+          (execStatus === 'completed' && contentStatus === 'usable') ||
+          execStatus === 'synthetic_executor_advisory'
+        );
+
+      if (evHasReadableSubjects) {
+        const evStale = execStatus === 'stale_packet_mismatch' || isSpecBoundRecordStale(ev, specId);
+        for (const subj of evSubjects) {
+          if (!subj || typeof subj !== 'object') continue;
+          const sId = text(subj.subject_id) ? subj.subject_id.trim() : null;
+          if (!sId) continue;
+          const sKeys = normalizePeerKeySet(sId);
+          if (!peerKeysOverlap(info.peerKeys, sKeys)) continue;
+          if (evStale) {
+            staleIgnoredCount += 1;
+            continue;
+          }
+          const disp = text(subj.disposition) ? subj.disposition.trim().toLowerCase() : '';
+          if (['included', 'excluded', 'pending'].includes(disp)) {
+            matchedAi = {
+              subject_id: sId,
+              disposition: disp,
+              reason: text(subj.reason) ? subj.reason.trim() : '',
+              review_id: text(ev.review_id ?? ev.review?.review_id) ? String(ev.review_id ?? ev.review?.review_id).trim() : null,
+              evidence_ids: Array.isArray(subj.evidence_ids) ? subj.evidence_ids.filter(text) : [],
+            };
+          }
+        }
+      }
+    }
+  }
+
+  if (matchedFormal) {
+    return {
+      status: matchedFormal.status,
+      needs_ruling: false,
+      excluded_from_active_pricing: matchedFormal.status === 'confirmed_excluded',
+      peer_asin: info.peerAsin ?? matchedFormal.matched_peer_key,
+      source: matchedFormal.source,
+      reason: matchedFormal.reason,
+      evidence: matchedFormal.evidence,
+      ...(matchedFormal.ruled_at ? { ruled_at: matchedFormal.ruled_at } : {}),
+      ...(matchedAi ? { ai_review_subject: matchedAi } : {}),
+      stale_ignored_count: staleIgnoredCount,
+      ...(invalidRulingIgnoredCount > 0 ? { invalid_ruling_ignored_count: invalidRulingIgnoredCount } : {}),
+    };
+  }
+
+  if (matchedAi && (matchedAi.disposition === 'excluded' || matchedAi.disposition === 'pending')) {
+    return {
+      status: matchedAi.disposition === 'excluded' ? 'ai_dispute_pending_ruling' : 'ai_pending_evidence',
+      needs_ruling: true,
+      excluded_from_active_pricing: false,
+      peer_asin: info.peerAsin,
+      source: matchedAi.review_id ? `ai_evidence_review:${matchedAi.review_id}` : 'ai_evidence_review',
+      reason: matchedAi.reason || (matchedAi.disposition === 'excluded'
+        ? '独立复核对标规格提出排除异议，待正式裁决。'
+        : '独立复核提示对标同箱部件/规格尚待补证，待正式裁决。'),
+      ai_review_subject: matchedAi,
+      stale_ignored_count: staleIgnoredCount,
+      ...(invalidRulingIgnoredCount > 0 ? { invalid_ruling_ignored_count: invalidRulingIgnoredCount } : {}),
+    };
+  }
+
+  if (staleIgnoredCount > 0 || invalidRulingIgnoredCount > 0) {
+    return {
+      status: 'undisputed',
+      needs_ruling: false,
+      excluded_from_active_pricing: false,
+      peer_asin: info.peerAsin,
+      source: null,
+      reason: null,
+      ...(matchedAi ? { ai_review_subject: matchedAi } : {}),
+      stale_ignored_count: staleIgnoredCount,
+      ...(invalidRulingIgnoredCount > 0 ? { invalid_ruling_ignored_count: invalidRulingIgnoredCount } : {}),
+    };
+  }
+
+  return null;
+}
+
+function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expectedComponents = null, candidate = null) {
   const marginDef = defs.find(item => item.id === 'refund_adjusted_pre_ad_margin');
   const contributionDef = defs.find(item => item.id === 'unit_contribution');
   const floor = profile.reference_screening.margin.minimum;
@@ -2139,8 +2394,17 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
     structuralReason = 'A common saleable unit and nonempty supported economic scenario set are required.';
     outerStructuralReason = structuralReason;
   } else {
-    for (const scenario of economics.scenarios) {
-      if (text(scenario?.id)) idCounts.set(scenario.id, (idCounts.get(scenario.id) ?? 0) + 1);
+    const periodId = text(economics?.operating_period_id) ? economics.operating_period_id.trim() : null;
+    const preLinkages = economics.scenarios.map(sc =>
+      resolveScenarioComparabilityLinkage(sc, candidate, { includeAdvisoryReview: false, periodId }),
+    );
+    const formallyExcludedIdSet = new Set();
+    for (let i = 0; i < economics.scenarios.length; i += 1) {
+      const sc = economics.scenarios[i];
+      if (text(sc?.id)) {
+        idCounts.set(sc.id, (idCounts.get(sc.id) ?? 0) + 1);
+        if (preLinkages[i]?.status === 'confirmed_excluded') formallyExcludedIdSet.add(sc.id);
+      }
     }
     if (economics.expected_primary_scenarios !== undefined) {
       const expectedList = economics.expected_primary_scenarios;
@@ -2149,6 +2413,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
       } else {
         const expectedSeen = new Set();
         const activeExpected = new Set();
+        const cancelledExpected = new Set();
         const summary = [];
         for (const entry of expectedList) {
           if (!entry || typeof entry !== 'object' || !text(entry.id) || expectedSeen.has(entry.id) ||
@@ -2159,6 +2424,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
           }
           expectedSeen.add(entry.id);
           const present = idCounts.has(entry.id);
+          const archivedExcluded = formallyExcludedIdSet.has(entry.id);
           if (entry.status === 'active') {
             activeExpected.add(entry.id);
             if (!present) {
@@ -2168,13 +2434,14 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
               summary.push({ id: entry.id, status: 'active', verdict: 'present' });
             }
           } else {
-            const validCancel = text(entry.reason) && hasEvidence(entry.evidence, ctx) && !present;
+            const validCancel = text(entry.reason) && hasEvidence(entry.evidence, ctx) && (!present || archivedExcluded);
             if (!validCancel) {
               structuralReason ??= present
                 ? `Cancelled pre-declared primary scenario ${entry.id} still appears in active scenarios.`
                 : `Cancelled pre-declared primary scenario ${entry.id} requires a reason and valid registered evidence.`;
               summary.push({ id: entry.id, status: 'cancelled', verdict: present ? 'conflict_still_present' : 'unverified_cancellation' });
             } else {
+              cancelledExpected.add(entry.id);
               summary.push({ id: entry.id, status: 'cancelled', verdict: 'evidenced_cancellation', reason: entry.reason, evidence: entry.evidence });
             }
           }
@@ -2183,7 +2450,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
           structuralReason ??= 'expected_primary_scenarios must include at least one active primary scenario.';
         }
         for (const scenarioId of idCounts.keys()) {
-          if (!activeExpected.has(scenarioId)) {
+          if (!activeExpected.has(scenarioId) && !(cancelledExpected.has(scenarioId) && formallyExcludedIdSet.has(scenarioId))) {
             structuralReason ??= `Undeclared primary scenario ${scenarioId} is not listed as active in expected_primary_scenarios.`;
             summary.push({ id: scenarioId, status: 'undeclared', verdict: 'undeclared_in_expected' });
           }
@@ -2196,8 +2463,12 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
     }
     outerStructuralReason = structuralReason;
     const effExpectedComponents = expectedComponents ?? economics?.saleable_set_composition ?? economics?.expected_components ?? null;
-    for (const original of economics.scenarios) {
+    for (let idx = 0; idx < economics.scenarios.length; idx += 1) {
+      const original = economics.scenarios[idx];
       const scenario = datedScenario(original, economics, ctx, profile, false, effExpectedComponents);
+      const linkage = preLinkages[idx];
+      const excludedFromActive = linkage?.status === 'confirmed_excluded';
+      const pendingComparability = linkage?.status === 'pending_evidence';
       const kitCheck = evaluateSingleFactoryCompleteKit({
         scenario: original,
         cost_ledger: original?.cost_ledger,
@@ -2206,14 +2477,29 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
       const validRecord = text(scenario?.id) && idCounts.get(scenario.id) === 1 && scenario.saleable_unit === economics.saleable_unit &&
         scenario.coherent === true && Array.isArray(scenario.assumptions) && scenario.assumptions.length > 0 && scenario.assumptions.every(text) &&
         scenario?.calculation?.scoring_supported === true && !kitCheck.is_cross_factory_or_incomplete;
-      let eligibilityReason = kitCheck.is_cross_factory_or_incomplete
-        ? kitCheck.kit_note
-        : (validRecord ? null : 'Economic scenarios need unique IDs, the same saleable unit, coherent inputs and explicit assumptions.');
+      let eligibilityReason = excludedFromActive
+        ? '对标可比性正式裁决已排除该情景（规格不符）。'
+        : pendingComparability
+          ? '对标可比性待补证（缺同规格确认）。'
+          : kitCheck.is_cross_factory_or_incomplete
+            ? kitCheck.kit_note
+            : (validRecord ? null : 'Economic scenarios need unique IDs, the same saleable unit, coherent inputs and explicit assumptions.');
       let priceAnchorReason = null;
-      if (scenario?.calculation?.price_usd !== undefined) {
+      let evidencedPriceBelowFloor = false;
+      if (excludedFromActive) {
+        priceAnchorReason = '对标可比性正式裁决已排除该情景（规格不符）。';
+      } else if (pendingComparability) {
+        priceAnchorReason = '对标可比性待补证（缺同规格确认）。';
+      } else if (scenario?.calculation?.price_usd !== undefined) {
         const ledgerPrice = scenario.calculation.price_usd;
         if (ledgerPrice < priceFloor) {
           priceAnchorReason = `Primary scenario price USD ${ledgerPrice} is below the USD ${priceFloor} minimum retail floor.`;
+          if (scenario.price_anchor !== undefined) {
+            const saAny = validateR58PriceAnchor(scenario.price_anchor, ctx, 0);
+            if (saAny.supported && saAny.value === ledgerPrice) evidencedPriceBelowFloor = true;
+          } else if (priceRefR58?.supported) {
+            evidencedPriceBelowFloor = true;
+          }
         } else if (scenario.price_anchor !== undefined) {
           const sa = validateR58PriceAnchor(scenario.price_anchor, ctx, priceFloor);
           if (!sa.supported || sa.value < priceFloor || sa.value !== ledgerPrice) {
@@ -2226,38 +2512,61 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
         }
       }
       if (priceAnchorReason && !eligibilityReason) eligibilityReason = priceAnchorReason;
-      if (eligibilityReason) structuralReason ??= eligibilityReason;
+      if (!excludedFromActive && eligibilityReason) structuralReason ??= eligibilityReason;
       const margin = readNumber(scenario?.margin, 'fraction', ctx, { min: -Infinity, max: 1 });
       const contribution = readNumber(scenario?.contribution_usd, 'USD', ctx, { min: -Infinity });
       const contradictoryTuple = margin.value !== null && contribution.value !== null && Math.sign(margin.value) !== Math.sign(contribution.value);
-      if (contradictoryTuple) {
+      if (contradictoryTuple && !excludedFromActive) {
         eligibilityReason = 'Supported margin and contribution have contradictory signs or zero under the required positive net revenue.';
         structuralReason = eligibilityReason;
       }
-      const coherenceSupported = validRecord && !contradictoryTuple && !eligibilityReason;
+      const coherenceSupported = !excludedFromActive && !pendingComparability && validRecord && !contradictoryTuple && !eligibilityReason;
       const meetsFloor = margin.value !== null && (scenario?.calculation?.scoring_supported
         ? ledgerMeetsMarginFloor(scenario.calculation, floor)
         : margin.value >= floor);
       const eligible = coherenceSupported && meetsFloor;
       eligibilityReason ??= margin.reason ?? (!meetsFloor ? 'The supported scenario margin is below the existing 30% floor.' : null);
       const effectiveMargin = eligible && margin.value < floor ? floor : margin.value;
-      diagnostics.scenarios.push({ id: scenario?.id ?? null, input: scenario, margin, contribution,
-        coherence_supported: coherenceSupported, price_anchor_supported: priceAnchorReason === null,
+      diagnostics.scenarios.push({
+        id: scenario?.id ?? null,
+        input: scenario,
+        margin,
+        contribution,
+        coherence_supported: coherenceSupported,
+        price_anchor_supported: priceAnchorReason === null,
+        ...(evidencedPriceBelowFloor ? { evidenced_price_below_floor: true } : {}),
+        ...(excludedFromActive ? { excluded_from_active_pricing: true } : {}),
+        ...(linkage ? { comparability_linkage: linkage } : {}),
         single_factory_complete_kit: kitCheck,
-        margin_eligible: eligible, eligibility_reason: eligibilityReason,
+        margin_eligible: eligible,
+        eligibility_reason: eligibilityReason,
         margin_score: eligible ? numericScore(marginDef, effectiveMargin) : null,
-        contribution_score: eligible && contribution.value !== null ? numericScore(contributionDef, contribution.value) : null });
+        contribution_score: eligible && contribution.value !== null ? numericScore(contributionDef, contribution.value) : null,
+      });
     }
+  }
+  const scenarios = diagnostics.scenarios;
+  const activeScenarios = scenarios.filter(s => s.excluded_from_active_pricing !== true);
+  const excludedScenarioIds = scenarios
+    .filter(s => s.excluded_from_active_pricing === true)
+    .map(s => s.id)
+    .filter(Boolean);
+  const excludedScenarioIdSet = new Set(excludedScenarioIds);
+  if (excludedScenarioIds.length > 0) {
+    diagnostics.excluded_scenario_ids = excludedScenarioIds;
+  }
+  if (scenarios.length > 0 && activeScenarios.length === 0) {
+    structuralReason ??= 'All primary pricing scenarios were excluded by formal peer comparability rulings; supply matching-spec peer evidence to re-price.';
   }
   if (Array.isArray(economics?.stress_scenarios)) {
     const primaryHasOngoingPromo = Boolean(priceRefR58?.has_ongoing_discount) ||
-      diagnostics.scenarios.some(sc => sc.input?.calculation?.ongoing_discount_usd > 0 || sc.input?.cost_ledger?.ongoing_coupon_usd > 0 ||
+      activeScenarios.some(sc => sc.input?.calculation?.ongoing_discount_usd > 0 || sc.input?.cost_ledger?.ongoing_coupon_usd > 0 ||
         sc.input?.cost_ledger?.ongoing_coupon_pct > 0 || sc.input?.cost_ledger?.prime_exclusive_discount_usd > 0 ||
         sc.input?.cost_ledger?.prime_exclusive_discount_pct > 0);
-    const primaryNetPrices = diagnostics.scenarios
+    const primaryNetPrices = activeScenarios
       .map(sc => sc.input?.calculation?.price_usd)
       .filter(number);
-    const primaryListPrices = diagnostics.scenarios
+    const primaryListPrices = activeScenarios
       .map(sc => sc.input?.calculation?.list_price_usd ?? sc.input?.calculation?.price_usd)
       .filter(number);
     if (number(priceRefR58?.net_effective_price_usd)) primaryNetPrices.push(priceRefR58.net_effective_price_usd);
@@ -2327,6 +2636,17 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
         }
       }
 
+      const stressPeriodId = text(economics?.operating_period_id) ? economics.operating_period_id.trim() : null;
+      const stressLinkage = resolveScenarioComparabilityLinkage(stress, candidate, { includeAdvisoryReview: false, periodId: stressPeriodId });
+      const stressBaseExcluded = text(stress?.base_scenario_id) && excludedScenarioIdSet.has(stress.base_scenario_id.trim());
+      const stressExcludedByPrice = !stressLinkage && !stressBaseExcluded &&
+        excludedScenarioIds.length > 0 &&
+        number(calc?.price_usd ?? stress?.cost_ledger?.price_usd) &&
+        scenarios.some(s => s.excluded_from_active_pricing === true && number(s.input?.calculation?.price_usd) &&
+          Math.abs(s.input.calculation.price_usd - (calc?.price_usd ?? stress?.cost_ledger?.price_usd)) < 1e-4) &&
+        !activeScenarios.some(s => number(s.input?.calculation?.price_usd) &&
+          Math.abs(s.input.calculation.price_usd - (calc?.price_usd ?? stress?.cost_ledger?.price_usd)) < 1e-4);
+      const stressExcluded = stressLinkage?.status === 'confirmed_excluded' || stressBaseExcluded || stressExcludedByPrice;
       const blockNumbers = doubleDeductionBlocked || promoTierUnverified;
       return {
         id: stress?.id ?? null,
@@ -2341,13 +2661,14 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
         landed_domestic_cap_at_30pct_cny: blockNumbers ? null : (calc?.landed_domestic_cap_at_30pct_cny ?? null),
         double_deduction_blocked: doubleDeductionBlocked,
         promo_tier_unverified: promoTierUnverified,
+        ...(stressExcluded ? { excluded_from_active_pricing: true } : {}),
+        ...(stressLinkage ? { comparability_linkage: stressLinkage } : {}),
         stress_issues: stressIssues,
         calculation: calc,
       };
     });
   }
-  const scenarios = diagnostics.scenarios;
-  const incompleteKitScenarioIds = scenarios
+  const incompleteKitScenarioIds = activeScenarios
     .filter(s => s.single_factory_complete_kit?.is_cross_factory_or_incomplete)
     .map(s => s.id)
     .filter(Boolean);
@@ -2357,15 +2678,15 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
   if (incompleteKitScenarioIds.length > 0) {
     diagnostics.incomplete_cross_factory_kit_scenario_ids = incompleteKitScenarioIds;
   }
-  const marginsComplete = !structuralReason && scenarios.every(scenario => scenario.margin.value !== null);
-  if (marginsComplete) diagnostics.margin_range = span(scenarios.map(scenario => scenario.margin.value));
+  const marginsComplete = !structuralReason && activeScenarios.length > 0 && activeScenarios.every(scenario => scenario.margin.value !== null);
+  if (marginsComplete) diagnostics.margin_range = span(activeScenarios.map(scenario => scenario.margin.value));
   let marginStatus = 'pending';
   let marginReason = structuralReason ?? 'One or more economic scenarios lacks a supported complete margin; missing costs are not zero.';
   if (marginsComplete) {
-    const allFail = scenarios.every(s => !s.margin_eligible);
-    const allPass = scenarios.every(s => s.margin_eligible);
+    const allFail = activeScenarios.every(s => !s.margin_eligible);
+    const allPass = activeScenarios.every(s => s.margin_eligible);
     const distinctFactories = new Set(
-      scenarios
+      activeScenarios
         .map(s => resolveVerifiedFactoryKey(s.input))
         .filter(Boolean),
     );
@@ -2384,7 +2705,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
       const scoreFloorRat = ratFromNumber(marginDef.mapping.score_at_floor);
       const weightRat = ratFromNumber(marginDef.weight);
       const slopeRat = ratDiv(ratSub(weightRat, scoreFloorRat), ratSub(fullAtRat, floorRat));
-      for (const s of scenarios) {
+      for (const s of activeScenarios) {
         if (s.margin_score === null && s.margin.value !== null) {
           const mRat = ratFromNumber(s.margin.value);
           const rawRat = ratAdd(scoreFloorRat, ratMul(slopeRat, ratSub(mRat, floorRat)));
@@ -2395,13 +2716,13 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
         }
       }
       diagnostics.crossing_margin_floor = true;
-      diagnostics.passing_scenario_ids = scenarios.filter(s => s.margin_eligible).map(s => s.id);
-      diagnostics.below_floor_scenario_ids = scenarios.filter(s => !s.margin_eligible).map(s => s.id);
+      diagnostics.passing_scenario_ids = activeScenarios.filter(s => s.margin_eligible).map(s => s.id);
+      diagnostics.below_floor_scenario_ids = activeScenarios.filter(s => !s.margin_eligible).map(s => s.id);
       marginStatus = 'crossing_pass';
       marginReason = `Supported scenarios cross the 30% floor (passing: ${diagnostics.passing_scenario_ids.join(', ')}; below floor: ${diagnostics.below_floor_scenario_ids.join(', ')}); r59 scores full interval along linear slope without inflating strict qualifying count.`;
     }
-  } else if (!outerStructuralReason && scenarios.length > 0) {
-    // When nonnegative domestic_freight is the ONLY unconfirmed/deferred cost and every scenario's bare-goods
+  } else if (!outerStructuralReason && activeScenarios.length > 0) {
+    // When nonnegative domestic_freight is the ONLY unconfirmed/deferred cost and every active scenario's bare-goods
     // upper-bound margin is already strictly below 30%, no nonnegative domestic freight can rescue eligibility.
     const scIdCounts = new Map();
     for (const sc of scenarios) {
@@ -2409,7 +2730,7 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
     }
     const floorRat = ratFromNumber(floor);
     const bareUpperBounds = [];
-    const allBareBelowFloor = scenarios.every(sc => {
+    const allBareBelowFloor = activeScenarios.every(sc => {
       const inp = sc?.input;
       const calc = inp?.calculation;
       const ledger = inp?.cost_ledger;
@@ -2433,31 +2754,31 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
       bareUpperBounds.push((calc.net_revenue_usd - calc.known_cost_usd) / calc.net_revenue_usd);
       return true;
     });
-    if (allBareBelowFloor && bareUpperBounds.length === scenarios.length) {
+    if (allBareBelowFloor && bareUpperBounds.length === activeScenarios.length) {
       diagnostics.bare_goods_margin_upper_bounds = span(bareUpperBounds);
       marginStatus = 'fail';
       marginReason = 'Even before adding unconfirmed nonnegative domestic freight, the supported bare-goods margin upper bound is below the existing 30% floor.';
     }
   }
   const completeMargin = marginStatus === 'pass' || marginStatus === 'crossing_pass';
-  const completeContribution = completeMargin && scenarios.every(scenario => scenario.contribution.value !== null);
-  const marginRange = completeMargin ? span(scenarios.map(scenario => scenario.margin_score)) : null;
-  const contributionRange = completeContribution ? span(scenarios.map(scenario => scenario.contribution_score)) : null;
-  const marginEvidence = mergeRefs(...scenarios.map(scenario => scenario.input?.margin?.evidence));
-  const contributionEvidence = mergeRefs(marginEvidence, ...scenarios.map(scenario => scenario.input?.contribution_usd?.evidence));
+  const completeContribution = completeMargin && activeScenarios.every(scenario => scenario.contribution.value !== null);
+  const marginRange = completeMargin ? span(activeScenarios.map(scenario => scenario.margin_score)) : null;
+  const contributionRange = completeContribution ? span(activeScenarios.map(scenario => scenario.contribution_score)) : null;
+  const marginEvidence = mergeRefs(...activeScenarios.map(scenario => scenario.input?.margin?.evidence));
+  const contributionEvidence = mergeRefs(marginEvidence, ...activeScenarios.map(scenario => scenario.input?.contribution_usd?.evidence));
   const marginItem = completeMargin ? scored(marginDef, point(marginRange), economics, { score_range: marginRange, evidence: marginEvidence,
-    scenario_scores: scenarios.map(s => ({ id: s.id, value: s.margin.value, score: s.margin_score, margin_eligible: s.margin_eligible })),
+    scenario_scores: activeScenarios.map(s => ({ id: s.id, value: s.margin.value, score: s.margin_score, margin_eligible: s.margin_eligible })),
     ...(diagnostics.crossing_margin_floor ? { crossing_margin_floor: true } : {}) }) :
     missing(marginDef, marginReason, economics, { evidence: marginEvidence, status: marginStatus === 'fail' ? 'ineligible' : 'needs_evidence' });
   const contributionItem = completeContribution ? scored(contributionDef, point(contributionRange), economics,
-    { score_range: contributionRange, evidence: contributionEvidence, scenario_scores: scenarios.map(s => ({ id: s.id, value: s.contribution.value, score: s.contribution_score })) }) :
+    { score_range: contributionRange, evidence: contributionEvidence, scenario_scores: activeScenarios.map(s => ({ id: s.id, value: s.contribution.value, score: s.contribution_score })) }) :
     missing(contributionDef, completeMargin ? 'Every coherent eligible scenario needs supported nonnegative unit contribution.' : marginReason, economics,
       { evidence: contributionEvidence, status: marginStatus === 'fail' ? 'ineligible' : 'needs_evidence' });
-  const supportedRange = completeMargin ? span(scenarios.map(s => s.margin_score + (completeContribution ? s.contribution_score : 0))) : [0, 0];
+  const supportedRange = completeMargin ? span(activeScenarios.map(s => s.margin_score + (completeContribution ? s.contribution_score : 0))) : [0, 0];
   let conditionalRange = [0, marginDef.weight + contributionDef.weight];
   if (marginStatus === 'fail') conditionalRange = null;
   else if (completeMargin) {
-    const ranges = scenarios.map(s => [s.margin_score + (s.contribution_score ?? 0), s.margin_score + (s.contribution_score ?? contributionDef.weight)]);
+    const ranges = activeScenarios.map(s => [s.margin_score + (s.contribution_score ?? 0), s.margin_score + (s.contribution_score ?? contributionDef.weight)]);
     conditionalRange = [Math.min(...ranges.map(range => range[0])), Math.max(...ranges.map(range => range[1]))];
   }
   diagnostics.reason = marginReason;
@@ -2470,10 +2791,54 @@ function scoreEconomics(economics, ctx, profile, defs, priceRefR58 = null, expec
 function screenCandidate(candidate, ctx, profit, items, profile) {
   const priceInput = candidate.screening?.reference_price_usd;
   const r58Anchor = validateR58PriceAnchor(priceInput, ctx);
-  const price = { value: r58Anchor.value };
-  const priceSupported = r58Anchor.supported;
   const priceRule = profile.reference_screening.comparable_reference_price;
-  const pricePass = priceSupported && price.value >= priceRule.minimum_inclusive;
+  let price = { value: r58Anchor.value };
+  let priceSupported = r58Anchor.supported;
+  let pricePass = priceSupported && price.value >= priceRule.minimum_inclusive;
+  let priceReasonOverride = null;
+  let effectivePriceRange = null;
+  let reanchoredFromExcludedRef = false;
+
+  const refLinkage = text(priceInput?.target_variant_asin)
+    ? resolveScenarioComparabilityLinkage(null, candidate, { includeAdvisoryReview: false, peerAsinOverride: priceInput.target_variant_asin })
+    : null;
+  const allScenarios = profit.diagnostics?.scenarios ?? [];
+  const allPrimaryExcluded = allScenarios.length > 0 && activePricingScenarios(allScenarios).length === 0;
+  if (allPrimaryExcluded) {
+    priceSupported = false;
+    price = { value: null };
+    pricePass = false;
+    priceReasonOverride = '所有主售价情景均经正式裁决排除（规格不符），尚缺已确认同规格对标售价。';
+  } else if (refLinkage?.status === 'confirmed_excluded' || refLinkage?.status === 'pending_evidence') {
+    const reanchorScenarios = allScenarios.filter(sc =>
+      sc.excluded_from_active_pricing !== true &&
+      sc.comparability_linkage?.status !== 'pending_evidence' &&
+      sc.input?.price_anchor !== undefined &&
+      (sc.price_anchor_supported === true || sc.evidenced_price_below_floor === true) &&
+      number(sc.input?.calculation?.price_usd),
+    );
+    if (reanchorScenarios.length > 0) {
+      const prices = reanchorScenarios.map(sc => sc.input.calculation.price_usd);
+      const minPrice = Math.min(...prices);
+      const maxPrice = Math.max(...prices);
+      priceSupported = true;
+      price = { value: minPrice };
+      pricePass = minPrice >= priceRule.minimum_inclusive;
+      effectivePriceRange = [minPrice, maxPrice];
+      reanchoredFromExcludedRef = true;
+      priceReasonOverride = pricePass
+        ? `原参考对标经裁决排除/待定后，已按其余已确认同规格对标重锚（最低 USD ${minPrice} ≥ USD ${priceRule.minimum_inclusive}）。`
+        : `原参考对标经裁决排除/待定后，其余已确认同规格对标最低售价 USD ${minPrice} 低于 USD ${priceRule.minimum_inclusive}。`;
+    } else {
+      priceSupported = false;
+      price = { value: null };
+      pricePass = false;
+      priceReasonOverride = refLinkage.status === 'confirmed_excluded'
+        ? '原主参考对标经正式裁决排除（规格不符），尚缺已确认同规格对标售价。'
+        : '主参考对标同箱规格待补证，尚缺已确认同规格对标售价。';
+    }
+  }
+
   const date = candidate.screening?.strong_date_dependency;
   const dateSupported = typeof date?.value === 'boolean' && date.unit === 'boolean' && hasEvidence(date.evidence, ctx) &&
     date.supported !== false && date.material_conflict !== true;
@@ -2486,10 +2851,17 @@ function screenCandidate(candidate, ctx, profit, items, profile) {
     ? 'fail'
     : (rights.status === 'scored' ? (rights.score === 0 ? 'fail' : 'pass') : 'pending');
   const conditions = [
-    { id: 'reference_price', status: priceSupported ? pricePass ? 'pass' : 'fail' : 'pending', input: priceInput ?? null,
-      reason: priceSupported
+    {
+      id: 'reference_price',
+      status: priceSupported ? pricePass ? 'pass' : 'fail' : 'pending',
+      input: priceInput ?? null,
+      ...(effectivePriceRange ? { effective_price_range: effectivePriceRange } : {}),
+      ...(reanchoredFromExcludedRef ? { reanchored_from_excluded_ref: true } : {}),
+      ...(refLinkage ? { comparability_linkage: refLinkage } : {}),
+      reason: priceReasonOverride ?? (priceSupported
         ? (pricePass ? `Supported matched-spec reference price is at least USD ${priceRule.minimum_inclusive}.` : `Supported matched-spec reference price is below USD ${priceRule.minimum_inclusive}.`)
-        : r58Anchor.reason ?? priceInput?.reason ?? 'A supported positive matched-spec reference price is required.' },
+        : r58Anchor.reason ?? priceInput?.reason ?? 'A supported positive matched-spec reference price is required.'),
+    },
     profit.screening,
     { id: 'specific_form_rights', status: rightsStatus,
       reason: rights.reason, evidence: rights.evidence },
@@ -2530,7 +2902,7 @@ function aggregate(items, definitionsByGroup, profit) {
   };
 }
 
-function validateOperatingPeriods(economics, isR58 = false, isR59 = false) {
+function validateOperatingPeriods(economics, candidate = null) {
   const periods = economics.operating_periods;
   if (Object.hasOwn(economics, 'scenarios')) {
     throw new TypeError('Operating-period economics cannot also contain root scenarios; put every scenario in its period.');
@@ -2538,15 +2910,26 @@ function validateOperatingPeriods(economics, isR58 = false, isR59 = false) {
   if (!text(economics.saleable_unit) || !Array.isArray(periods) || periods.length === 0) {
     throw new TypeError('Operating-period economics require one common saleable unit and a nonempty operating_periods array.');
   }
-  const periodsHaveCleanOct14Split = isR59 && periods.length === 2 &&
-    periods.some(p => Array.isArray(p?.scenarios) && p.scenarios.length > 0 &&
-      p.scenarios.every(s => s?.cost_ledger?.fee_context?.sales?.through === '2027-10-14')) &&
-    periods.some(p => Array.isArray(p?.scenarios) && p.scenarios.length > 0 &&
-      p.scenarios.every(s => s?.cost_ledger?.fee_context?.sales?.from === '2027-10-15'));
+  const activePeriodScenarios = p => {
+    const scs = Array.isArray(p?.scenarios) ? p.scenarios : [];
+    const nonExcl = scs.filter(s =>
+      resolveScenarioComparabilityLinkage(s, candidate, { includeAdvisoryReview: false, periodId: p?.id })?.status !== 'confirmed_excluded',
+    );
+    return nonExcl.length > 0 ? nonExcl : scs;
+  };
+  const periodsHaveCleanOct14Split = periods.length === 2 &&
+    periods.some(p => {
+      const scs = activePeriodScenarios(p);
+      return scs.length > 0 && scs.every(s => s?.cost_ledger?.fee_context?.sales?.through === '2027-10-14');
+    }) &&
+    periods.some(p => {
+      const scs = activePeriodScenarios(p);
+      return scs.length > 0 && scs.every(s => s?.cost_ledger?.fee_context?.sales?.from === '2027-10-15');
+    });
   const ids = new Set();
   const months = new Set();
   for (const period of periods) {
-    const allowEmptyWithExpected = isR58 && Array.isArray(period?.scenarios) && period.scenarios.length === 0 &&
+    const allowEmptyWithExpected = Array.isArray(period?.scenarios) && period.scenarios.length === 0 &&
       (period.expected_primary_scenarios !== undefined || economics.expected_primary_scenarios !== undefined);
     if (!text(period?.id) || ids.has(period.id) || !text(period.label) || !Array.isArray(period.months) ||
       period.months.length === 0 || !Array.isArray(period.scenarios) || (period.scenarios.length === 0 && !allowEmptyWithExpected)) {
@@ -2576,17 +2959,14 @@ function validateOperatingPeriods(economics, isR58 = false, isR59 = false) {
 
 const PRIMARY_OFF_PEAK_MONTHS = [2, 3, 4, 5, 6, 7, 8, 9];
 const PRIMARY_OFF_PEAK_MONTHS_R59 = [2, 3, 4, 5, 6, 7, 8, 9, 10];
-const HOLIDAY_PEAK_MONTHS = [10, 11, 12];
+const activePricingScenarios = scenarios => (Array.isArray(scenarios) ? scenarios.filter(s => s?.excluded_from_active_pricing !== true) : []);
 
-function isPrimaryOffPeakMonthsList(months, isR59 = false) {
+function isPrimaryOffPeakMonthsList(months) {
   if (!Array.isArray(months)) return false;
   if (months.length === PRIMARY_OFF_PEAK_MONTHS.length && PRIMARY_OFF_PEAK_MONTHS.every(m => months.includes(m))) {
     return true;
   }
-  if (isR59 && months.length === PRIMARY_OFF_PEAK_MONTHS_R59.length && PRIMARY_OFF_PEAK_MONTHS_R59.every(m => months.includes(m))) {
-    return true;
-  }
-  return false;
+  return months.length === PRIMARY_OFF_PEAK_MONTHS_R59.length && PRIMARY_OFF_PEAK_MONTHS_R59.every(m => months.includes(m));
 }
 
 function validIsoWindow(w) {
@@ -2606,7 +2986,7 @@ function monthsInIsoWindow(w) {
   return [...res].sort((a, b) => a - b);
 }
 
-function coversPrimaryOffPeakScenario(scenario, isR59 = false) {
+function coversPrimaryOffPeakScenario(scenario) {
   const ctx = scenario?.input?.cost_ledger?.fee_context;
   const calc = scenario?.input?.calculation;
   if (!ctx || !calc?.scoring_supported || calc.fee_validation?.status !== 'validated') return false;
@@ -2614,24 +2994,22 @@ function coversPrimaryOffPeakScenario(scenario, isR59 = false) {
     ctx.storage?.from === '2027-02-01' && ctx.storage?.through === '2027-09-30' &&
     ctx.inbound?.from >= '2027-01-15' && ctx.inbound?.through <= '2027-09-30';
   if (legacyOk) return true;
-  if (isR59) {
-    return ctx.sales?.from === '2027-02-01' && ctx.sales?.through === '2027-10-14' &&
-      ctx.storage?.from === '2027-02-01' && ctx.storage?.through === '2027-09-30' &&
-      ctx.inbound?.from >= '2027-01-15' && ctx.inbound?.through <= '2027-10-14';
-  }
-  return false;
+  return ctx.sales?.from === '2027-02-01' && ctx.sales?.through === '2027-10-14' &&
+    ctx.storage?.from === '2027-02-01' && ctx.storage?.through === '2027-09-30' &&
+    ctx.inbound?.from >= '2027-01-15' && ctx.inbound?.through <= '2027-10-14';
 }
 
-function coversPrimaryOffPeakDates(scenarios, isR59 = false) {
-  if (!Array.isArray(scenarios) || scenarios.length === 0) return false;
+function coversPrimaryOffPeakDates(scenarios) {
+  const active = activePricingScenarios(scenarios);
+  if (active.length === 0) return false;
   let mode = null;
-  for (const scenario of scenarios) {
+  for (const scenario of active) {
     const ctx = scenario?.input?.cost_ledger?.fee_context;
     if (!ctx || !validIsoWindow(ctx.sales) || !validIsoWindow(ctx.storage) || !validIsoWindow(ctx.inbound)) return false;
     const isLegacy = ctx.sales.from === '2027-02-01' && ctx.sales.through === '2027-09-30' &&
       ctx.storage.from === '2027-02-01' && ctx.storage.through === '2027-09-30' &&
       ctx.inbound.from >= '2027-01-15' && ctx.inbound.through <= '2027-09-30';
-    const isCanonicalR59 = isR59 && ctx.sales.from === '2027-02-01' && ctx.sales.through === '2027-10-14' &&
+    const isCanonicalR59 = ctx.sales.from === '2027-02-01' && ctx.sales.through === '2027-10-14' &&
       ctx.storage.from === '2027-02-01' && ctx.storage.through === '2027-09-30' &&
       ctx.inbound.from >= '2027-01-15' && ctx.inbound.through <= '2027-10-14';
     if (!isLegacy && !isCanonicalR59) return false;
@@ -2642,25 +3020,24 @@ function coversPrimaryOffPeakDates(scenarios, isR59 = false) {
   return true;
 }
 
-function hasExactPeakMonthsR58(period, isR59 = false) {
+function hasExactPeakMonthsR58(period) {
   if (!period || !Array.isArray(period.months)) return false;
   const sorted = [...period.months].sort((a, b) => a - b);
   if (sorted.length === 3 && sorted[0] === 10 && sorted[1] === 11 && sorted[2] === 12) return true;
-  if (isR59 && sorted.length === 4 && sorted[0] === 1 && sorted[1] === 10 && sorted[2] === 11 && sorted[3] === 12) return true;
-  return false;
+  return sorted.length === 4 && sorted[0] === 1 && sorted[1] === 10 && sorted[2] === 11 && sorted[3] === 12;
 }
 
 /**
  * Returns null when the period is a valid 2027 companion holiday peak panel, otherwise the first
  * concrete reason (missing/pending cost line, failed binding or date mismatch).
  */
-function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
-  if (!hasExactPeakMonthsR58(period, isR59)) {
-    return isR59 ? 'panel does not cover exact months [10, 11, 12] or [10, 11, 12, 1]' : 'panel does not cover exact months [10, 11, 12]';
+function diagnoseCompanionPeakPanelR58(period) {
+  if (!hasExactPeakMonthsR58(period)) {
+    return 'panel does not cover exact months [10, 11, 12] or [10, 11, 12, 1]';
   }
   if (period.diagnostics?.economics?.expected_structural_error) return 'expected primary scenario structure is invalid';
-  const scenarios = period.diagnostics?.economics?.scenarios;
-  if (!Array.isArray(scenarios) || scenarios.length === 0) return 'panel has no dated cost_ledger scenarios';
+  const scenarios = activePricingScenarios(period.diagnostics?.economics?.scenarios);
+  if (scenarios.length === 0) return 'panel has no dated cost_ledger scenarios';
   const allowedPeakPending = new Set(['fulfillment', 'collection']);
   const allowedPublishedFulfillmentIssues = new Set(['fee_outside_dates', 'fee_season_mismatch']);
   const scenarioReason = sc => {
@@ -2684,7 +3061,7 @@ function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
     if (missingIds.length) return `required cost lines missing: ${missingIds.join(', ')}`;
     if (ctx.marketplace !== 'US' || ctx.currency !== 'USD' || !text(ctx.package_ref)) return 'fee_context marketplace/currency/package_ref binding is invalid';
     if (!validIsoWindow(ctx.sales) || !validIsoWindow(ctx.storage) || !validIsoWindow(ctx.inbound)) return 'sales/storage/inbound fee windows are invalid';
-    const r59CrossYearPeakOk = isR59 &&
+    const r59CrossYearPeakOk =
       ctx.sales.from === '2027-10-15' &&
       (ctx.sales.through === '2028-01-14' || ctx.sales.through === '2027-12-31') &&
       (ctx.storage.from === '2027-10-01' || ctx.storage.from === '2027-10-15') &&
@@ -2693,7 +3070,7 @@ function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
       !ctx.storage.from.startsWith('2027-') || !ctx.storage.through.startsWith('2027-'))) return 'sales/storage windows are not in 2027';
     if (ctx.inbound.from < '2027-01-15' || ctx.inbound.through > ctx.sales.through) return 'inbound window falls outside 2027-01-15..sales end';
     const fulLine = ledger.lines.find(l => l?.id === 'fulfillment');
-    if (isR59 && hasProhibited2026PeakExtrapolation(fulLine, ledger)) {
+    if (hasProhibited2026PeakExtrapolation(fulLine, ledger)) {
       return '2027 Q4 peak fulfillment fees cannot be estimated from 2026 peak uplifts';
     }
     const fulBasis = fulLine?.fee_basis;
@@ -2744,8 +3121,7 @@ function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
     const stm = monthsInIsoWindow(ctx.storage);
     const legacyMonthsOk = sm.length === 3 && sm[0] === 10 && sm[1] === 11 && sm[2] === 12 &&
       stm.length === 3 && stm[0] === 10 && stm[1] === 11 && stm[2] === 12;
-    const r59MonthsOk = isR59 && r59CrossYearPeakOk;
-    return (legacyMonthsOk || r59MonthsOk) ? null : 'sales/storage windows do not cover Oct–Dec / 2027-10-15..2028-01-14';
+    return (legacyMonthsOk || r59CrossYearPeakOk) ? null : 'sales/storage windows do not cover Oct–Dec / 2027-10-15..2028-01-14';
   };
   for (const sc of scenarios) {
     const reason = scenarioReason(sc);
@@ -2754,14 +3130,15 @@ function diagnoseCompanionPeakPanelR58(period, isR59 = false) {
   return null;
 }
 
-function isValidCompanionPeakPanelR58(period, isR59 = false) {
-  return diagnoseCompanionPeakPanelR58(period, isR59) === null;
+function isValidCompanionPeakPanelR58(period) {
+  return diagnoseCompanionPeakPanelR58(period) === null;
 }
 
 function coversFullCalendarYearDates(scenarios) {
-  if (!Array.isArray(scenarios) || scenarios.length === 0) return false;
+  const active = activePricingScenarios(scenarios);
+  if (active.length === 0) return false;
   let targetYear = null;
-  for (const scenario of scenarios) {
+  for (const scenario of active) {
     const ctx = scenario?.input?.cost_ledger?.fee_context;
     if (!ctx || !validIsoWindow(ctx.sales) || !validIsoWindow(ctx.storage) || !validIsoWindow(ctx.inbound)) return false;
     const y = ctx.sales.from.slice(0, 4);
@@ -2991,7 +3368,7 @@ function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, scre
   if (condById.get('specific_form_rights')?.status === 'fail') return { eligible: false, items: [] };
   if (items.some(it => it.status === 'ineligible')) return { eligible: false, items: [] };
 
-  const scenarios = Array.isArray(profit?.diagnostics?.scenarios) ? profit.diagnostics.scenarios : [];
+  const scenarios = activePricingScenarios(profit?.diagnostics?.scenarios);
   if (scenarios.length === 0) return { eligible: false, items: [] };
   if (scenarios.some(sc => {
     const inp = sc?.input;
@@ -3071,8 +3448,8 @@ function evaluateSamplePendingEligibilityR59(candidate, ctx, profit, items, scre
   return { eligible: true, items: deferredList };
 }
 
-function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldReserved = false) {
-  if (isR59 && isPrivateMoldReserved) {
+function buildSeasonalQualificationR58(periods, isPrivateMoldReserved = false) {
+  if (isPrivateMoldReserved) {
     const displayId = selectDisplayPeriodR58(periods, null);
     return {
       counts_toward_target: false,
@@ -3082,18 +3459,20 @@ function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldRese
       reasons: ['Candidate is routed to private_mold_reserved (no open 1688 public mold verified) and never counts toward ready-stock qualifying target.'],
     };
   }
-  const hasPeakPanel = periods.some(p => isValidCompanionPeakPanelR58(p, isR59));
-  const offPeakCandidates = periods.filter(period =>
-    period.queue === 'comparable' &&
-    isPrimaryOffPeakMonthsList(period.months, isR59) &&
-    period.diagnostics?.economics?.scenarios?.length > 0 &&
-    period.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59)) &&
-    period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass',
-  ).sort(comparePeriodOrder);
+  const hasPeakPanel = periods.some(p => isValidCompanionPeakPanelR58(p));
+  const offPeakScenariosOf = period => activePricingScenarios(period.diagnostics?.economics?.scenarios);
+  const offPeakCandidates = periods.filter(period => {
+    const activeSc = offPeakScenariosOf(period);
+    return period.queue === 'comparable' &&
+      isPrimaryOffPeakMonthsList(period.months) &&
+      activeSc.length > 0 &&
+      activeSc.every(coversPrimaryOffPeakScenario) &&
+      period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass';
+  }).sort(comparePeriodOrder);
 
   if (hasPeakPanel && offPeakCandidates.length > 0) {
     const primary = offPeakCandidates[0];
-    const usesOct14 = primary.diagnostics.economics.scenarios.some(
+    const usesOct14 = offPeakScenariosOf(primary).some(
       s => s?.input?.cost_ledger?.fee_context?.sales?.through === '2027-10-14',
     );
     return {
@@ -3101,22 +3480,23 @@ function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldRese
       mode: 'seasonal_eligible',
       primary_period_id: primary.id,
       display_period_id: primary.id,
-      ...(isR59 ? { unpublished_peak_note: '待亚马逊公布 2027 旺季费率后补充' } : {}),
+      unpublished_peak_note: '待亚马逊公布 2027 旺季费率后补充',
       reasons: [usesOct14
         ? 'Primary 2027-02-01..2027-10-14 off-peak period is complete (21/21) and comparable with companion 2027 Q4 peak panel (peak fulfillment held blank pending official 2027 peak rate publication).'
         : 'Primary 2027-02-01..2027-09-30 off-peak period is complete (21/21) and comparable with companion Oct–Dec 2027 peak panel.'],
     };
   }
 
-  if (isR59 && hasPeakPanel) {
-    const samplePendingOffPeak = periods.filter(period =>
-      Array.isArray(period.sample_check_items) &&
-      period.sample_check_items.length > 0 &&
-      isPrimaryOffPeakMonthsList(period.months, isR59) &&
-      period.diagnostics?.economics?.scenarios?.length > 0 &&
-      period.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59)) &&
-      period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass',
-    ).sort(comparePeriodOrder);
+  if (hasPeakPanel) {
+    const samplePendingOffPeak = periods.filter(period => {
+      const activeSc = offPeakScenariosOf(period);
+      return Array.isArray(period.sample_check_items) &&
+        period.sample_check_items.length > 0 &&
+        isPrimaryOffPeakMonthsList(period.months) &&
+        activeSc.length > 0 &&
+        activeSc.every(coversPrimaryOffPeakScenario) &&
+        period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass';
+    }).sort(comparePeriodOrder);
     if (samplePendingOffPeak.length > 0) {
       const primary = samplePendingOffPeak[0];
       return {
@@ -3133,16 +3513,17 @@ function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldRese
       };
     }
 
-    const crossingOffPeak = periods.filter(period =>
-      Array.isArray(period.total_range) &&
-      !['excluded', 'deferred'].includes(period.queue) &&
-      period.screening?.status === 'crossing_eligible' &&
-      period.diagnostics?.economics?.crossing_margin_floor === true &&
-      isPrimaryOffPeakMonthsList(period.months, isR59) &&
-      period.diagnostics?.economics?.scenarios?.length > 0 &&
-      period.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59)) &&
-      period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass',
-    ).sort(comparePeriodOrder);
+    const crossingOffPeak = periods.filter(period => {
+      const activeSc = offPeakScenariosOf(period);
+      return Array.isArray(period.total_range) &&
+        !['excluded', 'deferred'].includes(period.queue) &&
+        period.screening?.status === 'crossing_eligible' &&
+        period.diagnostics?.economics?.crossing_margin_floor === true &&
+        isPrimaryOffPeakMonthsList(period.months) &&
+        activeSc.length > 0 &&
+        activeSc.every(coversPrimaryOffPeakScenario) &&
+        period.screening?.conditions?.find(condition => condition.id === 'strong_date_dependency')?.status === 'pass';
+    }).sort(comparePeriodOrder);
     if (crossingOffPeak.length > 0) {
       const primary = crossingOffPeak[0];
       return {
@@ -3159,23 +3540,21 @@ function buildSeasonalQualificationR58(periods, isR59 = false, isPrivateMoldRese
 
   const reasons = [];
   if (!hasPeakPanel) {
-    const nominalPeak = periods.filter(p => hasExactPeakMonthsR58(p, isR59)).sort(comparePeriodOrder)[0];
+    const nominalPeak = periods.filter(p => hasExactPeakMonthsR58(p)).sort(comparePeriodOrder)[0];
     if (nominalPeak) {
-      reasons.push(`Companion 2027 holiday peak panel (${nominalPeak.id}) is present with exact months [10, 11, 12], but its cost/fulfillment inputs are incomplete: ${diagnoseCompanionPeakPanelR58(nominalPeak, isR59)}.`);
+      reasons.push(`Companion 2027 holiday peak panel (${nominalPeak.id}) is present with exact months [10, 11, 12], but its cost/fulfillment inputs are incomplete: ${diagnoseCompanionPeakPanelR58(nominalPeak)}.`);
     } else {
       reasons.push('Missing valid 2027 companion holiday peak operating panel covering exact months [10, 11, 12] with dated cost_ledger.');
     }
   }
-  const nominalOffPeak = periods.find(p => isPrimaryOffPeakMonthsList(p.months, isR59));
+  const nominalOffPeak = periods.find(p => isPrimaryOffPeakMonthsList(p.months));
   if (!nominalOffPeak) {
     reasons.push('Missing primary off-peak operating panel covering all months 2 through 9.');
   } else {
     if (nominalOffPeak.queue !== 'comparable') reasons.push(`Primary off-peak panel (${nominalOffPeak.id}) has queue ${nominalOffPeak.queue}, not comparable.`);
-    if (!nominalOffPeak.diagnostics?.economics?.scenarios?.length ||
-      !nominalOffPeak.diagnostics.economics.scenarios.every(s => coversPrimaryOffPeakScenario(s, isR59))) {
-      reasons.push(isR59
-        ? `Primary off-peak panel (${nominalOffPeak.id}) does not cover full 2027-02-01..2027-10-14 sales (with 2027-02-01..2027-09-30 off-peak storage) validated scenarios.`
-        : `Primary off-peak panel (${nominalOffPeak.id}) does not cover full 2027-02-01..2027-09-30 validated scenarios.`);
+    const nominalActive = offPeakScenariosOf(nominalOffPeak);
+    if (!nominalActive.length || !nominalActive.every(coversPrimaryOffPeakScenario)) {
+      reasons.push(`Primary off-peak panel (${nominalOffPeak.id}) does not cover full 2027-02-01..2027-10-14 sales (with 2027-02-01..2027-09-30 off-peak storage) validated scenarios.`);
     }
     if (nominalOffPeak.screening?.conditions?.find(c => c.id === 'strong_date_dependency')?.status !== 'pass') {
       reasons.push('Strong date dependency did not pass on the primary off-peak panel.');
@@ -3564,8 +3943,6 @@ function buildOperationalDisclosuresR58(candidate, scenarios = []) {
 export function scoreCandidate(candidate, profile, internal = null) {
   const defs = definitions(profile);
   const ctx = context(candidate);
-  const isR58 = profile.revision >= 58;
-  const isR59 = profile.revision >= 59;
   const isOperatingPeriod = internal === INTERNAL_PERIOD_TOKEN;
   const isExplicitSeasonal = candidate?.product_seasonality === 'seasonal' ||
     candidate?.seasonality === 'seasonal' ||
@@ -3578,28 +3955,29 @@ export function scoreCandidate(candidate, profile, internal = null) {
   let effectiveCandidateEcon = candidate.economics;
   let unwrappedFromUnpublishedQ4Companion = false;
   if (!isOperatingPeriod && effectiveCandidateEcon && Object.hasOwn(effectiveCandidateEcon, 'operating_periods')) {
-    validateOperatingPeriods(effectiveCandidateEcon, isR58, isR59);
+    validateOperatingPeriods(effectiveCandidateEcon, candidate);
     const {
       operating_periods: rawPeriods,
       expected_primary_scenarios: rootExpected,
       stress_scenarios: rootStress,
       ...economics
     } = effectiveCandidateEcon;
-    const orderedPeriods = isR58 ? [...rawPeriods].sort(comparePeriodOrder) : rawPeriods;
+    const orderedPeriods = [...rawPeriods].sort(comparePeriodOrder);
     const evaluatedPeriods = orderedPeriods.map(period => {
-      const mergedExpected = isR58 ? mergeExpectedPrimaryScenarios(rootExpected, period.expected_primary_scenarios) : period.expected_primary_scenarios;
-      const mergedStress = isR58 ? mergeStressScenarios(rootStress, period.stress_scenarios) : period.stress_scenarios;
+      const mergedExpected = mergeExpectedPrimaryScenarios(rootExpected, period.expected_primary_scenarios);
+      const mergedStress = mergeStressScenarios(rootStress, period.stress_scenarios);
       const scoredP = scoreCandidate({
         ...candidate,
         economics: {
           ...economics,
           scenarios: period.scenarios,
           operating_months: period.months,
+          operating_period_id: period.id,
           ...(mergedExpected !== undefined ? { expected_primary_scenarios: mergedExpected } : {}),
           ...(mergedStress !== undefined ? { stress_scenarios: mergedStress } : {}),
         },
       }, profile, INTERNAL_PERIOD_TOKEN);
-      const isPeakWithPendingFul = isR59 && hasExactPeakMonthsR58(period, true) &&
+      const isPeakWithPendingFul = hasExactPeakMonthsR58(period) &&
         !Array.isArray(scoredP.diagnostics?.economics?.margin_range);
       return {
         ...scoredP,
@@ -3609,14 +3987,14 @@ export function scoreCandidate(candidate, profile, internal = null) {
         ...(isPeakWithPendingFul ? { unpublished_peak_note: period.unpublished_peak_note ?? '待亚马逊公布 2027 旺季费率后补充' } : {}),
       };
     });
-    const primaryOffPeakRaw = isR59 && isExplicitEvergreen
-      ? orderedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, true))
+    const primaryOffPeakRaw = isExplicitEvergreen
+      ? orderedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months))
       : null;
     const isUnpublishedPeakCompanionPeriodR59 = p => {
       if (Array.isArray(p.diagnostics?.economics?.margin_range)) return false;
-      if (isValidCompanionPeakPanelR58(p, true)) return true;
-      if (!hasExactPeakMonthsR58(p, true)) return false;
-      const scs = p.diagnostics?.economics?.scenarios ?? [];
+      if (isValidCompanionPeakPanelR58(p)) return true;
+      if (!hasExactPeakMonthsR58(p)) return false;
+      const scs = activePricingScenarios(p.diagnostics?.economics?.scenarios);
       if (scs.length === 0) return false;
       return !scs.some(sc => {
         const ledger = sc?.input?.cost_ledger;
@@ -3637,7 +4015,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
         .filter(p => p.id !== primaryOffPeakRaw.id)
         .every(isUnpublishedPeakCompanionPeriodR59),
     );
-    if (isR59 && isExplicitEvergreen && primaryOffPeakRaw && otherPeriodsAreUnpublishedPeak) {
+    if (isExplicitEvergreen && primaryOffPeakRaw && otherPeriodsAreUnpublishedPeak) {
       const mergedExpected = mergeExpectedPrimaryScenarios(rootExpected, primaryOffPeakRaw.expected_primary_scenarios);
       const mergedStress = mergeStressScenarios(rootStress, primaryOffPeakRaw.stress_scenarios);
       effectiveCandidateEcon = {
@@ -3649,10 +4027,12 @@ export function scoreCandidate(candidate, profile, internal = null) {
       unwrappedFromUnpublishedQ4Companion = true;
     } else {
       const isPrivateMoldReserved = candidate.sourcing_disposition === 'private_mold_reserved';
-      const qualR58 = buildSeasonalQualificationR58(evaluatedPeriods, true, isPrivateMoldReserved);
+      const qualR58 = buildSeasonalQualificationR58(evaluatedPeriods, isPrivateMoldReserved);
       const displayPeriodForOps = evaluatedPeriods.find(p => p.id === qualR58?.display_period_id) ?? evaluatedPeriods[0] ?? null;
-      const seasonalOps = buildOperationalDisclosuresR58(candidate, displayPeriodForOps?.diagnostics?.economics?.scenarios ?? []);
-      const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months, true));
+      const displayScenariosForOps = displayPeriodForOps?.diagnostics?.economics?.scenarios ?? [];
+      const activeOpsScenarios = activePricingScenarios(displayScenariosForOps);
+      const seasonalOps = buildOperationalDisclosuresR58(candidate, activeOpsScenarios.length ? activeOpsScenarios : displayScenariosForOps);
+      const primaryOffPeak = evaluatedPeriods.find(p => isPrimaryOffPeakMonthsList(p.months));
       const coreSourcePeriod = evaluatedPeriods.find(p => p.id === (qualR58?.primary_period_id ?? qualR58?.display_period_id)) ?? primaryOffPeak ?? evaluatedPeriods[0] ?? null;
       const seasonalDispR59 = isPrivateMoldReserved ? 'private_mold_reserved'
         : primaryOffPeak?.queue === 'excluded' ? 'hard_excluded'
@@ -3684,13 +4064,28 @@ export function scoreCandidate(candidate, profile, internal = null) {
       };
     }
   }
-  const economicsInput = isR58 && !isOperatingPeriod && effectiveCandidateEcon && Object.hasOwn(effectiveCandidateEcon, 'operating_months')
+  const economicsInput = !isOperatingPeriod && effectiveCandidateEcon && Object.hasOwn(effectiveCandidateEcon, 'operating_months')
     ? (() => { const { operating_months: _ignored, ...rest } = effectiveCandidateEcon; return rest; })()
     : effectiveCandidateEcon;
-  const priceRefR58 = isR58 ? validateR58PriceAnchor(candidate.screening?.reference_price_usd, ctx) : null;
+  const rawPriceRefR58 = validateR58PriceAnchor(candidate.screening?.reference_price_usd, ctx);
+  const screeningRefAsin = candidate.screening?.reference_price_usd?.target_variant_asin;
+  const screeningRefFormalLinkage = text(screeningRefAsin)
+    ? resolveScenarioComparabilityLinkage(null, candidate, { includeAdvisoryReview: false, peerAsinOverride: screeningRefAsin })
+    : null;
+  const priceRefR58 = (screeningRefFormalLinkage?.status === 'confirmed_excluded' || screeningRefFormalLinkage?.status === 'pending_evidence')
+    ? {
+        supported: false,
+        value: null,
+        min_value: null,
+        max_value: null,
+        reason: screeningRefFormalLinkage.status === 'confirmed_excluded'
+          ? '原主参考对标经正式裁决排除（规格不符），未自带独立价格锚点的情景不得继续沿用。'
+          : '主参考对标同箱规格待补证，未自带独立价格锚点的情景不得继续沿用。',
+      }
+    : rawPriceRefR58;
   const newcomers = scoreNewcomers(candidate.newcomer_cohort, ctx, profile, defs);
   const candidateExpectedComponents = candidate?.saleable_set_composition ?? candidate?.expected_components ?? null;
-  const profit = scoreEconomics(economicsInput, ctx, profile, defs, priceRefR58, candidateExpectedComponents);
+  const profit = scoreEconomics(economicsInput, ctx, profile, defs, priceRefR58, candidateExpectedComponents, candidate);
   const items = defs.map(item => {
     if (item.id === 'refund_adjusted_pre_ad_margin') return profit.margin;
     if (item.id === 'unit_contribution') return profit.contribution;
@@ -3704,38 +4099,38 @@ export function scoreCandidate(candidate, profile, internal = null) {
     return missing(item, 'Required evidence has not been supplied.');
   });
   const bidsItem = items.find(item => item.id === 'relevant_purchase_entry_bid');
-  if (isR58) {
-    const refBidUsd = number(bidsItem?.reference_bid_usd) && bidsItem.reference_bid_usd > 0 ? bidsItem.reference_bid_usd : null;
-    profit.diagnostics.break_even_click_cvr = refBidUsd === null ? null : {
-      reference_bid_usd: refBidUsd,
-      denominator_basis: 'ad_orders / ad_clicks (clickConvRate — never compare against search purchaseRate)',
-      scenarios: profit.diagnostics.scenarios.map(sc => {
-        const calc = sc.input?.calculation;
-        const contrib = calc?.status === 'sensitivity_only' ? calc?.contribution_usd : sc.input?.contribution_usd?.value;
-        return {
-          id: sc.id,
-          contribution_usd: number(contrib) ? contrib : null,
-          break_even_click_cvr: number(contrib) && contrib > 0 ? Math.round((refBidUsd / contrib) * 1e6) / 1e6 : null,
-        };
-      }),
-    };
-  }
+  const refBidUsd = number(bidsItem?.reference_bid_usd) && bidsItem.reference_bid_usd > 0 ? bidsItem.reference_bid_usd : null;
+  profit.diagnostics.break_even_click_cvr = refBidUsd === null ? null : {
+    reference_bid_usd: refBidUsd,
+    denominator_basis: 'ad_orders / ad_clicks (clickConvRate — never compare against search purchaseRate)',
+    scenarios: profit.diagnostics.scenarios.map(sc => {
+      const calc = sc.input?.calculation;
+      const contrib = calc?.status === 'sensitivity_only' ? calc?.contribution_usd : sc.input?.contribution_usd?.value;
+      const excluded = sc.excluded_from_active_pricing === true;
+      return {
+        id: sc.id,
+        contribution_usd: excluded ? null : (number(contrib) ? contrib : null),
+        break_even_click_cvr: excluded ? null : (number(contrib) && contrib > 0 ? Math.round((refBidUsd / contrib) * 1e6) / 1e6 : null),
+        ...(excluded ? { excluded_from_active_pricing: true } : {}),
+      };
+    }),
+  };
   const totals = aggregate(items, profile.group_budgets, profit);
   const screening = screenCandidate(candidate, ctx, profit, items, profile);
-  const coreSummaryR59 = isR59 ? computeR59CoreAndRemainingSummary(items, profit) : null;
+  const coreSummaryR59 = computeR59CoreAndRemainingSummary(items, profit);
 
-  const isTopLevelFlatR58 = isR58 && !isOperatingPeriod;
-  const isPrimaryOffPeakPeriodR58 = isR58 && isOperatingPeriod && isPrimaryOffPeakMonthsList(economicsInput?.operating_months, isR59);
+  const isTopLevelFlatR58 = !isOperatingPeriod;
+  const isPrimaryOffPeakPeriodR58 = isOperatingPeriod && isPrimaryOffPeakMonthsList(economicsInput?.operating_months);
   const flatHasFullCalendarYear = coversFullCalendarYearDates(profit.diagnostics.scenarios);
-  const flatHasEvergreen2027OffPeak = isR59 && isTopLevelFlatR58 && !isExplicitSeasonal &&
-    coversPrimaryOffPeakDates(profit.diagnostics.scenarios, true);
+  const flatHasEvergreen2027OffPeak = isTopLevelFlatR58 && !isExplicitSeasonal &&
+    coversPrimaryOffPeakDates(profit.diagnostics.scenarios);
   const fullYearDatesOk = !isTopLevelFlatR58 || flatHasFullCalendarYear || flatHasEvergreen2027OffPeak;
-  const offPeakDatesOk = !isPrimaryOffPeakPeriodR58 || coversPrimaryOffPeakDates(profit.diagnostics.scenarios, isR59);
+  const offPeakDatesOk = !isPrimaryOffPeakPeriodR58 || coversPrimaryOffPeakDates(profit.diagnostics.scenarios);
   const periodCoverageOk = fullYearDatesOk && offPeakDatesOk;
   const strongDateCondStatus = screening.conditions?.find(c => c.id === 'strong_date_dependency')?.status ?? null;
-  const isEvergreenFlatR59 = isR59 && !isOperatingPeriod && !isExplicitSeasonal &&
+  const isEvergreenFlatR59 = !isOperatingPeriod && !isExplicitSeasonal &&
     (strongDateCondStatus === 'pass' || isExplicitEvergreen);
-  const usesUnpublished2027Q4Note = isR59 && !isOperatingPeriod && !isExplicitSeasonal && (
+  const usesUnpublished2027Q4Note = !isOperatingPeriod && !isExplicitSeasonal && (
     (flatHasEvergreen2027OffPeak && !flatHasFullCalendarYear) ||
     unwrappedFromUnpublishedQ4Companion ||
     text(candidate?.unpublished_2027_q4_peak_note) ||
@@ -3847,19 +4242,18 @@ export function scoreCandidate(candidate, profile, internal = null) {
               : 'pending_evidence';
 
   const allowPkgShortlistFlat = flatDispR59 === 'hard_excluded';
+  const activeOpsFlat = activePricingScenarios(profit.diagnostics.scenarios);
   return {
     candidate_id: candidate.id, label: candidate.label ?? candidate.id, form: candidate.form ?? null,
     profile_revision: profile.revision, total_budget: 100, evidence: candidate.evidence ?? [], items, ...totals,
     supported_score: point(totals.supported_range), scoring_complete: totals.covered_weight === 100,
     total: hasFullTotalRange ? point(totals.supported_range) : null, total_range: hasFullTotalRange ? totals.supported_range : null,
     conditional_total_range: conditional, queue, screening,
-    ...(coreSummaryR59 ? {
-      core_85_range: coreSummaryR59.core_85_range,
-      core_85_score: coreSummaryR59.core_85_score,
-      core_85_covered_weight: coreSummaryR59.core_85_covered_weight,
-      confirmed_risk_deduction_15: coreSummaryR59.confirmed_risk_deduction_15,
-      remaining_15_summary: coreSummaryR59.remaining_15_summary,
-    } : {}),
+    core_85_range: coreSummaryR59.core_85_range,
+    core_85_score: coreSummaryR59.core_85_score,
+    core_85_covered_weight: coreSummaryR59.core_85_covered_weight,
+    confirmed_risk_deduction_15: coreSummaryR59.confirmed_risk_deduction_15,
+    remaining_15_summary: coreSummaryR59.remaining_15_summary,
     ...(isEvergreenFlatR59 ? { product_seasonality: 'evergreen' } : (!isOperatingPeriod && isExplicitSeasonal ? { product_seasonality: 'seasonal' } : {})),
     ...(resolvedUnpublishedQ4Note ? { unpublished_2027_q4_peak_note: resolvedUnpublishedQ4Note } : {}),
     ...(flatDispR59 ? { effective_disposition: flatDispR59 } : {}),
@@ -3871,7 +4265,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
       bids: bidsItem,
       newcomers: newcomers.diagnostics,
       economics: profit.diagnostics,
-      ...(!isOperatingPeriod ? { operational_disclosures: buildOperationalDisclosuresR58(candidate, profit.diagnostics.scenarios) } : {}),
+      ...(!isOperatingPeriod ? { operational_disclosures: buildOperationalDisclosuresR58(candidate, activeOpsFlat.length ? activeOpsFlat : profit.diagnostics.scenarios) } : {}),
     },
   };
 }
@@ -3881,8 +4275,6 @@ export function scoreBatch(batch, profile) {
   if (batch?.schema_version !== 1 || batch.profile_revision !== profile.revision || !Array.isArray(batch.candidates)) {
     throw new TypeError('A version-1 batch with matching profile_revision and a candidates array is required.');
   }
-  const isR58 = profile.revision >= 58;
-  const isR59 = profile.revision >= 59;
   const ids = new Set();
   const results = batch.candidates.map(candidate => {
     if (ids.has(candidate?.id)) throw new TypeError('Candidate IDs must be unique within a batch.');
@@ -3915,75 +4307,48 @@ export function scoreBatch(batch, profile) {
   const comparable = results.filter(result => result.queue === 'comparable').sort(compareR59Qualifying);
   const pending = results.filter(result => result.queue === 'pending')
     .sort((a, b) => {
-      if (isR59) {
-        const qa = a.qualification?.counts_toward_target === true;
-        const qb = b.qualification?.counts_toward_target === true;
-        if (qa && qb) return compareR59Qualifying(a, b);
-        if (qa !== qb) return qa ? -1 : 1;
-      }
-      return isR58
-        ? (compareRangeDesc(a.supported_range, b.supported_range) || (b.covered_weight - a.covered_weight) || compareText(a.candidate_id, b.candidate_id))
-        : (b.supported_range[0] - a.supported_range[0] || b.covered_weight - a.covered_weight);
+      const qa = a.qualification?.counts_toward_target === true;
+      const qb = b.qualification?.counts_toward_target === true;
+      if (qa && qb) return compareR59Qualifying(a, b);
+      if (qa !== qb) return qa ? -1 : 1;
+      return compareRangeDesc(a.supported_range, b.supported_range) || (b.covered_weight - a.covered_weight) || compareText(a.candidate_id, b.candidate_id);
     });
   const deferred = results.filter(result => result.queue === 'deferred');
   const excluded = results.filter(result => result.queue === 'excluded');
-  if (isR58) {
-    const tieSort = (a, b) => compareRangeDesc(a.supported_range, b.supported_range) ||
-      ((b.covered_weight ?? -1) - (a.covered_weight ?? -1)) || compareText(a.candidate_id, b.candidate_id);
-    deferred.sort(tieSort);
-    excluded.sort(tieSort);
-  }
+  const tieSort = (a, b) => compareRangeDesc(a.supported_range, b.supported_range) ||
+    ((b.covered_weight ?? -1) - (a.covered_weight ?? -1)) || compareText(a.candidate_id, b.candidate_id);
+  deferred.sort(tieSort);
+  excluded.sort(tieSort);
 
   const isSeasonalEligible = result => result.qualification?.counts_toward_target === true;
 
   const rawSeasonalReview = results.filter(result => result.queue === 'seasonal_review');
-  const seasonalEligible = rawSeasonalReview.filter(isSeasonalEligible);
-  const seasonalRemaining = rawSeasonalReview.filter(result => !isSeasonalEligible(result));
-  if (isR58) {
-    seasonalEligible.sort((a, b) => {
-      if (isR59) return compareR59Qualifying(a, b);
-      const pa = periodById(a, a.qualification.primary_period_id);
-      const pb = periodById(b, b.qualification.primary_period_id);
-      return compareRangeDesc(pa?.total_range, pb?.total_range) ||
-        compareText(a.candidate_id, b.candidate_id);
-    });
-    seasonalRemaining.sort((a, b) => {
+  const seasonalEligible = rawSeasonalReview.filter(isSeasonalEligible).sort(compareR59Qualifying);
+  const seasonalRemaining = rawSeasonalReview.filter(result => !isSeasonalEligible(result))
+    .sort((a, b) => {
       const pa = periodById(a, a.qualification.display_period_id);
       const pb = periodById(b, b.qualification.display_period_id);
       return compareRangeDesc(pa?.supported_range, pb?.supported_range) ||
         ((pb?.covered_weight ?? -1) - (pa?.covered_weight ?? -1)) || compareText(a.candidate_id, b.candidate_id);
     });
-  }
 
-  const seasonalReview = profile.revision >= 57 ? [...seasonalEligible, ...seasonalRemaining] : rawSeasonalReview;
+  const seasonalReview = [...seasonalEligible, ...seasonalRemaining];
   const leader = comparable[0];
   for (const result of pending) {
     result.may_exceed_comparable_leader = leader && result.conditional_total_range ? result.conditional_total_range[1] > leader.total_range[0] : null;
   }
-  const samplePendingFlatR59 = isR59
-    ? pending.filter(r => r.qualification?.counts_toward_target === true)
-    : [];
-  const nonQualifyingPendingR59 = isR59
-    ? pending.filter(r => r.qualification?.counts_toward_target !== true)
-    : pending;
-  const unifiedQualifyingOrderedR59 = isR59
-    ? [...comparable, ...samplePendingFlatR59, ...seasonalEligible].sort(compareR59Qualifying)
-    : [];
+  const samplePendingFlatR59 = pending.filter(r => r.qualification?.counts_toward_target === true);
+  const nonQualifyingPendingR59 = pending.filter(r => r.qualification?.counts_toward_target !== true);
+  const unifiedQualifyingOrderedR59 = [...comparable, ...samplePendingFlatR59, ...seasonalEligible].sort(compareR59Qualifying);
   const queues = { comparable, pending, deferred, excluded, ...(seasonalReview.length ? { seasonal_review: seasonalReview } : {}) };
-  const orderedCandidates = isR59
-    ? [...unifiedQualifyingOrderedR59, ...nonQualifyingPendingR59, ...seasonalRemaining, ...deferred, ...excluded]
-    : profile.revision >= 57
-      ? [...comparable, ...seasonalEligible, ...pending, ...seasonalRemaining, ...deferred, ...excluded]
-      : Object.values(queues).flat();
+  const orderedCandidates = [...unifiedQualifyingOrderedR59, ...nonQualifyingPendingR59, ...seasonalRemaining, ...deferred, ...excluded];
   const dispositionByCandId = new Map(orderedCandidates.map(c => [c.candidate_id, c.effective_disposition]));
-  const rawPkgShortlist = profile.revision >= 59
-    ? [
-        ...(Array.isArray(batch.packaging_redesign_shortlist) ? batch.packaging_redesign_shortlist : []),
-        ...orderedCandidates
-          .filter(c => c.packaging_redesign_shortlist?.eligible === true)
-          .map(c => ({ form_id: c.candidate_id, label: c.label, ...c.packaging_redesign_shortlist })),
-      ]
-    : [];
+  const rawPkgShortlist = [
+    ...(Array.isArray(batch.packaging_redesign_shortlist) ? batch.packaging_redesign_shortlist : []),
+    ...orderedCandidates
+      .filter(c => c.packaging_redesign_shortlist?.eligible === true)
+      .map(c => ({ form_id: c.candidate_id, label: c.label, ...c.packaging_redesign_shortlist })),
+  ];
   const seenPkgShortlistIds = new Set();
   const filteredPackagingRedesignShortlist = rawPkgShortlist.filter(row => {
     if (!row || row.eligible !== true) return false;
@@ -3994,10 +4359,14 @@ export function scoreBatch(batch, profile) {
     seenPkgShortlistIds.add(dedupKey);
     return true;
   });
+  const allSamplePendingCount = results.filter(
+    r => r.qualification?.counts_toward_target === true &&
+      (r.qualification?.mode === 'sample_pending_qualifying' || r.qualification?.mode === 'seasonal_sample_pending_qualifying'),
+  ).length;
   return {
     schema_version: 1, profile_revision: profile.revision, total_budget: 100,
     candidates: orderedCandidates,
-    ...(isR59 ? { qualifying_order: unifiedQualifyingOrderedR59.map(r => r.candidate_id) } : {}),
+    qualifying_order: unifiedQualifyingOrderedR59.map(r => r.candidate_id),
     order: Object.fromEntries(Object.entries(queues).map(([key, values]) => [key, values.map(result => result.candidate_id)])),
     comparable_leader: leader ? { candidate_id: leader.candidate_id, total_range: leader.total_range, conservative_score: leader.total_range[0] } : null,
     ...(filteredPackagingRedesignShortlist.length > 0 ? { packaging_redesign_shortlist: filteredPackagingRedesignShortlist } : {}),
@@ -4010,29 +4379,17 @@ export function scoreBatch(batch, profile) {
       pending: pending.length, deferred: deferred.length, excluded: excluded.length,
       ...(seasonalReview.length ? { seasonal_review: seasonalReview.length,
         seasonal_eligible: seasonalEligible.length } : {}),
-      ...(isR58 ? {
-        qualifying: isR59
-          ? results.filter(r => r.qualification?.counts_toward_target === true).length
-          : comparable.length + seasonalEligible.length,
-      } : {}),
-      ...(isR59 ? (() => {
-        const allSamplePendingCount = results.filter(
-          r => r.qualification?.counts_toward_target === true &&
-            (r.qualification?.mode === 'sample_pending_qualifying' || r.qualification?.mode === 'seasonal_sample_pending_qualifying'),
-        ).length;
-        return allSamplePendingCount > 0 ? { sample_pending_qualifying: allSamplePendingCount } : {};
-      })() : {}),
-      ...(profile.revision >= 59 ? {
-        dispositions: {
-          full_annual_qualifying: results.filter(r => r.effective_disposition === 'full_annual_qualifying').length,
-          seasonal_off_peak_qualifying: results.filter(r => r.effective_disposition === 'seasonal_off_peak_qualifying').length,
-          crossing_30pct_interval: results.filter(r => r.effective_disposition === 'crossing_30pct_interval').length,
-          pending_evidence: results.filter(r => r.effective_disposition === 'pending_evidence').length,
-          private_mold_reserved: results.filter(r => r.effective_disposition === 'private_mold_reserved').length,
-          deferred: results.filter(r => r.effective_disposition === 'deferred').length,
-          hard_excluded: results.filter(r => r.effective_disposition === 'hard_excluded').length,
-        },
-      } : {}),
+      qualifying: results.filter(r => r.qualification?.counts_toward_target === true).length,
+      ...(allSamplePendingCount > 0 ? { sample_pending_qualifying: allSamplePendingCount } : {}),
+      dispositions: {
+        full_annual_qualifying: results.filter(r => r.effective_disposition === 'full_annual_qualifying').length,
+        seasonal_off_peak_qualifying: results.filter(r => r.effective_disposition === 'seasonal_off_peak_qualifying').length,
+        crossing_30pct_interval: results.filter(r => r.effective_disposition === 'crossing_30pct_interval').length,
+        pending_evidence: results.filter(r => r.effective_disposition === 'pending_evidence').length,
+        private_mold_reserved: results.filter(r => r.effective_disposition === 'private_mold_reserved').length,
+        deferred: results.filter(r => r.effective_disposition === 'deferred').length,
+        hard_excluded: results.filter(r => r.effective_disposition === 'hard_excluded').length,
+      },
     },
   };
 }

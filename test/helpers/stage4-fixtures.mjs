@@ -155,3 +155,83 @@ export function makeSpApiFeesEstimate({
   };
 }
 
+export function makeStage4OrganizerTrayCandidate(baseTemplate, {
+  id = 'form-syn-organizer-tray-kit',
+  specSha256 = 'a'.repeat(64),
+  specVersion = 1,
+  lowAsin = 'B0SYN8LOW1',
+  highAsin = 'B0SYN8HIG2',
+  lowPrice = 38.00,
+  highPrice = 48.00,
+} = {}) {
+  const cand = structuredClone(baseTemplate);
+  cand.id = id;
+  cand.label = '桌面收纳盒＋可拆托盘套装（合成验收案例）';
+  cand.form = '1整套桌面收纳盒含可拆托盘';
+  cand.spec_sha256 = specSha256;
+  cand.spec_version = specVersion;
+  cand.product_seasonality = 'evergreen';
+
+  const makeScenario = (scId, label, priceUsd, asin) => {
+    const sc = structuredClone(cand.economics.scenarios[0]);
+    sc.id = scId;
+    sc.label = label;
+    sc.quote_id = 'q1688-syn-kit-100';
+    sc.price_anchor = {
+      value: priceUsd,
+      unit: 'USD',
+      matched_spec: true,
+      target_variant_asin: asin,
+      fulfillment_channel: 'FBA',
+      sales_history_supported: true,
+      evidence: [cand.evidence[0].id],
+    };
+    sc.cost_ledger.id = scId;
+    sc.cost_ledger.price_usd = priceUsd;
+    sc.cost_ledger.fee_context = {
+      ...sc.cost_ledger.fee_context,
+      sales: { from: '2027-02-01', through: '2027-10-14' },
+      storage: { from: '2027-02-01', through: '2027-09-30' },
+      inbound: { from: '2027-01-15', through: '2027-10-14' },
+    };
+    const refLine = sc.cost_ledger.lines.find(l => l.id === 'referral');
+    if (refLine) {
+      const r = sc.cost_ledger.refund_fraction ?? 0.04;
+      const grossRef = priceUsd * 0.15;
+      refLine.amount_usd = Number((grossRef * (1 - r) + r * Math.min(5, grossRef * 0.2)).toFixed(6));
+    }
+    const colLine = sc.cost_ledger.lines.find(l => l.id === 'collection');
+    if (colLine) {
+      const r = sc.cost_ledger.refund_fraction ?? 0.04;
+      const nonColAmz = ['referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'return_disposition']
+        .reduce((s, lid) => s + (sc.cost_ledger.lines.find(l => l.id === lid)?.amount_usd ?? 0), 0);
+      const payout = Math.max(0, priceUsd * (1 - r) - nonColAmz);
+      colLine.amount_usd = Number((payout * (sc.cost_ledger.collection_rate ?? 0.005)).toFixed(6));
+    }
+    delete sc.margin;
+    delete sc.contribution_usd;
+    return sc;
+  };
+
+  cand.screening.reference_price_usd = {
+    value: lowPrice,
+    unit: 'USD',
+    matched_spec: true,
+    target_variant_asin: lowAsin,
+    fulfillment_channel: 'FBA',
+    sales_history_supported: true,
+    supported_price_range: [lowPrice, highPrice],
+    evidence: [cand.evidence[0].id],
+  };
+  cand.economics.expected_primary_scenarios = [
+    { id: 'sc-low-no-tray', status: 'active' },
+    { id: 'sc-high-parts-unknown', status: 'active' },
+  ];
+  cand.economics.scenarios = [
+    makeScenario('sc-low-no-tray', `低价对标 $${lowPrice}（${lowAsin}）`, lowPrice, lowAsin),
+    makeScenario('sc-high-parts-unknown', `高价对标 $${highPrice}（${highAsin}）`, highPrice, highAsin),
+  ];
+  return cand;
+}
+
+

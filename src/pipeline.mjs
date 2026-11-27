@@ -4286,6 +4286,136 @@ export function attachCandidateEvidenceReview(
   return boundEnvelope;
 }
 
+const VALID_PEER_COMPARABILITY_RULING_STATUSES = new Set([
+  'confirmed_excluded',
+  'pending_evidence',
+  'confirmed_comparable',
+]);
+
+function normalizeComparabilityTargetKey(raw) {
+  if (!nonemptyStr(raw)) return null;
+  const upper = raw.trim().toUpperCase();
+  const stripped = upper.replace(/^(?:PEER|ASIN|COMPETITOR)[-_:\s]+/, '');
+  return stripped || upper;
+}
+
+/**
+ * Bind formal peer comparability rulings (`confirmed_excluded` / `pending_evidence` / `confirmed_comparable`)
+ * to a candidate's current spec identity while preserving raw scenarios, raw quotes, and review history.
+ * Pure (non-mutating): returns a cloned candidate object ready for deterministic `scoreBatch` / `renderReport`.
+ */
+export function applyPeerComparabilityRulings(candidate, rulings, { currentSpecSha = null, currentSpecVersion = null } = {}) {
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+    throw new TypeError('applyPeerComparabilityRulings requires a candidate object.');
+  }
+  const inputList = Array.isArray(rulings) ? rulings : (rulings && typeof rulings === 'object' ? [rulings] : null);
+  if (!inputList || inputList.length === 0) {
+    throw new TypeError('applyPeerComparabilityRulings requires a non-empty ruling or rulings array.');
+  }
+
+  const candId = nonemptyStr(candidate.id)
+    ? candidate.id.trim()
+    : (nonemptyStr(candidate.candidate_id) ? candidate.candidate_id.trim() : null);
+  const resolvedSpecSha = nonemptyStr(currentSpecSha)
+    ? currentSpecSha.trim()
+    : (nonemptyStr(candidate.spec_sha256)
+        ? candidate.spec_sha256.trim()
+        : (nonemptyStr(candidate.form_spec_sha256) ? candidate.form_spec_sha256.trim() : null));
+  const resolvedSpecVer = Number.isInteger(currentSpecVersion) && currentSpecVersion > 0
+    ? currentSpecVersion
+    : (Number.isInteger(candidate.spec_version) && candidate.spec_version > 0 ? candidate.spec_version : null);
+
+  const normalizedIncoming = inputList.map((raw, idx) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new TypeError(`Peer comparability ruling at index ${idx} must be an object.`);
+    }
+    const status = nonemptyStr(raw.status) ? raw.status.trim() : '';
+    if (!VALID_PEER_COMPARABILITY_RULING_STATUSES.has(status)) {
+      throw new TypeError(
+        `Peer comparability ruling at index ${idx} has invalid status "${status}"; expected one of confirmed_excluded, pending_evidence, confirmed_comparable.`,
+      );
+    }
+    const source = nonemptyStr(raw.source) ? raw.source.trim() : '';
+    if (!source) {
+      throw new TypeError(`Peer comparability ruling at index ${idx} requires a non-empty source.`);
+    }
+    const reason = nonemptyStr(raw.reason) ? raw.reason.trim() : '';
+    if (!reason) {
+      throw new TypeError(`Peer comparability ruling at index ${idx} requires a non-empty reason.`);
+    }
+    const peerRaw = [raw.peer_asin, raw.target_variant_asin, raw.subject_id].find(nonemptyStr) ?? null;
+    const scenarioId = nonemptyStr(raw.scenario_id) ? raw.scenario_id.trim() : null;
+    if (!peerRaw && !scenarioId) {
+      throw new TypeError(`Peer comparability ruling at index ${idx} requires peer_asin, subject_id, or scenario_id.`);
+    }
+    const peerAsin = peerRaw ? normalizeComparabilityTargetKey(peerRaw) : null;
+    const periodId = nonemptyStr(raw.period_id)
+      ? raw.period_id.trim()
+      : (nonemptyStr(raw.operating_period_id) ? raw.operating_period_id.trim() : null);
+    const rulingCandId = nonemptyStr(raw.candidate_id) ? raw.candidate_id.trim() : candId;
+    const specSha = nonemptyStr(raw.spec_sha256)
+      ? raw.spec_sha256.trim()
+      : (nonemptyStr(raw.form_spec_sha256) ? raw.form_spec_sha256.trim() : resolvedSpecSha);
+    const specVer = Number.isInteger(raw.spec_version) && raw.spec_version > 0
+      ? raw.spec_version
+      : resolvedSpecVer;
+    const evidence = Array.isArray(raw.evidence)
+      ? raw.evidence.filter(nonemptyStr).map(e => e.trim())
+      : [];
+    return {
+      ...(peerAsin ? { peer_asin: peerAsin } : {}),
+      ...(nonemptyStr(raw.subject_id) ? { subject_id: raw.subject_id.trim() } : {}),
+      ...(scenarioId ? { scenario_id: scenarioId } : {}),
+      ...(periodId ? { period_id: periodId } : {}),
+      status,
+      source,
+      reason,
+      ...(evidence.length > 0 ? { evidence } : {}),
+      ...(rulingCandId ? { candidate_id: rulingCandId } : {}),
+      ...(specSha ? { spec_sha256: specSha } : {}),
+      ...(specVer !== null ? { spec_version: specVer } : {}),
+      ...(raw.stale_spec === true ? { stale_spec: true } : {}),
+      ...(nonemptyStr(raw.ruled_at) ? { ruled_at: raw.ruled_at.trim() } : {}),
+    };
+  });
+
+  const out = structuredClone(candidate);
+  const existing = Array.isArray(out.peer_comparability_rulings) ? out.peer_comparability_rulings : [];
+  const merged = [...existing];
+
+  const targetSig = entry => {
+    const peerKey = normalizeComparabilityTargetKey(entry?.peer_asin ?? entry?.target_variant_asin ?? entry?.subject_id) ?? '';
+    const scKey = nonemptyStr(entry?.scenario_id) ? entry.scenario_id.trim() : '';
+    const perKey = nonemptyStr(entry?.period_id ?? entry?.operating_period_id)
+      ? String(entry.period_id ?? entry.operating_period_id).trim()
+      : '';
+    const shaKey = nonemptyStr(entry?.spec_sha256 ?? entry?.form_spec_sha256)
+      ? String(entry.spec_sha256 ?? entry.form_spec_sha256).trim().toLowerCase()
+      : '';
+    const verKey = Number.isInteger(entry?.spec_version) ? String(entry.spec_version) : '';
+    return `${shaKey}|${verKey}|${perKey}|${peerKey}|${scKey}`;
+  };
+
+  for (const nextRuling of normalizedIncoming) {
+    const sig = targetSig(nextRuling);
+    let prevStatus = null;
+    for (let i = merged.length - 1; i >= 0; i -= 1) {
+      if (targetSig(merged[i]) === sig) {
+        prevStatus = merged[i]?.status ?? null;
+        break;
+      }
+    }
+    // Append-only: preserves every prior ruling reason/history and guarantees newest ruling wins.
+    merged.push({
+      ...nextRuling,
+      ...(prevStatus && prevStatus !== nextRuling.status ? { previous_status: prevStatus } : {}),
+    });
+  }
+
+  out.peer_comparability_rulings = merged;
+  return out;
+}
+
 /**
  * Run a complete multi-item Phase 2 batch with single-controller non-blocking orchestration:
  *  - Rejects duplicate form_ids upfront.
@@ -4873,6 +5003,15 @@ export async function runPhase2Batch(store, {
         }
       }
 
+      // Bind authoritative DB form spec identity BEFORE deterministic scoreBatch and bundle hashing
+      // so formal comparability rulings validate strictly against current form spec_sha256/spec_version.
+      if (latestForm.spec_sha256) {
+        rawInputCand.spec_sha256 = latestForm.spec_sha256;
+      }
+      if (Number.isInteger(latestForm.spec_version) && latestForm.spec_version > 0) {
+        rawInputCand.spec_version = latestForm.spec_version;
+      }
+
       const manifest = researchOut.discovery
         ? prepareDiscovery(researchOut.discovery.pool, researchOut.discovery.decisions)
         : null;
@@ -4918,11 +5057,8 @@ export async function runPhase2Batch(store, {
       const receiptStoreDir = gate4HookOpts.receiptStoreDir ?? gate4HookOpts.receiptDir ?? null;
       const allowTestDoubleReceipt = Boolean(gate4HookOpts.allowTestDoubleReceipt === true);
       const reviewPacket = researchOut.evidence_review_packet ?? item.evidence_review_packet ?? null;
-      const enforceQualifyingOnlyGate4 = (profile.revision ?? 59) >= 59 || gate4HookOpts.qualifyingOnly === true;
       if (reviewPacket) {
-        const pktSpecCheck = (profile.revision ?? 59) >= 59
-          ? doesReviewPacketMatchDbFormSpec(reviewPacket, latestForm)
-          : { matches: true };
+        const pktSpecCheck = doesReviewPacketMatchDbFormSpec(reviewPacket, latestForm);
         if (!pktSpecCheck.matches) {
           const stalePktMarker = projectSafeAdvisoryMarker({
             status: 'unavailable',
@@ -4940,7 +5076,7 @@ export async function runPhase2Batch(store, {
             ...gate4HookOpts,
             candidateId: formId,
             formSpecSha256: latestForm.spec_sha256,
-            ...(enforceQualifyingOnlyGate4 ? { candidateQualification: qualification } : {}),
+            candidateQualification: qualification,
           });
           if (gate4Res?.status !== 'skipped_non_qualifying') {
             attachedEvidenceReview = attachCandidateEvidenceReview(inputCand, gate4Res, reviewPacket, {
@@ -4975,9 +5111,6 @@ export async function runPhase2Batch(store, {
         }
       }
 
-      if ((profile.revision ?? 59) >= 59 && latestForm.spec_sha256) {
-        inputCand.spec_sha256 = latestForm.spec_sha256;
-      }
       const resultBytes = Buffer.from(`${JSON.stringify(scoredResult, null, 2)}\n`, 'utf8');
       const htmlBytes = Buffer.from(
         renderReport(scoredResult, boundBatch, {
