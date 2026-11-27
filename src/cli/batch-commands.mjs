@@ -16,6 +16,8 @@ import {
 } from '../fba-calculator.mjs';
 import { replayBatchIntoStore } from '../history-import.mjs';
 import {
+  applyPeerComparabilityRulings,
+  attachGate1APriceCliffStress,
   buildAutoEarlyScreenScenariosFromGate1A,
   runPhase2Batch,
 } from '../pipeline.mjs';
@@ -60,6 +62,10 @@ function summarizeBatchPollOutput(polled, {
     : (downloadRequested ? 0 : undefined);
   const inputFileId = polled?.batch?.input_file_id ?? null;
 
+  const batchErrors = Array.isArray(polled?.batch_errors) && polled.batch_errors.length > 0
+    ? polled.batch_errors
+    : (Array.isArray(polled?.batch?.errors?.data) && polled.batch.errors.data.length > 0 ? polled.batch.errors.data : null);
+
   return {
     mode,
     batch_id: polled?.batch_id ?? batchId ?? null,
@@ -70,6 +76,9 @@ function summarizeBatchPollOutput(polled, {
     ...(inputFileId ? { input_file_id: inputFileId, file_id: inputFileId } : {}),
     ...(polled?.output_file_id !== undefined ? { output_file_id: polled.output_file_id } : {}),
     ...(polled?.error_file_id !== undefined ? { error_file_id: polled.error_file_id } : {}),
+    ...(batchErrors ? { batch_errors: batchErrors } : {}),
+    ...(polled?.output_file_error ? { output_file_error: polled.output_file_error } : {}),
+    ...(polled?.error_file_error ? { error_file_error: polled.error_file_error } : {}),
     ...(parsedOutputCount !== undefined ? { parsed_output_count: parsedOutputCount } : {}),
     ...(parsedErrorCount !== undefined ? { parsed_error_count: parsedErrorCount } : {}),
     ...(parsedOutput ? { parsed_output: parsedOutput } : {}),
@@ -197,14 +206,38 @@ export async function runOpenAiBatchPollCommand({
       endpoint: parsedInput.endpoint,
       allowAstraApi: false,
     });
-    const logicalId = 'cli-batch-' + sha256Hex(canonicalJson([
+    // Order-insensitive logicalRequestId over normalized JSONL lines sorted by custom_id so
+    // swapping two lines in batch.jsonl never triggers a duplicate billable POST.
+    const normalizedLines = built.jsonl.trim().split('\n');
+    const orderInsensitiveLines = normalizedLines
+      .map((line, idx) => ({ customId: built.custom_ids[idx], line }))
+      .sort((a, b) => a.customId.localeCompare(b.customId))
+      .map(entry => entry.line);
+    const orderInsensitiveSha = sha256Hex(`${orderInsensitiveLines.join('\n')}\n`);
+    const baseLogicalId = 'cli-batch-' + sha256Hex(canonicalJson([
       accountScope,
       parsedInput.endpoint,
-      built.jsonl_sha256,
+      orderInsensitiveSha,
     ]));
 
     // Check existing ledger attempt BEFORE any billable POST to guarantee 0 duplicate POSTs!
-    const prior = ledger.getAttemptByLogicalId(logicalId, { accountScope });
+    // Allow a fresh retry slot ONLY when a prior attempt is provably pre-batch zero-charge terminal
+    // (rejected/failed_known with confirmed_zero_charge=true, no batch_id, and no batch_post_sha256).
+    let logicalId = baseLogicalId;
+    let prior = ledger.getAttemptByLogicalId(logicalId, { accountScope });
+    let retryIdx = 0;
+    while (prior) {
+      const isPreBatchZeroChargeTerminal = Boolean(
+        (prior.status === 'rejected' || prior.status === 'failed_known') &&
+        prior.confirmed_zero_charge === true &&
+        !prior.provider_response_id &&
+        !prior.batch_manifest?.batch_post_sha256,
+      );
+      if (!isPreBatchZeroChargeTerminal) break;
+      retryIdx += 1;
+      logicalId = `${baseLogicalId}-r${retryIdx}`;
+      prior = ledger.getAttemptByLogicalId(logicalId, { accountScope });
+    }
     if (prior) {
       if (prior.provider_response_id) {
         const polled = await client.retrieveBatch(prior.provider_response_id, {
@@ -290,15 +323,16 @@ export async function runOpenAiBatchPollCommand({
   const pollPolicy = {
     ...policy,
     maxRetries: 0,
-    ...(resolvedAttemptId ? { attemptId: resolvedAttemptId } : {}),
+    ...(resolvedAttemptId ? { attemptId: resolvedAttemptId } : { bindPendingRecoveryByManifest: true }),
     downloadOutput,
   };
   const polled = await client.retrieveBatch(batchId, pollPolicy);
-  const receipt = resolvedAttemptId ? spendReceipt(ledger, resolvedAttemptId, accountScope) : null;
+  const finalAttemptId = resolvedAttemptId ?? polled?.attempt_id ?? null;
+  const receipt = finalAttemptId ? spendReceipt(ledger, finalAttemptId, accountScope) : null;
   const result = summarizeBatchPollOutput(polled, {
     mode: 'polled',
     batchId,
-    attemptId: resolvedAttemptId,
+    attemptId: finalAttemptId,
     receipt,
     downloadRequested: downloadOutput,
   });
@@ -502,6 +536,24 @@ export async function runDailyWorkflowBatchCommand({
       if (typeof qObj.quote_id === 'string' && qObj.quote_id.trim()) {
         const existingQ = store.getQuoteById(qObj.quote_id.trim());
         if (existingQ && existingQ.form_id === upsertedForm.form_id && existingQ.spec_version === upsertedForm.spec_version) {
+          const sameGoods = !Number.isFinite(qObj.goods_cny_total) ||
+            Math.abs(Number(qObj.goods_cny_total) - Number(existingQ.goods_cny_total)) <= 1e-6;
+          const sameDom = qObj.domestic_freight_cny_total === undefined ||
+            (qObj.domestic_freight_cny_total === null
+              ? existingQ.domestic_freight_cny_total === null
+              : (existingQ.domestic_freight_cny_total !== null &&
+                Math.abs(Number(qObj.domestic_freight_cny_total) - Number(existingQ.domestic_freight_cny_total)) <= 1e-6));
+          const incomingFactory = typeof qObj.factory_id === 'string' && qObj.factory_id.trim()
+            ? qObj.factory_id.trim()
+            : null;
+          const sameFactory = incomingFactory === null ||
+            existingQ.factory_id === null ||
+            incomingFactory === existingQ.factory_id;
+          if (!sameGoods || !sameDom || !sameFactory) {
+            throw new Phase2CliError(
+              `报价 ID "${existingQ.quote_id}" 已存在但价格或工厂与已存记录冲突；请使用新的 quote_id 录入变更后的报价。`,
+            );
+          }
           return false;
         }
       }
@@ -834,7 +886,29 @@ export async function runDailyWorkflowBatchCommand({
   if ((command === 'single-product' || command === 'single-dive') && requestedReportDir) {
     const singleBatchSrc = hydratedItems[0]?.scored_batch ?? hydratedItems[0]?.research_out?.batch ?? null;
     if (singleBatchSrc && Array.isArray(singleBatchSrc.candidates) && singleBatchSrc.candidates.length > 0) {
-      const boundSingleBatch = attachStoreDiscoveryProvenance(structuredClone(singleBatchSrc), store);
+      const exportBatch = structuredClone(singleBatchSrc);
+      const singleFormId = hydratedItems[0]?.form?.form_id ?? null;
+      const singleFormRow = singleFormId ? store.getCandidateForm(singleFormId) : null;
+      const singleGate1a = singleFormRow?.gate1a_result_json ? JSON.parse(singleFormRow.gate1a_result_json) : null;
+      if (singleFormRow) {
+        const cIdx = exportBatch.candidates.findIndex(c => c?.id === singleFormId);
+        if (cIdx >= 0) {
+          let cObj = exportBatch.candidates[cIdx];
+          attachGate1APriceCliffStress(cObj, singleGate1a);
+          if (singleFormRow.spec_sha256) cObj.spec_sha256 = singleFormRow.spec_sha256;
+          if (Number.isInteger(singleFormRow.spec_version) && singleFormRow.spec_version > 0) {
+            cObj.spec_version = singleFormRow.spec_version;
+          }
+          if (Array.isArray(hydratedItems[0]?.peer_comparability_rulings) && hydratedItems[0].peer_comparability_rulings.length > 0) {
+            cObj = applyPeerComparabilityRulings(cObj, hydratedItems[0].peer_comparability_rulings, {
+              currentSpecSha: singleFormRow.spec_sha256,
+              currentSpecVersion: singleFormRow.spec_version,
+            });
+            exportBatch.candidates[cIdx] = cObj;
+          }
+        }
+      }
+      const boundSingleBatch = attachStoreDiscoveryProvenance(exportBatch, store);
       const { notesByFormId, storedPackagingShortlist } = enrichBatchAndResultFromStore(boundSingleBatch, store, {
         profileRevision: profile.revision,
         profile,

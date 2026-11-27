@@ -911,7 +911,8 @@ function spendReceipt(ledger, attemptId, accountScope) {
   return {
     attempt_id: row.attempt_id, logical_request_id: row.logical_request_id, provider_response_id: row.provider_response_id,
     model: row.model, status: row.status, content_status: row.content_status, cleanup_status: row.cleanup_status,
-    reserved_cents: row.reserved_cents, usage_cost_micros: row.usage_cost_micros, posted_billed_cents: row.posted_billed_cents,
+    reserved_cents: row.reserved_cents, usage_cost_micros: row.usage_cost_micros,
+    provisional_usage_cost_micros: row.provisional_usage_cost_micros ?? null, posted_billed_cents: row.posted_billed_cents,
     input_tokens: row.usage?.input_tokens ?? null, output_tokens: row.usage?.output_tokens ?? null,
     reasoning_tokens: row.usage?.output_tokens_details?.reasoning_tokens ?? null,
     web_search_calls: row.usage?.web_search_calls ?? (row.endpoint === '/v1/decisions' ? 0 : null),
