@@ -10,6 +10,7 @@ import { extractNewcomerReviewOriginBreakdown } from './observations.mjs';
 import { R58_FONT_FACE_CSS } from './report-fonts.mjs';
 import { R58_STUDIO_CSS, R58_AI_SECTIONS_CSS } from './report-studio-css.mjs';
 import { verifySavedCodexReceipt } from './receipt-verifier.mjs';
+import { resolveScenarioComparabilityLinkage } from './scoring.mjs';
 
 const GROUP_LABELS = {
   profit: '盈利能力', suggested_bid_pressure: '建议竞价压力', niche_demand: '需求依据',
@@ -308,9 +309,28 @@ function sanitizeDisplayTree(value, keyName = '', allowRootImageUri = false) {
   return value;
 }
 
-const isScoredSupportedR58 = sc => sc?.coherence_supported === true &&
+const isActivePricingScenario = sc =>
+  sc?.excluded_from_active_pricing !== true && sc?.comparability_linkage?.status !== 'confirmed_excluded';
+
+const isScoredSupportedR58 = sc => isActivePricingScenario(sc) &&
+  sc?.coherence_supported === true &&
   sc?.input?.calculation?.scoring_supported === true &&
   sc?.input?.calculation?.status !== 'sensitivity_only';
+
+function effectiveScenarioLinkage(sc, original = null, periodId = null) {
+  if (original && typeof original === 'object') {
+    const resolved = resolveScenarioComparabilityLinkage(sc?.input ?? sc, original, {
+      includeAdvisoryReview: true,
+      periodId,
+    });
+    if (resolved && resolved.status && resolved.status !== 'undisputed') return resolved;
+    return resolved ?? null;
+  }
+  const existing = sc?.comparability_linkage && typeof sc.comparability_linkage === 'object'
+    ? sc.comparability_linkage
+    : null;
+  return existing;
+}
 
 function readableSanitized(value, depth = 0) {
   if (value === null || value === undefined) return '未知';
@@ -452,34 +472,24 @@ function resolvePrimarySeasonalPeriodR58(candidate, rev = candidate?.profile_rev
     ?? null;
 }
 
-function isPrivateMoldReservedR59(candidate, rev = candidate?.profile_revision ?? 0) {
-  return rev >= 59 && (
-    candidate?.effective_disposition === 'private_mold_reserved' ||
-    candidate?.qualification?.mode === 'private_mold_reserved'
-  );
+function isPrivateMoldReservedR59(candidate) {
+  return candidate?.effective_disposition === 'private_mold_reserved' ||
+    candidate?.qualification?.mode === 'private_mold_reserved';
 }
 
-function candidateFilterBucket(candidate, rev = candidate?.profile_revision ?? 0) {
-  if (isPrivateMoldReservedR59(candidate, rev)) return 'reserved';
-  if (isCandidateEligible(candidate, rev)) return 'eligible';
+function candidateFilterBucket(candidate, rev = candidate?.profile_revision ?? 59) {
+  if (isPrivateMoldReservedR59(candidate)) return 'reserved';
+  if (isCandidateEligible(candidate)) return 'eligible';
   if (candidate?.queue === 'excluded' || candidate?.queue === 'deferred') return 'hold';
-  if (rev >= 58 && candidate?.queue === 'seasonal_review') {
+  if (candidate?.queue === 'seasonal_review') {
     const prim = resolvePrimarySeasonalPeriodR58(candidate, rev);
     if (prim?.queue === 'excluded' || prim?.queue === 'deferred') return 'hold';
   }
   return 'pending';
 }
 
-function isCandidateEligible(candidate, rev = candidate?.profile_revision ?? 0) {
-  if (rev >= 58) return candidate?.qualification?.counts_toward_target === true;
-  if (candidate?.queue === 'comparable') return true;
-  if (candidate?.queue === 'seasonal_review') {
-    const monthsReq = [2, 3, 4, 5, 6, 7, 8, 9];
-    const hasPeak = array(candidate.operating_periods).some(p => [10, 11, 12].every(m => array(p?.months).includes(m)));
-    return hasPeak && array(candidate.operating_periods).some(p =>
-      p?.queue === 'comparable' && monthsReq.every(m => array(p?.months).includes(m)));
-  }
-  return false;
+function isCandidateEligible(candidate) {
+  return candidate?.qualification?.counts_toward_target === true;
 }
 
 function sInputs(scenarios, calc) {
@@ -498,46 +508,45 @@ function calcMeetsFloor30(calc, sc = null) {
   return null;
 }
 
-function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 0) {
+function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 59, original = null) {
   const target = candidate?.queue === 'seasonal_review'
-    ? (rev >= 58
-      ? ((candidate?.qualification?.display_period_id
-        ? array(candidate.operating_periods).find(p => p?.id === candidate.qualification.display_period_id)
-        : null) ?? array(candidate.operating_periods)[0] ?? candidate)
-      : (array(candidate.operating_periods).find(p => p?.queue === 'comparable') ?? array(candidate.operating_periods)[0] ?? candidate))
+    ? ((candidate?.qualification?.display_period_id
+      ? array(candidate.operating_periods).find(p => p?.id === candidate.qualification.display_period_id)
+      : null) ?? array(candidate.operating_periods)[0] ?? candidate)
     : candidate;
-  const scenarios = array(target?.diagnostics?.economics?.scenarios);
+  const allScenarios = array(target?.diagnostics?.economics?.scenarios);
+  const scenarios = allScenarios.filter(isActivePricingScenario);
   const scoredLedgers = scenarios
-    .filter(s => rev < 58 || isScoredSupportedR58(s))
+    .filter(isScoredSupportedR58)
     .map(s => s?.input?.calculation)
     .filter(c => c && c.status !== 'sensitivity_only');
-  const sensitivityScenarios = rev >= 58
-    ? []
-    : scenarios.filter(s => s?.input?.calculation?.status === 'sensitivity_only');
-  const primarySensScenarios = sensitivityScenarios.filter(s => s?.input?.cost_ledger?.source_inputs?.matched_grade_primary === true);
-  const chosenSensLedgers = (primarySensScenarios.length ? primarySensScenarios : sensitivityScenarios).map(s => s.input.calculation);
-  const activeLedgers = scoredLedgers.some(c => finite(c?.margin)) ? scoredLedgers : (chosenSensLedgers.length ? chosenSensLedgers : scoredLedgers);
-  const isSensitivity = !scoredLedgers.some(c => finite(c?.margin)) && chosenSensLedgers.some(c => finite(c?.margin));
+  const activeLedgers = scoredLedgers;
+  const isSensitivity = false;
 
-  const validatedRefPrice = rev >= 58
-    ? (() => {
-      const rp = array(target?.screening?.conditions).find(c => c?.id === 'reference_price' && c?.status === 'pass');
-      return finite(rp?.input?.value) ? [rp.input.value, rp.input.value] : null;
-    })()
-    : null;
-  const bareGoodsBounds = rev >= 58 && Array.isArray(target?.diagnostics?.economics?.bare_goods_margin_upper_bounds) &&
+  const validatedRefPrice = (() => {
+    const rp = array(target?.screening?.conditions).find(c => c?.id === 'reference_price' && c?.status === 'pass');
+    if (Array.isArray(rp?.effective_price_range) && rp.effective_price_range.length === 2 && rp.effective_price_range.every(finite)) {
+      return rp.effective_price_range;
+    }
+    return finite(rp?.input?.value) ? [rp.input.value, rp.input.value] : null;
+  })();
+  const bareGoodsBounds = Array.isArray(target?.diagnostics?.economics?.bare_goods_margin_upper_bounds) &&
     target.diagnostics.economics.bare_goods_margin_upper_bounds.length === 2
     ? target.diagnostics.economics.bare_goods_margin_upper_bounds
     : null;
-  const nonSensCoherentCalcs = rev >= 58
-    ? scenarios
-      .filter(s => s?.input?.coherent === true && !(s?.input?.cost_ledger?.sensitivity_only === true))
-      .map(s => s?.input?.calculation)
-      .filter(Boolean)
-    : [];
-  const prices = minMaxRange(activeLedgers.map(c => c?.price_usd)) ??
-    (bareGoodsBounds ? minMaxRange(nonSensCoherentCalcs.map(c => c?.price_usd)) : null) ??
-    validatedRefPrice;
+  const nonSensCoherentCalcs = scenarios
+    .filter(s => s?.input?.coherent === true && !(s?.input?.cost_ledger?.sensitivity_only === true))
+    .map(s => s?.input?.calculation)
+    .filter(Boolean);
+  const hasPendingComparability = scenarios.some(s => s?.comparability_linkage?.status === 'pending_evidence');
+  const hasUnresolvedComparability =
+    !Array.isArray(target?.diagnostics?.economics?.margin_range) &&
+    ((allScenarios.length > 0 && scenarios.length === 0) || hasPendingComparability);
+  const prices = hasUnresolvedComparability
+    ? null
+    : (minMaxRange(activeLedgers.map(c => c?.price_usd)) ??
+      (bareGoodsBounds ? minMaxRange(nonSensCoherentCalcs.map(c => c?.price_usd)) : null) ??
+      validatedRefPrice);
   const isBareGoodsCalc = c => {
     const domLine = array(c?.lines).find(l => l?.id === 'domestic_freight');
     return Boolean(c?.cost_basis === 'bare_goods_1688' ||
@@ -549,7 +558,7 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
     ? activeLedgers
     : (nonSensCoherentCalcs.length > 0
       ? nonSensCoherentCalcs
-      : scenarios
+      : (scenarios.length > 0 ? scenarios : allScenarios)
         .filter(s => !(s?.input?.cost_ledger?.sensitivity_only === true))
         .map(s => s?.input?.calculation ?? s?.input?.cost_ledger)
         .filter(Boolean));
@@ -559,108 +568,100 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
     const dom = array(c?.lines).find(l => l.id === 'domestic_freight')?.amount_usd;
     return finite(proc) && finite(dom) ? proc + dom : null;
   }));
+  let marginFloorStatus = 'unknown';
+  const hasUnresolvedPrimaryScenario =
+    Boolean(target?.diagnostics?.economics?.expected_structural_error) ||
+    (allScenarios.length > 0 && scenarios.length === 0) ||
+    scenarios.some(s => !(s?.input?.cost_ledger?.sensitivity_only === true) && !isScoredSupportedR58(s));
+  const marginScreenStatus = array(target?.screening?.conditions).find(c => c?.id === 'margin')?.status ?? null;
   const margins = Array.isArray(target?.diagnostics?.economics?.margin_range) && target.diagnostics.economics.margin_range.length === 2
     ? target.diagnostics.economics.margin_range
-    : (minMaxRange(activeLedgers.map(c => c?.margin)) ?? bareGoodsBounds);
-  let marginFloorStatus = 'unknown';
-  const hasUnresolvedPrimaryScenario = rev >= 59 && (
-    Boolean(target?.diagnostics?.economics?.expected_structural_error) ||
-    scenarios.some(s => !(s?.input?.cost_ledger?.sensitivity_only === true) && !isScoredSupportedR58(s))
-  );
-  const marginScreenStatus = array(target?.screening?.conditions).find(c => c?.id === 'margin')?.status ?? null;
-  if (rev >= 58) {
-    if (hasUnresolvedPrimaryScenario) {
-      marginFloorStatus = marginScreenStatus === 'fail' ? 'fail' : 'unknown';
-    } else {
-      const ledgerVerdicts = activeLedgers
-        .map(c => calcMeetsFloor30(c, scenarios.find(s => s?.input?.calculation === c)))
-        .filter(v => typeof v === 'boolean');
-      if (ledgerVerdicts.length) {
-        marginFloorStatus = ledgerVerdicts.every(Boolean) ? 'pass' : ledgerVerdicts.every(v => !v) ? 'fail' : 'cross';
-      } else if (margins) {
-        marginFloorStatus = margins[0] >= 0.3 ? 'pass' : margins[1] < 0.3 ? 'fail' : 'cross';
-      }
+    : (hasUnresolvedPrimaryScenario
+      ? bareGoodsBounds
+      : (minMaxRange(activeLedgers.map(c => c?.margin)) ?? bareGoodsBounds));
+  if (hasUnresolvedPrimaryScenario) {
+    marginFloorStatus = marginScreenStatus === 'fail' ? 'fail' : 'unknown';
+  } else {
+    const ledgerVerdicts = activeLedgers
+      .map(c => calcMeetsFloor30(c, scenarios.find(s => s?.input?.calculation === c)))
+      .filter(v => typeof v === 'boolean');
+    if (ledgerVerdicts.length) {
+      marginFloorStatus = ledgerVerdicts.every(Boolean) ? 'pass' : ledgerVerdicts.every(v => !v) ? 'fail' : 'cross';
+    } else if (margins) {
+      marginFloorStatus = margins[0] >= 0.3 ? 'pass' : margins[1] < 0.3 ? 'fail' : 'cross';
     }
-  } else if (margins) {
-    marginFloorStatus = margins[0] >= 0.3 ? 'pass' : margins[1] < 0.3 ? 'fail' : 'cross';
   }
-  const adMargins = minMaxRange(activeLedgers.map(c => c?.advertising_scenario_margin));
-  const eligibleScenarios = rev >= 58 ? scenarios.filter(isScoredSupportedR58) : scenarios;
-  const contributions = minMaxRange(
-    eligibleScenarios.map(s => s?.contribution?.value).filter(finite).length
-      ? eligibleScenarios.map(s => s?.contribution?.value)
-      : activeLedgers.map(c => c?.contribution_usd),
-  );
+  const adMargins = hasUnresolvedComparability ? null : minMaxRange(activeLedgers.map(c => c?.advertising_scenario_margin));
+  const eligibleScenarios = scenarios.filter(isScoredSupportedR58);
+  const contributions = hasUnresolvedComparability
+    ? null
+    : minMaxRange(
+      eligibleScenarios.map(s => s?.contribution?.value).filter(finite).length
+        ? eligibleScenarios.map(s => s?.contribution?.value)
+        : activeLedgers.map(c => c?.contribution_usd),
+    );
   const cnyTotals = minMaxRange(activeLedgers.map(c => {
     const si = sInputs(scenarios, c);
     if (isBareGoodsCalc(c) && finite(si?.procurement_cny)) return si.procurement_cny;
     return finite(si?.procurement_cny) && finite(si?.domestic_per_unit_cny) ? si.procurement_cny + si.domestic_per_unit_cny : null;
   }));
-  const orderUnitsRange = rev >= 58
-    ? minMaxRange(activeLedgers.map(c => {
-      const si = sInputs(scenarios, c);
-      const procLine = array(c?.lines).find(l => l.id === 'procurement');
-      const domLine = array(c?.lines).find(l => l.id === 'domestic_freight');
-      const u = procLine?.order_units ?? domLine?.order_units ?? si?.order_units ?? si?.complete_saleable_sets ?? null;
-      return finite(u) && u > 0 ? u : null;
-    }))
-    : null;
-  const capCandidateScenarios = rev >= 58
-    ? (activeLedgers.length
-      ? scenarios.filter(s => activeLedgers.includes(s?.input?.calculation))
-      : scenarios.filter(s => {
-        const cl = s?.input?.cost_ledger;
-        const c = s?.input?.calculation;
-        if (!c || cl?.sensitivity_only === true || cl?.sensitivity_only === 'true') return false;
-        if (s?.input?.coherent === false) return false;
-        if (validatedRefPrice && finite(c.price_usd) && c.price_usd > validatedRefPrice[1] + 1e-6) return false;
-        return true;
-      }))
-    : [];
-  const landedCapUsd = rev >= 58
-    ? minMaxRange(capCandidateScenarios.map(s => s?.input?.calculation?.landed_domestic_cap_at_30pct_usd))
-    : null;
-  const landedCapCny = rev >= 58
-    ? minMaxRange(capCandidateScenarios.map(s => {
-      const c = s?.input?.calculation;
-      if (finite(c?.landed_domestic_cap_at_30pct_cny)) return c.landed_domestic_cap_at_30pct_cny;
-      const si = s?.input?.cost_ledger?.source_inputs;
-      const fx = finite(si?.fx_cny_per_usd) ? si.fx_cny_per_usd : si?.fx_usdcny;
-      return finite(c?.landed_domestic_cap_at_30pct_usd) && finite(fx) && fx > 0
-        ? c.landed_domestic_cap_at_30pct_usd * fx
-        : null;
-    }))
-    : null;
-  const targetGoodsCnyAt30Pct = rev >= 59
-    ? minMaxRange(capCandidateScenarios.map(s => {
-      const c = s?.input?.calculation;
+  const orderUnitsRange = minMaxRange(activeLedgers.map(c => {
+    const si = sInputs(scenarios, c);
+    const procLine = array(c?.lines).find(l => l.id === 'procurement');
+    const domLine = array(c?.lines).find(l => l.id === 'domestic_freight');
+    const u = procLine?.order_units ?? domLine?.order_units ?? si?.order_units ?? si?.complete_saleable_sets ?? null;
+    return finite(u) && u > 0 ? u : null;
+  }));
+  const capCandidateScenarios = activeLedgers.length
+    ? scenarios.filter(s => activeLedgers.includes(s?.input?.calculation))
+    : scenarios.filter(s => {
       const cl = s?.input?.cost_ledger;
-      const si = cl?.source_inputs;
-      const procLineRaw = array(cl?.lines).find(l => l?.id === 'procurement');
-      const domLineRaw = array(cl?.lines).find(l => l?.id === 'domestic_freight');
-      const fx = [si?.fx_cny_per_usd, si?.fx_usdcny, cl?.fx_cny_per_usd, procLineRaw?.fx_cny_per_usd, domLineRaw?.fx_cny_per_usd]
-        .find(v => finite(v) && v > 0) ?? null;
-      const capCny = finite(c?.landed_domestic_cap_at_30pct_cny)
-        ? c.landed_domestic_cap_at_30pct_cny
-        : (finite(c?.landed_domestic_cap_at_30pct_usd) && fx !== null
-          ? c.landed_domestic_cap_at_30pct_usd * fx
-          : null);
-      if (capCny === null) return null;
-      const domUsd = array(c?.lines).find(l => l?.id === 'domestic_freight')?.amount_usd ?? domLineRaw?.amount_usd ?? null;
-      const domCny = finite(domUsd) && fx !== null ? domUsd * fx : 0;
-      return Math.max(0, capCny - domCny);
-    }))
-    : null;
-  const stressMargins = rev >= 58
-    ? minMaxRange(array(target?.diagnostics?.economics?.stress_scenarios).map(st => st?.margin))
-    : null;
+      const c = s?.input?.calculation;
+      if (!c || cl?.sensitivity_only === true || cl?.sensitivity_only === 'true') return false;
+      if (s?.input?.coherent === false) return false;
+      if (validatedRefPrice && finite(c.price_usd) && c.price_usd > validatedRefPrice[1] + 1e-6) return false;
+      return true;
+    });
+  const landedCapUsd = hasUnresolvedComparability ? null : minMaxRange(capCandidateScenarios.map(s => s?.input?.calculation?.landed_domestic_cap_at_30pct_usd));
+  const landedCapCny = hasUnresolvedComparability ? null : minMaxRange(capCandidateScenarios.map(s => {
+    const c = s?.input?.calculation;
+    if (finite(c?.landed_domestic_cap_at_30pct_cny)) return c.landed_domestic_cap_at_30pct_cny;
+    const si = s?.input?.cost_ledger?.source_inputs;
+    const fx = finite(si?.fx_cny_per_usd) ? si.fx_cny_per_usd : si?.fx_usdcny;
+    return finite(c?.landed_domestic_cap_at_30pct_usd) && finite(fx) && fx > 0
+      ? c.landed_domestic_cap_at_30pct_usd * fx
+      : null;
+  }));
+  const targetGoodsCnyAt30Pct = minMaxRange(capCandidateScenarios.map(s => {
+    const c = s?.input?.calculation;
+    const cl = s?.input?.cost_ledger;
+    const si = cl?.source_inputs;
+    const procLineRaw = array(cl?.lines).find(l => l?.id === 'procurement');
+    const domLineRaw = array(cl?.lines).find(l => l?.id === 'domestic_freight');
+    const fx = [si?.fx_cny_per_usd, si?.fx_usdcny, cl?.fx_cny_per_usd, procLineRaw?.fx_cny_per_usd, domLineRaw?.fx_cny_per_usd]
+      .find(v => finite(v) && v > 0) ?? null;
+    const capCny = finite(c?.landed_domestic_cap_at_30pct_cny)
+      ? c.landed_domestic_cap_at_30pct_cny
+      : (finite(c?.landed_domestic_cap_at_30pct_usd) && fx !== null
+        ? c.landed_domestic_cap_at_30pct_usd * fx
+        : null);
+    if (capCny === null) return null;
+    const domUsd = array(c?.lines).find(l => l?.id === 'domestic_freight')?.amount_usd ?? domLineRaw?.amount_usd ?? null;
+    const domCny = finite(domUsd) && fx !== null ? domUsd * fx : 0;
+    return Math.max(0, capCny - domCny);
+  }));
+  const stressMargins = minMaxRange(
+    array(target?.diagnostics?.economics?.stress_scenarios)
+      .filter(st => st?.excluded_from_active_pricing !== true)
+      .map(st => st?.margin),
+  );
   const complete = Array.isArray(target?.total_range) && (
     target?.queue === 'comparable' ||
-    (rev >= 59 && target?.diagnostics?.economics?.crossing_margin_floor === true)
+    target?.diagnostics?.economics?.crossing_margin_floor === true
   );
   let crossingPassSummary = null;
   let crossingBelowSummary = null;
-  if (rev >= 59 && target?.diagnostics?.economics?.crossing_margin_floor === true) {
+  if (target?.diagnostics?.economics?.crossing_margin_floor === true) {
     const fmtCrossingScen = s => {
       const qid = s?.input?.quote_id ?? s?.input?.cost_ledger?.source_inputs?.quote_id ?? null;
       const tag = typeof qid === 'string' && qid.trim() ? qid.trim() : string(s?.id, '情景');
@@ -674,24 +675,19 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
       crossingBelowSummary = failScens.map(fmtCrossingScen).join('、');
     }
   }
-  const sampleCheckItems = rev >= 59
-    ? array(target?.sample_check_items ?? candidate?.sample_check_items ?? candidate?.qualification?.sample_check_items)
-    : [];
-  const core85Range = rev >= 59
-    ? (Array.isArray(target?.core_85_range) ? target.core_85_range : (Array.isArray(candidate?.core_85_range) ? candidate.core_85_range : null))
-    : null;
-  const confirmedRiskDeduction15 = rev >= 59
-    ? (finite(target?.confirmed_risk_deduction_15) ? target.confirmed_risk_deduction_15 : (finite(candidate?.confirmed_risk_deduction_15) ? candidate.confirmed_risk_deduction_15 : null))
-    : null;
-  const remaining15Summary = rev >= 59
-    ? (target?.remaining_15_summary ?? candidate?.remaining_15_summary ?? null)
-    : null;
-  const productSeasonality = rev >= 59
-    ? string(candidate?.product_seasonality ?? candidate?.qualification?.product_seasonality).trim() || null
-    : null;
-  const unpublished2027Q4PeakNote = rev >= 59
-    ? string(candidate?.unpublished_2027_q4_peak_note ?? candidate?.qualification?.unpublished_2027_q4_peak_note).trim() || null
-    : null;
+  const targetPeriodId = candidate?.queue === 'seasonal_review' ? (target?.id ?? null) : null;
+  const scenarioLinkages = allScenarios.map(s => effectiveScenarioLinkage(s, original, targetPeriodId)).filter(Boolean);
+  const aiDisputeCount = scenarioLinkages.filter(l => l.needs_ruling === true).length;
+  const excludedPeerCount = scenarioLinkages.filter(l => l.status === 'confirmed_excluded').length;
+  const pendingPeerCount = scenarioLinkages.filter(l => l.status === 'pending_evidence').length;
+  const sampleCheckItems = array(target?.sample_check_items ?? candidate?.sample_check_items ?? candidate?.qualification?.sample_check_items);
+  const core85Range = Array.isArray(target?.core_85_range) ? target.core_85_range : (Array.isArray(candidate?.core_85_range) ? candidate.core_85_range : null);
+  const confirmedRiskDeduction15 = finite(target?.confirmed_risk_deduction_15)
+    ? target.confirmed_risk_deduction_15
+    : (finite(candidate?.confirmed_risk_deduction_15) ? candidate.confirmed_risk_deduction_15 : null);
+  const remaining15Summary = target?.remaining_15_summary ?? candidate?.remaining_15_summary ?? null;
+  const productSeasonality = string(candidate?.product_seasonality ?? candidate?.qualification?.product_seasonality).trim() || null;
+  const unpublished2027Q4PeakNote = string(candidate?.unpublished_2027_q4_peak_note ?? candidate?.qualification?.unpublished_2027_q4_peak_note).trim() || null;
   return {
     target,
     prices,
@@ -720,9 +716,12 @@ function extractMetricsSnapshot(candidate, rev = candidate?.profile_revision ?? 
     remaining15Summary,
     productSeasonality,
     unpublished2027Q4PeakNote,
+    aiDisputeCount,
+    excludedPeerCount,
+    pendingPeerCount,
     periodLabel: candidate?.queue === 'seasonal_review'
       ? string(target?.label, '主营时段')
-      : (rev >= 59 && unpublished2027Q4PeakNote ? '2027 淡季常青窗口' : '全时段'),
+      : (unpublished2027Q4PeakNote ? '2027 淡季常青窗口' : '全时段'),
   };
 }
 
@@ -919,6 +918,9 @@ function r57NewcomerDetails(result, rev = result?.profile_revision ?? 0) {
 
 function r57RevenueAllocationStrip(scenarios, rev = 57) {
   const r58 = rev >= 58;
+  if (array(scenarios).some(sc => sc?.excluded_from_active_pricing !== true && sc?.comparability_linkage?.status === 'pending_evidence')) {
+    return '';
+  }
   const valid = scenarios
     .filter(sc => !r58 || isScoredSupportedR58(sc))
     .map(sc => ({
@@ -1078,6 +1080,9 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
           <tr><th scope="row">一次性实验室／合规检测费提醒<span class="th-note">独立列示于首批参考本金旁 · 不摊入单件毛利、不设硬红线</span></th><td class="num-col" colspan="${scenarios.length}">${escape(labText)}</td></tr>`;
           })()}` : ''}${refBidUsd !== null ? `
           <tr><th scope="row">广告盈亏平衡所需点击转化率<span class="th-note">广告订单数 ÷ 广告点击数；仅可与点击转化率 clickConvRate 对照，严禁与搜索购买率 purchaseRate 混比</span></th>${scenarios.map(sc => {
+            if (sc.excluded_from_active_pricing === true) {
+              return '<td class="num-col ink-muted">证据已排除</td>';
+            }
             const c = sc.input?.calculation;
             const cond = c?.status === 'sensitivity_only';
             const contrib = cond ? c?.contribution_usd : sc.input?.contribution_usd?.value;
@@ -1095,15 +1100,45 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
         const adText = finite(st.advertising_scenario_margin) ? `${escape(numberText(st.advertising_scenario_margin * 100))}%` : '待补证';
         const capCny = finite(st.landed_domestic_cap_at_30pct_cny) ? `（约 ¥${escape(numberText(st.landed_domestic_cap_at_30pct_cny))}）` : '';
         const capText = finite(st.landed_domestic_cap_at_30pct_usd) ? `；${anyBareGoodsWaterfall ? '保30%裸货上限' : '保30%到深含运上限'} ${money2(st.landed_domestic_cap_at_30pct_usd)}${capCny}` : '';
+        const stExcl = st.excluded_from_active_pricing === true;
+        const stBadge = stExcl ? '<span class="th-note ink-fail">证据已排除 · 原始压力试算留档</span>' : '';
         const issues = array(st.stress_issues);
         const issuesHtml = issues.length
           ? `<p class="${st.double_deduction_blocked ? 'ink-fail' : 'muted'}"><strong>压力情景核查提示：</strong>${issues.map(iss => escape(sanitizeTextPaths(string(iss?.reason ?? iss)))).join('；')}</p>`
           : '';
-        return `<div class="kv-row"><dt>${escape(sanitizeTextPaths(string(st.label ?? st.id, '压力情景')))}</dt><dd><div class="kv-main">压力售价 ${money2(st.price_usd)} · 广告前毛利率 ${mText} · 单件贡献 ${cText} · 扣15%广告后 ${adText}${capText}</div>${issuesHtml}${array(st.assumptions).length ? `<p class="muted">${st.assumptions.map(a => escape(readableSanitized(a))).join('；')}</p>` : ''}</dd></div>`;
+        return `<div class="kv-row"><dt>${escape(sanitizeTextPaths(string(st.label ?? st.id, '压力情景')))}${stBadge}</dt><dd><div class="kv-main${stExcl ? ' ink-muted' : ''}">压力售价 ${money2(st.price_usd)} · 广告前毛利率 ${mText} · 单件贡献 ${cText} · 扣15%广告后 ${adText}${capText}</div>${issuesHtml}${array(st.assumptions).length ? `<p class="muted">${st.assumptions.map(a => escape(readableSanitized(a))).join('；')}</p>` : ''}</dd></div>`;
       }).join('')}</dl>
     </div>` : '';
 
   const expectedPrimaryNote = expectedPrimary.length ? `<p class="muted">预声明主情景核验：${expectedPrimary.map(e => `${escape(e.id)}（${e.verdict === 'present' ? '已纳入' : e.verdict === 'evidenced_cancellation' ? `有据撤销：${escape(sanitizeTextPaths(string(e.reason)))}` : escape(e.verdict)}）`).join('；')}。</p>` : '';
+
+  const scrubLinkText = val => {
+    const raw = typeof val === 'string' ? val.trim() : '';
+    if (!raw) return '';
+    const pathStripped = sanitizeTextPaths(raw)
+      .replace(/(?:[A-Za-z]:\\|\\\\[^\\/\s]+\\[^\\/\s]+\\)[^\s"'<>；;，,）)\]]+/g, '[REDACTED_LOCAL_PATH]')
+      .replace(/(?:[A-Za-z]:\/)[^\s"'<>；;，,）)\]]+/g, '[REDACTED_LOCAL_PATH]');
+    return redactShareableReviewTree(pathStripped);
+  };
+  const waterfallPeriodId = result?.id && Array.isArray(result?.months) ? result.id : null;
+  const scenarioLinks = scenarios.map(sc => effectiveScenarioLinkage(sc, original, waterfallPeriodId));
+  const linkBadgeHtml = link => {
+    if (!link?.status || link.status === 'undisputed') return '';
+    if (link.status === 'confirmed_excluded') return '<span class="th-note ink-fail">证据已排除 · 不计同套售价</span>';
+    if (link.status === 'pending_evidence') return '<span class="th-note">待补证 · 缺同规格确认</span>';
+    if (link.status === 'ai_dispute_pending_ruling') return '<span class="th-note ink-fail">复核提出异议 · 待裁决</span>';
+    if (link.status === 'ai_pending_evidence') return '<span class="th-note">待补证 · 复核提示待裁决</span>';
+    if (link.status === 'confirmed_comparable') return '<span class="th-note ink-pass">裁决确认可比</span>';
+    return '';
+  };
+  const linkShortCellNote = link => {
+    if (!link?.status || link.status === 'undisputed' || link.status === 'confirmed_comparable') return '';
+    if (link.status === 'confirmed_excluded') return '<span class="th-note ink-fail">证据已排除</span>';
+    if (link.status === 'pending_evidence') return '<span class="th-note">待补证</span>';
+    if (link.status === 'ai_dispute_pending_ruling') return '<span class="th-note ink-fail">复核提出异议 · 待裁决</span>';
+    if (link.status === 'ai_pending_evidence') return '<span class="th-note">待补证 · 待裁决</span>';
+    return '';
+  };
 
   return `<section class="ledger-section">
     <div class="section-head"><h3>单件利润与费用拆解</h3><span class="muted">可售单位：${escape(diagnostics.saleable_unit ?? '未知')}</span></div>
@@ -1114,19 +1149,25 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
         <thead>
           <tr>
             <th scope="col">核算项目</th>
-            ${scenarios.map(sc => {
+            ${scenarios.map((sc, idx) => {
               const calc = sc.input?.calculation;
               const cond = calc?.status === 'sensitivity_only';
               const kit = sc.single_factory_complete_kit ?? calc?.single_factory_complete_kit ?? evaluateSingleFactoryCompleteKit({ scenario: sc.input, cost_ledger: sc.input?.cost_ledger });
-              const rawLabel = string(sc.input?.label, sc.id ?? '未命名情景');
-              const dispLabel = r58 ? sanitizeTextPaths(rawLabel) : rawLabel;
+              const dispLabel = sanitizeTextPaths(string(sc.input?.label, sc.id ?? '未命名情景'));
               const kitNote = kit?.is_cross_factory_or_incomplete ? '<span class="th-note">跨厂拼套·不计入围</span>' : '';
-              return `<th scope="col" class="num-col">${escape(dispLabel)}${cond ? '<span class="th-note">条件试算·不计分</span>' : ''}${kitNote}</th>`;
+              return `<th scope="col" class="num-col">${escape(dispLabel)}${cond ? '<span class="th-note">条件试算·不计分</span>' : ''}${kitNote}${linkBadgeHtml(scenarioLinks[idx])}</th>`;
             }).join('')}
           </tr>
         </thead>
         <tbody>
-          <tr><th scope="row">美站销售定价</th>${scenarios.map(sc => `<td class="num-col"><strong>${money2(sc.input?.calculation?.price_usd)}</strong></td>`).join('')}</tr>
+          <tr><th scope="row">美站销售定价</th>${scenarios.map((sc, idx) => {
+            const link = scenarioLinks[idx];
+            const isExcl = link?.status === 'confirmed_excluded' || sc.excluded_from_active_pricing === true;
+            const priceHtml = isExcl
+              ? `<s class="ink-muted">${money2(sc.input?.calculation?.price_usd)}</s>`
+              : `<strong>${money2(sc.input?.calculation?.price_usd)}</strong>`;
+            return `<td class="num-col${isExcl ? ' ink-muted' : ''}">${priceHtml}${linkShortCellNote(link)}</td>`;
+          }).join('')}</tr>
           <tr><th scope="row">退货率代理 ／ 退款后净收入</th>${scenarios.map(sc => {
             const c = sc.input?.calculation;
             return `<td class="num-col">${finite(c?.refund_fraction) ? `${escape(numberText(c.refund_fraction * 100))}%` : '未知'} ／ ${money2(c?.net_revenue_usd)}</td>`;
@@ -1149,15 +1190,16 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
             const contrib = cond ? c?.contribution_usd : sc.input?.contribution_usd?.value;
             return `<td class="num-col"><strong>${finite(contrib) ? money2(contrib) : '未知'}</strong></td>`;
           }).join('')}</tr>
-          <tr class="row-sum"><th scope="row">退款调整后广告前毛利率（门槛 30%）</th>${scenarios.map(sc => {
+          <tr class="row-sum"><th scope="row">退款调整后广告前毛利率（门槛 30%）</th>${scenarios.map((sc, idx) => {
             const c = sc.input?.calculation;
             const cond = c?.status === 'sensitivity_only';
             const m = cond ? { value: c.margin, unit: 'fraction' } : sc.input?.margin;
-            const pass30 = r58
-              ? (isScoredSupportedR58(sc) && finite(m?.value) ? calcMeetsFloor30(c, sc) : null)
-              : (finite(m?.value) ? m.value >= 0.3 : null);
-            const tone = pass30 === true ? 'ink-pass' : pass30 === false ? 'ink-fail' : 'ink-muted';
-            return `<td class="num-col ${tone}"><strong>${escape(observed(m))}</strong></td>`;
+            const link = scenarioLinks[idx];
+            const isExcl = link?.status === 'confirmed_excluded' || sc.excluded_from_active_pricing === true;
+            const pass30 = !isExcl && isScoredSupportedR58(sc) && finite(m?.value) ? calcMeetsFloor30(c, sc) : null;
+            const tone = isExcl ? 'ink-muted' : pass30 === true ? 'ink-pass' : pass30 === false ? 'ink-fail' : 'ink-muted';
+            const valHtml = isExcl ? `<s>${escape(observed(m))}</s>` : `<strong>${escape(observed(m))}</strong>`;
+            return `<td class="num-col ${tone}">${valHtml}${linkShortCellNote(link)}</td>`;
           }).join('')}</tr>
           <tr><th scope="row">扣 15% 广告费后净毛利 ／ 贡献</th>${scenarios.map(sc => {
             const c = sc.input?.calculation;
@@ -1174,30 +1216,52 @@ function r57EconomicWaterfall(result, tableCaptionId, rev = result?.profile_revi
         </tbody>
       </table>
     </div>${expectedPrimaryNote}${stressSection}
-    <div class="scenario-folds">${scenarios.map(scenario => {
+    <div class="scenario-folds">${scenarios.map((scenario, idx) => {
       const calculation = scenario.input?.calculation;
       const conditional = calculation?.status === 'sensitivity_only';
       const validation = object(calculation?.fee_validation);
       const context = object(validation.context);
       const windowText = window => window ? `${window.from} 至 ${window.through}` : '待补证';
-      const explanation = conditional ? '费用已算出，但售价或其他情景假设尚未确认；不授予经济分。' :
-        scenario.coherence_supported === true && scenario.margin_eligible === true ? '该情景满足毛利条件。' :
+      const link = scenarioLinks[idx];
+      const linkReason = scrubLinkText(link?.reason);
+      const linkSource = scrubLinkText(link?.source);
+      const linkPeer = scrubLinkText(link?.peer_asin);
+      const explanation = link?.status === 'confirmed_excluded' ? '证据已排除（规格不符，不计入同套售价与毛利区间，原始报价保留备查）。' :
+        link?.status === 'pending_evidence' ? '待补证（对标同箱规格未确认，暂停计入达标）。' :
+        conditional ? '费用已算出，但售价或其他情景假设尚未确认；不授予经济分。' :
+        scenario.coherence_supported === true && scenario.margin_eligible === true
+          ? (link?.needs_ruling ? '该情景满足毛利条件（注：独立复核提出异议／待补证，待正式裁决）。' : '该情景满足毛利条件。') :
           calculation && !calculation.scoring_supported ? `完整费用尚待补证：${array(calculation.pending_lines).map(id => COST_LABELS[id] ?? id).join('、') || '费率适用日期或来源'}。见下方核对。` :
             reasonText(scenario.eligibility_reason ?? scenario.margin?.reason ?? '该情景尚不满足或尚不能判断毛利条件。');
+      const linkFoldNote = link && link.status && link.status !== 'undisputed'
+        ? (() => {
+          const headingMap = {
+            confirmed_excluded: '对标可比性正式裁决 · 证据已排除',
+            pending_evidence: '对标可比性正式裁决 · 待补证',
+            ai_dispute_pending_ruling: '独立复核提出异议 · 待裁决（仅提醒，正式裁决前不改计分）',
+            ai_pending_evidence: '独立复核提示待补证 · 待裁决（仅提醒，正式裁决前不改计分）',
+            confirmed_comparable: '对标可比性正式裁决 · 确认可比',
+          };
+          const cls = link.status === 'confirmed_excluded' || link.status === 'ai_dispute_pending_ruling'
+            ? 'ink-fail'
+            : link.status === 'confirmed_comparable' ? 'ink-pass' : 'muted';
+          const metaParts = [linkPeer ? `对标 ${linkPeer}` : '', linkSource ? `来源 ${linkSource}` : ''].filter(Boolean).join(' · ');
+          return `<p class="${cls}"><strong>${escape(headingMap[link.status] ?? link.status)}</strong>${metaParts ? `（${escape(metaParts)}）` : ''}${linkReason ? `：${escape(linkReason)}` : ''}</p>`;
+        })()
+        : '';
       const adNote = calculation && finite(calculation.advertising_scenario_margin) && finite(calculation.advertising_scenario_contribution_usd)
         ? `售价15%广告敏感度参考（US$ ${escape(numberText(calculation.advertising_15pct_usd))}）：广告后单件贡献 US$ ${escape(numberText(calculation.advertising_scenario_contribution_usd))}，广告后毛利率 ${escape(numberText(calculation.advertising_scenario_margin * 100))}%${finite(calculation.procurement_cap_at_30pct_usd) ? `；30%广告前毛利对应采购单价上限 US$ ${escape(numberText(calculation.procurement_cap_at_30pct_usd))}` : ''}（仅作敏感度参考，不改变主毛利计分）。`
         : '';
-      const retComp = r58 ? calculation?.returns_processing_components : null;
+      const retComp = calculation?.returns_processing_components ?? null;
       const retNote = retComp
         ? `退货费口径：退款率 r_refund=${escape(numberText(retComp.r_refund * 100))}%，实物退货率 r_physical=${escape(numberText(retComp.r_physical * 100))}%${retComp.return_threshold !== null ? `，类目阈值 ${escape(numberText(retComp.return_threshold * 100))}%` : ''}，超阈费 US$ ${escape(numberText(retComp.expected_fee_per_shipped_unit_usd))}。`
         : '';
-      const foldTitle = r58 ? sanitizeTextPaths(string(scenario.input?.label, scenario.id ?? '未命名情景')) : string(scenario.input?.label, scenario.id ?? '未命名情景');
+      const foldTitle = sanitizeTextPaths(string(scenario.input?.label, scenario.id ?? '未命名情景'));
       const kit = scenario.single_factory_complete_kit ?? calculation?.single_factory_complete_kit ?? evaluateSingleFactoryCompleteKit({ scenario: scenario.input, cost_ledger: scenario.input?.cost_ledger });
       const kitFoldNote = kit?.is_cross_factory_or_incomplete
         ? `<p class="ink-fail"><strong>单厂齐套核查未通过（保留采购情景供复核，不计入入围）：</strong>${escape(kit.kit_note ?? INCOMPLETE_CROSS_FACTORY_KIT_NOTE_ZH)}${kit.distinct_factory_count > 1 ? `（检测到 ${escape(String(kit.distinct_factory_count))} 家不同工厂拼套）` : ''}。</p>`
         : '';
-      const winSep = r58 ? '·' : '—';
-      return `<details class="quiet-fold"><summary>${escape(foldTitle)} · ${escape(explanation)}</summary><div class="fold-body">${kitFoldNote}${calculation ? `<p class="muted">适用窗口 ${winSep} 销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。费率核验：${validation.status === 'validated' ? '通过' : '存在待补证项'}。</p>` : ''}${adNote ? `<p class="muted">${adNote}</p>` : ''}${retNote ? `<p class="muted">${retNote}</p>` : ''}${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(issue.code === 'domestic_quote_required' ? (r58 ? '修订58要求提供整数 order_units >= 100 的非首单常规复购货款与国内运费报价（且须与 source_inputs/sku_lines 口径一致，first_order_promotion: false）。' : '需要100采购单位的非首单常规复购货款与国内运费报价（须明确order_units: 100及first_order_promotion: false），不能沿用旧暂缓规则或首单促销减免。') : (FEE_ISSUES[issue.code] ?? (r58 ? sanitizeTextPaths(string(issue.reason)) : issue.reason)))}</li>`).join('')}</ul>` : ''}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(r58 ? readableSanitized(value) : readable(value))}</li>`).join('')}</ul>` : ''}</div></details>`;
+      return `<details class="quiet-fold"><summary>${escape(foldTitle)} · ${escape(explanation)}</summary><div class="fold-body">${linkFoldNote}${kitFoldNote}${calculation ? `<p class="muted">适用窗口 · 销售：${escape(windowText(context.sales))}；仓储：${escape(windowText(context.storage))}；入库：${escape(windowText(context.inbound))}。费率核验：${validation.status === 'validated' ? '通过' : '存在待补证项'}。</p>` : ''}${adNote ? `<p class="muted">${adNote}</p>` : ''}${retNote ? `<p class="muted">${retNote}</p>` : ''}${array(validation.issues).length ? `<ul>${validation.issues.map(issue => `<li><strong>${escape(COST_LABELS[issue.line] ?? '费用情景')}</strong>：${escape(issue.code === 'domestic_quote_required' ? '修订58要求提供整数 order_units >= 100 的非首单常规复购货款与国内运费报价（且须与 source_inputs/sku_lines 口径一致，first_order_promotion: false）。' : (FEE_ISSUES[issue.code] ?? sanitizeTextPaths(string(issue.reason))))}</li>`).join('')}</ul>` : ''}${array(scenario.input?.assumptions).length ? `<ul>${scenario.input.assumptions.map(value => `<li>${escape(readableSanitized(value))}</li>`).join('')}</ul>` : ''}</div></details>`;
     }).join('')}</div>
   </section>`;
 }
@@ -1357,7 +1421,7 @@ function r59PackagingRedesignAppendix(result, batch, rev = 0) {
 
 function renderComparisonMatrix(candidates, originals, rev = 57) {
   if (!candidates.length) return '';
-  const snaps = candidates.map(cand => extractMetricsSnapshot(cand, rev));
+  const snaps = candidates.map(cand => extractMetricsSnapshot(cand, rev, originals.get(cand?.candidate_id)));
   const anyOver100 = rev >= 58 && snaps.some(s => s.orderUnitsRange && s.orderUnitsRange[1] > 100);
   const allBareGoodsMatrix = snaps.length > 0 && snaps.every(s => s.isBareGoods);
   const anyBareGoodsMatrix = snaps.some(s => s.isBareGoods);
@@ -1579,7 +1643,7 @@ function renderR58ExhibitionReel(candidates, originals, rev) {
     ${candidates.map((cand, idx) => {
       const orig = originals.get(cand?.candidate_id);
       const pres = object(orig?.presentation);
-      const snap = extractMetricsSnapshot(cand, rev);
+      const snap = extractMetricsSnapshot(cand, rev, orig);
       const eligible = isCandidateEligible(cand, rev);
       const bucket = candidateFilterBucket(cand, rev);
       const idxPad = String(idx + 1).padStart(2, '0');
@@ -1695,7 +1759,7 @@ function renderR58SculpturalLedger(snapshot, queueLabel) {
         </div>
       </div>
     </div>
-    <p class="hero-stat-sub">${deltaHtml}</p>
+    <p class="hero-stat-sub">${deltaHtml}</p>${snapshot.aiDisputeCount > 0 ? `\n    <p class="hero-stat-sub ink-fail">独立复核对 ${escape(numberText(snapshot.aiDisputeCount))} 个对标情景提出异议／待补证（待裁决，正式裁决前不改动毛利与总分）</p>` : ''}${(snapshot.excludedPeerCount > 0 || snapshot.pendingPeerCount > 0) ? `\n    <p class="hero-stat-sub muted">已联动对标裁决重算：排除错规格 ${escape(numberText(snapshot.excludedPeerCount))} 项 · 待补证 ${escape(numberText(snapshot.pendingPeerCount))} 项（原始报价与复核记录均已保留）</p>` : ''}
     ${snapshot.isBareGoods ? `<p class="hero-stat-sub muted">${escape(BARE_GOODS_DISCLOSURE_ZH)}</p>` : ''}
   </div>
   <dl class="side-ledger">
@@ -2284,7 +2348,7 @@ function r58PeriodPanel(period, presentation, registry, prefix, panelIndex, rev 
   const ineligible = array(period.items).filter(item => item.status === 'ineligible');
   const conditions = array(period.screening?.conditions).filter(condition => condition.status !== 'pass');
   const economics = object(period.diagnostics?.economics);
-  const periodScenarios = array(economics.scenarios);
+  const periodScenarios = array(economics.scenarios).filter(isActivePricingScenario);
   const contributions = periodScenarios.map(scenario => scenario?.contribution?.value);
   const contribution = contributions.length && contributions.every(finite) && periodScenarios.every(isScoredSupportedR58)
     ? [Math.min(...contributions), Math.max(...contributions)]
@@ -2382,7 +2446,7 @@ function r58SeasonalCard(result, original, index, rev = 58, reportOptions = {}) 
   const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
   const periods = array(result.operating_periods);
   const eligible = isCandidateEligible(result, rev);
-  const snapshot = extractMetricsSnapshot(result, rev);
+  const snapshot = extractMetricsSnapshot(result, rev, original);
   const defaultPeriodIdx = Math.max(0, result.qualification?.display_period_id
     ? periods.findIndex(p => p?.id === result.qualification.display_period_id)
     : 0);
@@ -2466,7 +2530,7 @@ function r58SingleCard(result, original, index, rev = 58, reportOptions = {}) {
     ? `已计分权重 ${numberText(result.covered_weight)} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。`
     : `证据覆盖权重 ${numberText(result.covered_weight)} / 100；未评分权重 ${numberText(result.unscored_weight)}。`;
   const eligible = isCandidateEligible(result, rev);
-  const snapshot = extractMetricsSnapshot(result, rev);
+  const snapshot = extractMetricsSnapshot(result, rev, original);
   const hasSamplePendingSingleR59 = rev >= 59 && snapshot.sampleCheckItems.length > 0;
   const idxPad = String(index + 1).padStart(2, '0');
   const hasBrief = array(presentation.risks).length || array(presentation.next_checks).length || mainGaps.length;
@@ -2546,7 +2610,7 @@ function r58SingleCard(result, original, index, rev = 58, reportOptions = {}) {
 }
 
 function renderR58Report(result, batch = {}, reportOptions = {}) {
-  const rev = result?.profile_revision ?? 58;
+  const rev = result?.profile_revision ?? 59;
   const rawPresentation = { ...object(batch?.presentation), discovery_summary: batch?.discovery_summary };
   const presentation = sanitizeDisplayTree(rawPresentation);
   const rawCandidates = array(result?.candidates);
@@ -2658,7 +2722,7 @@ function renderR58Report(result, batch = {}, reportOptions = {}) {
   ].join('');
 
   const maxPanels = Math.max(12, ...candidates.map(c => (c?.queue === 'seasonal_review' ? array(c.operating_periods).length + 2 : 4)));
-  const reportSnaps = candidates.map(cand => extractMetricsSnapshot(cand, rev));
+  const reportSnaps = candidates.map(cand => extractMetricsSnapshot(cand, rev, originals.get(cand?.candidate_id)));
   const anyOver100Report = reportSnaps.some(s => s.orderUnitsRange && s.orderUnitsRange[1] > 100);
   const allBareGoodsReport = reportSnaps.length > 0 && reportSnaps.every(s => s.isBareGoods);
   const anyBareGoodsReport = reportSnaps.some(s => s.isBareGoods);
