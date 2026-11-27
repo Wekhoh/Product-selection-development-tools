@@ -4,7 +4,7 @@ Domain terms for evidence-based discovery and evaluation of physical product for
 
 ## Operating period
 
-An explicit set of calendar months with its own coherent economic scenarios and applicable fee schedules. Revision53 separates off-peak and peak storage estimates, normally January–September and October–December. A period is an estimate for owner review, not an adopted selling plan or seasonal-demand forecast. One physical form can have separate complete, pending or excluded period results without an annual score or duplicate card count.
+An explicit set of calendar months with its own coherent economic scenarios and applicable fee schedules. Active 2027 schedules separate off-peak and peak storage estimates, normally February–September (2–9月) and October–December (with unpublished 2027 Q4 peak fulfillment left blank after the 2027-02-01..2027-10-14 off-peak fulfillment window). A period is an estimate for owner review, not an adopted selling plan or seasonal-demand forecast. One physical form can have separate complete, pending or excluded period results without an annual score or duplicate card count.
 
 ## Language
 
