@@ -1266,9 +1266,8 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       record.age_days = calendarDayDiff(obsCal, launchCal);
     }
 
-    let keepaAnomalyRecorded = false;
-    const recordKeepaReviewAnomaly = ({ allowHighRatingFallback = false } = {}) => {
-      if (!isR59 || keepaAnomalyRecorded) return;
+    const recordKeepaReviewAnomaly = () => {
+      if (!isR59) return;
       const rawSummary = member?.keepa_review_anomaly_summary && typeof member.keepa_review_anomaly_summary === 'object'
         ? member.keepa_review_anomaly_summary
         : null;
@@ -1310,7 +1309,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         rawSummary?.has_drop === true ||
         normalizedEvents.some(e => e.direction === 'drop'),
       );
-      const hasLegacyOrHighRatingAnomaly = allowHighRatingFallback && Boolean(
+      const hasLegacyOrHighRatingAnomaly = Boolean(
         member?.keepa_review_anomaly === true ||
         member?.review_velocity_anomaly === true ||
         member?.suspected_merged_or_vine_spike === true ||
@@ -1349,11 +1348,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         events: normalizedEvents,
         note_zh: anomalyNote,
       });
-      keepaAnomalyRecorded = true;
     };
-    if (member?.comparability_verdict !== 'excluded_different_task') {
-      recordKeepaReviewAnomaly({ allowHighRatingFallback: false });
-    }
 
     const pushClassified = (kind, poolEligible, missingPoolStats) => {
       classified.push({
@@ -1471,8 +1466,6 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       continue;
     }
 
-    recordKeepaReviewAnomaly({ allowHighRatingFallback: true });
-
     if (record.effective_status === 'ramp_up_zero_sales') {
       if (record.age_days >= 30 || !unitsReading.exactZero) {
         record.effective_status = 'pending';
@@ -1495,6 +1488,9 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         record.effective_status = 'ramp_up_zero_sales';
       }
     }
+
+    // Record Keepa review anomalies strictly after comparability, age (<=90d), exclusion, and active-status checks pass.
+    recordKeepaReviewAnomaly();
 
     const activePoolEligible = record.effective_status !== 'ramp_up_zero_sales' &&
       !(record.age_days < 30 && unitsReading.exactZero);
@@ -4138,6 +4134,7 @@ export function scoreCandidate(candidate, profile, internal = null) {
       const mergedStress = mergeStressScenarios(rootStress, primaryOffPeakRaw.stress_scenarios);
       effectiveCandidateEcon = {
         ...economics,
+        operating_period_id: primaryOffPeakRaw.id,
         scenarios: primaryOffPeakRaw.scenarios,
         ...(mergedExpected !== undefined ? { expected_primary_scenarios: mergedExpected } : {}),
         ...(mergedStress !== undefined ? { stress_scenarios: mergedStress } : {}),
@@ -4226,6 +4223,9 @@ export function scoreCandidate(candidate, profile, internal = null) {
   const newcomers = scoreNewcomers(candidate.newcomer_cohort, ctx, profile, defs);
   const candidateExpectedComponents = candidate?.saleable_set_composition ?? candidate?.expected_components ?? null;
   const profit = scoreEconomics(economicsInput, ctx, profile, defs, priceRefR58, candidateExpectedComponents, candidate);
+  if (currentPeriodId && !isOperatingPeriod) {
+    profit.diagnostics.operating_period_id = currentPeriodId;
+  }
   const items = defs.map(item => {
     if (item.id === 'refund_adjusted_pre_ad_margin') return profit.margin;
     if (item.id === 'unit_contribution') return profit.contribution;
