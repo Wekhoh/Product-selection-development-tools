@@ -209,7 +209,7 @@ export function sanitizeDiagnosticText(text) {
   out = out.replace(/(?:路|大道|街|巷|弄)\s*[零一二三四五六七八九十百千\d]+\s*号/g, '[REDACTED_STREET]');
   out = out.replace(CHINESE_BUILDING_UNIT_GLOBAL_RE, '[REDACTED_UNIT]');
   out = out.replace(/[A-Za-z]:\\Users\\[^\\\s"'<>]+(?:\\[^\s"'<>]*)*/gi, '[REDACTED_PATH]');
-  out = out.replace(/(?:file:\/\/\/)?\/?(?:Users|home)\/[^/\s"'<>]+(?:\/[^\s"'<>]*)*/gi, '[REDACTED_PATH]');
+  out = out.replace(/(?:file:\/\/\/|(?<![A-Za-z0-9._-])\/|(?<![A-Za-z0-9._/-]))(?:Users|home)\/[^/\s"'<>]+(?:\/[^\s"'<>]*)*/gi, '[REDACTED_PATH]');
   out = out.replace(/\b(?:sk-[A-Za-z0-9_-]{6,}|gh[pousr]_[A-Za-z0-9_]{6,}|github_pat_[A-Za-z0-9_]{6,}|xox[bpas]-[A-Za-z0-9-]{6,}|pk_live_[A-Za-z0-9_-]{6,}|rk_live_[A-Za-z0-9_-]{6,}|ya29\.[A-Za-z0-9._-]{8,}|1\/\/[0-9A-Za-z_-]{12,}|oauth_[A-Za-z0-9._-]{8,}|AIza[A-Za-z0-9_-]{10,}|(?:AKIA|ASIA)[0-9A-Z]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9._-]{6,})/g, '[REDACTED_TOKEN]');
   out = out.replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/gi, '$1[REDACTED_TOKEN]');
   out = out.replace(

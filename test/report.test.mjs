@@ -273,3 +273,56 @@ test('r58 curatorial studio gallery embeds offline WOFF2 fonts, Polar Rose SVG, 
   assert.doesNotMatch(renderReport(scoreBatch(badBatch, profile), badBatch), /<img\b/);
 });
 
+test('presentation.summary, presentation.risks, presentation.next_checks, and related presentation free-text scrub raw emails in rendered HTML', () => {
+  const batch = structuredClone(fixture);
+  batch.presentation.title = '批次标题 contact.batch@vendor.org';
+  batch.presentation.summary = '批次摘要 owner.batch@example.net';
+  batch.presentation.discovery = [{ label: '线索发现', detail: '来自 disc@example.org', source: 'src@example.org' }];
+  batch.presentation.timings = [{ label: '耗时阶段', seconds: 12, note: '执行人 timing@example.org' }];
+  batch.presentation.limitations = ['边界限制 lim@example.org'];
+  batch.candidates[0].presentation.summary = '候选摘要 test.user@supplier.cn 请核对';
+  batch.candidates[0].presentation.subtitle_en = 'Subtitle sub@vendor.cn';
+  batch.candidates[0].presentation.risks = [
+    '风险一：联系 leaked@domain.com 核对报价',
+    { label: '结构风险', value: 'objval@domain.com', note: '附注 objnote@domain.com', source: 'objsrc@domain.com' },
+  ];
+  batch.candidates[0].presentation.next_checks = [
+    '下一步：向 next.check@factory.cn 要包材尺寸',
+    { problem: '待查项目 prob@factory.cn', next_step: '跟进 step@factory.cn' },
+  ];
+  batch.candidates[0].presentation.blockers = [
+    { problem: '阻断问题 blk@factory.cn', next_step: '处置 blkstep@factory.cn' },
+  ];
+  batch.candidates[0].presentation.procurement = [
+    { label: '采购联系 proc@factory.cn', value: 'val@factory.cn', note: 'note@factory.cn', source: 'src2@factory.cn' },
+  ];
+
+  const html = renderReport(scoreBatch(batch, profile), batch);
+  for (const rawEmail of [
+    'contact.batch@vendor.org',
+    'owner.batch@example.net',
+    'disc@example.org',
+    'src@example.org',
+    'timing@example.org',
+    'lim@example.org',
+    'test.user@supplier.cn',
+    'sub@vendor.cn',
+    'leaked@domain.com',
+    'objval@domain.com',
+    'objnote@domain.com',
+    'objsrc@domain.com',
+    'next.check@factory.cn',
+    'prob@factory.cn',
+    'step@factory.cn',
+    'blk@factory.cn',
+    'blkstep@factory.cn',
+    'proc@factory.cn',
+    'val@factory.cn',
+    'note@factory.cn',
+    'src2@factory.cn',
+  ]) {
+    assert.equal(html.includes(rawEmail), false, `raw email ${rawEmail} must not leak into rendered HTML`);
+  }
+  assert.match(html, /\[REDACTED_EMAIL\]/);
+});
+

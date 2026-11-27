@@ -968,20 +968,25 @@ export async function runDailyWorkflowBatchCommand({
       });
       const scoredSingle = scoreBatch(boundSingleBatch, profile);
       if (workflowStoppedNonEvaluated && Array.isArray(scoredSingle.candidates)) {
-        const targetQueue = ['gate1a_rejected', 'gate1b_rejected', 'excluded', 'private_mold_reserved'].includes(effLifecycle)
-          ? 'excluded'
-          : (effLifecycle === 'deferred' ? 'deferred' : 'pending');
+        const targetQueue = effLifecycle === 'private_mold_reserved'
+          ? 'pending'
+          : (['gate1a_rejected', 'gate1b_rejected', 'excluded'].includes(effLifecycle)
+            ? 'excluded'
+            : (effLifecycle === 'deferred' ? 'deferred' : 'pending'));
+        const targetDisposition = effLifecycle === 'private_mold_reserved'
+          ? 'private_mold_reserved'
+          : (targetQueue === 'excluded'
+            ? 'hard_excluded'
+            : (targetQueue === 'deferred' ? 'deferred' : 'pending_evidence'));
         let mutated = false;
         for (const sc of scoredSingle.candidates) {
           if ((sc.candidate_id ?? sc.id) === singleFormId && sc.qualification?.counts_toward_target === true) {
             sc.queue = targetQueue;
-            sc.effective_disposition = targetQueue === 'excluded'
-              ? 'hard_excluded'
-              : (targetQueue === 'deferred' ? 'deferred' : 'pending');
+            sc.effective_disposition = targetDisposition;
             sc.qualification = {
               ...(sc.qualification ?? {}),
               counts_toward_target: false,
-              mode: 'workflow_stopped_non_qualifying',
+              mode: effLifecycle === 'private_mold_reserved' ? 'private_mold_reserved' : 'workflow_stopped_non_qualifying',
               blocked_by_workflow_lifecycle: effLifecycle,
               workflow_stop_reason: singleGate1b?.reason ?? singleGate1a?.reason ?? `Workflow lifecycle is "${effLifecycle}" (not evaluated).`,
             };
@@ -989,22 +994,63 @@ export async function runDailyWorkflowBatchCommand({
           }
         }
         if (mutated) {
+          const cands = scoredSingle.candidates;
+          const comparableCands = cands.filter(c => c.queue === 'comparable');
+          const pendingCands = cands.filter(c => c.queue === 'pending');
+          const deferredCands = cands.filter(c => c.queue === 'deferred');
+          const excludedCands = cands.filter(c => c.queue === 'excluded');
+          const seasonalCands = cands.filter(c => c.queue === 'seasonal_review');
+          const seasonalEligibleCands = seasonalCands.filter(c => c.qualification?.counts_toward_target === true);
+          const allSamplePendingCount = cands.filter(
+            r => r.qualification?.counts_toward_target === true &&
+              (r.qualification?.mode === 'sample_pending_qualifying' || r.qualification?.mode === 'seasonal_sample_pending_qualifying'),
+          ).length;
+          const prevSummary = scoredSingle.summary && typeof scoredSingle.summary === 'object' ? scoredSingle.summary : {};
+          const {
+            sample_pending_qualifying: _dropSamplePending,
+            seasonal_review: _dropSeasonalReview,
+            seasonal_eligible: _dropSeasonalEligible,
+            ...restPrevSummary
+          } = prevSummary;
           scoredSingle.summary = {
-            ...(scoredSingle.summary ?? {}),
-            qualifying: scoredSingle.candidates.filter(c => c.qualification?.counts_toward_target === true).length,
-            comparable: scoredSingle.candidates.filter(c => c.queue === 'comparable').length,
-            pending: scoredSingle.candidates.filter(c => c.queue === 'pending').length,
-            deferred: scoredSingle.candidates.filter(c => c.queue === 'deferred').length,
-            excluded: scoredSingle.candidates.filter(c => c.queue === 'excluded').length,
-            hard_excluded: scoredSingle.candidates.filter(c => c.effective_disposition === 'hard_excluded').length,
+            ...restPrevSummary,
+            candidates: cands.length,
+            complete: comparableCands.length,
+            complete_points: comparableCands.filter(r => r.total !== null).length,
+            complete_ranges: comparableCands.filter(r => r.total === null).length,
+            all_items_supported: cands.filter(r => r.scoring_complete).length,
+            partial: cands.filter(r => r.queue !== 'seasonal_review' && !r.scoring_complete).length,
+            pending: pendingCands.length,
+            deferred: deferredCands.length,
+            excluded: excludedCands.length,
+            ...(seasonalCands.length > 0 || Object.hasOwn(prevSummary, 'seasonal_review')
+              ? { seasonal_review: seasonalCands.length, seasonal_eligible: seasonalEligibleCands.length }
+              : {}),
+            qualifying: cands.filter(r => r.qualification?.counts_toward_target === true).length,
+            ...(allSamplePendingCount > 0 ? { sample_pending_qualifying: allSamplePendingCount } : {}),
+            dispositions: {
+              full_annual_qualifying: cands.filter(c => c.effective_disposition === 'full_annual_qualifying').length,
+              seasonal_off_peak_qualifying: cands.filter(c => c.effective_disposition === 'seasonal_off_peak_qualifying').length,
+              crossing_30pct_interval: cands.filter(c => c.effective_disposition === 'crossing_30pct_interval').length,
+              pending_evidence: cands.filter(c => c.effective_disposition === 'pending_evidence').length,
+              private_mold_reserved: cands.filter(c => c.effective_disposition === 'private_mold_reserved').length,
+              deferred: cands.filter(c => c.effective_disposition === 'deferred').length,
+              hard_excluded: cands.filter(c => c.effective_disposition === 'hard_excluded').length,
+            },
           };
           scoredSingle.queues = {
-            comparable: scoredSingle.candidates.filter(c => c.queue === 'comparable'),
-            pending: scoredSingle.candidates.filter(c => c.queue === 'pending'),
-            deferred: scoredSingle.candidates.filter(c => c.queue === 'deferred'),
-            excluded: scoredSingle.candidates.filter(c => c.queue === 'excluded'),
-            ...(scoredSingle.queues?.seasonal_review ? { seasonal_review: scoredSingle.candidates.filter(c => c.queue === 'seasonal_review') } : {}),
+            comparable: comparableCands,
+            pending: pendingCands,
+            deferred: deferredCands,
+            excluded: excludedCands,
+            ...(seasonalCands.length > 0 || scoredSingle.queues?.seasonal_review ? { seasonal_review: seasonalCands } : {}),
           };
+          scoredSingle.qualifying_order = cands.filter(c => c.qualification?.counts_toward_target === true).map(c => c.candidate_id);
+          scoredSingle.order = Object.fromEntries(Object.entries(scoredSingle.queues).map(([k, v]) => [k, v.map(c => c.candidate_id)]));
+          const nextLeader = comparableCands[0] ?? null;
+          scoredSingle.comparable_leader = nextLeader
+            ? { candidate_id: nextLeader.candidate_id, total_range: nextLeader.total_range, conservative_score: nextLeader.total_range?.[0] ?? null }
+            : null;
         }
       }
       if (notesByFormId.size > 0 && Array.isArray(scoredSingle.candidates)) {

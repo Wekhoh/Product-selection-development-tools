@@ -999,9 +999,9 @@ function starReferenceSection(original) {
   if (raw === null || raw === undefined) return '';
   const rating = finite(raw) ? raw : finite(raw?.value) ? raw.value : null;
   if (rating === null || rating <= 0 || rating > 5) return '';
-  const scope = typeof raw === 'object' ? string(raw.scope || raw.population || original?.market?.population) : string(original?.market?.population);
-  const period = typeof raw === 'object' ? string(raw.period || original?.market?.period) : string(original?.market?.period);
-  const note = typeof raw === 'object' ? string(raw.note, '仅作细分市场口碑与预期参考，不纳入100分评分。') : '仅作细分市场口碑与预期参考，不纳入100分评分。';
+  const scope = scrubShareableText(typeof raw === 'object' ? string(raw.scope || raw.population || original?.market?.population) : string(original?.market?.population));
+  const period = scrubShareableText(typeof raw === 'object' ? string(raw.period || original?.market?.period) : string(original?.market?.period));
+  const note = scrubShareableText(typeof raw === 'object' ? string(raw.note, '仅作细分市场口碑与预期参考，不纳入100分评分。') : '仅作细分市场口碑与预期参考，不纳入100分评分。') || '仅作细分市场口碑与预期参考，不纳入100分评分。';
   return `<p class="star-ref">细分市场显示均星参考（不计分）：<strong>${escape(numberText(rating))} 星</strong>${scope ? ` · ${escape(scope)}` : ''}${period ? `（${escape(period)}）` : ''}。${escape(note)}</p>`;
 }
 
@@ -1020,12 +1020,14 @@ function r57BriefList(title, value, rev = 57) {
     (item && typeof item === 'object' && !Array.isArray(item) && (typeof item.label === 'string' || typeof item.problem === 'string' || item.value !== undefined)));
   if (!items.length) return '';
   const cleanChannel = rev >= 59 ? unifyFactoryInquiryLabel : v => v;
+  const cleanText = v => scrubShareableText(cleanChannel(v));
   return `<div class="brief-col"><h3>${escape(title)}</h3><ul class="brief-list">${items.map(item => {
-    if (typeof item === 'string') return `<li>${formatCleanBullet(cleanChannel(item), rev)}</li>`;
-    const head = cleanChannel(string(item.label || item.problem, '提示'));
-    const detail = item.value !== undefined ? `：${escape(readable(item.value))}${typeof item.unit === 'string' ? ` ${escape(item.unit)}` : ''}` : '';
-    const note = cleanChannel(string(item.note || item.next_step));
-    const source = string(item.source);
+    if (typeof item === 'string') return `<li>${formatCleanBullet(cleanText(item), rev)}</li>`;
+    const head = cleanText(string(item.label || item.problem, '提示')) || '提示';
+    const unitText = typeof item.unit === 'string' ? scrubShareableText(item.unit) : '';
+    const detail = item.value !== undefined ? `：${escape(scrubShareableText(readable(item.value)))}${unitText ? ` ${escape(unitText)}` : ''}` : '';
+    const note = cleanText(string(item.note || item.next_step));
+    const source = scrubShareableText(string(item.source));
     return `<li><strong>${escape(head)}</strong>${detail}${note ? `<p class="muted">${escape(note)}</p>` : ''}${source || safeHttpUrl(item.url) ? `<p class="source">来源：${sourceLink(source || '查看来源', item.url)}</p>` : ''}</li>`;
   }).join('')}</ul></div>`;
 }
@@ -1038,10 +1040,11 @@ function r57KeyValueSection(title, value) {
   const rows = array(value).filter(row => row && typeof row === 'object' && !Array.isArray(row));
   if (!rows.length) return '';
   return `<section class="ledger-section"><h3>${escape(title)}</h3><dl class="kv-rows">${rows.map(row => {
-    const label = string(row.label, '补充记录');
-    const main = `${readable(row.value)}${typeof row.unit === 'string' ? ` ${row.unit}` : ''}`;
-    const note = string(row.note);
-    const source = string(row.source);
+    const label = scrubShareableText(string(row.label, '补充记录')) || '补充记录';
+    const unitText = typeof row.unit === 'string' ? scrubShareableText(row.unit) : '';
+    const main = `${scrubShareableText(readable(row.value))}${unitText ? ` ${unitText}` : ''}`;
+    const note = scrubShareableText(string(row.note));
+    const source = scrubShareableText(string(row.source));
     const validUrl = safeHttpUrl(row.url);
     return `<div class="kv-row"><dt>${escape(label)}</dt><dd><div class="kv-main">${escape(main)}${validUrl ? ` <a class="pill-link" href="${escape(validUrl)}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer">${escape(source || '查看来源')} ${SVG_EXT}</a>` : ''}</div>${note ? `<p class="muted">${escape(note)}</p>` : ''}${!validUrl && source ? `<p class="source">来源：${escape(source)}</p>` : ''}</dd></div>`;
   }).join('')}</dl></section>`;
@@ -1863,7 +1866,7 @@ function renderComparisonMatrix(candidates, originals, rev = 57) {
             const eligible = isCandidateEligible(cand, rev);
             const bucketAttr = ` data-bucket="${candidateFilterBucket(cand, rev)}"`;
             const topCheck = array(pres.next_checks)[0] ?? array(pres.risks)[0] ?? array(pres.blockers)[0]?.problem ?? '核对下方评分明细';
-            const topCheckStr = typeof topCheck === 'string' ? topCheck : string(topCheck?.label || topCheck?.problem, '核对下方评分明细');
+            const topCheckStr = scrubShareableText(typeof topCheck === 'string' ? topCheck : string(topCheck?.label || topCheck?.problem, '核对下方评分明细')) || '核对下方评分明细';
             const leadMatch = topCheckStr.match(/^([^：:—]{4,26})[：:—]\s*(.*)$/s);
             let clipped = topCheckStr;
             if (leadMatch) {
@@ -1911,13 +1914,20 @@ function r57BatchContext(presentation) {
   const timings = array(presentation.timings);
   const limitations = array(presentation.limitations);
   if (!discovery.length && !timings.length && !limitations.length) return linkedSummary ? `<div class="footer-meta">${linkedSummary}</div>` : '';
-  return `<section class="method-section" aria-labelledby="method-heading"><h2 id="method-heading" class="sr-only">核算边界与发现路径</h2><details class="quiet-fold batch-context"><summary>核算边界、发现路径与耗时记录</summary><div class="fold-body">${linkedSummary}${limitations.length ? `<h3>核算与方法边界</h3><ul>${limitations.map(value => `<li>${escape(readable(value))}</li>`).join('')}</ul>` : ''}${discovery.length ? `<h3>发现与覆盖记录</h3><ul>${discovery.map(value => {
-    if (typeof value === 'string') return `<li>${escape(value)}</li>`;
+  return `<section class="method-section" aria-labelledby="method-heading"><h2 id="method-heading" class="sr-only">核算边界与发现路径</h2><details class="quiet-fold batch-context"><summary>核算边界、发现路径与耗时记录</summary><div class="fold-body">${linkedSummary}${limitations.length ? `<h3>核算与方法边界</h3><ul>${limitations.map(value => `<li>${escape(scrubShareableText(readable(value)))}</li>`).join('')}</ul>` : ''}${discovery.length ? `<h3>发现与覆盖记录</h3><ul>${discovery.map(value => {
+    if (typeof value === 'string') return `<li>${escape(scrubShareableText(value))}</li>`;
     const row = object(value);
-    return `<li><strong>${escape(string(row.label, '发现记录'))}</strong>${typeof row.detail === 'string' ? `：${escape(row.detail)}` : ''}${typeof row.status === 'string' ? `（${escape(row.status)}）` : ''}${row.source || safeHttpUrl(row.url) ? `<p class="source">${sourceLink(string(row.source, '查看来源'), row.url)}${typeof row.observed_at === 'string' ? ` · ${escape(row.observed_at)}` : ''}</p>` : ''}</li>`;
+    const label = scrubShareableText(string(row.label, '发现记录')) || '发现记录';
+    const detail = typeof row.detail === 'string' ? scrubShareableText(row.detail) : '';
+    const status = typeof row.status === 'string' ? scrubShareableText(row.status) : '';
+    const source = scrubShareableText(string(row.source, '查看来源')) || '查看来源';
+    const observedAt = typeof row.observed_at === 'string' ? scrubShareableText(row.observed_at) : '';
+    return `<li><strong>${escape(label)}</strong>${detail ? `：${escape(detail)}` : ''}${status ? `（${escape(status)}）` : ''}${row.source || safeHttpUrl(row.url) ? `<p class="source">${sourceLink(source, row.url)}${observedAt ? ` · ${escape(observedAt)}` : ''}</p>` : ''}</li>`;
   }).join('')}</ul>` : ''}${timings.length ? `<h3>记录耗时</h3><dl class="kv-rows">${timings.map(value => {
     const row = object(value);
-    return `<div class="kv-row"><dt>${escape(string(row.label, '阶段'))}</dt><dd>${finite(row.seconds) && row.seconds >= 0 ? `${escape(numberText(row.seconds))} 秒` : '未测量'}${typeof row.note === 'string' ? `<p class="muted">${escape(row.note)}</p>` : ''}</dd></div>`;
+    const label = scrubShareableText(string(row.label, '阶段')) || '阶段';
+    const note = typeof row.note === 'string' ? scrubShareableText(row.note) : '';
+    return `<div class="kv-row"><dt>${escape(label)}</dt><dd>${finite(row.seconds) && row.seconds >= 0 ? `${escape(numberText(row.seconds))} 秒` : '未测量'}${note ? `<p class="muted">${escape(note)}</p>` : ''}</dd></div>`;
   }).join('')}</dl>` : ''}</div></details></section>`;
 }
 
@@ -2036,8 +2046,8 @@ function r58PolishRangeCopy(text) {
 }
 
 function r58ShortPlinthTitle(cand, pres) {
-  if (typeof pres?.short_title === 'string' && pres.short_title.trim()) return pres.short_title.trim();
-  const raw = string(cand?.label ?? cand?.candidate_id, '未命名候选').trim();
+  if (typeof pres?.short_title === 'string' && pres.short_title.trim()) return scrubShareableText(pres.short_title);
+  const raw = scrubShareableText(string(cand?.label ?? cand?.candidate_id, '未命名候选')) || '未命名候选';
   const stripped = raw.replace(/[（(|].*$/, '').trim();
   return stripped || raw;
 }
@@ -2053,7 +2063,7 @@ function renderR58ExhibitionReel(candidates, originals, rev, imagePool) {
       const eligible = isCandidateEligible(cand, rev);
       const bucket = candidateFilterBucket(cand, rev);
       const idxPad = String(idx + 1).padStart(2, '0');
-      const fullTitle = string(cand?.label ?? cand?.candidate_id, `候选 ${idxPad}`);
+      const fullTitle = scrubShareableText(string(cand?.label ?? cand?.candidate_id, `候选 ${idxPad}`)) || `候选 ${idxPad}`;
       const shortTitle = r58ShortPlinthTitle(cand, pres);
       const plinthImg = imageUri(pres.hero_image_data_uri) ?? imageUri(pres.image_data_uri) ?? imageUri(pres.contact_sheet_data_uri);
 
@@ -2078,7 +2088,7 @@ function renderR58ExhibitionReel(candidates, originals, rev, imagePool) {
       const mTone = snap.marginFloorStatus === 'pass' ? 'ink-pass' : snap.marginFloorStatus === 'fail' ? 'ink-fail' : '';
       const staggerCls = candidates.length >= 3 && idx % 2 === 1 ? ' is-stagger' : '';
       const specimenSub = isPrivateMoldReservedR59(cand, rev) ? '疑似私模／需开模留档' : (QUEUES[cand?.queue] ?? '候选');
-      const plinthAlt = string(pres.image_alt, shortTitle);
+      const plinthAlt = scrubShareableText(string(pres.image_alt, shortTitle)) || shortTitle;
       const plinthMediaHtml = plinthImg
         ? imagePool.renderImage(plinthImg, { alt: plinthAlt, mode: 'cover', width: 960, height: 720, lazy: false })
         : '';
@@ -2192,8 +2202,8 @@ function renderR58SculpturalLedger(snapshot, queueLabel) {
 function r58ContactSheetFigure(presentation, label, prefix, imagePool) {
   const sheet = imageUri(presentation?.contact_sheet_data_uri);
   if (!sheet) return '';
-  const caption = string(presentation?.contact_sheet_caption, '4×4 类目视觉聚类联系表（用于确认同形态同任务可比集与价位带切分）');
-  const altText = string(presentation?.contact_sheet_alt, `${label} 视觉聚类联系表`);
+  const caption = scrubShareableText(string(presentation?.contact_sheet_caption, '4×4 类目视觉聚类联系表（用于确认同形态同任务可比集与价位带切分）')) || '4×4 类目视觉聚类联系表（用于确认同形态同任务可比集与价位带切分）';
+  const altText = scrubShareableText(string(presentation?.contact_sheet_alt, `${label} 视觉聚类联系表`)) || `${label} 视觉聚类联系表`;
   const zoomId = `${prefix}-sheet-zoom`;
   const mediaHtml = imagePool.renderImage(sheet, { alt: altText, mode: 'contain', lazy: true });
   return `<section class="ledger-section" data-section="contact-sheet">
@@ -2217,8 +2227,8 @@ function r58ContactSheetFigure(presentation, label, prefix, imagePool) {
 function r58ReferenceImageFigure(presentation, label, prefix, imagePool) {
   const image = imageUri(presentation?.image_data_uri);
   if (!image) return '';
-  const altText = string(presentation?.image_alt, `${label} 原始参考与核验存证`);
-  const caption = string(presentation?.image_caption, '所附参考与报价核验截图，供核对具体规格');
+  const altText = scrubShareableText(string(presentation?.image_alt, `${label} 原始参考与核验存证`)) || `${label} 原始参考与核验存证`;
+  const caption = scrubShareableText(string(presentation?.image_caption, '所附参考与报价核验截图，供核对具体规格')) || '所附参考与报价核验截图，供核对具体规格';
   const zoomId = `${prefix}-img-zoom`;
   const mediaHtml = imagePool.renderImage(image, { alt: altText, mode: 'contain', lazy: true });
   return `<section class="ledger-section">
@@ -2961,7 +2971,7 @@ function r58PeriodPanel(period, presentation, registry, prefix, panelIndex, rev 
     <div class="period-meta-line">
       <div>
         <strong>${escape(r58PolishRangeCopy(period.label))}</strong> · <span class="muted">${label} · 适用 ${escape(array(period.months).join('、'))}月</span>
-        ${typeof presentation.summary === 'string' ? `<p class="period-note">${escape(r58PolishRangeCopy(presentation.summary))}</p>` : ''}
+        ${typeof presentation.summary === 'string' ? `<p class="period-note">${escape(scrubShareableText(presentation.summary))}</p>` : ''}
       </div>
       <div class="period-inline-nums num">
         <span>毛利 <strong>${margin ? `${escape(rangeText(margin))}%` : (rev >= 59 && typeof period.unpublished_peak_note === 'string' && period.unpublished_peak_note.trim() ? escape(period.unpublished_peak_note.trim()) : '未知')}</strong></span>
@@ -3051,7 +3061,7 @@ function r58SeasonalCard(result, original, index, rev = 59, reportOptions = {}, 
   const idxPad = String(index + 1).padStart(2, '0');
   const hasBrief = array(presentation.risks).length || array(presentation.next_checks).length || blockers.length;
   const bucket = candidateFilterBucket(result, rev);
-  const cardLabel = result.label ?? result.candidate_id;
+  const cardLabel = scrubShareableText(string(result.label ?? result.candidate_id)) || string(result.candidate_id);
 
   return `<article class="candidate" id="${prefix}" data-queue="seasonal_review" data-eligible="${eligible ? 'true' : 'false'}" data-bucket="${bucket}">
     <div class="split-stage">
@@ -3061,19 +3071,19 @@ function r58SeasonalCard(result, original, index, rev = 59, reportOptions = {}, 
           <h2>${escape(cardLabel)}</h2>
         </div>
         <div class="status-row">
-          ${typeof presentation.subtitle_en === 'string' && presentation.subtitle_en.trim() ? `<span class="st-en">${escape(presentation.subtitle_en.trim())}</span><span class="pc-sep">·</span>` : ''}
+          ${typeof presentation.subtitle_en === 'string' && presentation.subtitle_en.trim() ? `<span class="st-en">${escape(scrubShareableText(presentation.subtitle_en))}</span><span class="pc-sep">·</span>` : ''}
           ${renderDotStatus(result, snapshot, rev)}
           <span class="pc-sep">·</span>
           <span class="muted queue-tag">分季评估</span>
         </div>
-        ${typeof presentation.summary === 'string' ? `<p class="lead-copy">${escape(r58PolishRangeCopy(presentation.summary))}</p>` : ''}
+        ${typeof presentation.summary === 'string' ? `<p class="lead-copy">${escape(scrubShareableText(presentation.summary))}</p>` : ''}
         ${renderR58SculpturalLedger(snapshot, '待补证')}
         <p class="spec-copy">${escape(result.form ?? '具体可售规格尚待明确')}</p>
         ${starReferenceSection(original)}
         ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${r59ReturnCauseDiagnosisSection(result, original, rev)}${r59FactoryInquiryChecklistSection(result, original, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与核查清单">
           ${r57BriefList('风险与边界提示', presentation.risks, rev)}
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
-          ${blockers.length ? `<div class="brief-col"><h3>共同问题与后续处理</h3><ul class="brief-list">${blockers.map(row => `<li><strong>${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.problem) : row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.next_step) : row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
+          ${blockers.length ? `<div class="brief-col"><h3>共同问题与后续处理</h3><ul class="brief-list">${blockers.map(row => `<li><strong>${escape(scrubShareableText(row.problem))}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(scrubShareableText(row.next_step))}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
         </section>` : ''}${renderR58EvidenceReview(result, original, reportOptions, rev)}${r57ReviewNotes(result, original, rev)}${r57OperationalDisclosures(result, rev)}
       </div>
       <div class="stage-hairline" aria-hidden="true"></div>
@@ -3133,7 +3143,7 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
     ? `<p class="muted coverage-line">达标口径核验：${result.qualification.reasons.map(r => escape(sanitizeTextPaths(reasonText(r)))).join('；')}</p>`
     : '';
   const bucket = candidateFilterBucket(result, rev);
-  const cardLabel = result.label ?? result.candidate_id;
+  const cardLabel = scrubShareableText(string(result.label ?? result.candidate_id)) || string(result.candidate_id);
 
   return `<article class="candidate" id="${prefix}" data-queue="${queue}" data-eligible="${eligible ? 'true' : 'false'}" data-bucket="${bucket}">
     <div class="split-stage">
@@ -3143,12 +3153,12 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
           <h2>${escape(cardLabel)}</h2>
         </div>
         <div class="status-row">
-          ${typeof presentation.subtitle_en === 'string' && presentation.subtitle_en.trim() ? `<span class="st-en">${escape(presentation.subtitle_en.trim())}</span><span class="pc-sep">·</span>` : ''}
+          ${typeof presentation.subtitle_en === 'string' && presentation.subtitle_en.trim() ? `<span class="st-en">${escape(scrubShareableText(presentation.subtitle_en))}</span><span class="pc-sep">·</span>` : ''}
           ${renderDotStatus(result, snapshot, rev)}
           <span class="pc-sep">·</span>
           <span class="muted queue-tag">${rev >= 59 && snapshot.productSeasonality === 'evergreen' ? `常青款 · ${hasSamplePendingSingleR59 ? '入围（含拿样待核）' : QUEUES[queue]}` : (hasSamplePendingSingleR59 ? '入围（含拿样待核）' : QUEUES[queue])}</span>
         </div>
-        ${typeof presentation.summary === 'string' ? `<p class="lead-copy">${escape(r58PolishRangeCopy(presentation.summary))}</p>` : ''}
+        ${typeof presentation.summary === 'string' ? `<p class="lead-copy">${escape(scrubShareableText(presentation.summary))}</p>` : ''}
         ${renderR58SculpturalLedger(snapshot, incompleteLabel)}
         <p class="spec-copy">${escape(result.form ?? '具体可售规格尚待明确')}</p>
         ${starReferenceSection(original)}
@@ -3161,7 +3171,7 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
         ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${r59ReturnCauseDiagnosisSection(result, original, rev)}${r59FactoryInquiryChecklistSection(result, original, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与缺口">
           ${r57BriefList('风险与边界提示', presentation.risks, rev)}
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
-          ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li><strong>${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.problem) : row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.next_step) : row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
+          ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li><strong>${escape(scrubShareableText(row.problem))}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(scrubShareableText(row.next_step))}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
         </section>` : ''}${renderR58EvidenceReview(result, original, reportOptions, rev)}${r57ReviewNotes(result, original, rev)}${r57OperationalDisclosures(result, rev)}
         ${screenGaps.length ? `<p class="muted coverage-line">筛选状态：${screenGaps.map(condition => `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : '<p class="muted coverage-line">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}${qualReasonNote}
       </div>
@@ -3240,7 +3250,7 @@ function renderR58Report(result, batch = {}, reportOptions = {}) {
       },
     ];
   }));
-  const title = string(presentation.title, '美国站选品视觉策展室');
+  const title = scrubShareableText(string(presentation.title, '美国站选品视觉策展室')) || '美国站选品视觉策展室';
   const eligibleCount = candidates.filter(cand => isCandidateEligible(cand, rev)).length;
   const holdCount = candidates.filter(cand => candidateFilterBucket(cand, rev) === 'hold').length;
   const pendingBucketCount = candidates.filter(cand => candidateFilterBucket(cand, rev) === 'pending').length;
@@ -3365,7 +3375,7 @@ function renderR58Report(result, batch = {}, reportOptions = {}) {
     ? `，平铺待拿样入围 ${escape(numberText(flatSamplePendingEligibleCount))} 个`
     : '';
 
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="text-scale" content="scale"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"><meta name="referrer" content="no-referrer"><title>${escape(title)}</title><style>${R58_FONT_FACE_CSS}${R58_STUDIO_CSS}\n${dynamicCss}</style></head><body><a class="skip-link" href="#cards">跳到候选卡</a>${imagePool.defsSpriteHtml()}<main class="studio-page"><header class="masthead"><div class="mh-left"><h1>${escape(title)}</h1><p class="mh-colophon"><span class="mh-en">US FBA Product Curation · 2027 Fee Architecture · Rev ${escape(result?.profile_revision ?? 59)}</span>${typeof presentation.summary === 'string' ? `<span class="mh-sep">／</span><span>${escape(presentation.summary)}</span>` : ''}</p><p class="batch-counts">本轮 ${escape(numberText(candidates.length))} 个候选；完整可比 ${escape(numberText(completeCount))} 个${flatSamplePendingHeadline}，${headlinePendingText}。${seasonalCounts}${r58OrderRule}</p></div>${candidates.length ? `<div class="mh-right" role="region" aria-label="筛选与视图控制"><div class="typo-nav" role="radiogroup" aria-label="候选筛选">${filterNavHtml}</div>${queueLinks ? `<nav class="queue-nav" aria-label="跳转候选队列">${queueLinks}</nav>` : ''}</div>` : ''}</header>${renderR58ExhibitionReel(candidates, originals, rev, imagePool)}<p class="filter-empty muted">当前筛选条件下暂无候选款式，请切换至“全部”查看完整展列。</p><section id="cards" aria-label="候选产品深度精算展台">${candidates.length ? candidates.map((candidate, index) => (candidate?.queue === 'seasonal_review' ? r58SeasonalCard(object(candidate), originals.get(candidate?.candidate_id), index, rev, reportOptions, imagePool) : r58SingleCard(object(candidate), originals.get(candidate?.candidate_id), index, rev, reportOptions, imagePool))).join('') : '<div class="empty-state"><h2>本轮没有候选卡</h2><p class="muted">保留发现与覆盖记录；没有候选不等于市场中没有机会。</p></div>'}</section>${renderComparisonMatrix(candidates, originals, rev)}${r59PackagingRedesignAppendix(result, batch, rev)}${r57BatchContext(presentation)}<footer class="report-footer"><p>评分反映本轮证据与已确认试评规则。未知不按零计，不把已知部分折算为100分；初步评分、供应验证、主人决定与实际经营效果分别核验。</p><p>规则版本：修订 ${escape(result?.profile_revision ?? '未知')} · 离线单文件零外部请求</p></footer></main></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="text-scale" content="scale"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; script-src 'none'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'"><meta name="referrer" content="no-referrer"><title>${escape(title)}</title><style>${R58_FONT_FACE_CSS}${R58_STUDIO_CSS}\n${dynamicCss}</style></head><body><a class="skip-link" href="#cards">跳到候选卡</a>${imagePool.defsSpriteHtml()}<main class="studio-page"><header class="masthead"><div class="mh-left"><h1>${escape(title)}</h1><p class="mh-colophon"><span class="mh-en">US FBA Product Curation · 2027 Fee Architecture · Rev ${escape(result?.profile_revision ?? 59)}</span>${typeof presentation.summary === 'string' ? `<span class="mh-sep">／</span><span>${escape(scrubShareableText(presentation.summary))}</span>` : ''}</p><p class="batch-counts">本轮 ${escape(numberText(candidates.length))} 个候选；完整可比 ${escape(numberText(completeCount))} 个${flatSamplePendingHeadline}，${headlinePendingText}。${seasonalCounts}${r58OrderRule}</p></div>${candidates.length ? `<div class="mh-right" role="region" aria-label="筛选与视图控制"><div class="typo-nav" role="radiogroup" aria-label="候选筛选">${filterNavHtml}</div>${queueLinks ? `<nav class="queue-nav" aria-label="跳转候选队列">${queueLinks}</nav>` : ''}</div>` : ''}</header>${renderR58ExhibitionReel(candidates, originals, rev, imagePool)}<p class="filter-empty muted">当前筛选条件下暂无候选款式，请切换至“全部”查看完整展列。</p><section id="cards" aria-label="候选产品深度精算展台">${candidates.length ? candidates.map((candidate, index) => (candidate?.queue === 'seasonal_review' ? r58SeasonalCard(object(candidate), originals.get(candidate?.candidate_id), index, rev, reportOptions, imagePool) : r58SingleCard(object(candidate), originals.get(candidate?.candidate_id), index, rev, reportOptions, imagePool))).join('') : '<div class="empty-state"><h2>本轮没有候选卡</h2><p class="muted">保留发现与覆盖记录；没有候选不等于市场中没有机会。</p></div>'}</section>${renderComparisonMatrix(candidates, originals, rev)}${r59PackagingRedesignAppendix(result, batch, rev)}${r57BatchContext(presentation)}<footer class="report-footer"><p>评分反映本轮证据与已确认试评规则。未知不按零计，不把已知部分折算为100分；初步评分、供应验证、主人决定与实际经营效果分别核验。</p><p>规则版本：修订 ${escape(result?.profile_revision ?? '未知')} · 离线单文件零外部请求</p></footer></main></body></html>`;
 }
 
 export function renderReport(result, batch = {}, reportOptions = {}) {
