@@ -2415,3 +2415,344 @@ test('Round-2 Codex Regressions #8, #9, #10: primary_discovery admissibility & c
 
   store.close();
 });
+
+test('Step 2 auto-wiring & store queue: runPhase2Batch upserts calibration_tracking without overwriting owner_confirmed, and selectNextStoreBatch isolates pending pool & exclusions', async () => {
+  const { DatabaseSync } = await import('node:sqlite');
+  await withTempDirAsync(async dir => {
+    const dbPath = join(dir, 'step2.sqlite');
+
+    // 1. Simulate legacy candidate_forms schema lacking presentation tracking columns, then verify additive _migrateSchema()
+    const seedStore = openSelectionStore(dbPath);
+    seedStore.close();
+    const raw = new DatabaseSync(dbPath);
+    raw.exec(`
+      CREATE TABLE candidate_forms_old AS SELECT
+        form_id, product_family_key, spec_version, spec_sha256, label, buyer_task,
+        saleable_set_composition_json, grade_or_material, target_child_asin, leaf_node_path,
+        lifecycle_status, sourcing_disposition, gate1a_result_json, gate1b_result_json,
+        negotiation_shortlist_json, packaging_redesign_shortlist_json, landed_domestic_cap_cny,
+        cooldown_until, cooldown_reason, promotion_track, created_at, updated_at
+      FROM candidate_forms;
+      DROP TABLE candidate_forms;
+      CREATE TABLE candidate_forms (
+        form_id TEXT PRIMARY KEY,
+        product_family_key TEXT NOT NULL,
+        spec_version INTEGER NOT NULL DEFAULT 1 CHECK(spec_version >= 1),
+        spec_sha256 TEXT NOT NULL,
+        label TEXT NOT NULL,
+        buyer_task TEXT NOT NULL,
+        saleable_set_composition_json TEXT NOT NULL,
+        grade_or_material TEXT,
+        target_child_asin TEXT,
+        leaf_node_path TEXT,
+        lifecycle_status TEXT NOT NULL DEFAULT 'discovered',
+        sourcing_disposition TEXT,
+        gate1a_result_json TEXT,
+        gate1b_result_json TEXT,
+        negotiation_shortlist_json TEXT,
+        packaging_redesign_shortlist_json TEXT,
+        landed_domestic_cap_cny REAL,
+        cooldown_until TEXT,
+        cooldown_reason TEXT,
+        promotion_track TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      DROP TABLE candidate_forms_old;
+    `);
+    raw.close();
+
+    const store = openSelectionStore(dbPath);
+    try {
+      const formCols = store._tableColumns('candidate_forms');
+      assert.equal(formCols.has('last_presented_at'), true);
+      assert.equal(formCols.has('presentation_count'), true);
+
+      // 2. Test runPhase2Batch auto-wiring into calibration_tracking
+      const { estimateGate1A2027 } = await import('../src/fba-calculator.mjs');
+      const baseCand = structuredClone(fixture.candidates[0]);
+      const sc0Base = baseCand.economics.scenarios[0];
+      const fx = 7.0;
+      const procUsd = sc0Base.cost_ledger.lines.find(l => l.id === 'procurement').amount_usd;
+      const domUsd = sc0Base.cost_ledger.lines.find(l => l.id === 'domestic_freight').amount_usd;
+      const hhUsd = sc0Base.cost_ledger.lines.find(l => l.id === 'headhaul').amount_usd;
+      const unitGoodsCny = Math.round(procUsd * fx * 10000) / 10000;
+      const totalDomCny = Math.round(domUsd * fx * 100 * 100) / 100;
+      const salesWin = { from: '2027-02-01', through: '2027-10-14' };
+      const storageWin = { from: '2027-02-01', through: '2027-09-30' };
+      const inboundWin = { from: '2027-01-20', through: '2027-02-01' };
+      const g1aScens = baseCand.economics.scenarios.map(sc => ({
+        id: sc.id,
+        pkg: { length_in: 10, width_in: 6, height_in: 2, weight_lb: 1.5 },
+        price_usd: sc.cost_ledger.price_usd,
+        fx_cny_per_usd: fx, refund_fraction: 0.02, physical_return_fraction: 0.02,
+        fee_category: 'Home and Kitchen',
+        referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.20, refund_admin_cap_usd: 5.0, minimum_referral_usd: 0.30 },
+        headhaul_usd: hhUsd, collection_rate: 0.006,
+        sales_window: salesWin, storage_window: storageWin, inbound_window: inboundWin,
+        is_apparel: false, is_dangerous_goods: false, is_sipp: false,
+      }));
+      const rawEst = estimateGate1A2027(g1aScens[0]);
+      const cachedEst = {
+        fulfillment_usd: rawEst.components.fulfillment.total_usd,
+        placement_usd: rawEst.components.placement.selected_usd,
+        storage_usd: rawEst.components.storage.per_unit_usd,
+      };
+      const quoteForCand = (formId, qid) => ({
+        quote_id: qid,
+        factory_id: 'fac-step2-1',
+        observed_at: '2026-11-27',
+        expires_at: null,
+        redacted_destination: '广东深圳',
+        raw_readback_ref: `rb-${qid}`,
+        goods_first_order_promotion: false,
+        freight_first_order_promotion: false,
+        fx_cny_per_usd: fx,
+        pkg: { length_in: 10, width_in: 6, height_in: 2, unit_weight_lb: 1.5 },
+        sku_lines: [{ offer_id: 'o1', sku_id: 's1', component_id: 'item', qty_per_saleable_set: 1, pack_multiple: 1, moq_qty: 100, ordered_qty: 100, unit_price_cny: unitGoodsCny, regular_goods_promo_false: true }],
+        actual_sets: 100,
+        actual_complete_sets: 100,
+        goods_cny_total: Math.round(unitGoodsCny * 100 * 100) / 100,
+        domestic_freight_cny_total: totalDomCny,
+      });
+      const alignCand = (cand, id, qid) => {
+        const c = structuredClone(cand);
+        c.id = id;
+        delete c.spec_sha256;
+        delete c.spec_version;
+        for (const s of c.economics.scenarios) {
+          s.quote_id = qid;
+          s.cost_ledger.fee_context = { ...s.cost_ledger.fee_context, sales: salesWin, storage: storageWin, inbound: inboundWin };
+          s.cost_ledger.source_inputs = { ...(s.cost_ledger.source_inputs ?? {}), quote_id: qid, fx_cny_per_usd: fx };
+          for (const l of s.cost_ledger.lines) {
+            if (l.id === 'procurement' || l.id === 'domestic_freight') { l.fx_cny_per_usd = fx; l.order_units = 100; }
+            if (l.id === 'fulfillment') l.amount_usd = cachedEst.fulfillment_usd;
+            if (l.id === 'placement') l.amount_usd = cachedEst.placement_usd;
+            if (l.id === 'storage') l.amount_usd = Math.max(l.amount_usd, cachedEst.storage_usd);
+          }
+          const r = s.cost_ledger.refund_fraction ?? 0.04;
+          const nonCol = ['referral', 'fulfillment', 'placement', 'storage', 'returns_processing', 'return_disposition']
+            .reduce((sum, lid) => sum + (s.cost_ledger.lines.find(l => l.id === lid)?.amount_usd ?? 0), 0);
+          const colLine = s.cost_ledger.lines.find(l => l.id === 'collection');
+          if (colLine) colLine.amount_usd = Number((Math.max(0, s.cost_ledger.price_usd * (1 - r) - nonCol) * (s.cost_ledger.collection_rate ?? 0.005)).toFixed(6));
+        }
+        return c;
+      };
+      const mkBatchItem = (formId, qid) => ({
+        form: {
+          form_id: formId,
+          product_family_key: formId,
+          label: `AutoCal ${formId}`,
+          buyer_task: 'Organize bench parts',
+          saleable_set_composition: [{ component_id: 'item', qty_per_saleable_set: 1 }],
+        },
+        leads: [{
+          lead_id: `ld-${formId}`,
+          source_channel: 'reddit',
+          source_ref: `https://example.com/${formId}`,
+          phrase_or_title: formId,
+          observed_at: '2026-11-27',
+          disposition: 'product',
+        }],
+        gate1a_scenarios: g1aScens,
+        sourcing_executor: async () => ({ status: 'quoted', quote: quoteForCand(formId, qid) }),
+        early_screen_builder: () => g1aScens.map(g => ({
+          profile_revision: 59, id: g.id, saleable_unit: '1 complete set', price_usd: g.price_usd, fx_cny_per_usd: fx,
+          order_units: 100, goods_cny_per_unit: unitGoodsCny, domestic_freight_cny_per_unit: totalDomCny / 100,
+          first_order_promotion: false, goods_first_order_promotion: false,
+          pkg: { length_in: 10, width_in: 6, height_in: 2, unit_weight_lb: 1.5 },
+          headhaul: { usd_per_unit: hhUsd, bond_included: true },
+          refund_fraction: 0.02, physical_return_fraction: 0.02, return_threshold: 0.08, returns_processing_usd: 0,
+          is_apparel_or_shoes: false,
+          referral_terms: g.referral_terms,
+          fulfillment_usd: cachedEst.fulfillment_usd, placement_usd: cachedEst.placement_usd,
+          storage: { cubic_feet_per_unit: (10 * 6 * 2) / 1728, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
+          operating_period: 'off_peak', operating_months: [2, 3, 4, 5, 6, 7, 8, 9, 10],
+          fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'pack-1', sales: salesWin, storage: storageWin, inbound: inboundWin },
+          collection_rate: 0.006, other_applicable_usd: 0, specific_rights_conflict: 'unknown', strong_date_dependency: false,
+        })),
+        deep_research_executor: async () => ({
+          batch: { schema_version: 1, profile_revision: 59, candidates: [alignCand(baseCand, formId, qid)] },
+        }),
+      });
+
+      // Pre-seed form-auto-cal-b with owner_confirmed decision BEFORE runPhase2Batch
+      store.upsertCalibrationTracking({
+        form_id: 'form-auto-cal-b',
+        spec_version: 1,
+        system_verdict: 'pending_evidence',
+        owner_decision: 'keep',
+        owner_decision_source: 'owner_confirmed',
+        owner_reason: '主人已确认保留',
+      });
+      // Pre-seed form-auto-cal-c with legacy_unknown sample_check
+      store.upsertCalibrationTracking({
+        form_id: 'form-auto-cal-c',
+        spec_version: 1,
+        system_verdict: 'pending_evidence',
+        owner_decision: 'sample_check',
+        owner_reason: '旧脚本已定',
+      });
+
+      const autoOut = await runPhase2Batch(store, {
+        items: [
+          mkBatchItem('form-auto-cal-a', 'q-auto-a'),
+          mkBatchItem('form-auto-cal-b', 'q-auto-b'),
+          mkBatchItem('form-auto-cal-c', 'q-auto-c'),
+        ],
+        profile,
+        as_of_date: '2026-11-27',
+        batch_id: 'batch-step2-auto',
+      });
+      assert.equal(autoOut.gate2_3.filter(x => x.status === 'evaluated').length, 3);
+
+      const calA = store.getCalibrationTrackingForForm('form-auto-cal-a', 1);
+      assert.ok(calA);
+      assert.equal(calA.batch_id, 'batch-step2-auto');
+      assert.ok(Array.isArray(calA.core_85_range));
+      assert.ok(Array.isArray(calA.supported_range));
+      assert.ok(Array.isArray(calA.pre_ad_margin_range));
+      assert.equal(calA.owner_decision, null);
+      assert.equal(calA.owner_decision_source, null);
+
+      const calB = store.getCalibrationTrackingForForm('form-auto-cal-b', 1);
+      assert.equal(calB.owner_decision, 'keep');
+      assert.equal(calB.owner_decision_source, 'owner_confirmed');
+      assert.equal(calB.owner_reason, '主人已确认保留');
+      assert.equal(calB.batch_id, 'batch-step2-auto');
+
+      const calC = store.getCalibrationTrackingForForm('form-auto-cal-c', 1);
+      assert.equal(calC.owner_decision, 'sample_check');
+      assert.equal(calC.owner_decision_source, 'legacy_unknown');
+
+      const calSummary = store.getCalibrationRetrospectiveSummary({ batch_id: 'batch-step2-auto' });
+      assert.equal(calSummary.awaiting_owner_decision_count, 1);
+      assert.equal(calSummary.owner_confirmed_count, 1);
+      assert.equal(calSummary.legacy_unknown_source_count, 1);
+
+      // 3. Seed exclusion buckets + 3 priority tiers for selectNextStoreBatch
+      const addForm = (id, status, opts = {}) => {
+        store.upsertCandidateForm({
+          form_id: id,
+          product_family_key: id,
+          label: `Form ${id}`,
+          buyer_task: 'Task',
+          saleable_set_composition: [{ component_id: 'item', qty_per_saleable_set: 1 }],
+          lifecycle_status: status,
+          ...(opts.promotion_track ? { promotion_track: opts.promotion_track } : {}),
+          ...(opts.cooldown_until ? { cooldown_until: opts.cooldown_until, cooldown_reason: 'cooling' } : {}),
+        });
+        if (opts.gate1a_result || opts.gate1b_result || opts.sourcing_disposition) {
+          store.updateFormLifecycle(id, status, {
+            ...(opts.gate1a_result ? { gate1a_result: opts.gate1a_result } : {}),
+            ...(opts.gate1b_result ? { gate1b_result: opts.gate1b_result } : {}),
+            ...(opts.sourcing_disposition ? { sourcing_disposition: opts.sourcing_disposition } : {}),
+          });
+        }
+      };
+
+      // Exclusions
+      addForm('squirrel-basic', 'discovered');
+      addForm('form-hist-custom', 'discovered');
+      store.upsertRawLead({
+        lead_id: 'ld-hist-1',
+        source_channel: 'historical_trial_r57',
+        source_ref: 'https://example.com/hist1',
+        phrase_or_title: 'hist trial',
+        observed_at: '2026-11-19',
+      });
+      store.linkLeadToForm({ lead_id: 'ld-hist-1', form_id: 'form-hist-custom', link_role: 'primary_discovery' });
+      addForm('form-excl-g1a', 'gate1a_rejected');
+      addForm('form-excl-g1b-json', 'gate1a_needs_verification', { gate1b_result: { status: 'gate1b_rejected' } });
+      addForm('form-excl-cooldown', 'discovered', { cooldown_until: '2099-12-31' });
+      addForm('form-excl-private-eval', 'gate1b_pending');
+      store.recordEvaluation({
+        form_id: 'form-excl-private-eval',
+        period_id: 'annual',
+        profile_revision: 59,
+        evidence_bundle_sha256: 'a'.repeat(64),
+        qualification: { counts_toward_target: false, mode: 'private_mold_reserved' },
+        queue_bucket: 'pending',
+        covered_weight: 80,
+        supported_range: [70, 75],
+        result_sha256: 'b'.repeat(64),
+        receipt: { spec_version: 1 },
+      });
+      addForm('form-excl-r57-only', 'evaluated');
+      store.recordEvaluation({
+        form_id: 'form-excl-r57-only',
+        period_id: 'annual',
+        profile_revision: 57,
+        evidence_bundle_sha256: 'c'.repeat(64),
+        qualification: { counts_toward_target: true, mode: 'complete' },
+        queue_bucket: 'comparable',
+        covered_weight: 100,
+        supported_range: [80, 82],
+        result_sha256: 'd'.repeat(64),
+        receipt: { spec_version: 1 },
+      });
+
+      // Eligible Tier 1 & Tier 2 & Tier 3
+      addForm('form-elig-t1-g1b', 'gate1a_needs_verification', { gate1b_result: { status: 'gate1b_passed' } });
+      addForm('form-elig-t1-disc', 'discovered', { promotion_track: 'track_a_resonance' });
+      addForm('form-elig-t2-uneval', 'gate1a_needs_verification');
+      addForm('form-elig-t3-pending-rev', 'evaluated');
+      store.recordEvaluation({
+        form_id: 'form-elig-t3-pending-rev',
+        period_id: 'annual',
+        profile_revision: 59,
+        evidence_bundle_sha256: 'e'.repeat(64),
+        qualification: { counts_toward_target: false, mode: 'none' },
+        queue_bucket: 'pending',
+        covered_weight: 60,
+        supported_range: [50, 55],
+        result_sha256: 'f'.repeat(64),
+        receipt: { spec_version: 1 },
+      });
+      store.upsertCalibrationTracking({
+        form_id: 'form-elig-t3-pending-rev',
+        spec_version: 1,
+        system_verdict: 'pending_evidence',
+        owner_decision: 'pending_owner_review',
+      });
+
+      const pull1 = store.selectNextStoreBatch({ limit: 10, asOfDate: '2026-11-27' });
+      assert.deepEqual(
+        pull1.selected.map(x => x.form_id),
+        [
+          'form-elig-t1-g1b',
+          'form-elig-t1-disc',
+          'form-elig-t2-uneval',
+          'form-auto-cal-a',
+          'form-elig-t3-pending-rev',
+        ],
+      );
+      assert.equal(pull1.excluded_counts.historical_trial_drill, 2);
+      assert.equal(pull1.excluded_counts.terminal_lifecycle_or_private_mold, 1);
+      assert.equal(pull1.excluded_counts.cooldown_active, 1);
+      assert.equal(pull1.excluded_counts.gate1b_rejected_json, 1);
+      assert.equal(pull1.excluded_counts.evaluation_reserved_or_excluded, 1);
+      assert.equal(pull1.excluded_counts.legacy_pre_r59_archived, 1);
+      assert.equal(pull1.excluded_counts.calibration_decided_or_excluded, 2);
+
+      // Pending-pool isolation ("待拍板池")
+      store.markFormsPresented(['form-elig-t1-g1b', 'form-elig-t1-disc'], '2026-11-27T10:00:00Z');
+      const pull2 = store.selectNextStoreBatch({ limit: 10, asOfDate: '2026-11-27' });
+      assert.deepEqual(pull2.selected.map(x => x.form_id), ['form-elig-t2-uneval', 'form-auto-cal-a', 'form-elig-t3-pending-rev']);
+      assert.equal(pull2.pending_pool_skipped_count, 2);
+      assert.deepEqual(pull2.pending_pool_form_ids, ['form-elig-t1-g1b', 'form-elig-t1-disc']);
+
+      const pullPending = store.selectNextStoreBatch({ limit: 10, pendingPool: true, asOfDate: '2026-11-27' });
+      assert.deepEqual(pullPending.selected.map(x => x.form_id), ['form-elig-t1-g1b', 'form-elig-t1-disc']);
+
+      const pullInclude = store.selectNextStoreBatch({ limit: 5, includeShown: true, asOfDate: '2026-11-27' });
+      assert.deepEqual(
+        pullInclude.selected.map(x => x.form_id),
+        ['form-elig-t2-uneval', 'form-auto-cal-a', 'form-elig-t3-pending-rev', 'form-elig-t1-g1b', 'form-elig-t1-disc'],
+      );
+      assert.equal(pullInclude.pending_pool_skipped_count, 0);
+    } finally {
+      store.close();
+    }
+  });
+});

@@ -3114,3 +3114,185 @@ test('Phase-2 CLI & replay: serve-report --check, contact-sheet UNKNOWN default,
     }
   });
 });
+
+test('Issue #55 & Step 2 CLI: daily-batch supports uncapped --input vs explicit --limit, --from-store --limit 10 with pending-pool isolation, --dry-run, CAPTCHA_PAUSED guard, and README smoke example', async () => {
+  await withTempDirAsync('issue55-daily-batch-', async dir => {
+    const mkInputItem = idx => ({
+      form: {
+        form_id: `form-i55-${String(idx).padStart(2, '0')}`,
+        product_family_key: `fam-i55-${idx}`,
+        label: `Synthetic Item ${idx}`,
+        buyer_task: 'Sort workshop tools',
+        saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+      },
+      asin: `B0I55000${String(idx).padStart(2, '0')}`,
+      gate1a_scenarios: [{
+        id: 'sc-40',
+        price_usd: 40,
+        available_date: '2025-05-01',
+        pkg: { length_in: 12, width_in: 8, height_in: 4, unit_weight_lb: 1.5 },
+        fx_cny_per_usd: 7.2,
+        refund_fraction: 0.04,
+        physical_return_fraction: 0.04,
+        fee_category: 'Home and Kitchen',
+        referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5, minimum_referral_usd: 0.3 },
+        headhaul_usd: 2.0,
+        collection_rate: 0.005,
+        other_applicable_usd: 0,
+        sales_window: { from: '2027-02-01', through: '2027-10-14' },
+        storage_window: { from: '2027-02-01', through: '2027-09-30' },
+        inbound_window: { from: '2027-01-15', through: '2027-10-14' },
+      }],
+    });
+
+    const elevenPath = join(dir, 'eleven.json');
+    writeFileSync(elevenPath, JSON.stringify({
+      as_of_date: '2026-11-27',
+      items: Array.from({ length: 11 }, (_, i) => mkInputItem(i + 1)),
+    }, null, 2));
+
+    // 1. --input without --limit remains uncapped (11 items -> 11 ingested)
+    const rUncapped = await runCliMem(['daily-batch', '--db', ':memory:', '--input', elevenPath]);
+    assert.equal(rUncapped.code, 0, rUncapped.stderr);
+    const jUncapped = JSON.parse(rUncapped.stdout);
+    assert.equal(jUncapped.mode, 'input_batch');
+    assert.equal(jUncapped.input_item_count, 11);
+    assert.equal(jUncapped.limit_applied, null);
+    assert.equal(jUncapped.selected_count, 11);
+    assert.equal(jUncapped.truncated_by_limit, false);
+    assert.equal(jUncapped.batch_report.ingested.length, 11);
+
+    // 2. --input with explicit --limit 10 slices cleanly and reports metadata
+    const rLimited = await runCliMem(['daily-batch', '--db', ':memory:', '--input', elevenPath, '--limit', '10']);
+    assert.equal(rLimited.code, 0, rLimited.stderr);
+    const jLimited = JSON.parse(rLimited.stdout);
+    assert.equal(jLimited.input_item_count, 11);
+    assert.equal(jLimited.limit_applied, 10);
+    assert.equal(jLimited.selected_count, 10);
+    assert.equal(jLimited.truncated_by_limit, true);
+    assert.equal(jLimited.batch_report.ingested.length, 10);
+
+    // 3. Invalid flags & flag combos exit 2
+    for (const badArgs of [
+      ['daily-batch', '--db', ':memory:', '--input', elevenPath, '--limit', '0'],
+      ['daily-batch', '--db', ':memory:', '--input', elevenPath, '--limit', 'abc'],
+      ['daily-batch', '--db', ':memory:', '--from-store', '--input', elevenPath],
+      ['daily-batch', '--db', ':memory:', '--pending-pool'],
+      ['daily-batch', '--db', ':memory:', '--include-shown'],
+      ['daily-batch', '--db', ':memory:', '--from-store', '--pending-pool', '--include-shown'],
+      ['single-product', '--db', ':memory:', '--from-store'],
+      ['single-product', '--db', ':memory:', '--input', elevenPath, '--limit', '1'],
+    ]) {
+      const rBad = await runCliMem(badArgs);
+      assert.equal(rBad.code, 2, `Expected exit 2 for ${badArgs.join(' ')}`);
+    }
+
+    // 4. --from-store queue pulling, pending-pool isolation, --dry-run, and CAPTCHA_PAUSED
+    const storeDbPath = join(dir, 'store-queue.sqlite');
+    const st = openSelectionStore(storeDbPath);
+    for (let i = 1; i <= 12; i++) {
+      st.upsertCandidateForm({
+        form_id: `form-q-${String(i).padStart(2, '0')}`,
+        product_family_key: `fam-q-${i}`,
+        label: `Queue Form ${i}`,
+        buyer_task: 'Task',
+        saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+        lifecycle_status: i <= 2 ? 'discovered' : 'gate1a_needs_verification',
+      });
+    }
+    st.upsertCandidateForm({
+      form_id: 'form-q-rejected',
+      product_family_key: 'fam-q-rej',
+      label: 'Rejected',
+      buyer_task: 'Task',
+      saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+      lifecycle_status: 'gate1a_rejected',
+    });
+    st.close();
+
+    // --dry-run does not mark presented
+    const rDry = await runCliMem(['daily-batch', '--db', storeDbPath, '--from-store', '--dry-run']);
+    assert.equal(rDry.code, 0, rDry.stderr);
+    const jDry = JSON.parse(rDry.stdout);
+    assert.equal(jDry.limit, 10);
+    assert.equal(jDry.dry_run, true);
+    assert.equal(jDry.marked_presented, false);
+    assert.equal(jDry.selected_count, 10);
+
+    // Real pull 1 marks first 10
+    const rPull1 = await runCliMem(['daily-batch', '--db', storeDbPath, '--from-store']);
+    assert.equal(rPull1.code, 0, rPull1.stderr);
+    const jPull1 = JSON.parse(rPull1.stdout);
+    assert.equal(jPull1.marked_presented, true);
+    assert.equal(jPull1.selected_count, 10);
+    assert.equal(jPull1.unseen_eligible_count, 12);
+
+    // Real pull 2 skips the 10 shown undecided cards -> returns remaining 2 unseen
+    const rPull2 = await runCliMem(['daily-batch', '--db', storeDbPath, '--from-store', '--limit', '10']);
+    assert.equal(rPull2.code, 0, rPull2.stderr);
+    const jPull2 = JSON.parse(rPull2.stdout);
+    assert.equal(jPull2.selected_count, 2);
+    assert.equal(jPull2.pending_pool_skipped_count, 10);
+    assert.equal(jPull2.pending_pool_form_ids.length, 10);
+
+    // Confirm 8 of the 10 from pull 1, leaving 2 in pending_pool; verify --pending-pool returns those 2
+    const stConf = openSelectionStore(storeDbPath);
+    for (const s of jPull1.selected_forms.slice(0, 8)) {
+      stConf.upsertCalibrationTracking({
+        form_id: s.form_id,
+        system_verdict: 'pending_evidence',
+        owner_decision: 'drop',
+        owner_decision_source: 'owner_confirmed',
+      });
+    }
+    stConf.close();
+
+    const rPending = await runCliMem(['daily-batch', '--db', storeDbPath, '--from-store', '--pending-pool', '--limit', '10']);
+    assert.equal(rPending.code, 0, rPending.stderr);
+    const jPending = JSON.parse(rPending.stdout);
+    // 2 remaining undecided from pull 1 + 2 shown by pull 2 = 4 in pending_pool
+    assert.equal(jPending.selected_count, 4);
+    assert.deepEqual(
+      jPending.selected_forms.map(x => x.form_id).sort(),
+      [...jPull1.selected_forms.slice(8, 10), ...jPull2.selected_forms].map(x => x.form_id).sort(),
+    );
+
+    // CAPTCHA_PAUSED blocks marking presented on non-dry-run --from-store
+    const stPause = openSelectionStore(storeDbPath);
+    stPause.upsertCandidateForm({
+      form_id: 'form-q-unseen-after-pause',
+      product_family_key: 'fam-q-p',
+      label: 'Unseen Paused',
+      buyer_task: 'Task',
+      saleable_set_composition: [{ component_id: 'unit', qty_per_saleable_set: 1 }],
+      lifecycle_status: 'discovered',
+    });
+    stPause.pauseQueue('gate1b_1688_queue', '1688 slider active');
+    stPause.close();
+
+    const rPaused = await runCliMem(['daily-batch', '--db', storeDbPath, '--from-store', '--limit', '10']);
+    assert.equal(rPaused.code, 0, rPaused.stderr);
+    const jPaused = JSON.parse(rPaused.stdout);
+    assert.equal(jPaused.batch_paused, true);
+    assert.equal(jPaused.pause_status, 'CAPTCHA_PAUSED');
+    assert.equal(jPaused.marked_presented, false);
+    const stVerifyPause = openSelectionStore(storeDbPath, { readOnly: true });
+    assert.equal(stVerifyPause.getCandidateForm('form-q-unseen-after-pause').last_presented_at, null);
+    stVerifyPause.close();
+
+    // 5. Minimal README daily-batch smoke example (1 synthetic item, :memory:, no 1688 quote -> gate1b_pending)
+    const readmeMinPath = join(dir, 'readme-daily-batch.json');
+    writeFileSync(readmeMinPath, JSON.stringify({
+      as_of_date: '2026-11-27',
+      items: [mkInputItem(1)],
+    }, null, 2));
+    const rReadme = await runCliMem(['daily-batch', '--db', ':memory:', '--input', readmeMinPath, '--limit', '10']);
+    assert.equal(rReadme.code, 0, rReadme.stderr);
+    const jReadme = JSON.parse(rReadme.stdout);
+    assert.equal(jReadme.ok, true);
+    assert.equal(jReadme.batch_report.ingested.length, 1);
+    assert.equal(jReadme.batch_report.gate1a[0].proceed_to_gate1b, true);
+    assert.equal(jReadme.batch_report.gate1b[0].status, 'gate1b_pending');
+    assert.equal(jReadme.batch_report.evaluations.length, 0);
+  });
+});

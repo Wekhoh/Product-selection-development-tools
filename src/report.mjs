@@ -134,7 +134,13 @@ const escape = value => {
 const numberText = value => finite(value) ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value) : '未知';
 const rangeText = range => Array.isArray(range) && range.length === 2 && range.every(finite) ?
   range[0] === range[1] ? numberText(range[0]) : `${numberText(range[0])}–${numberText(range[1])}` : '未知';
-const reasonText = value => REASONS.get(value) ?? string(value, '证据尚待补齐。');
+const CROSSING_FLOOR_RE = /^Supported scenarios cross the 30% floor \(passing:\s*([^;]+);\s*below floor:\s*([^)]+)\)/;
+const reasonText = value => {
+  if (REASONS.has(value)) return REASONS.get(value);
+  const m = typeof value === 'string' ? CROSSING_FLOOR_RE.exec(value) : null;
+  if (m) return `有据情景毛利区间跨过 30% 红线（达标：${m[1].trim()}；低于 30%：${m[2].trim()}）；r59 按线性斜率记完整区间分，不计入严格达标数。`;
+  return string(value, '证据尚待补齐。');
+};
 
 function readable(value, depth = 0) {
   if (value === null || value === undefined) return '未知';
@@ -2666,6 +2672,18 @@ function r59PriceBandBannersAndObservationBar(original, rev = 59) {
   return html;
 }
 
+const isLongEnglishBlock = text => {
+  if (typeof text !== 'string' || text.length <= 180) return false;
+  const latinCount = (text.match(/[A-Za-z]/g) ?? []).length;
+  const cjkCount = (text.match(/[\u4e00-\u9fff]/g) ?? []).length;
+  return latinCount > text.length * 0.45 && cjkCount < 40;
+};
+const renderFoldableReason = (rawText, inlineSep = ' · ') => {
+  const cleaned = r58CleanCopy(string(rawText));
+  return isLongEnglishBlock(cleaned)
+    ? `<details class="quiet-fold"><summary>查看英文合规/专利原文</summary><div class="fold-body">${escape(cleaned)}</div></details>`
+    : `${inlineSep}<span>${escape(cleaned)}</span>`;
+};
 function r59SamplePendingBanner(snapshot, rev = 59) {
   if (!Array.isArray(snapshot?.sampleCheckItems) || snapshot.sampleCheckItems.length === 0) return '';
   return `<section class="quiet-surface" data-section="sample-pending-checklist" aria-label="拿样与 1688 问厂待核清单">
@@ -2674,7 +2692,7 @@ function r59SamplePendingBanner(snapshot, rev = 59) {
       <span class="num"><strong>已得分 ${escape(rangeText(snapshot.supportedRange))} / 已覆盖总权重 ${escape(numberText(snapshot.coveredWeight))}</strong></span>
     </div>
     <ul class="brief-list">${snapshot.sampleCheckItems.map(it =>
-      `<li><strong>${escape(string(it.label ?? it.id))}（${escape(numberText(it.weight))} 分留空）</strong> · <span>${escape(r58CleanCopy(string(it.reason)))}</span></li>`
+      `<li><strong>${escape(string(it.label ?? it.id))}（${escape(numberText(it.weight))} 分留空）</strong>${renderFoldableReason(it.reason)}</li>`
     ).join('')}</ul>
   </section>`;
 }
@@ -2873,7 +2891,7 @@ function r59CoreAndRemainingSection(snapshot, rev = 59) {
         `<li><strong>${escape(string(it.label ?? it.id))}（已得 ${escape(rangeText(it.score_range))} / ${escape(numberText(it.weight))} 分）</strong>${it.reason ? ` · <span>${escape(r58CleanCopy(reasonText(it.reason)))}</span>` : ''}</li>`
       ),
       ...extraPendingRem.map(it =>
-        `<li><strong>${escape(string(it.label ?? it.id))}（${escape(numberText(it.weight))} 分待核）</strong> · <span>${escape(r58CleanCopy(reasonText(it.reason)))}</span></li>`
+        `<li><strong>${escape(string(it.label ?? it.id))}（${escape(numberText(it.weight))} 分待核）</strong>${renderFoldableReason(reasonText(it.reason))}</li>`
       ),
     ];
     parts.push(`<details class="quiet-fold" data-section="remaining-15-breakdown"><summary>剩余 15 分已证项与待核原因明细（已证 ${scoredRem.length} 项${extraPendingRem.length > 0 ? ` · 待核 ${extraPendingRem.length} 项` : ''}）</summary><ul class="brief-list">${rows.join('')}</ul></details>`);
@@ -3117,9 +3135,13 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
   const presentation = object(original?.presentation);
   const registry = array(result.evidence);
   const prefix = `candidate-${index + 1}`;
+  const snapshot = extractMetricsSnapshot(result, rev, original);
+  const sampleIds = rev >= 59 ? new Set(array(snapshot.sampleCheckItems).map(it => it?.id).filter(Boolean)) : new Set();
   const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
   const gaps = array(result.items).filter(item => item.status === 'needs_evidence');
-  const mainGaps = blockers.length ? blockers : gaps.slice(0, 3).map(item => ({ problem: `${ITEM_LABELS[item.id] ?? item.id}：${reasonText(item.reason)}`, next_step: '补齐对应来源和适用口径后重新计算。' }));
+  const gapItemsForMain = (rev >= 59 && blockers.length === 0 ? gaps.filter(item => !sampleIds.has(item.id)) : gaps).slice(0, 3);
+  const mainGaps = blockers.length ? blockers : gapItemsForMain.map(item => ({ id: item.id, head: ITEM_LABELS[item.id] ?? item.id, reason: reasonText(item.reason), next_step: '补齐对应来源和适用口径后重新计算。' }));
+  const shownLeftIds = new Set([...sampleIds, ...(blockers.length === 0 ? gapItemsForMain.map(item => item.id).filter(Boolean) : [])]);
   const screenGaps = array(result.screening?.conditions).filter(condition => condition.status !== 'pass');
   const queue = Object.hasOwn(QUEUES, result.queue) ? result.queue : 'pending';
   const isCrossingR59 = rev >= 59 && result?.diagnostics?.economics?.crossing_margin_floor === true;
@@ -3130,7 +3152,6 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
     ? `已计分权重 ${numberText(result.covered_weight)} / 100；不满足合格评分条件 ${ineligible.length} 项；待补证 ${gaps.length} 项。`
     : `证据覆盖权重 ${numberText(result.covered_weight)} / 100；未评分权重 ${numberText(result.unscored_weight)}。`;
   const eligible = isCandidateEligible(result, rev);
-  const snapshot = extractMetricsSnapshot(result, rev, original);
   const hasSamplePendingSingleR59 = rev >= 59 && snapshot.sampleCheckItems.length > 0;
   const idxPad = String(index + 1).padStart(2, '0');
   const hasBrief = array(presentation.risks).length || array(presentation.next_checks).length || mainGaps.length;
@@ -3166,9 +3187,9 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
         ${r59CoreAndRemainingSection(snapshot, rev)}${r59PriceBandBannersAndObservationBar(original, rev)}${r59SamplePendingBanner(snapshot, rev)}${r59ReturnCauseDiagnosisSection(result, original, rev)}${r59FactoryInquiryChecklistSection(result, original, rev)}${hasBrief ? `<section class="quiet-surface brief-grid" aria-label="关键风险与缺口">
           ${r57BriefList('风险与边界提示', presentation.risks, rev)}
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
-          ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li><strong>${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.problem) : row.problem)}</strong>${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.next_step) : row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
+          ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li>${row.head !== undefined ? `<strong>${escape(row.head)}</strong>${renderFoldableReason(row.reason, '：')}` : `<strong>${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.problem) : row.problem)}</strong>`}${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.next_step) : row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
         </section>` : ''}${renderR58EvidenceReview(result, original, reportOptions, rev)}${r57ReviewNotes(result, original, rev)}${r57OperationalDisclosures(result, rev)}
-        ${screenGaps.length ? `<p class="muted coverage-line">筛选状态：${screenGaps.map(condition => `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(reasonText(condition.reason))}`).join('；')}</p>` : '<p class="muted coverage-line">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}${qualReasonNote}
+        ${screenGaps.length ? `<p class="muted coverage-line">筛选状态：${screenGaps.map(condition => { const condLookupId = condition.id === 'specific_form_rights' ? 'specific_design_rights' : condition.id; const condNote = condition.status !== 'fail' && shownLeftIds.has(condLookupId) ? (sampleIds.has(condLookupId) ? '详情见上方拿样待核清单' : '详情见上方缺口说明') : reasonText(condition.reason); return `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖', public_compliance_or_category_ban: '公开准入／禁售合规' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(condNote)}`; }).join('；')}</p>` : '<p class="muted coverage-line">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}${qualReasonNote}
       </div>
       <div class="stage-hairline" aria-hidden="true"></div>
       <div class="right-wing">

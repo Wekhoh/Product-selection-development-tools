@@ -4749,6 +4749,7 @@ export async function runPhase2Batch(store, {
   as_of_date = new Date().toISOString().slice(0, 10),
   openai_hooks = null,
   resume_skip_completed = false,
+  batch_id = null,
 } = {}) {
   if (!Array.isArray(items) || items.length === 0) throw new TypeError('runPhase2Batch requires a nonempty items array.');
   if (!profile || typeof profile !== 'object') throw new TypeError('runPhase2Batch requires a profile object.');
@@ -5581,6 +5582,36 @@ export async function runPhase2Batch(store, {
           report.evaluations.push(evRec.evaluation);
         }
         store.updateFormLifecycle(formId, 'evaluated');
+        const calSourcePeriod = Array.isArray(scoredCand.operating_periods) && scoredCand.operating_periods.length > 0
+          ? (scoredCand.operating_periods.find(p => p.id === (qualification?.primary_period_id ?? qualification?.display_period_id)) ?? scoredCand.operating_periods[0] ?? null)
+          : null;
+        const calSystemVerdict = scoredCand.effective_disposition ?? qualification?.mode ?? scoredCand.queue ?? 'pending_evidence';
+        const calCore85 = scoredCand.core_85_range ?? calSourcePeriod?.core_85_range ?? null;
+        const calSupportedRange = scoredCand.supported_range ?? calSourcePeriod?.supported_range ?? null;
+        const calPreAdMargin = scoredCand.diagnostics?.economics?.margin_range ?? calSourcePeriod?.diagnostics?.economics?.margin_range ?? null;
+        const calBatchId = typeof item.batch_id === 'string' && item.batch_id.trim()
+          ? item.batch_id.trim()
+          : (typeof batch_id === 'string' && batch_id.trim() ? batch_id.trim() : null);
+        const priorCal = store.getCalibrationTrackingForForm(formId, recheck.spec_version);
+        const hasPriorDecisionOrSource = Boolean(
+          priorCal && (
+            priorCal.owner_decision_source === 'owner_confirmed' ||
+            priorCal.owner_decision_source === 'script_demo_excluded' ||
+            priorCal.owner_decision_source === 'legacy_unknown' ||
+            priorCal.owner_decision !== null
+          ),
+        );
+        store.upsertCalibrationTracking({
+          form_id: formId,
+          spec_version: recheck.spec_version,
+          form_spec_sha256: recheck.spec_sha256,
+          ...(calBatchId ? { batch_id: calBatchId } : {}),
+          system_verdict: calSystemVerdict,
+          core_85_range: calCore85,
+          supported_range: calSupportedRange,
+          pre_ad_margin_range: calPreAdMargin,
+          ...(hasPriorDecisionOrSource ? {} : { owner_decision: null, owner_decision_source: null }),
+        });
       });
       if (txAborted) {
         report.gate2_3.push({

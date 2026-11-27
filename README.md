@@ -36,6 +36,14 @@ node src/phase2-cli.mjs status --db outputs/example-phase2.sqlite
 node src/phase2-cli.mjs openai-status --db outputs/example-phase2.sqlite
 ```
 
+Minimal offline `daily-batch` smoke example (clean checkout, `:memory:` SQLite, synthetic input, zero network; `gate1a_scenarios` and `asin` are pre-supplied, while 1688 sourcing / deep research executors are omitted so `batch_report.gate1b` reports `"gate1b_pending"` and `batch_report.evaluations` stays `[]`; also shows `--from-store --limit 10` on-demand store queue pull):
+
+```sh
+node --input-type=module -e "import { mkdirSync, writeFileSync } from 'node:fs'; mkdirSync('outputs', { recursive: true }); writeFileSync('outputs/example-daily-batch.json', JSON.stringify({ as_of_date: '2026-11-27', items: [{ form: { form_id: 'example-desk-tray', product_family_key: 'example-desk-tray', label: 'Synthetic Desk Tray', buyer_task: 'Sort desk tools', saleable_set_composition: [{ component_id: 'tray', qty_per_saleable_set: 1 }] }, asin: 'B0SYNTRAY1', gate1a_scenarios: [{ id: 'sc-40', price_usd: 40, available_date: '2025-05-01', pkg: { length_in: 12, width_in: 8, height_in: 4, unit_weight_lb: 1.5 }, fx_cny_per_usd: 7.2, refund_fraction: 0.04, physical_return_fraction: 0.04, fee_category: 'Home and Kitchen', referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5, minimum_referral_usd: 0.3 }, headhaul_usd: 2.0, collection_rate: 0.005, other_applicable_usd: 0, sales_window: { from: '2027-02-01', through: '2027-10-14' }, storage_window: { from: '2027-02-01', through: '2027-09-30' }, inbound_window: { from: '2027-01-15', through: '2027-10-14' } }] }] }, null, 2));"
+node src/phase2-cli.mjs daily-batch --db :memory: --input outputs/example-daily-batch.json --limit 10
+node src/phase2-cli.mjs daily-batch --db outputs/example-phase2.sqlite --from-store --limit 10
+```
+
 OpenAI budget reconciliation, offline Batch `.jsonl` construction, and Gate-4 red-team review CLI subcommands (paid OpenAI HTTP policy remains `enabled: false` by default; `redteam-review` runs strictly offline when `--dry-run` or `--offline` is supplied, and when run live uses local subscription-backed `codex exec` on `gpt-6.2-astra` at normal/default speed with `max` reasoning):
 
 ```sh
@@ -49,7 +57,7 @@ node src/phase2-cli.mjs redteam-review --packet outputs/packet.json --output out
 For a fresh selection run, `node src/phase2-cli.mjs --help` lists all operator commands:
 
 - `single-product` accepts a bare ASIN/keyword/post seed (registering the lead + derived `form_id` in SQLite), a Gate 1A/1B/scored single-product workflow spec, or a raw-receipt `ingest-trial` spec, and exports V4 `01 视觉策展室` HTML directly when `--report-dir <dir>` is supplied (with optional Gate-4 `GPT-6.2 Astra` review on qualifying cards).
-- `daily-batch` runs a small daily discovery/screening batch (`--limit 10` default, resumable after `CAPTCHA_PAUSED` via `resume-1688`), persisting intermediate checkpoints in SQLite.
+- `daily-batch` has two explicit modes: (1) `--input <daily-batch.json>` ingests and screens an **uncapped** batch funnel by default (slicing only when `--limit <n>` is explicitly supplied), and (2) `--from-store [--limit 10]` pulls up to 10 unconfirmed, non-drill, non-rejected/reserved, non-`owner_confirmed`/archived cards on demand from SQLite—skipping already-shown undecided cards ("待拍板池") by default unless `--pending-pool` or `--include-shown` is passed (resumable after `CAPTCHA_PAUSED` via `resume-1688`). Note `src/cli.mjs` scores standalone Phase 1 batch fixtures, `single-product` runs a single-item workflow/seed, and `daily-batch` runs multi-item Phase 2 workflows or store queue pulls.
 - `calibration-track` records and summarizes 4-item post-card calibration outcomes (`ip_clearance`, `factory_quote_accuracy`, `package_tier_match`, `owner_verdict`) across real cards in SQLite.
 - `sp-api-calibrate` extracts read-only SP-API `catalogItems`, `productFees`, and `listingsRestrictions` calibration before finalist profit evaluation (distinguishing peer brand-gating from white-label category restrictions).
 - `dedupe-forms` checks proposed titles, keywords, buyer tasks and identifiers against persisted leads and forms. `luna-triage` screens up to 200 metadata rows or a 16-tile `4x4` PNG contact sheet via `/v1/decisions`.

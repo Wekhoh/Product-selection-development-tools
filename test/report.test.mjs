@@ -1679,3 +1679,68 @@ test('Report Q31 Vine/VP/直评 & compliance fee note, and shareable HTML PII sc
   });
 });
 
+test('Step 2 preview dedup: folds >180-char English patent/compliance text once on left wing, escapes XSS/PII, and translates crossing_pass cleanly', () => {
+  const longPatent = 'US-9999999-PATENT-DEDUP utility and design patent search shows overlapping interlocking tray dividers with flared side latches, pending OEM tooling review before final procurement clearance. Contact legal@example.com <script>alert(1)</script> '.padEnd(220, 'x');
+  const longCompliance = 'LACEY-ACT-COMPLIANCE-DEDUP timber declaration and CARB Phase 2 formaldehyde composite wood labeling checks required for US import clearance and Amazon compliance review. '.padEnd(220, 'y');
+
+  // 1. sample_pending_qualifying card: sampleIds omitted from mainGaps, screenGaps emits cross-reference, long English folded once
+  const sampleBatch = structuredClone(fixture);
+  const sampleCand = structuredClone(sampleBatch.candidates[0]);
+  sampleCand.id = 'syn-sample-dedup';
+  sampleCand.label = '合成木质收纳盒';
+  const evId = sampleCand.evidence[0].id;
+  sampleCand.judgments.specific_design_rights = { anchor: null, prescreen_completed: true, sample_check_required: true, reason: longPatent, evidence: [evId] };
+  sampleCand.judgments.applicable_public_requirements = { anchor: null, prescreen_completed: true, sample_check_required: true, reason: longCompliance, evidence: [evId] };
+  sampleBatch.candidates = [sampleCand];
+  const sampleScored = scoreBatch(sampleBatch, profile);
+  assert.equal(sampleScored.candidates[0].qualification?.mode, 'sample_pending_qualifying');
+  const sampleHtml = renderReport(sampleScored, sampleBatch);
+  const leftSample = sampleHtml.match(/<div class="left-wing">([\s\S]*?)<div class="stage-hairline"/)?.[1] ?? '';
+  assert.ok(leftSample.includes('<details class="quiet-fold"><summary>查看英文合规/专利原文</summary>'));
+  assert.equal(sampleHtml.includes('<script>alert(1)</script>'), false);
+  assert.equal(sampleHtml.includes('legal@example.com'), false);
+  assert.equal(leftSample.split('US-9999999-PATENT-DEDUP').length - 1, 1);
+  assert.equal(leftSample.split('LACEY-ACT-COMPLIANCE-DEDUP').length - 1, 1);
+  assert.equal(leftSample.includes('需要解决的缺口'), false);
+  assert.ok(leftSample.includes('详情见上方拿样待核清单'));
+
+  // 2. non-sample pending card (blockers empty) + crossing_pass + screenGaps cross-reference
+  const pendingBatch = structuredClone(fixture);
+  const pendingCand = structuredClone(pendingBatch.candidates[1]);
+  pendingCand.id = 'syn-pending-dedup';
+  pendingCand.judgments.specific_design_rights = { anchor: null, reason: longPatent.replace(/US-9999999-PATENT-DEDUP/g, 'PATENT-MAIN-GAP-DEDUP'), evidence: [] };
+  pendingCand.economics.scenarios[1].margin.value = 0.20;
+  pendingCand.economics.scenarios[1].contribution_usd.value = 6.5;
+  pendingCand.economics.scenarios[1].cost_ledger.lines.find(l => l.id === 'procurement').amount_usd += 8;
+  pendingBatch.candidates = [pendingCand];
+  const pendingHtml = renderReport(scoreBatch(pendingBatch, profile), pendingBatch);
+  const leftPending = pendingHtml.match(/<div class="left-wing">([\s\S]*?)<div class="stage-hairline"/)?.[1] ?? '';
+  assert.ok(leftPending.includes('需要解决的缺口'));
+  assert.ok(leftPending.includes('<details class="quiet-fold"><summary>查看英文合规/专利原文</summary>'));
+  assert.ok(leftPending.includes('详情见上方缺口说明'));
+  assert.ok(pendingHtml.includes('区间跨线待核'));
+  assert.ok(pendingHtml.includes('有据情景毛利区间跨过 30% 红线'));
+  assert.equal(pendingHtml.includes('crossing_pass'), false);
+  assert.equal(pendingHtml.includes('Supported scenarios cross the 30% floor'), false);
+
+  // 3. Seasonal card crossing_pass period panel & public_compliance_or_category_ban hard ban
+  const seasonalBatch = structuredClone(fixture);
+  const seasonalCand = makeSeasonalCandidate(seasonalBatch.candidates[1], 'syn-seasonal-crossing');
+  const seasCross = structuredClone(pendingCand.economics.scenarios[1]);
+  seasCross.cost_ledger.fee_context = structuredClone(seasonalCand.economics.operating_periods[0].scenarios[0].cost_ledger.fee_context);
+  seasCross.cost_ledger.lines.forEach((l, i) => {
+    const templateBasis = seasonalCand.economics.operating_periods[0].scenarios[0].cost_ledger.lines[i]?.fee_basis;
+    if (l.fee_basis && templateBasis) l.fee_basis = structuredClone(templateBasis);
+  });
+  seasonalCand.economics.operating_periods[0].scenarios.push(seasCross);
+  const banCand = structuredClone(seasonalBatch.candidates[0]);
+  banCand.id = 'syn-public-ban';
+  banCand.judgments.applicable_public_requirements = { anchor: 0, hard_ban: true, reason: 'Synthetic prohibited category.', evidence: ['ev1'] };
+  seasonalBatch.candidates = [seasonalCand, banCand];
+  const seasonalHtml = renderReport(scoreBatch(seasonalBatch, profile), seasonalBatch);
+  assert.ok(seasonalHtml.includes('区间跨线待核'));
+  assert.ok(seasonalHtml.includes('有据情景毛利区间跨过 30% 红线'));
+  assert.equal(seasonalHtml.includes('Supported scenarios cross the 30% floor'), false);
+  assert.ok(seasonalHtml.includes('公开准入／禁售合规'));
+});
+
