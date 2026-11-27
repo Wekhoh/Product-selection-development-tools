@@ -185,9 +185,9 @@ function deriveExactCnyLineRat(lineId, deriv, isR59 = false) {
 }
 
 export function calculateEconomics(input, options = {}) {
-  const isR57Plus = (options.profileRevision ?? 0) >= 57;
-  const isR58Plus = (options.profileRevision ?? 0) >= 58;
-  const isR59Plus = (options.profileRevision ?? 0) >= 59;
+  const isR57Plus = true;
+  const isR58Plus = true;
+  const isR59Plus = (options.profileRevision ?? 59) >= 59;
   const pricing = isR58Plus ? resolveEffectivePricing(input) : null;
   if (isR58Plus && !pricing.valid && (input?.list_price_usd !== undefined || input?.net_effective_price_usd !== undefined ||
     input?.ongoing_coupon_usd !== undefined || input?.ongoing_coupon_pct !== undefined ||

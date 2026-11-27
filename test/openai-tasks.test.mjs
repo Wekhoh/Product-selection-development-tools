@@ -20,10 +20,8 @@ import { dirname, join } from 'node:path';
 import { assertNoRawPii, containsSecretToken, detectRawPii } from '../src/contracts.mjs';
 import { sha256Hex } from '../src/store.mjs';
 import {
-  DEFAULT_AUTHORIZED_REVIEW_POLICIES,
   EVIDENCE_REVIEW_JSON_SCHEMA,
   SCHEMA_VERSION,
-  assertAuthorizedReviewExecutionPolicy,
   buildEvidenceReviewResponseRequest,
   freezeEvidenceReviewPacket,
   isEvidenceReviewStale,
@@ -134,7 +132,6 @@ function assertStrictAndDeepFrozenSchema(node, path = 'root') {
 function makeSamplePacketInput(overrides = {}) {
   return {
     review_id: 'rev-synth-001',
-    execution_policy_ref: { scope: 'local-only-policy', enabled: false },
     candidate: {
       subject_id: 'cand-synth-main',
       intended_use: 'Hold workshop router jig fences square on aluminum T-tracks',
@@ -361,12 +358,10 @@ test('OpenAI Strict JSON Schemas (P2-05): all exported schemas are recursively d
 });
 
 test('evidence-review (P1-18, P2-07, P1-07): full-tree URL & nested local-policy guard, strict criterion vocabulary, and attachment digest staleness', () => {
-  const pktA = freezeEvidenceReviewPacket(makeSamplePacketInput({ execution_policy_ref: null }));
-  const pktB = freezeEvidenceReviewPacket(makeSamplePacketInput({ execution_policy_ref: 'local-policy-prod' }));
+  const pktA = freezeEvidenceReviewPacket(makeSamplePacketInput());
+  const pktB = freezeEvidenceReviewPacket(makeSamplePacketInput());
 
   assert.equal(pktA.schema_version, SCHEMA_VERSION);
-  assert.equal('execution_policy_ref' in pktA, false);
-  assert.equal('execution_policy_ref' in pktB, false);
   assert.equal(pktA.packet_sha256, pktB.packet_sha256);
   assert.match(pktA.packet_sha256, /^[0-9a-f]{64}$/);
   assert.equal(Object.isFrozen(pktA), true);
@@ -477,8 +472,6 @@ test('evidence-review (P1-18, P2-07, P1-07): full-tree URL & nested local-policy
 
   // P1-18: Reject nested local-only keys anywhere below top-level
   for (const badNestedKey of [
-    'execution_policy_ref',
-    'executionPolicyRef',
     'logical_request_id',
     'logicalRequestId',
     'packet_sha256',
@@ -684,23 +677,20 @@ test('evidence-review (P1-08, P1-09, P1-02): question subject overlap, strict fa
   };
   assert.equal(validateEvidenceReviewOutput(packet, externalAndUrlOut).valid, true);
 
-  // P0-25 & P1-02: Require authorized execution_policy_ref unless allowOfflineDraftWithoutPolicy === true, and key logical_request_id by review_id
-  assert.throws(
-    () => buildEvidenceReviewResponseRequest(makeSamplePacketInput()),
-    (err) => err instanceof TypeError && err.code === 'EXECUTION_POLICY_DISABLED',
-  );
+  // liveEnabled boolean gating (default false -> offline draft; liveEnabled: true -> live request) and key logical_request_id by review_id
+  const defaultDraftReq = buildEvidenceReviewResponseRequest(makeSamplePacketInput());
+  assert.equal(defaultDraftReq._offline_draft_only, true);
+  assert.equal(defaultDraftReq.offline_draft_only, true);
   assert.throws(
     () => buildEvidenceReviewResponseRequest(
-      makeSamplePacketInput({ execution_policy_ref: { scope: 'local-only-policy', enabled: true } }),
-      { model: 'gpt-6.2-astra' },
+      makeSamplePacketInput(),
+      { model: 'gpt-6.2-astra', liveEnabled: true },
     ),
     /blocked on paid Responses API/i,
   );
-  const authorizedBaseInput = {
-    ...baseInput,
-    execution_policy_ref: { scope: 'local-only-policy', enabled: true },
-  };
-  const terraReq = buildEvidenceReviewResponseRequest(authorizedBaseInput);
+  const terraReq = buildEvidenceReviewResponseRequest(baseInput, { liveEnabled: true });
+  assert.equal('_offline_draft_only' in terraReq, false);
+  assert.equal('offline_draft_only' in terraReq, false);
   assert.equal(terraReq.model, 'gpt-6.1-terra');
   assert.deepEqual(terraReq.reasoning, { effort: 'xhigh' });
   assert.deepEqual(terraReq.tools, []);
@@ -1821,55 +1811,17 @@ test('Deep boundary regressions: >6-depth schema secret/PII, receiptDir ordering
   });
 });
 
-test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1-18): policy auth, review_id logical key, attachmentDataUrls SHA-256, 2-subject coverage, excluded contradiction, and URL keys', () => {
-  // P0-25: assertAuthorizedReviewExecutionPolicy & allowOfflineDraftWithoutPolicy
-  for (const invalidPacket of [
-    (() => {
-      const p = makeSamplePacketInput();
-      delete p.execution_policy_ref;
-      return p;
-    })(),
-    makeSamplePacketInput({ execution_policy_ref: null }),
-    makeSamplePacketInput({ execution_policy_ref: '   ' }),
-    makeSamplePacketInput({ execution_policy_ref: { scope: 'local', enabled: false } }),
-    makeSamplePacketInput({ execution_policy_ref: { scope: 'local', enabled: 'true' } }),
-    makeSamplePacketInput({ execution_policy_ref: 123 }),
-  ]) {
-    assert.throws(
-      () => assertAuthorizedReviewExecutionPolicy(invalidPacket),
-      (err) => err instanceof TypeError && err.code === 'EXECUTION_POLICY_DISABLED',
-    );
-    assert.throws(
-      () => buildEvidenceReviewResponseRequest(invalidPacket),
-      (err) => err instanceof TypeError && err.code === 'EXECUTION_POLICY_DISABLED',
-    );
-  }
-  assert.equal(
-    assertAuthorizedReviewExecutionPolicy(makeSamplePacketInput({ execution_policy_ref: 'local-authorized-policy' })).authorized,
-    true,
-  );
-  assert.equal(
-    assertAuthorizedReviewExecutionPolicy(
-      makeSamplePacketInput({ execution_policy_ref: 'pol-live-01' }),
-      { authorizedPolicyIds: ['pol-live-01'] },
-    ).authorized,
-    true,
-  );
-  assert.equal(
-    assertAuthorizedReviewExecutionPolicy(makeSamplePacketInput({ execution_policy_ref: { enabled: true } })).authorized,
-    true,
-  );
-
-  // Offline draft opt-in works with strict boolean true, rejects string 'true'
+test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1-18): liveEnabled gating, review_id logical key, attachmentDataUrls SHA-256, 2-subject coverage, excluded contradiction, and URL keys', () => {
+  // liveEnabled boolean gating (default false -> offline draft; liveEnabled: true -> live request)
   assert.throws(
-    () => buildEvidenceReviewResponseRequest(makeSamplePacketInput({ execution_policy_ref: null }), {
-      allowOfflineDraftWithoutPolicy: 'true',
+    () => buildEvidenceReviewResponseRequest(makeSamplePacketInput(), {
+      liveEnabled: 'true',
     }),
-    /allowOfflineDraftWithoutPolicy must be a boolean/i,
+    /liveEnabled must be a boolean/i,
   );
   const offlineDraftReq = buildEvidenceReviewResponseRequest(
-    makeSamplePacketInput({ execution_policy_ref: null }),
-    { allowOfflineDraftWithoutPolicy: true },
+    makeSamplePacketInput(),
+    { liveEnabled: false },
   );
   assert.equal(offlineDraftReq.logical_request_id, 'evrev-rev-synth-001');
   assert.equal(offlineDraftReq._offline_draft_only, true);
@@ -1877,10 +1829,12 @@ test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1
 
   // P1-02: Reusing same review_id with modified packet content keeps identical `evrev-${review_id}` logical_request_id
   const reqV1 = buildEvidenceReviewResponseRequest(
-    makeSamplePacketInput({ execution_policy_ref: 'local-authorized-policy', instructions: 'First version.' }),
+    makeSamplePacketInput({ instructions: 'First version.' }),
+    { liveEnabled: true },
   );
   const reqV2 = buildEvidenceReviewResponseRequest(
-    makeSamplePacketInput({ execution_policy_ref: 'local-authorized-policy', instructions: 'Modified second version.' }),
+    makeSamplePacketInput({ instructions: 'Modified second version.' }),
+    { liveEnabled: true },
   );
   assert.equal(reqV1.logical_request_id, 'evrev-rev-synth-001');
   assert.equal(reqV2.logical_request_id, 'evrev-rev-synth-001');
@@ -1891,7 +1845,6 @@ test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1
   const pngRawBytes = Buffer.from(SYNTH_PNG_DATA_URI.split(',')[1], 'base64');
   const pngSha = sha256Hex(pngRawBytes);
   const pktWithImg = makeSamplePacketInput({
-    execution_policy_ref: 'local-authorized-policy',
     attachment_sha256s: [pngSha],
   });
   assert.throws(
@@ -1913,6 +1866,7 @@ test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1
   );
   const imgBoundReq = buildEvidenceReviewResponseRequest(pktWithImg, {
     attachmentDataUrls: [SYNTH_PNG_DATA_URI],
+    liveEnabled: true,
   });
   assert.equal(imgBoundReq.input[0].content.length, 2);
   assert.deepEqual(imgBoundReq.input[0].content[1], {
@@ -1921,7 +1875,7 @@ test('Round 2 evidence-review regressions (P0-25, P1-02, P1-07, P1-08, P1-09, P1
     detail: 'high',
   });
   assert.throws(
-    () => buildEvidenceReviewResponseRequest(makeSamplePacketInput({ execution_policy_ref: 'local-authorized-policy' }), {
+    () => buildEvidenceReviewResponseRequest(makeSamplePacketInput(), {
       attachmentDataUrls: [SYNTH_PNG_DATA_URI],
     }),
     /attachment_sha256s is empty or omitted/i,
@@ -2029,22 +1983,14 @@ test('Round 2 codex-runner regressions (P0-24, P0-25, P0-26, P0-27, P0-28, P1-06
     });
     assert.equal(genericHighRes.data.ok, 1);
 
-    // Missing, null, disabled, or already-frozen (policy-stripped) packet with enabled: true returns EXECUTION_POLICY_DISABLED with 0 spawns
-    for (const unauthPkt of [
-      frozenAuth,
-      makeSamplePacketInput({ execution_policy_ref: null }),
-      makeSamplePacketInput({ execution_policy_ref: { enabled: false } }),
-      (() => { const p = makeSamplePacketInput(); delete p.execution_policy_ref; return p; })(),
-    ]) {
-      const blockedRes = await runCodexEvidenceReview(unauthPkt, {
-        enabled: true,
-        testMode: true,
-        spawnImpl: zeroSpawn,
-      });
-      assert.equal(blockedRes.status, 'unavailable');
-      assert.equal(blockedRes.execution_status, 'not_submitted');
-      assert.equal(blockedRes.error_code, 'EXECUTION_POLICY_DISABLED');
-    }
+    // Disabled Gate-4 (`enabled: false`) returns unavailable with 0 spawns
+    const disabledRes = await runCodexEvidenceReview(makeSamplePacketInput(), {
+      enabled: false,
+      testMode: true,
+      spawnImpl: zeroSpawn,
+    });
+    assert.equal(disabledRes.status, 'unavailable');
+    assert.equal(disabledRes.execution_status, 'not_submitted');
     assert.equal(unexpectedSpawns, 0);
 
     // 2. P0-26: Mutating getter schema is snapshotted ONCE (`getterReads === 1`) and exact bytes written to tempSchemaPath
@@ -3233,38 +3179,8 @@ test('Round 3 codex-runner regressions (P0-24, P0-26, P0-27, P0-28, P1-02, P1-06
 });
 
 test('Round 3 evidence-review regressions (P0-25, P1-02, P1-New gaps consistency vs optional follow-up)', () => {
-  // 1. P0-25: Trusted local policy registry & attachment/packet binding
-  assert.equal('local-authorized-policy' in DEFAULT_AUTHORIZED_REVIEW_POLICIES, true);
-  assert.equal('local-policy-only' in DEFAULT_AUTHORIZED_REVIEW_POLICIES, true);
-
-  assert.throws(
-    () => assertAuthorizedReviewExecutionPolicy(makeSamplePacketInput({ execution_policy_ref: 'unregistered-random-id' })),
-    (err) => err instanceof TypeError && err.code === 'EXECUTION_POLICY_DISABLED',
-  );
-  assert.throws(
-    () => buildEvidenceReviewResponseRequest(makeSamplePacketInput({ execution_policy_ref: 'unregistered-random-id' })),
-    (err) => err instanceof TypeError && err.code === 'EXECUTION_POLICY_DISABLED',
-  );
-
-  // Policy disallowing attachments blocks packets carrying attachment_sha256s
-  const pngRaw = Buffer.from(SYNTH_PNG_DATA_URI.split(',')[1], 'base64');
-  const pngSha = sha256Hex(pngRaw);
-  assert.throws(
-    () => buildEvidenceReviewResponseRequest(
-      makeSamplePacketInput({
-        execution_policy_ref: { policy_id: 'no-img-pol', enabled: true, allow_attachments: false },
-        attachment_sha256s: [pngSha],
-      }),
-      { attachmentDataUrls: [SYNTH_PNG_DATA_URI] },
-    ),
-    (err) => err instanceof TypeError && err.code === 'EXECUTION_POLICY_DISABLED',
-  );
-
-  // Offline draft is non-dispatchable (`_offline_draft_only: true`, `offline_draft_only: true`) and `_locked_logical_request_id` is non-writable
-  const draft = buildEvidenceReviewResponseRequest(
-    makeSamplePacketInput({ execution_policy_ref: null }),
-    { allowOfflineDraftWithoutPolicy: true },
-  );
+  // 1. liveEnabled default false (offline draft) vs liveEnabled: true (dispatchable live request)
+  const draft = buildEvidenceReviewResponseRequest(makeSamplePacketInput());
   assert.equal(draft._offline_draft_only, true);
   assert.equal(draft.offline_draft_only, true);
   assert.equal(draft._locked_logical_request_id, 'evrev-rev-synth-001');
@@ -3275,7 +3191,8 @@ test('Round 3 evidence-review regressions (P0-25, P1-02, P1-New gaps consistency
   assert.throws(() => { draft._locked_logical_request_id = 'override-id'; }, TypeError);
 
   const liveReq = buildEvidenceReviewResponseRequest(
-    makeSamplePacketInput({ execution_policy_ref: 'local-authorized-policy' }),
+    makeSamplePacketInput(),
+    { liveEnabled: true },
   );
   assert.equal('_offline_draft_only' in liveReq, false);
   assert.equal('offline_draft_only' in liveReq, false);

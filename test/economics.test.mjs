@@ -4,7 +4,7 @@ import { calculateEconomics, netReferral, collectionFromDisbursement } from '../
 
 const fixture = () => ({
   id: 'synthetic-plan', saleable_unit: 'one synthetic set', price_usd: 50,
-  refund_fraction: 0.04, assumptions: ['Synthetic independent shipment ledger'],
+  refund_fraction: 0.04, return_threshold: 0.081, assumptions: ['Synthetic independent shipment ledger'],
   lines: [
     ['procurement', 12.5], ['domestic_freight', 0], ['headhaul', 3],
     ['referral', 7.2], ['fulfillment', 5], ['placement', 1], ['storage', 0.5],

@@ -890,6 +890,14 @@ export async function runDailyWorkflowBatchCommand({
       const singleFormId = hydratedItems[0]?.form?.form_id ?? null;
       const singleFormRow = singleFormId ? store.getCandidateForm(singleFormId) : null;
       const singleGate1a = singleFormRow?.gate1a_result_json ? JSON.parse(singleFormRow.gate1a_result_json) : null;
+      const singleGate1b = singleFormRow?.gate1b_result_json ? JSON.parse(singleFormRow.gate1b_result_json) : null;
+      const batchGate1a = Array.isArray(batchReport?.gate1a)
+        ? batchReport.gate1a.find(g => g?.form_id === singleFormId) ?? null
+        : null;
+      const effLifecycle = singleFormRow?.effective_lifecycle_status ?? singleFormRow?.lifecycle_status ?? null;
+      const workflowStoppedNonEvaluated = Boolean(
+        singleFormRow && effLifecycle && effLifecycle !== 'evaluated',
+      );
       if (singleFormRow) {
         const cIdx = exportBatch.candidates.findIndex(c => c?.id === singleFormId);
         if (cIdx >= 0) {
@@ -898,6 +906,51 @@ export async function runDailyWorkflowBatchCommand({
           if (singleFormRow.spec_sha256) cObj.spec_sha256 = singleFormRow.spec_sha256;
           if (Number.isInteger(singleFormRow.spec_version) && singleFormRow.spec_version > 0) {
             cObj.spec_version = singleFormRow.spec_version;
+          }
+          if (workflowStoppedNonEvaluated) {
+            if (!Array.isArray(cObj.evidence) || cObj.evidence.length === 0) {
+              cObj.evidence = [{
+                id: 'sqlite-workflow-ruling',
+                source: 'SQLite candidate_forms workflow ruling',
+                observed_at: (singleFormRow.updated_at ?? asOfDate).slice(0, 10),
+              }];
+            }
+            const evId = cObj.evidence[0].id;
+            if (singleGate1a?.specific_rights_conflict_proven === true || batchGate1a?.specific_rights_conflict_proven === true) {
+              cObj.judgments = {
+                ...(cObj.judgments && typeof cObj.judgments === 'object' ? cObj.judgments : {}),
+                specific_design_rights: {
+                  ...(cObj.judgments?.specific_design_rights && typeof cObj.judgments.specific_design_rights === 'object'
+                    ? cObj.judgments.specific_design_rights
+                    : {}),
+                  proven_conflict: true,
+                  reason: singleGate1a?.reason ?? batchGate1a?.reason ?? 'Confirmed specific rights conflict in Gate 1A workflow ruling.',
+                },
+              };
+            } else if (effLifecycle === 'deferred') {
+              cObj.screening = {
+                ...(cObj.screening && typeof cObj.screening === 'object' ? cObj.screening : {}),
+                strong_date_dependency: {
+                  value: true,
+                  unit: 'boolean',
+                  evidence: [evId],
+                  reason: 'Deferred in workflow ruling.',
+                },
+              };
+            } else if (singleGate1a?.prohibited === true || batchGate1a?.prohibited === true) {
+              cObj.judgments = {
+                ...(cObj.judgments && typeof cObj.judgments === 'object' ? cObj.judgments : {}),
+                applicable_public_requirements: {
+                  ...(cObj.judgments?.applicable_public_requirements && typeof cObj.judgments.applicable_public_requirements === 'object'
+                    ? cObj.judgments.applicable_public_requirements
+                    : {}),
+                  proven_conflict: true,
+                  reason: singleGate1a?.reason ?? 'Stopped by Gate 1A statutory/category prohibition.',
+                  evidence: [evId],
+                },
+              };
+            }
+            exportBatch.candidates[cIdx] = cObj;
           }
           if (Array.isArray(hydratedItems[0]?.peer_comparability_rulings) && hydratedItems[0].peer_comparability_rulings.length > 0) {
             cObj = applyPeerComparabilityRulings(cObj, hydratedItems[0].peer_comparability_rulings, {
@@ -914,6 +967,92 @@ export async function runDailyWorkflowBatchCommand({
         profile,
       });
       const scoredSingle = scoreBatch(boundSingleBatch, profile);
+      if (workflowStoppedNonEvaluated && Array.isArray(scoredSingle.candidates)) {
+        const targetQueue = effLifecycle === 'private_mold_reserved'
+          ? 'pending'
+          : (['gate1a_rejected', 'gate1b_rejected', 'excluded'].includes(effLifecycle)
+            ? 'excluded'
+            : (effLifecycle === 'deferred' ? 'deferred' : 'pending'));
+        const targetDisposition = effLifecycle === 'private_mold_reserved'
+          ? 'private_mold_reserved'
+          : (targetQueue === 'excluded'
+            ? 'hard_excluded'
+            : (targetQueue === 'deferred' ? 'deferred' : 'pending_evidence'));
+        let mutated = false;
+        for (const sc of scoredSingle.candidates) {
+          if ((sc.candidate_id ?? sc.id) === singleFormId && sc.qualification?.counts_toward_target === true) {
+            sc.queue = targetQueue;
+            sc.effective_disposition = targetDisposition;
+            sc.qualification = {
+              ...(sc.qualification ?? {}),
+              counts_toward_target: false,
+              mode: effLifecycle === 'private_mold_reserved' ? 'private_mold_reserved' : 'workflow_stopped_non_qualifying',
+              blocked_by_workflow_lifecycle: effLifecycle,
+              workflow_stop_reason: singleGate1b?.reason ?? singleGate1a?.reason ?? `Workflow lifecycle is "${effLifecycle}" (not evaluated).`,
+            };
+            mutated = true;
+          }
+        }
+        if (mutated) {
+          const cands = scoredSingle.candidates;
+          const comparableCands = cands.filter(c => c.queue === 'comparable');
+          const pendingCands = cands.filter(c => c.queue === 'pending');
+          const deferredCands = cands.filter(c => c.queue === 'deferred');
+          const excludedCands = cands.filter(c => c.queue === 'excluded');
+          const seasonalCands = cands.filter(c => c.queue === 'seasonal_review');
+          const seasonalEligibleCands = seasonalCands.filter(c => c.qualification?.counts_toward_target === true);
+          const allSamplePendingCount = cands.filter(
+            r => r.qualification?.counts_toward_target === true &&
+              (r.qualification?.mode === 'sample_pending_qualifying' || r.qualification?.mode === 'seasonal_sample_pending_qualifying'),
+          ).length;
+          const prevSummary = scoredSingle.summary && typeof scoredSingle.summary === 'object' ? scoredSingle.summary : {};
+          const {
+            sample_pending_qualifying: _dropSamplePending,
+            seasonal_review: _dropSeasonalReview,
+            seasonal_eligible: _dropSeasonalEligible,
+            ...restPrevSummary
+          } = prevSummary;
+          scoredSingle.summary = {
+            ...restPrevSummary,
+            candidates: cands.length,
+            complete: comparableCands.length,
+            complete_points: comparableCands.filter(r => r.total !== null).length,
+            complete_ranges: comparableCands.filter(r => r.total === null).length,
+            all_items_supported: cands.filter(r => r.scoring_complete).length,
+            partial: cands.filter(r => r.queue !== 'seasonal_review' && !r.scoring_complete).length,
+            pending: pendingCands.length,
+            deferred: deferredCands.length,
+            excluded: excludedCands.length,
+            ...(seasonalCands.length > 0 || Object.hasOwn(prevSummary, 'seasonal_review')
+              ? { seasonal_review: seasonalCands.length, seasonal_eligible: seasonalEligibleCands.length }
+              : {}),
+            qualifying: cands.filter(r => r.qualification?.counts_toward_target === true).length,
+            ...(allSamplePendingCount > 0 ? { sample_pending_qualifying: allSamplePendingCount } : {}),
+            dispositions: {
+              full_annual_qualifying: cands.filter(c => c.effective_disposition === 'full_annual_qualifying').length,
+              seasonal_off_peak_qualifying: cands.filter(c => c.effective_disposition === 'seasonal_off_peak_qualifying').length,
+              crossing_30pct_interval: cands.filter(c => c.effective_disposition === 'crossing_30pct_interval').length,
+              pending_evidence: cands.filter(c => c.effective_disposition === 'pending_evidence').length,
+              private_mold_reserved: cands.filter(c => c.effective_disposition === 'private_mold_reserved').length,
+              deferred: cands.filter(c => c.effective_disposition === 'deferred').length,
+              hard_excluded: cands.filter(c => c.effective_disposition === 'hard_excluded').length,
+            },
+          };
+          scoredSingle.queues = {
+            comparable: comparableCands,
+            pending: pendingCands,
+            deferred: deferredCands,
+            excluded: excludedCands,
+            ...(seasonalCands.length > 0 || scoredSingle.queues?.seasonal_review ? { seasonal_review: seasonalCands } : {}),
+          };
+          scoredSingle.qualifying_order = cands.filter(c => c.qualification?.counts_toward_target === true).map(c => c.candidate_id);
+          scoredSingle.order = Object.fromEntries(Object.entries(scoredSingle.queues).map(([k, v]) => [k, v.map(c => c.candidate_id)]));
+          const nextLeader = comparableCands[0] ?? null;
+          scoredSingle.comparable_leader = nextLeader
+            ? { candidate_id: nextLeader.candidate_id, total_range: nextLeader.total_range, conservative_score: nextLeader.total_range?.[0] ?? null }
+            : null;
+        }
+      }
       if (notesByFormId.size > 0 && Array.isArray(scoredSingle.candidates)) {
         for (const sc of scoredSingle.candidates) {
           const notes = notesByFormId.get(sc.candidate_id || sc.id);

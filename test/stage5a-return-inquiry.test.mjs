@@ -888,9 +888,20 @@ test('Stage 5A Round 1 Astra Regressions (SPEC-6..10c): threshold SSOT, slot 1-5
     () => parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(['你好。', baseBullets[1], '包装外箱尺寸多少？', '你好。', '样品？'])), ctx),
     /slot 1/i,
   );
-  assert.throws(
-    () => parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(baseBullets, false, '\n6. 请直接安排300套生产。')), ctx),
-    /strictly 5 lines/i,
+  const canonicalRes = parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(baseBullets, false, '\n6. 请直接安排300套生产。')), ctx);
+  assert.equal(canonicalRes.copy_paste_message_zh, baseBullets.map((q, i) => `${i + 1}. ${q}`).join('\n'));
+  assert.equal(canonicalRes.copy_paste_message_zh.split('\n').length, 5);
+
+  const naturalParaphraseBullets = [
+    '请确认整套用料、零件结构参数，并提供全套实物合照。',
+    '按日常复购，一百套和三百套发到深圳包物流各自批价多少、生产周期几天？',
+    '单品独立包装与大箱长宽高、毛重是多少？多少套一箱，是否支持原厂箱直发？',
+    '针对实木件易变形松动的问题，大货品控如何把关？',
+    '寄样确认后，大货与样板保持同工艺对照验货，请配合核对。',
+  ];
+  assert.equal(
+    parseFactoryInquiryChecklistResult(wrapResponsesEnvelope(makeInquiry(naturalParaphraseBullets)), ctx).valid,
+    true,
   );
 
   // SPEC-8 & SPEC-10a-c: Unselected parse rejection, cross-card diagnosis rejection, rights-excluded block, stale flag override, Vision & scored-card direct build

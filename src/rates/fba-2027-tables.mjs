@@ -604,11 +604,8 @@ export function getHistoricalFba2027RateTableSnapshots() {
  * When `profileRevision <= 57` is requested, returns the Nov-19 r57 snapshot; when `profileRevision === 58`, returns the frozen r58 snapshot.
  */
 export function getFba2027RateTableSnapshot({ profileRevision = 59 } = {}) {
-  if (Number.isFinite(profileRevision) && profileRevision <= 57) {
-    return getHistoricalFba2027RateTableSnapshots()[0];
-  }
-  if (Number.isFinite(profileRevision) && profileRevision <= 58) {
-    return getHistoricalFba2027RateTableSnapshots()[1];
+  if (Number.isFinite(profileRevision) && profileRevision < 59) {
+    throw new RangeError(`Profile revision ${profileRevision} is retired; only Revision 59+ is supported.`);
   }
   return {
     metadata: FBA_2027_METADATA,

@@ -103,13 +103,6 @@ function toUsSiteCalendarDate(value) {
   if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
   return US_SITE_DATE_FORMATTER.format(new Date(value));
 }
-function threeCalendarMonthsEarlier(isoCalDate) {
-  const y = Number(isoCalDate.slice(0, 4));
-  const m = Number(isoCalDate.slice(5, 7)) - 1;
-  const d = Number(isoCalDate.slice(8, 10));
-  const maxDayInTarget = new Date(Date.UTC(y, m - 2, 0)).getUTCDate();
-  return new Date(Date.UTC(y, m - 3, Math.min(d, maxDayInTarget))).toISOString().slice(0, 10);
-}
 function calendarDayDiff(laterCal, earlierCal) {
   return Math.round((Date.parse(`${laterCal}T00:00:00Z`) - Date.parse(`${earlierCal}T00:00:00Z`)) / 86_400_000);
 }
@@ -142,7 +135,7 @@ function definitions(profile) {
     profile.workflow?.scoring_and_ordering?.revision !== profile.revision) {
     throw new TypeError('The profile needs valid margin and matching shared mappings.');
   }
-  if (profile.revision >= 51) {
+  {
     const { actual_rating_points: a, sales_cap: s } = profile.measurement.current_category_newcomers ?? {};
     if (!a || !s || !Object.values(a).every(number) || !Object.values(s).every(number) ||
       a.max_points !== 4 || s.max_points !== 4 || a.full_points_through < 0 || a.linear_end_rating <= a.full_points_through ||
@@ -259,22 +252,20 @@ function scored(item, score, input, extra = {}) {
 function scoreMetric(item, input, ctx, profile) {
   let validScope;
   if (item.id === 'purchase_demand_scale') {
-    const allowedGrains = profile.revision >= 59
-      ? new Set(['parent_units', 'family_units', 'target_child_units'])
-      : new Set(['parent_units']);
+    const allowedGrains = new Set(['parent_units', 'family_units', 'target_child_units']);
     const isSingleOrMedianStat = [input?.grain, input?.scope, input?.basis, input?.aggregation, input?.statistic, input?.method].some(
       v => typeof v === 'string' && /(?:single_color|single_child|single_variant|\bmedian\b|\bp50\b|\baverage\b|\bmean\b)/i.test(v),
     ) || input?.single_child_only === true || input?.is_median === true;
     if (isSingleOrMedianStat) {
       return missing(item, 'purchase_demand_scale requires category comparable total sales and cannot use a single-variant or median statistic.', input);
     }
-    if (profile.revision >= 59 && input?.grain === 'target_child_units' && !Object.hasOwn(input, 'value_range')) {
+    if (input?.grain === 'target_child_units' && !Object.hasOwn(input, 'value_range')) {
       return missing(item, 'purchase_demand_scale with target_child_units requires a coherent deduplicated niche value_range (point target_child_units belongs only to Q31).', input);
     }
     validScope = input?.window_days === 30 && input.window_basis === 'latest_30_days' &&
       input.coverage_supported === true && input.deduplicated === true &&
       ['niche', 'period', 'grain'].every(key => text(input[key])) &&
-      (profile.revision < 57 || allowedGrains.has(input.grain));
+      allowedGrains.has(input.grain);
   } else {
     validScope = input?.applicable === true && text(input.category) && text(input.period);
   }
@@ -371,8 +362,7 @@ function scoreJudgment(item, input, ctx, profile = null, candidate = null) {
   });
 }
 
-function scoreMarket(item, market, ctx, profile = null) {
-  const isR59 = (profile?.revision ?? 0) >= 59;
+function scoreMarket(item, market, ctx) {
   const concentration = { product_dispersion: 'product', brand_dispersion: 'brand', seller_dispersion: 'seller' }[item.id];
   const flatConcMap = {
     product_dispersion: market?.product_concentration_top10,
@@ -384,11 +374,11 @@ function scoreMarket(item, market, ctx, profile = null) {
     new_product_sales_share: market?.newcomer_sales_share,
   };
   const input = concentration
-    ? (market?.concentrations?.[concentration] ?? (isR59 ? flatConcMap[item.id] : undefined))
-    : (market?.newcomer?.[item.id === 'new_product_count_share' ? 'count_share' : 'unit_sales_share'] ?? (isR59 ? flatNewMap[item.id] : undefined));
-  const effectivePeriod = market?.period ?? (isR59 ? (market?.archive_month ?? market?.dataMonth ?? null) : null);
-  const effectiveHeadGroup = market?.head_group ?? (isR59 && concentration && flatConcMap[item.id] ? 'top10' : null);
-  const effectiveEvidence = market?.evidence ?? (isR59 ? input?.evidence : undefined);
+    ? (market?.concentrations?.[concentration] ?? flatConcMap[item.id])
+    : (market?.newcomer?.[item.id === 'new_product_count_share' ? 'count_share' : 'unit_sales_share'] ?? flatNewMap[item.id]);
+  const effectivePeriod = market?.period ?? market?.archive_month ?? market?.dataMonth ?? null;
+  const effectiveHeadGroup = market?.head_group ?? (concentration && flatConcMap[item.id] ? 'top10' : null);
+  const effectiveEvidence = market?.evidence ?? input?.evidence;
   const commonValid = market?.provider === 'sellersprite' && market.relevant === true &&
     ['report_id', 'population', 'family_basis'].every(key => text(market[key])) &&
     text(effectivePeriod) &&
@@ -396,15 +386,11 @@ function scoreMarket(item, market, ctx, profile = null) {
   if (!commonValid || (concentration && !text(effectiveHeadGroup))) {
     return missing(item, input?.reason ?? 'One relevant source-native report with compatible population, period and basis is required.', input);
   }
-  const effectiveAgeMonths = market.newcomer_age_months ?? (isR59 && market.archive_basis === 'sellersprite_latest_monthly_archive' ? 3 : null);
-  const effectiveSalesWin = market.newcomer_sales_window ?? (isR59 ? (input?.window ?? (market.archive_basis === 'sellersprite_latest_monthly_archive' ? 'latest_monthly_archive' : null)) : null);
-  const allowedSalesWindows = isR59
-    ? new Set(['latest_30_days', 'latest_monthly_archive', 'monthly_archive', 'NEAR_30_DAYS'])
-    : new Set(['latest_30_days']);
+  const effectiveAgeMonths = market.newcomer_age_months ?? (market.archive_basis === 'sellersprite_latest_monthly_archive' ? 3 : null);
+  const effectiveSalesWin = market.newcomer_sales_window ?? input?.window ?? (market.archive_basis === 'sellersprite_latest_monthly_archive' ? 'latest_monthly_archive' : null);
+  const allowedSalesWindows = new Set(['latest_30_days', 'latest_monthly_archive', 'monthly_archive', 'NEAR_30_DAYS']);
   if (!concentration && (effectiveAgeMonths !== 3 || !allowedSalesWindows.has(effectiveSalesWin))) {
-    return missing(item, isR59
-      ? 'Native newcomer shares require a three-month report using latest_30_days or SellerSprite latest monthly archive.'
-      : 'Native newcomer shares require the same three-month report and latest-30-day unit window.', input);
+    return missing(item, 'Native newcomer shares require a three-month report using latest_30_days or SellerSprite latest monthly archive.', input);
   }
   if (!concentration && input && Object.hasOwn(input, 'denominator') && (!number(input.denominator) || input.denominator <= 0)) {
     return missing(item, 'A supplied native ratio denominator must be supported and positive; zero or unknown is not a zero share.', input);
@@ -414,21 +400,7 @@ function scoreMarket(item, market, ctx, profile = null) {
     { report_id: market.report_id, source_population: market.population, period: effectivePeriod, family_basis: market.family_basis });
 }
 
-function bidSource(input, source, bids, ctx, profile = null) {
-  const isR59 = (profile?.revision ?? 0) >= 59;
-  if (!isR59) {
-    const strategy = input?.strategy ?? (source === 'sellersprite' ? 'unspecified' : null);
-    const compatible = input?.match_type === 'exact' &&
-      (source === 'sif' ? strategy === 'fixed' : ['fixed', 'unspecified'].includes(strategy)) &&
-      (!input.marketplace || input.marketplace === bids.marketplace) && (!input.currency || input.currency === bids.currency);
-    if (!compatible) return { point: null, range: null, reason: 'Missing or incompatible exact-match strategy, currency or marketplace.', strategy };
-    const reading = readNumber(input, 'USD', ctx);
-    const low = readNumber({ ...input, value: input.low }, 'USD', ctx);
-    const high = readNumber({ ...input, value: input.high }, 'USD', ctx);
-    const range = low.value !== null && high.value !== null && low.value <= high.value ? [low.value, high.value] : null;
-    return { point: reading.value, range, reason: reading.reason, strategy,
-      limitation: source === 'sellersprite' && strategy === 'unspecified' ? 'SellerSprite strategy is unspecified; this is an approximate trial input.' : null };
-  }
+function bidSource(input, source, bids, ctx) {
   if (!input || typeof input !== 'object') {
     return { point: null, range: null, reason: 'Source observation not supplied.', strategy: null };
   }
@@ -437,7 +409,7 @@ function bidSource(input, source, bids, ctx, profile = null) {
   const marketCurrencyOk = (!input.marketplace || input.marketplace === bids.marketplace) &&
     (!input.currency || input.currency === bids.currency);
 
-  if (isR59 && source === 'sif') {
+  if (source === 'sif') {
     // Tier 1: SIF fixed exact when present; Tier 2: SIF already-returned "提高和降低（精准）" (cpc_raise_exact / up_and_down) when fixed is absent!
     const fixedPresent = input.value !== null && input.value !== undefined;
     const raiseVal = input.cpc_raise_exact ?? input.raise_exact_value ??
@@ -470,7 +442,7 @@ function bidSource(input, source, bids, ctx, profile = null) {
     }
   }
 
-  if (isR59 && source === 'sellersprite') {
+  if (source === 'sellersprite') {
     // Tier 3a ss_web real-time requires explicit down_only or fixed strategy (unspecified web scrapes are rejected).
     const allowedSsStrategies = channel === 'ss_web' ? ['fixed', 'down_only'] : ['fixed', 'down_only', 'unspecified'];
     const compatibleSs = input.match_type === 'exact' && allowedSsStrategies.includes(rawStrategy) && marketCurrencyOk;
@@ -509,11 +481,9 @@ function bidSource(input, source, bids, ctx, profile = null) {
     limitation: source === 'sellersprite' && strategy === 'unspecified' ? 'SellerSprite strategy is unspecified; this is an approximate trial input.' : null };
 }
 
-function scoreBids(item, bids, ctx, profile) {
-  const isR59 = profile.revision >= 59;
-  const singleEntry = profile.revision >= 55 && bids?.entries?.length === 1;
-  const allowEqualEntries = profile.revision >= 56;
-  const longTailTerms = isR59 && Array.isArray(bids?.long_tail_opportunistic_terms)
+function scoreBids(item, bids, ctx) {
+  const singleEntry = bids?.entries?.length === 1;
+  const longTailTerms = Array.isArray(bids?.long_tail_opportunistic_terms)
     ? bids.long_tail_opportunistic_terms
       .filter(t => t && typeof t === 'object' && text(t.query))
       .map(t => ({
@@ -522,7 +492,7 @@ function scoreBids(item, bids, ctx, profile) {
         note: text(t.note) ? t.note.trim() : '超长尾蓝海捡漏词（仅作投放捡漏参考，不锁死主词竞价 15 分）',
       }))
     : undefined;
-  const isParentProxy = isR59 && bids?.entry_scope === 'parent_functional_proxy';
+  const isParentProxy = bids?.entry_scope === 'parent_functional_proxy';
   if (isParentProxy && !text(bids?.proxy_reason)) {
     return missing(item, 'Cold-start parent_functional_proxy requires a nonempty proxy_reason.', bids);
   }
@@ -536,14 +506,11 @@ function scoreBids(item, bids, ctx, profile) {
   };
 
   if (!bids || bids.marketplace !== 'US' || bids.currency !== 'USD' || bids.match_type !== 'exact' ||
-    (!singleEntry && !allowEqualEntries && !text(bids.volume_period) && !(isR59 && bids?.unbid_after_all_tiers === true)) ||
     !text(bids.selection_reason) || !hasEvidence(bids.evidence, ctx) ||
     !Array.isArray(bids.entries) || bids.entries.length === 0) {
-    return missing(item, bids?.reason ?? (allowEqualEntries
-      ? 'A supported main-entry set with US/exact/USD scope is required.'
-      : 'A supported main-entry set with common monthly volume and US/exact/USD scope is required.'), bids, r59ScopeMeta);
+    return missing(item, bids?.reason ?? 'A supported main-entry set with US/exact/USD scope is required.', bids, r59ScopeMeta);
   }
-  if (isR59 && bids.entries.length > 3) {
+  if (bids.entries.length > 3) {
     return missing(item, 'Revision 59 Tier 1 restricts main purchase entries to 1–3 core/mid-core queries; move peripheral long-tail queries to long_tail_opportunistic_terms.', bids, r59ScopeMeta);
   }
   const queries = new Set();
@@ -557,32 +524,32 @@ function scoreBids(item, bids, ctx, profile) {
       volume.value = null;
       volume.reason = 'Entry volume does not use the declared common period.';
     }
-    if (allowEqualEntries && !singleEntry && entry?.volume?.value != null && !text(bids.volume_period)) {
+    if (!singleEntry && entry?.volume?.value != null && !text(bids.volume_period)) {
       volume.value = null;
       volume.reason = 'Supplied monthly volumes need a declared common period.';
     }
-    const sources = Object.fromEntries(['sellersprite', 'sif'].map(source => [source, bidSource(entry?.[source], source, bids, ctx, profile)]));
+    const sources = Object.fromEntries(['sellersprite', 'sif'].map(source => [source, bidSource(entry?.[source], source, bids, ctx)]));
     // Tier 3a ss_web is strictly a fallback when SIF Tier 1/2 has no usable exact bid.
     const rawUsable = Object.entries(sources).filter(([, value]) => value.point !== null);
-    const usable = isR59 && sources.sif.point !== null && sources.sellersprite.channel === 'ss_web'
+    const usable = sources.sif.point !== null && sources.sellersprite.channel === 'ss_web'
       ? [['sif', sources.sif]]
       : rawUsable;
     const combined = usable.length ? usable.reduce((sum, [, value]) => sum + value.point / usable.length, 0) : null;
     return { query: entry?.query ?? null, volume: volume.value, volume_reason: volume.reason, sources,
       combined_point: combined, source_label: usable.length === 2 ? 'two_source_mean' : usable.length ? `${usable[0][0]}_only` : 'needs_evidence',
-      ...(profile.revision >= 57 && combined !== null && (entry?.low_exposure_baseline === true || text(entry?.low_exposure_note))
+      ...(combined !== null && (entry?.low_exposure_baseline === true || text(entry?.low_exposure_note))
         ? { low_exposure_baseline: true, low_exposure_note: text(entry?.low_exposure_note)
           ? entry.low_exposure_note.trim()
           : '周曝光极低或无历史数据，采用原生工具返回的平台基准建议竞价。' }
         : {}) };
   });
 
-  if (isR59 && bids.entries.some((rawE, i) =>
+  if (bids.entries.some((rawE, i) =>
     (rawE?.all_tiers_exhausted === true || rawE?.unbid_after_all_tiers === true) && entries[i]?.combined_point !== null,
   )) {
     return missing(item, 'Entry declares all_tiers_exhausted / unbid_after_all_tiers while supplying a usable exact bid.', bids, r59ScopeMeta);
   }
-  if (isR59 && (bids.unbid_after_all_tiers === true || bids.entries.every(e => e?.all_tiers_exhausted === true || e?.unbid_after_all_tiers === true))) {
+  if (bids.unbid_after_all_tiers === true || bids.entries.every(e => e?.all_tiers_exhausted === true || e?.unbid_after_all_tiers === true)) {
     if (duplicate) {
       return missing(item, 'Main purchase entries must be unique.', bids, r59ScopeMeta);
     }
@@ -606,7 +573,7 @@ function scoreBids(item, bids, ctx, profile) {
   const absentVolumes = bids.entries.map(entry => (entry?.volume == null ||
     (typeof entry.volume === 'object' && !Array.isArray(entry.volume) && entry.volume.value == null)) &&
     entry?.volume?.supported !== false && entry?.volume?.material_conflict !== true);
-  const equalEntries = allowEqualEntries && !singleEntry && !duplicate && allPoints && absentVolumes.some(Boolean) &&
+  const equalEntries = !singleEntry && !duplicate && allPoints && absentVolumes.some(Boolean) &&
     entries.every((entry, index) => entry.volume !== null || absentVolumes[index]);
   const rangeScenarios = Object.fromEntries(['sellersprite', 'sif'].map(source => {
     if (duplicate || (!singleEntry && !validVolumes && !equalEntries) || entries.some(entry => !entry.sources[source].range)) return [source, null];
@@ -617,16 +584,13 @@ function scoreBids(item, bids, ctx, profile) {
       score_range: [numericScore(item, range[1]), numericScore(item, range[0])], interpretation: 'Source-labeled range scenario; not the main score or actual CPC.' }];
   }));
   const extra = { ...r59ScopeMeta, entries, range_scenarios: rangeScenarios, reference_bid_usd: null,
-    ...(profile.revision >= 55 ? { aggregation_method: allowEqualEntries && duplicate ? null : singleEntry ? 'single_main_entry' : equalEntries
-      ? 'equal_main_entries' : allowEqualEntries && !validVolumes ? null : 'monthly_search_weighted' } : {}),
+    aggregation_method: duplicate ? null : singleEntry ? 'single_main_entry' : equalEntries
+      ? 'equal_main_entries' : !validVolumes ? null : 'monthly_search_weighted',
     ...(equalEntries ? { aggregation_reason: 'Monthly search volume is missing; every main entry has a usable exact point. Equal entry weights do not establish equal demand.' } : {}),
     evidence: mergeRefs(bids.evidence, ...bids.entries.flatMap(entry => [entry?.volume?.evidence, entry?.sellersprite?.evidence, entry?.sif?.evidence])) };
   if (duplicate) return missing(item, 'Main-entry queries must be nonempty and deduplicated before scoring.', bids, extra);
-  if (allowEqualEntries && !allPoints) return missing(item, 'A required main-entry native exact point is missing from both usable sources.', bids, extra);
-  if (!singleEntry && !validVolumes && !equalEntries) return missing(item, allowEqualEntries
-    ? 'Supplied monthly volumes need valid compatible evidence and a positive total; equal weighting only resolves missing volume.'
-    : 'Every selected entry needs supported monthly volume and the total must be positive.', bids, extra);
   if (!allPoints) return missing(item, 'A required main-entry native exact point is missing from both usable sources.', bids, extra);
+  if (!singleEntry && !validVolumes && !equalEntries) return missing(item, 'Supplied monthly volumes need valid compatible evidence and a positive total; equal weighting only resolves missing volume.', bids, extra);
   const reference = singleEntry ? entries[0].combined_point
     : entries.reduce((sum, entry) => sum +
       (equalEntries ? 1 / entries.length : entry.volume / totalVolume) * entry.combined_point, 0);
@@ -724,18 +688,14 @@ function findMissingSif30DayParam(input, citedEv) {
 
 function scoreNatural(member, ctx, profile, cohortPeriod = null, cohortGrain = null) {
   const input = member.natural;
-  const validSubjects = profile.revision >= 58
-    ? [member.family_id, member.asin, member.parent_asin, member.representative_asin].filter(text).map(s => s.trim())
-    : [member.family_id, member.asin];
-  const subjectOk = !input?.subject || (profile.revision >= 58
-    ? (text(input.subject) && validSubjects.includes(input.subject.trim()))
-    : validSubjects.includes(input.subject));
+  const validSubjects = [member.family_id, member.asin, member.parent_asin, member.representative_asin].filter(text).map(s => s.trim());
+  const subjectOk = !input?.subject || (text(input.subject) && validSubjects.includes(input.subject.trim()));
   if (input?.scope !== 'overall' || !text(input.period) || !hasEvidence(input.relevant_entries_evidence, ctx) ||
     (input.provider && input.provider !== 'sif') || !subjectOk) {
     return { score: null, reason: input?.reason ?? 'A SIF overall share needs identified period, subject and relevant-entry evidence.', input };
   }
-  if (profile.revision >= 58) {
-    const isNear30Cohort = profile.revision >= 59 && /^NEAR_30_DAYS(?:@\d{4}-\d{2}-\d{2})?$/i.test(String(cohortPeriod ?? '').trim());
+  {
+    const isNear30Cohort = /^NEAR_30_DAYS(?:@\d{4}-\d{2}-\d{2})?$/i.test(String(cohortPeriod ?? '').trim());
     const validNear30NatPeriod = isNear30Cohort && (
       input.period === cohortPeriod ||
       /^NEAR_30_DAYS(?:@\d{4}-\d{2}-\d{2})?$/i.test(input.period.trim()) ||
@@ -804,7 +764,7 @@ function scoreNatural(member, ctx, profile, cohortPeriod = null, cohortGrain = n
       readNumber(input.keyword_counts?.[source]?.[channel], 'count', ctx, { integer: true }).value]))]));
   const ssOrg = counts.sellersprite.organic;
   const ssAd = counts.sellersprite.ad;
-  const coverageExposureMismatch = profile.revision >= 58 && reading.value !== null && ssOrg !== null &&
+  const coverageExposureMismatch = reading.value !== null && ssOrg !== null &&
     reading.value < 0.35 &&
     (ssOrg >= 50 || (ssOrg >= 20 && ssAd !== null && ssOrg >= ssAd * 1.5));
   return {
@@ -1074,18 +1034,16 @@ const R58_COMPARABLE_VERDICTS = new Set(['comparable', 'same_task']);
 const INTERNAL_PERIOD_TOKEN = Symbol('INTERNAL_OPERATING_PERIOD');
 const stripInternalRat = ({ e_rat: _unused, e_rat_hi: _unusedHi, ...rest }) => rest;
 
-function isAlignedLatest30DayPeriod(period, obsCal, isR59 = false) {
+function isAlignedLatest30DayPeriod(period, obsCal) {
   if (!text(period) || !obsCal) return false;
   const trimmed = period.trim();
-  if (isR59) {
-    const nearMatch = /^NEAR_30_DAYS(?:@(\d{4}-\d{2}-\d{2}))?$/i.exec(trimmed);
-    if (nearMatch) {
-      if (!nearMatch[1]) return true;
-      const anchorCal = toUsSiteCalendarDate(nearMatch[1]);
-      if (!anchorCal) return false;
-      const lag = calendarDayDiff(obsCal, anchorCal);
-      return lag >= 0 && lag <= 5;
-    }
+  const nearMatch = /^NEAR_30_DAYS(?:@(\d{4}-\d{2}-\d{2}))?$/i.exec(trimmed);
+  if (nearMatch) {
+    if (!nearMatch[1]) return true;
+    const anchorCal = toUsSiteCalendarDate(nearMatch[1]);
+    if (!anchorCal) return false;
+    const lag = calendarDayDiff(obsCal, anchorCal);
+    return lag >= 0 && lag <= 5;
   }
   const m = /^(\d{4}-\d{2}-\d{2})\/(\d{4}-\d{2}-\d{2})$/.exec(trimmed);
   if (!m) return false;
@@ -1095,7 +1053,7 @@ function isAlignedLatest30DayPeriod(period, obsCal, isR59 = false) {
   const spanDays = calendarDayDiff(throughCal, fromCal) + 1;
   if (spanDays !== 30) return false;
   const lagDays = calendarDayDiff(obsCal, throughCal);
-  return lagDays >= 0 && lagDays <= (isR59 ? 5 : 2);
+  return lagDays >= 0 && lagDays <= 5;
 }
 
 function scoreNewcomersR58(cohort, ctx, profile, defs) {
@@ -1118,7 +1076,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
   };
   const reviewAnomalyAdvisories = [];
   const pending = reason => {
-    if (isR59 && reviewAnomalyAdvisories.length > 0) {
+    if (reviewAnomalyAdvisories.length > 0) {
       diagnostics.review_anomaly_advisories = reviewAnomalyAdvisories;
     }
     return {
@@ -1126,24 +1084,15 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     };
   };
 
-  const isR59 = profile.revision >= 59;
-  const validGrains = isR59
-    ? new Set([...R58_VALID_NEWCOMER_GRAINS, 'target_child_units'])
-    : R58_VALID_NEWCOMER_GRAINS;
-  const validObservationBases = isR59
-    ? new Set(['current_latest_30_days', 'sellersprite_near_30_days', 'NEAR_30_DAYS'])
-    : new Set(['current_latest_30_days']);
-  const validCohortScopes = isR59
-    ? new Set(['current_relevant_bsr_top100', 'sellersprite_near_30_days', 'sellersprite_near_30_days_leaf'])
-    : new Set(['current_relevant_bsr_top100']);
-  const validRefScopes = isR59
-    ? new Set([
-        'current_relevant_bsr_top100_all_ages',
-        'current_relevant_bsr_top100_mature_only',
-        'sellersprite_near_30_days_all_ages',
-        'sellersprite_near_30_days_mature_only',
-      ])
-    : new Set(['current_relevant_bsr_top100_all_ages']);
+  const validGrains = new Set([...R58_VALID_NEWCOMER_GRAINS, 'target_child_units']);
+  const validObservationBases = new Set(['current_latest_30_days', 'sellersprite_near_30_days', 'NEAR_30_DAYS']);
+  const validCohortScopes = new Set(['current_relevant_bsr_top100', 'sellersprite_near_30_days', 'sellersprite_near_30_days_leaf']);
+  const validRefScopes = new Set([
+    'current_relevant_bsr_top100_all_ages',
+    'current_relevant_bsr_top100_mature_only',
+    'sellersprite_near_30_days_all_ages',
+    'sellersprite_near_30_days_mature_only',
+  ]);
 
   if (!cohort || cohort.reference_supported !== true || !validObservationBases.has(cohort.observation_basis) ||
     !validCohortScopes.has(cohort.scope) || cohort.query_complete !== true ||
@@ -1154,7 +1103,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     return pending(cohort?.reason ?? 'A completed current-category query with valid sales grain and aligned all-age sales reference is required.');
   }
 
-  const isNear30DaysMode = isR59 && (
+  const isNear30DaysMode = (
     cohort.scope === 'sellersprite_near_30_days' ||
     cohort.scope === 'sellersprite_near_30_days_leaf' ||
     cohort.observation_basis === 'sellersprite_near_30_days' ||
@@ -1169,7 +1118,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     diagnostics.rolling_source_disclosure = near30DaysDisclosure;
   }
 
-  const allowChildUnitsRange = isR59 && cohort.grain === 'target_child_units';
+  const allowChildUnitsRange = cohort.grain === 'target_child_units';
   const readUnitsObservation = input => {
     if (allowChildUnitsRange && input && typeof input === 'object' && Object.hasOwn(input, 'value_range') && input.value_range !== null) {
       const vr = input.value_range;
@@ -1212,12 +1161,10 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
 
   const obsCal = toUsSiteCalendarDate(cohort.observation_date);
   if (!obsCal) return pending('Invalid observation_date on newcomer_cohort.');
-  if ((cohort.window_days !== undefined && cohort.window_days !== 30) || !isAlignedLatest30DayPeriod(cohort.period, obsCal, isR59)) {
-    return pending(isR59
-      ? 'Revision 59 newcomer cohort requires NEAR_30_DAYS or a verified 30-day rolling period aligned with observation_date.'
-      : 'Revision 58 newcomer cohort requires a verified latest-30-day period aligned with observation_date (YYYY-MM-DD/YYYY-MM-DD, 30 days).');
+  if ((cohort.window_days !== undefined && cohort.window_days !== 30) || !isAlignedLatest30DayPeriod(cohort.period, obsCal)) {
+    return pending('Revision 59 newcomer cohort requires NEAR_30_DAYS or a verified 30-day rolling period aligned with observation_date.');
   }
-  const earliestCal = isR59 ? ninetyCalendarDaysEarlier(obsCal) : threeCalendarMonthsEarlier(obsCal);
+  const earliestCal = ninetyCalendarDaysEarlier(obsCal);
 
   const hasParentSalesEvidenceSignal = evList => evList.some(ev => {
     if (!ev || typeof ev !== 'object') return false;
@@ -1267,7 +1214,6 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     }
 
     const recordKeepaReviewAnomaly = () => {
-      if (!isR59) return;
       const rawSummary = member?.keepa_review_anomaly_summary && typeof member.keepa_review_anomaly_summary === 'object'
         ? member.keepa_review_anomaly_summary
         : null;
@@ -1350,12 +1296,11 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       });
     };
 
-    const pushClassified = (kind, poolEligible, missingPoolStats) => {
+    const pushClassified = (kind, poolEligible) => {
       classified.push({
         record,
         kind,
         poolEligible,
-        missingPoolStats,
         ratingsVal: ratingsReading.value,
         unitsVal: unitsReading.value,
         unitsLo: unitsReading.lo,
@@ -1369,18 +1314,18 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     if (member?.comparability_verdict !== undefined && !R58_VALID_COMPARABILITY.has(member.comparability_verdict)) {
       record.effective_status = 'pending';
       record.reason = text(member.reason) ? member.reason : 'Buyer-task comparability verdict must be comparable (or same_task) or excluded_different_task; unknown/pending remains blocking.';
-      pushClassified('pending', false, false);
+      pushClassified('pending', false);
       continue;
     }
 
     if (member?.comparability_verdict === 'excluded_different_task') {
       if (text(member.reason) && hasEvidence(member.evidence, ctx)) {
         record.effective_status = 'excluded';
-        pushClassified('task_excluded', false, false);
+        pushClassified('task_excluded', false);
       } else {
         record.effective_status = 'pending';
         record.reason = 'Task-comparability exclusion requires a reason and valid evidence references.';
-        pushClassified('pending', false, false);
+        pushClassified('pending', false);
       }
       continue;
     }
@@ -1391,9 +1336,8 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
         record.reason = text(member.reason) ? member.reason : 'Supported old reviews predate the purported recent launch; excluded from the normal-start reference.';
         const relevantForStrat = inBsrWindow && !(record.age_days < 30 && unitsReading.exactZero);
         const missingStatsRaw = ratingsReading.value === null || unitsReading.value === null;
-        const missingPoolStats = !isR59 && relevantForStrat && missingStatsRaw;
         const poolEligible = relevantForStrat && !missingStatsRaw;
-        pushClassified('old_review_excluded', poolEligible, missingPoolStats);
+        pushClassified('old_review_excluded', poolEligible);
       } else {
         record.effective_status = 'pending';
         record.reason = !R58_COMPARABLE_VERDICTS.has(member.comparability_verdict)
@@ -1401,7 +1345,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
           : badUnitsWindow
             ? 'Newcomer units_30d observation must cover the aligned 30-day cohort window.'
             : 'The asserted old-review conflict lacks valid evidence references.';
-        pushClassified('pending', false, false);
+        pushClassified('pending', false);
       }
       continue;
     }
@@ -1415,15 +1359,14 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
           : badUnitsWindow
             ? 'Newcomer units_30d observation must cover the aligned 30-day cohort window.'
             : 'An excluded newcomer record requires a reason and valid evidence references.';
-        pushClassified('pending', false, false);
+        pushClassified('pending', false);
       } else {
         const relevantForStrat = member.sampling_excluded === true && inBsrWindow &&
           R58_COMPARABLE_VERDICTS.has(member.comparability_verdict) &&
           !(record.age_days < 30 && unitsReading.exactZero);
         const missingStatsRaw = ratingsReading.value === null || unitsReading.value === null;
-        const missingPoolStats = !isR59 && relevantForStrat && missingStatsRaw;
         const poolEligible = relevantForStrat && !missingStatsRaw;
-        pushClassified(member.sampling_excluded === true ? 'sampling_excluded' : 'other_excluded', poolEligible, missingPoolStats);
+        pushClassified(member.sampling_excluded === true ? 'sampling_excluded' : 'other_excluded', poolEligible);
       }
       continue;
     }
@@ -1431,20 +1374,20 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
     if (badUnitsWindow) {
       record.effective_status = 'pending';
       record.reason = 'Newcomer units_30d observation must cover the aligned 30-day cohort window.';
-      pushClassified('pending', false, false);
+      pushClassified('pending', false);
       continue;
     }
 
     if (!['qualified', 'unsampled_stratified', 'ramp_up_zero_sales'].includes(record.effective_status)) {
       record.effective_status = 'pending';
-      pushClassified('pending', false, false);
+      pushClassified('pending', false);
       continue;
     }
 
     if (!R58_COMPARABLE_VERDICTS.has(member?.comparability_verdict)) {
       record.effective_status = 'pending';
       record.reason = 'Revision 58 requires an explicit buyer-task comparability_verdict ("comparable" or "same_task") on every active newcomer record.';
-      pushClassified('pending', false, false);
+      pushClassified('pending', false);
       continue;
     }
 
@@ -1453,16 +1396,14 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       invalidReference = true;
       record.effective_status = 'pending';
       record.reason = 'A newcomer record needs frozen family/listing identity and valid evidence references.';
-      pushClassified('pending', false, false);
+      pushClassified('pending', false);
       continue;
     }
 
     if (!inBsrWindow) {
       record.effective_status = 'pending';
-      record.reason = isR59
-        ? 'A current-category newcomer needs a valid US-site launch date within 90 calendar days (not in the future).'
-        : 'A current-category newcomer needs matching rank 1-100 and a valid US-site launch date within three calendar months (not in the future).';
-      pushClassified('pending', false, false);
+      record.reason = 'A current-category newcomer needs a valid US-site launch date within 90 calendar days (not in the future).';
+      pushClassified('pending', false);
       continue;
     }
 
@@ -1470,14 +1411,14 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       if (record.age_days >= 30 || !unitsReading.exactZero) {
         record.effective_status = 'pending';
         record.reason = 'Only verified <30-day zero-sales listings may be pre-excluded as ramp_up_zero_sales.';
-        pushClassified('pending', false, false);
+        pushClassified('pending', false);
         continue;
       }
     } else if (record.effective_status === 'unsampled_stratified') {
       if (ratingsReading.value === null || unitsReading.value === null) {
         record.effective_status = 'pending';
         record.reason = 'unsampled_stratified requires reliable ratings and units_30d inputs; missing inputs remain blocking.';
-        pushClassified('pending', false, false);
+        pushClassified('pending', false);
         continue;
       }
       if (record.age_days < 30 && unitsReading.exactZero) {
@@ -1494,7 +1435,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
 
     const activePoolEligible = record.effective_status !== 'ramp_up_zero_sales' &&
       !(record.age_days < 30 && unitsReading.exactZero);
-    pushClassified('active', activePoolEligible, false);
+    pushClassified('active', activePoolEligible);
   }
 
   // Transitive family/ASIN/parent_asin/representative_asin/shared_launch grouping across ALL members so duplicates never inflate counts or distort pools.
@@ -1535,7 +1476,6 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
   const statusRank = s => s === 'qualified' ? 0 : s === 'unsampled_stratified' ? 1 : 2;
   const uniqueActive = [];
   const samplingExcludedPool = [];
-  let hasExcludedMissingPoolStats = false;
 
   for (const group of allGroups) {
     if (group.some(e => e.kind === 'pending')) continue;
@@ -1589,8 +1529,6 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
             unitsHi: rep.unitsHi,
             age_days: rep.record.age_days,
           });
-        } else if (group.some(e => e.missingPoolStats)) {
-          hasExcludedMissingPoolStats = true;
         }
       }
       continue;
@@ -1878,10 +1816,6 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
       return pending('Stratified sampling (unsampled_stratified) is only permitted when N_active > 5.');
     }
   } else {
-    if (hasExcludedMissingPoolStats) {
-      diagnostics.examples = evalQualified.map(stripInternalRat);
-      return pending('Stratified sampling requires reliable ratings and units_30d on every in-window old-review/sampling-excluded listing so quintile placement and replacement order remain deterministic.');
-    }
     // Deterministic 5-quintile stratification is unconditionally triggered by deduplicated N_active > 5
     // so input-label switching between qualified and unsampled_stratified can never game the score.
     const allActiveEval = [...evalQualified, ...evalUnsampled];
@@ -1941,7 +1875,7 @@ function scoreNewcomersR58(cohort, ctx, profile, defs) {
 
   diagnostics.stratification = stratifiedMeta;
   diagnostics.examples = scoringPool.map(stripInternalRat);
-  if (isR59 && reviewAnomalyAdvisories.length > 0) {
+  if (reviewAnomalyAdvisories.length > 0) {
     diagnostics.review_anomaly_advisories = reviewAnomalyAdvisories;
   }
 
@@ -2058,10 +1992,10 @@ function datedScenario(scenario, economics, ctx, profile, forceSensitivityOnly =
         ...(scenarioKitCheck?.is_cross_factory_or_incomplete ? { single_factory_complete_kit: false } : {}),
       }
       : rawLedger;
-    calculation = calculateEconomics(ledger, { requireFeeBasis: true, requireRegularRepeatOrder: profile.revision >= 57,
+    calculation = calculateEconomics(ledger, { requireFeeBasis: true, requireRegularRepeatOrder: true,
       profileRevision: profile.revision, evidenceIds: [...ctx.evidence.keys()], operatingMonths: economics.operating_months,
       externalPackages: economics?.packages });
-    if (profile.revision >= 59 && calculation?.scoring_supported) {
+    if (calculation?.scoring_supported) {
       const effPricing = resolveEffectivePricing(ledger);
       const hasOngoingCouponOnly = effPricing.valid &&
         ((effPricing.ongoing_coupon_usd ?? 0) > 0 || (effPricing.ongoing_coupon_pct ?? 0) > 0) &&
@@ -4231,11 +4165,11 @@ export function scoreCandidate(candidate, profile, internal = null) {
     if (item.id === 'unit_contribution') return profit.contribution;
     if (item.id === 'low_rating_sales_performance') return newcomers.low;
     if (item.id === 'natural_visibility_development') return newcomers.natural;
-    if (item.id === 'relevant_purchase_entry_bid') return scoreBids(item, candidate.bids, ctx, profile);
+    if (item.id === 'relevant_purchase_entry_bid') return scoreBids(item, candidate.bids, ctx);
     if (['purchase_demand_scale', 'low_return_preference'].includes(item.id)) return scoreMetric(item, candidate.metrics?.[item.id], ctx, profile);
     if (item.mapping.anchors?.some(anchor => !Array.isArray(anchor))) return scoreJudgment(item, candidate.judgments?.[item.id], ctx, profile, candidate);
     if (['market_entry', 'normal_newcomer'].includes(item.group) &&
-      !['low_rating_sales_performance', 'natural_visibility_development'].includes(item.id)) return scoreMarket(item, candidate.market, ctx, profile);
+      !['low_rating_sales_performance', 'natural_visibility_development'].includes(item.id)) return scoreMarket(item, candidate.market, ctx);
     return missing(item, 'Required evidence has not been supplied.');
   });
   const bidsItem = items.find(item => item.id === 'relevant_purchase_entry_bid');

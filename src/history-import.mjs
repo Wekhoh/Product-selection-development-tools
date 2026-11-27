@@ -9,12 +9,13 @@ import { prepareDiscovery, attachDiscovery } from './discovery.mjs';
 import { resolveChannelMeta } from './discovery-channels.mjs';
 import { scoreBatch } from './scoring.mjs';
 import { renderReport } from './report.mjs';
-import { getFba2027RateTableSnapshot, getHistoricalFba2027RateTableSnapshots } from './fba-calculator.mjs';
+import { getFba2027RateTableSnapshot } from './fba-calculator.mjs';
 import {
   canonicalJson,
   computeEvidenceBundleHash,
   normalizeProvider,
   sha256Hex,
+  stripAdvisoryAttachmentsForBundleHash,
 } from './store.mjs';
 
 const toPathStr = p => (p instanceof URL ? fileURLToPath(p) : String(p));
@@ -451,71 +452,6 @@ export function importRetainedAssetsManifest(store, manifest) {
   });
 }
 
-function reconstructVersionQualification(scored, profileRevision) {
-  if (scored.qualification) return scored.qualification;
-  if (scored.queue === 'comparable') {
-    return {
-      counts_toward_target: true,
-      mode: 'comparable',
-      primary_period_id: null,
-      display_period_id: null,
-      reasons: [`Reconstructed comparable qualification for historical revision ${profileRevision}.`],
-    };
-  }
-  if (scored.queue === 'seasonal_review' && Array.isArray(scored.operating_periods)) {
-    const hasPeak = scored.operating_periods.some(p =>
-      Array.isArray(p.months) && HOLIDAY_PEAK_MONTHS.every(m => p.months.includes(m)),
-    );
-    const matchingOffPeak = scored.operating_periods.find(p => {
-      if (p.queue !== 'comparable') return false;
-      if (profileRevision < 57) return true;
-      const monthsOk = Array.isArray(p.months) &&
-        p.months.length === PRIMARY_OFF_PEAK_MONTHS.length &&
-        PRIMARY_OFF_PEAK_MONTHS.every(m => p.months.includes(m));
-      const scens = p.diagnostics?.economics?.scenarios;
-      const datesOk = Array.isArray(scens) && scens.length > 0 && scens.every(sc => {
-        const ctx = sc?.input?.cost_ledger?.fee_context ?? sc?.fee_context;
-        const calc = sc?.input?.calculation;
-        if (!ctx) return false;
-        if (calc && (!calc.scoring_supported || calc.fee_validation?.status !== 'validated')) return false;
-        return ctx.sales?.from === '2027-02-01' &&
-          ctx.sales?.through === '2027-09-30' &&
-          ctx.storage?.from === '2027-02-01' &&
-          ctx.storage?.through === '2027-09-30' &&
-          ctx.inbound?.from >= '2027-01-15' &&
-          ctx.inbound?.through <= '2027-09-30';
-      });
-      const dateDepOk = p.screening?.conditions?.find(c => c.id === 'strong_date_dependency')?.status === 'pass';
-      return monthsOk && datesOk && dateDepOk;
-    });
-    const isEligible = profileRevision >= 57 ? Boolean(hasPeak && matchingOffPeak) : Boolean(matchingOffPeak);
-    if (isEligible) {
-      return {
-        counts_toward_target: true,
-        mode: 'seasonal_eligible',
-        primary_period_id: matchingOffPeak.id,
-        display_period_id: matchingOffPeak.id,
-        reasons: [`Reconstructed seasonal_eligible qualification under historical revision ${profileRevision}.`],
-      };
-    }
-    const fallbackPeriod = scored.operating_periods[0]?.id ?? null;
-    return {
-      counts_toward_target: false,
-      mode: 'none',
-      primary_period_id: null,
-      display_period_id: fallbackPeriod,
-      reasons: [`Historical revision ${profileRevision} seasonal review did not satisfy eligibility criteria.`],
-    };
-  }
-  return {
-    counts_toward_target: false,
-    mode: 'none',
-    primary_period_id: null,
-    display_period_id: null,
-    reasons: [`Historical revision ${profileRevision} queue: ${scored.queue}.`],
-  };
-}
-
 function findMatchingAttemptIdsForCandidate(store, inputCand, explicitAttemptIds, repoRoot) {
   const matched = new Set(explicitAttemptIds ?? []);
   const evidenceList = Array.isArray(inputCand?.evidence) ? inputCand.evidence : [];
@@ -558,7 +494,7 @@ export function replayBatchIntoStore(store, {
   if (!batch || typeof batch !== 'object') throw new TypeError('batch object is required.');
   if (!profile || typeof profile !== 'object') throw new TypeError('profile object is required.');
 
-  const effectiveRev = Number(profile.revision ?? batch.profile_revision ?? 58);
+  const effectiveRev = Number(profile.revision ?? batch.profile_revision ?? 59);
   const effectiveFeeSnapshot = fee_table_snapshot ?? getFba2027RateTableSnapshot({ profileRevision: effectiveRev });
   const manifest = discovery ? prepareDiscovery(discovery.pool, discovery.decisions) : null;
   const boundBatch = manifest ? attachDiscovery(batch, manifest) : batch;
@@ -615,24 +551,21 @@ export function replayBatchIntoStore(store, {
       const inputCand = boundBatch.candidates.find(c => c.id === candId) ?? boundBatch.candidates[i];
       const formId = inputCand?.discovery?.form_id || candId;
       const label = inputCand?.discovery?.label || scored.label || scored.name || formId;
-      const isR59Replay = effectiveRev >= 59;
-      const candSaleableUnit = isR59Replay
-        ? (inputCand?.saleable_unit ||
-          inputCand?.economics?.saleable_unit ||
-          inputCand?.operating_periods?.[0]?.scenarios?.[0]?.saleable_unit ||
-          scored?.economics?.saleable_unit ||
-          scored?.operating_periods?.[0]?.scenarios?.[0]?.saleable_unit ||
-          label)
-        : (inputCand?.saleable_unit || label);
-      const buyerTask = (isR59Replay && typeof inputCand?.buyer_task === 'string' && inputCand.buyer_task.trim())
+      const candSaleableUnit = inputCand?.saleable_unit ||
+        inputCand?.economics?.saleable_unit ||
+        inputCand?.operating_periods?.[0]?.scenarios?.[0]?.saleable_unit ||
+        scored?.economics?.saleable_unit ||
+        scored?.operating_periods?.[0]?.scenarios?.[0]?.saleable_unit ||
+        label;
+      const buyerTask = (typeof inputCand?.buyer_task === 'string' && inputCand.buyer_task.trim())
         ? inputCand.buyer_task.trim()
         : (inputCand?.discovery?.description || candSaleableUnit || label);
-      const frozenComposition = isR59Replay && inputCand?.saleable_set_composition && typeof inputCand.saleable_set_composition === 'object'
+      const frozenComposition = inputCand?.saleable_set_composition && typeof inputCand.saleable_set_composition === 'object'
         ? inputCand.saleable_set_composition
         : { saleable_unit: candSaleableUnit };
-      const frozenGradeOrMaterial = isR59Replay ? (inputCand?.grade_or_material ?? null) : null;
-      const frozenTargetChildAsin = isR59Replay ? (inputCand?.target_child_asin ?? null) : null;
-      const frozenLeafNodePath = isR59Replay ? (inputCand?.leaf_node_path ?? null) : null;
+      const frozenGradeOrMaterial = inputCand?.grade_or_material ?? null;
+      const frozenTargetChildAsin = inputCand?.target_child_asin ?? null;
+      const frozenLeafNodePath = inputCand?.leaf_node_path ?? null;
 
       const { form } = store.upsertCandidateForm({
         form_id: formId,
@@ -667,39 +600,16 @@ export function replayBatchIntoStore(store, {
         target_child_asin: frozenTargetChildAsin,
         leaf_node_path: frozenLeafNodePath,
       }));
-      let activeCandFeeSnapshot = effectiveFeeSnapshot;
-      const deterministicCandInput = (isR59Replay && inputCand && typeof inputCand === 'object' && Object.hasOwn(inputCand, 'evidence_review'))
-        ? (() => { const { evidence_review: _adv, ...rest } = inputCand; return rest; })()
-        : inputCand;
-      let bundleHash = computeEvidenceBundleHash({
+      const deterministicCandInput = stripAdvisoryAttachmentsForBundleHash(inputCand);
+      const bundleHash = computeEvidenceBundleHash({
         form_spec_sha256: replaySpecSha,
         candidate_input: deterministicCandInput,
         discovery_manifest: manifest,
         profile_snapshot: profile,
-        fee_table_snapshot: activeCandFeeSnapshot,
+        fee_table_snapshot: effectiveFeeSnapshot,
       });
-      if (fee_table_snapshot === null && !isR59Replay) {
-        const existingEvals = store.getEvaluationsForForm(formId)
-          .filter(ev => Number(ev.profile_revision) === Number(profile.revision));
-        if (existingEvals.length > 0 && !existingEvals.some(ev => ev.evidence_bundle_sha256 === bundleHash)) {
-          for (const histSnap of getHistoricalFba2027RateTableSnapshots()) {
-            const altHash = computeEvidenceBundleHash({
-              form_spec_sha256: replaySpecSha,
-              candidate_input: inputCand,
-              discovery_manifest: manifest,
-              profile_snapshot: profile,
-              fee_table_snapshot: histSnap,
-            });
-            if (existingEvals.some(ev => ev.evidence_bundle_sha256 === altHash)) {
-              activeCandFeeSnapshot = histSnap;
-              bundleHash = altHash;
-              break;
-            }
-          }
-        }
-      }
 
-      const intrinsicScoredForHash = (isR59Replay && scored && typeof scored === 'object')
+      const intrinsicScoredForHash = (scored && typeof scored === 'object')
         ? (() => {
             const {
               may_exceed_comparable_leader: _batchLeaderCmp,
@@ -711,7 +621,7 @@ export function replayBatchIntoStore(store, {
           })()
         : scored;
       const perCandidateSha = sha256Hex(canonicalJson(intrinsicScoredForHash));
-      const qualification = reconstructVersionQualification(scored, profile.revision);
+      const qualification = scored.qualification;
       const linkedAttempts = findMatchingAttemptIdsForCandidate(store, inputCand, source_attempt_ids, repoRoot);
 
       const periods = Array.isArray(scored.operating_periods) && scored.operating_periods.length > 0
@@ -753,7 +663,7 @@ export function replayBatchIntoStore(store, {
             summary: result.summary,
             batch_id: batch.batch_id ?? null,
           },
-          ...(isR59Replay && inputCand?.evidence_review ? { evidence_review: inputCand.evidence_review } : {}),
+          ...(inputCand?.evidence_review ? { evidence_review: inputCand.evidence_review } : {}),
           source_attempt_ids: linkedAttempts,
         });
         recorded.push(evRes);

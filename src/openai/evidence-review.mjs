@@ -6,9 +6,10 @@
  *  - Semantic post-validation (1:1 subject/question coverage, required-criteria coverage on included subjects,
  *    flexible packet/file/URL/MCP citation references, and rejection of score/weight/price/action fields)
  */
-import { containsSecretToken } from '../contracts.mjs';
+import { assertNonemptyString, containsSecretToken } from '../contracts.mjs';
 import { validEvidenceDate } from '../observations.mjs';
 import { canonicalJson, sha256Hex } from '../store.mjs';
+import { assertPlainObject, deepFreeze, isPlainObject } from '../utils/objects.mjs';
 
 export const SCHEMA_VERSION = 'evidence-review-draft-v1';
 
@@ -35,8 +36,6 @@ const MAX_ATTACHMENT_IMAGE_BYTES = 25 * 1024 * 1024;
 const EXTERNAL_ACTION_DIRECTIVE_RE = /\b(?:execute_command|place_order|send_supplier_message|contact_supplier_now|wire_funds|submit_purchase_order)\b/i;
 
 const NESTED_LOCAL_ONLY_KEYS = new Set([
-  'execution_policy_ref',
-  'executionpolicyref',
   'logical_request_id',
   'logicalrequestid',
   'packet_sha256',
@@ -74,18 +73,6 @@ const FORBIDDEN_OUTPUT_KEYS = new Set([
   'command',
   'shell_command',
 ]);
-
-function deepFreeze(value) {
-  if (value === null || typeof value !== 'object') return value;
-  if (Array.isArray(value)) {
-    for (const item of value) deepFreeze(item);
-    return Object.freeze(value);
-  }
-  for (const key of Object.keys(value)) {
-    deepFreeze(value[key]);
-  }
-  return Object.freeze(value);
-}
 
 export const EVIDENCE_REVIEW_JSON_SCHEMA = deepFreeze({
   type: 'object',
@@ -187,35 +174,6 @@ export const EVIDENCE_REVIEW_JSON_SCHEMA = deepFreeze({
   },
 });
 
-function isPlainObject(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function assertPlainObject(value, label) {
-  if (!isPlainObject(value)) {
-    throw new TypeError(`${label} must be a plain object.`);
-  }
-  for (const dangerous of ['__proto__', 'constructor', 'prototype']) {
-    if (Object.prototype.hasOwnProperty.call(value, dangerous)) {
-      throw new TypeError(`${label} contains forbidden prototype key "${dangerous}".`);
-    }
-  }
-  return value;
-}
-
-function assertNonemptyString(value, label, { maxLength = 4096 } = {}) {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw new TypeError(`${label} must be a nonempty string.`);
-  }
-  const trimmed = value.trim();
-  if (trimmed.length > maxLength) {
-    throw new RangeError(`${label} exceeds maximum length of ${maxLength} characters.`);
-  }
-  return trimmed;
-}
-
 function assertSafeIdentifier(value, label) {
   const trimmed = assertNonemptyString(value, label, { maxLength: 128 });
   if (!SAFE_ID_RE.test(trimmed)) {
@@ -234,217 +192,6 @@ function normalizeAttachmentSha256List(rawList, label = 'attachment_sha256s') {
     }
     return entry.trim();
   });
-}
-
-function makePolicyDisabledError(message) {
-  const err = new TypeError(message);
-  err.code = 'EXECUTION_POLICY_DISABLED';
-  return err;
-}
-
-export const DEFAULT_AUTHORIZED_REVIEW_POLICIES = deepFreeze({
-  'local-authorized-policy': {
-    policy_id: 'local-authorized-policy',
-    enabled: true,
-    allow_external_review: true,
-    allow_attachments: true,
-  },
-  'local-policy-only': {
-    policy_id: 'local-policy-only',
-    enabled: true,
-    allow_external_review: true,
-    allow_attachments: true,
-  },
-});
-
-function verifyResolvedReviewPolicyObject(policyObj, rawPacket, {
-  hasAttachments = false,
-  frozenPacket = null,
-  policyLabel = 'execution_policy_ref',
-} = {}) {
-  if (!isPlainObject(policyObj)) {
-    throw makePolicyDisabledError(`${policyLabel} must resolve to a plain policy object with enabled: true.`);
-  }
-  assertPlainObject(policyObj, policyLabel);
-  if (!Object.hasOwn(policyObj, 'enabled') || typeof policyObj.enabled !== 'boolean') {
-    throw makePolicyDisabledError(`${policyLabel} policy object must declare boolean enabled: true.`);
-  }
-  if (policyObj.enabled !== true) {
-    throw makePolicyDisabledError(`${policyLabel}.enabled is false; live evidence review is disabled by policy.`);
-  }
-  if (Object.hasOwn(policyObj, 'allow_external_review')) {
-    if (typeof policyObj.allow_external_review !== 'boolean' || policyObj.allow_external_review !== true) {
-      throw makePolicyDisabledError(`${policyLabel}.allow_external_review must be true for live evidence review.`);
-    }
-  }
-  if (hasAttachments && Object.hasOwn(policyObj, 'allow_attachments')) {
-    if (typeof policyObj.allow_attachments !== 'boolean' || policyObj.allow_attachments !== true) {
-      throw makePolicyDisabledError(`${policyLabel}.allow_attachments is false; packet attachments are not authorized for disclosure.`);
-    }
-  }
-  if (Object.hasOwn(policyObj, 'allowed_review_ids') && policyObj.allowed_review_ids !== undefined && policyObj.allowed_review_ids !== null) {
-    if (!Array.isArray(policyObj.allowed_review_ids)) {
-      throw makePolicyDisabledError(`${policyLabel}.allowed_review_ids must be an array when provided.`);
-    }
-    const revId = typeof rawPacket?.review_id === 'string' ? rawPacket.review_id.trim() : '';
-    if (!revId || !policyObj.allowed_review_ids.includes(revId)) {
-      throw makePolicyDisabledError(`${policyLabel} does not authorize review_id "${revId}".`);
-    }
-  }
-  if (Object.hasOwn(policyObj, 'allowed_packet_sha256') && policyObj.allowed_packet_sha256 !== undefined && policyObj.allowed_packet_sha256 !== null) {
-    if (typeof policyObj.allowed_packet_sha256 !== 'string' || !HEX_SHA256_RE.test(policyObj.allowed_packet_sha256)) {
-      throw makePolicyDisabledError(`${policyLabel}.allowed_packet_sha256 must be a 64-char hex SHA-256 when provided.`);
-    }
-    if (frozenPacket && frozenPacket.packet_sha256 !== policyObj.allowed_packet_sha256) {
-      throw makePolicyDisabledError(`${policyLabel}.allowed_packet_sha256 does not match frozen packet_sha256.`);
-    }
-  }
-  return Object.freeze({ ...policyObj });
-}
-
-/**
- * Verify local execution policy authorization BEFORE/AT live dispatch for an evidence-review packet.
- * Resolves string `execution_policy_ref` identifiers against `options.resolvePolicy` /
- * `options.authorizedPolicies` / `options.authorizedPolicyIds` (defaulting to
- * `DEFAULT_AUTHORIZED_REVIEW_POLICIES`), or validates an explicit `{ enabled: true }` policy object,
- * checking attachment & packet bindings when present.
- */
-export function assertAuthorizedReviewExecutionPolicy(rawPacket, options = {}) {
-  if (options !== undefined && options !== null) {
-    assertPlainObject(options, 'policyOptions');
-  }
-  const opts = options ?? {};
-  if (!isPlainObject(rawPacket)) {
-    throw makePolicyDisabledError('evidence_review_packet must be a plain object with an authorized execution_policy_ref.');
-  }
-  for (const dangerous of ['__proto__', 'constructor', 'prototype']) {
-    if (Object.prototype.hasOwnProperty.call(rawPacket, dangerous)) {
-      throw new TypeError(`evidence_review_packet contains forbidden prototype key "${dangerous}".`);
-    }
-  }
-  if (Object.prototype.hasOwnProperty.call(rawPacket, 'executionPolicyRef') && rawPacket.executionPolicyRef !== undefined) {
-    throw makePolicyDisabledError('evidence_review_packet.executionPolicyRef is forbidden; supply execution_policy_ref.');
-  }
-  if (!Object.hasOwn(rawPacket, 'execution_policy_ref')) {
-    throw makePolicyDisabledError(
-      'Missing execution_policy_ref on evidence_review_packet; live execution requires an explicit authorized policy.',
-    );
-  }
-  const ref = rawPacket.execution_policy_ref;
-  if (ref === null || ref === undefined) {
-    throw makePolicyDisabledError(
-      'execution_policy_ref is null/disabled; live execution requires a registered policy ID or { enabled: true }.',
-    );
-  }
-
-  const hasAttachments = Boolean(
-    opts.hasAttachments === true ||
-    (Array.isArray(rawPacket.attachment_sha256s) && rawPacket.attachment_sha256s.length > 0) ||
-    (Array.isArray(opts.frozenPacket?.attachment_sha256s) && opts.frozenPacket.attachment_sha256s.length > 0),
-  );
-
-  const resolveNamedRef = (trimmedId) => {
-    const resolverFn = typeof opts.resolvePolicy === 'function'
-      ? opts.resolvePolicy
-      : (typeof opts.authorizedPolicies === 'function' ? opts.authorizedPolicies : null);
-    if (resolverFn) {
-      const resolved = resolverFn(trimmedId, {
-        packet: rawPacket,
-        frozenPacket: opts.frozenPacket ?? null,
-        hasAttachments,
-      });
-      if (resolved === true) {
-        return Object.freeze({ policy_id: trimmedId, enabled: true });
-      }
-      if (!resolved) {
-        throw makePolicyDisabledError(`execution_policy_ref "${trimmedId}" was rejected by local policy resolver.`);
-      }
-      return verifyResolvedReviewPolicyObject(resolved, rawPacket, {
-        hasAttachments,
-        frozenPacket: opts.frozenPacket ?? null,
-        policyLabel: `execution_policy_ref["${trimmedId}"]`,
-      });
-    }
-
-    if (opts.authorizedPolicies instanceof Map) {
-      if (!opts.authorizedPolicies.has(trimmedId)) {
-        throw makePolicyDisabledError(`execution_policy_ref "${trimmedId}" is not registered in authorizedPolicies.`);
-      }
-      const entry = opts.authorizedPolicies.get(trimmedId);
-      if (entry === true) return Object.freeze({ policy_id: trimmedId, enabled: true });
-      return verifyResolvedReviewPolicyObject(entry, rawPacket, {
-        hasAttachments,
-        frozenPacket: opts.frozenPacket ?? null,
-        policyLabel: `authorizedPolicies["${trimmedId}"]`,
-      });
-    }
-
-    if (opts.authorizedPolicies !== undefined && opts.authorizedPolicies !== null) {
-      assertPlainObject(opts.authorizedPolicies, 'options.authorizedPolicies');
-      if (!Object.hasOwn(opts.authorizedPolicies, trimmedId)) {
-        throw makePolicyDisabledError(`execution_policy_ref "${trimmedId}" is not registered in authorizedPolicies.`);
-      }
-      const entry = opts.authorizedPolicies[trimmedId];
-      if (entry === true) return Object.freeze({ policy_id: trimmedId, enabled: true });
-      return verifyResolvedReviewPolicyObject(entry, rawPacket, {
-        hasAttachments,
-        frozenPacket: opts.frozenPacket ?? null,
-        policyLabel: `authorizedPolicies["${trimmedId}"]`,
-      });
-    }
-
-    if (opts.authorizedPolicyIds !== undefined && opts.authorizedPolicyIds !== null) {
-      if (!Array.isArray(opts.authorizedPolicyIds) && !(opts.authorizedPolicyIds instanceof Set)) {
-        throw new TypeError('options.authorizedPolicyIds must be an Array or Set of policy ID strings.');
-      }
-      const idSet = new Set(opts.authorizedPolicyIds);
-      if (!idSet.has(trimmedId)) {
-        throw makePolicyDisabledError(`execution_policy_ref "${trimmedId}" is not in authorizedPolicyIds.`);
-      }
-      return Object.freeze({ policy_id: trimmedId, enabled: true });
-    }
-
-    if (!Object.hasOwn(DEFAULT_AUTHORIZED_REVIEW_POLICIES, trimmedId)) {
-      throw makePolicyDisabledError(
-        `execution_policy_ref "${trimmedId}" is not registered in the trusted local review policy registry.`,
-      );
-    }
-    return verifyResolvedReviewPolicyObject(DEFAULT_AUTHORIZED_REVIEW_POLICIES[trimmedId], rawPacket, {
-      hasAttachments,
-      frozenPacket: opts.frozenPacket ?? null,
-      policyLabel: `DEFAULT_AUTHORIZED_REVIEW_POLICIES["${trimmedId}"]`,
-    });
-  };
-
-  if (typeof ref === 'string') {
-    const trimmed = ref.trim();
-    if (!trimmed || /[\0\r\n]/.test(ref) || trimmed.length > 512) {
-      throw makePolicyDisabledError('execution_policy_ref string must be a non-empty single-line policy identifier.');
-    }
-    const resolvedPolicy = resolveNamedRef(trimmed);
-    return Object.freeze({ authorized: true, policy_ref: trimmed, resolved_policy: resolvedPolicy });
-  }
-  if (isPlainObject(ref)) {
-    const verifiedObj = verifyResolvedReviewPolicyObject(ref, rawPacket, {
-      hasAttachments,
-      frozenPacket: opts.frozenPacket ?? null,
-      policyLabel: 'execution_policy_ref',
-    });
-    if (Object.hasOwn(ref, 'policy_id') && ref.policy_id !== undefined) {
-      if (typeof ref.policy_id !== 'string' || !ref.policy_id.trim() || /[\0\r\n]/.test(ref.policy_id) || ref.policy_id.trim().length > 512) {
-        throw makePolicyDisabledError('execution_policy_ref.policy_id must be a non-empty single-line policy identifier when provided.');
-      }
-      if (
-        opts.resolvePolicy !== undefined ||
-        opts.authorizedPolicies !== undefined ||
-        opts.authorizedPolicyIds !== undefined
-      ) {
-        resolveNamedRef(ref.policy_id.trim());
-      }
-    }
-    return Object.freeze({ authorized: true, policy_ref: verifiedObj, resolved_policy: verifiedObj });
-  }
-  throw makePolicyDisabledError('execution_policy_ref must be a registered policy ID string or a plain object with enabled: true.');
 }
 
 function hasValidAttachmentMagicBytes(buf, format) {
@@ -728,9 +475,9 @@ function buildCanonicalPacketContent(packet) {
 }
 
 /**
- * Validate, sanitize, strip `execution_policy_ref`, enforce first-slice admission bounds,
+ * Validate, sanitize, enforce first-slice admission bounds,
  * reject raw HTTP(S) URLs and nested local-only keys across the full packet tree, and bind `packet_sha256`
- * over canonical packet content (excluding `packet_sha256` and `execution_policy_ref`).
+ * over canonical packet content (excluding `packet_sha256`).
  */
 export function freezeEvidenceReviewPacket(input) {
   assertPlainObject(input, 'evidence_review_packet');
@@ -738,7 +485,7 @@ export function freezeEvidenceReviewPacket(input) {
     throw new TypeError('evidence_review_packet_input contains a secret or credential token; redact before freezing.');
   }
 
-  for (const forbiddenTopAlias of ['executionPolicyRef', 'logical_request_id', 'logicalRequestId', 'packetSha256']) {
+  for (const forbiddenTopAlias of ['logical_request_id', 'logicalRequestId', 'packetSha256']) {
     if (Object.prototype.hasOwnProperty.call(input, forbiddenTopAlias) && input[forbiddenTopAlias] !== undefined) {
       throw new TypeError(`evidence_review_packet.${forbiddenTopAlias} is a forbidden local-only field.`);
     }
@@ -764,22 +511,6 @@ export function freezeEvidenceReviewPacket(input) {
   const attachmentSha256s = input.attachment_sha256s === undefined || input.attachment_sha256s === null
     ? null
     : normalizeAttachmentSha256List(input.attachment_sha256s, 'attachment_sha256s');
-
-  // Validate local-only execution_policy_ref type if present, then strip it completely from frozen output.
-  if (input.execution_policy_ref !== undefined && input.execution_policy_ref !== null) {
-    if (typeof input.execution_policy_ref !== 'string' && !isPlainObject(input.execution_policy_ref)) {
-      throw new TypeError('execution_policy_ref must be null, a policy ID string, or a plain policy object.');
-    }
-    if (isPlainObject(input.execution_policy_ref)) {
-      assertPlainObject(input.execution_policy_ref, 'execution_policy_ref');
-      if (
-        Object.hasOwn(input.execution_policy_ref, 'enabled') &&
-        typeof input.execution_policy_ref.enabled !== 'boolean'
-      ) {
-        throw new TypeError('execution_policy_ref.enabled must be a boolean when provided.');
-      }
-    }
-  }
 
   // 1. Candidate
   const rawCandidate = assertPlainObject(input.candidate, 'candidate');
@@ -1056,7 +787,7 @@ function ensureVerifiedFrozenPacket(frozenPacket) {
   if (!HEX_SHA256_RE.test(String(frozenPacket.packet_sha256 || ''))) {
     throw new TypeError('frozenPacket.packet_sha256 must be a valid 64-character lowercase hex SHA-256 digest.');
   }
-  for (const localKey of ['execution_policy_ref', 'executionPolicyRef', 'logical_request_id', 'logicalRequestId', 'packetSha256']) {
+  for (const localKey of ['logical_request_id', 'logicalRequestId', 'packetSha256']) {
     if (Object.prototype.hasOwnProperty.call(frozenPacket, localKey)) {
       throw new TypeError(`frozenPacket must not retain local-only ${localKey}.`);
     }
@@ -1444,33 +1175,12 @@ export function buildEvidenceReviewResponseRequest(packetInput, {
   reasoningEffort = 'xhigh',
   maxOutputTokens = 16384,
   attachmentDataUrls = undefined,
-  allowOfflineDraftWithoutPolicy = false,
-  authorizedPolicies = undefined,
-  authorizedPolicyIds = undefined,
-  resolvePolicy = undefined,
+  liveEnabled = false,
 } = {}) {
-  if (typeof allowOfflineDraftWithoutPolicy !== 'boolean') {
-    throw new TypeError('allowOfflineDraftWithoutPolicy must be a boolean.');
-  }
-  const hasSuppliedAttachments = Array.isArray(attachmentDataUrls) && attachmentDataUrls.length > 0;
-  if (allowOfflineDraftWithoutPolicy !== true) {
-    assertAuthorizedReviewExecutionPolicy(packetInput, {
-      authorizedPolicies,
-      authorizedPolicyIds,
-      resolvePolicy,
-      hasAttachments: hasSuppliedAttachments,
-    });
+  if (typeof liveEnabled !== 'boolean') {
+    throw new TypeError('liveEnabled must be a boolean.');
   }
   const frozen = freezeEvidenceReviewPacket(packetInput);
-  if (allowOfflineDraftWithoutPolicy !== true) {
-    assertAuthorizedReviewExecutionPolicy(packetInput, {
-      authorizedPolicies,
-      authorizedPolicyIds,
-      resolvePolicy,
-      hasAttachments: hasSuppliedAttachments || (Array.isArray(frozen.attachment_sha256s) && frozen.attachment_sha256s.length > 0),
-      frozenPacket: frozen,
-    });
-  }
   if (/astra/i.test(String(model))) {
     throw new TypeError('Flagship Astra models are blocked on paid Responses API; use runCodexEvidenceReview via local subscription Codex CLI.');
   }
@@ -1521,7 +1231,7 @@ export function buildEvidenceReviewResponseRequest(packetInput, {
     writable: false,
     configurable: false,
   });
-  if (allowOfflineDraftWithoutPolicy === true) {
+  if (liveEnabled !== true) {
     Object.defineProperty(req, '_offline_draft_only', {
       value: true,
       enumerable: true,

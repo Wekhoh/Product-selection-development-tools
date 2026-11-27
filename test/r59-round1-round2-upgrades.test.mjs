@@ -2221,8 +2221,11 @@ test('Astra Full-Capability Audit Round-1 Remediations (B1, H1-H16, M1-M9, L1)',
     assert.equal(lookupUnifiedPlacementFee2027({ pkg: specOverPkg }).selected_usd, 0, 'M1: special_oversize_light exempt ($0.00) from placement');
     assert.equal(lookupUnifiedReturnsProcessing2027({ pkg: specOverPkg, physical_return_fraction: 0.08, fee_category: 'Home and Kitchen' }).status, 'verified');
 
-    assert.equal(getFba2027RateTableSnapshot({ profileRevision: 58 }).oversize_2027_tiers, undefined, 'M3: r58 snapshot frozen without r59 tables');
-    assert.equal(getFba2027RateTableSnapshot({ profileRevision: 58 }).metadata.default_off_peak_window, undefined, 'M3: r58 metadata frozen');
+    assert.throws(
+      () => getFba2027RateTableSnapshot({ profileRevision: 58 }),
+      /retired|59/i,
+      'M3: pre-r59 rate snapshots retired in active runtime',
+    );
     assert.equal(getFba2027RateTableSnapshot({ profileRevision: 59 }).metadata.default_off_peak_window.through, '2027-10-14');
     assert.equal(Array.isArray(getFba2027RateTableSnapshot({ profileRevision: 59 }).oversize_2027_tiers), true);
     assert.equal(canonicalizeConnectorToolName('mcp__codex_apps__amz_spapi_sp_api_execute'), 'sp_api_execute', 'M5: amz_spapi prefix stripped');

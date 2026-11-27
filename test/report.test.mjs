@@ -273,3 +273,315 @@ test('r58 curatorial studio gallery embeds offline WOFF2 fonts, Polar Rose SVG, 
   assert.doesNotMatch(renderReport(scoreBatch(badBatch, profile), badBatch), /<img\b/);
 });
 
+test('presentation.summary, presentation.risks, presentation.next_checks, and related presentation free-text scrub raw emails in rendered HTML', () => {
+  const batch = structuredClone(fixture);
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFz8AAAAASUVORK5CYII=';
+  batch.presentation.title = '批次标题 contact.batch@vendor.org';
+  batch.presentation.summary = '批次摘要 owner.batch@example.net';
+  batch.presentation.discovery = [{ label: '线索发现', detail: '来自 disc@example.org', source: 'src@example.org' }];
+  batch.presentation.timings = [{ label: '耗时阶段', seconds: 12, note: '执行人 timing@example.org' }];
+  batch.presentation.limitations = ['边界限制 lim@example.org'];
+  batch.packaging_redesign_shortlist = [
+    {
+      form_id: 'pkg-rescue-probe',
+      label: '改包装候选 pkg.label@vendor.cn',
+      eligible: true,
+      price_usd: 35,
+      overshoot_mm: 4,
+      original_margin: 0.27,
+      redesigned_margin: 0.33,
+      offending_side: 'longest',
+      summary_zh: '压缩包装说明 pkg.note@vendor.cn',
+    },
+  ];
+  batch.candidates[0].label = '候选产品 label@vendor.cn';
+  batch.candidates[0].form = '可售规格 form@vendor.cn';
+  batch.candidates[0].presentation.summary = '候选摘要 test.user@supplier.cn 请核对';
+  batch.candidates[0].presentation.subtitle_en = 'Subtitle sub@vendor.cn';
+  batch.candidates[0].presentation.one_time_lab_fee_note = '一次性实验室检测费 lab.fee@vendor.cn（不摊进单件）';
+  batch.candidates[0].presentation.concept_images = [
+    {
+      data_uri: png,
+      title: '概念图标题 concept.title@vendor.cn',
+      caption: '概念图说明 concept.caption@vendor.cn',
+      alt: '概念图替代文本 concept.alt@vendor.cn',
+    },
+  ];
+  batch.candidates[0].presentation.risks = [
+    '风险一：联系 leaked@domain.com 核对报价',
+    { label: '结构风险', value: 'objval@domain.com', note: '附注 objnote@domain.com', source: 'objsrc@domain.com' },
+  ];
+  batch.candidates[0].presentation.next_checks = [
+    '下一步：向 next.check@factory.cn 要包材尺寸',
+    { problem: '待查项目 prob@factory.cn', next_step: '跟进 step@factory.cn' },
+  ];
+  batch.candidates[0].presentation.blockers = [
+    { problem: '阻断问题 blk@factory.cn（通过旺旺核对）', next_step: '处置 blkstep@factory.cn' },
+  ];
+  batch.candidates[0].presentation.procurement = [
+    { label: '采购联系 proc@factory.cn', value: 'val@factory.cn', note: 'note@factory.cn', source: 'src2@factory.cn' },
+  ];
+
+  const scored = scoreBatch(batch, profile);
+  scored.candidates[0].diagnostics.operational_disclosures = [
+    { id: 'ops_probe', label: '核查项 ops.label@vendor.cn', status: 'needs_check', note: '排雷备注 ops.note@vendor.cn' },
+  ];
+  const html = renderReport(scored, batch);
+  for (const rawEmail of [
+    'contact.batch@vendor.org',
+    'owner.batch@example.net',
+    'disc@example.org',
+    'src@example.org',
+    'timing@example.org',
+    'lim@example.org',
+    'pkg.label@vendor.cn',
+    'pkg.note@vendor.cn',
+    'label@vendor.cn',
+    'form@vendor.cn',
+    'test.user@supplier.cn',
+    'sub@vendor.cn',
+    'lab.fee@vendor.cn',
+    'concept.title@vendor.cn',
+    'concept.caption@vendor.cn',
+    'concept.alt@vendor.cn',
+    'leaked@domain.com',
+    'objval@domain.com',
+    'objnote@domain.com',
+    'objsrc@domain.com',
+    'next.check@factory.cn',
+    'prob@factory.cn',
+    'step@factory.cn',
+    'blk@factory.cn',
+    'blkstep@factory.cn',
+    'proc@factory.cn',
+    'val@factory.cn',
+    'note@factory.cn',
+    'src2@factory.cn',
+    'ops.label@vendor.cn',
+    'ops.note@vendor.cn',
+  ]) {
+    assert.equal(html.includes(rawEmail), false, `raw email ${rawEmail} must not leak into rendered HTML`);
+  }
+  assert.match(html, /\[REDACTED_EMAIL\]/);
+  const matrixRow = html.match(/<th scope="row"><a class="row-jump" href="#candidate-1">[\s\S]*?<\/a><\/th>/)?.[0] ?? '';
+  assert.match(matrixRow, /候选产品 \[REDACTED_EMAIL\]/);
+  const reelSection = html.match(/<section class="exhibition-reel"[\s\S]*?<\/section>/)?.[0] ?? '';
+  assert.match(reelSection, /候选产品 \[REDACTED_EMAIL\]/);
+  const cardHeading = html.match(/<article class="candidate" id="candidate-1"[\s\S]*?<h2>([\s\S]*?)<\/h2>/)?.[1] ?? '';
+  assert.match(cardHeading, /候选产品 \[REDACTED_EMAIL\]/);
+  assert.match(html, /<p class="spec-copy">可售规格 \[REDACTED_EMAIL\]<\/p>/);
+  assert.match(html, /一次性实验室检测费 \[REDACTED_EMAIL\]/);
+  assert.match(html, /概念图标题 \[REDACTED_EMAIL\]/);
+  assert.match(html, /概念图说明 \[REDACTED_EMAIL\]/);
+  assert.match(html, /alt="概念图替代文本 \[REDACTED_EMAIL\]"/);
+  assert.match(html, /核查项 \[REDACTED_EMAIL\]/);
+  assert.match(html, /排雷备注 \[REDACTED_EMAIL\]/);
+  assert.match(html, /改包装候选 \[REDACTED_EMAIL\]/);
+  assert.match(html, /压缩包装说明 \[REDACTED_EMAIL\]/);
+  assert.match(html, /阻断问题 \[REDACTED_EMAIL\]（通过1688 问厂核对）/);
+  assert.doesNotMatch(html, /旺旺/);
+});
+
+test('all remaining HTML free-text render paths scrub raw emails/paths while preserving https:// URLs with /Users/ segments', () => {
+  const batch = structuredClone(fixture);
+  batch.candidates = [structuredClone(batch.candidates[0])];
+  batch.candidates[0].evidence[0].source = '来源 bib-link@probe.cn';
+  Object.assign(batch.candidates[0].metrics.purchase_demand_scale, {
+    value: null,
+    value_range: [100, 500],
+    coherent: true,
+    range_basis: '区间依据 range-basis@probe.cn',
+    niche: '市场 niche-range@probe.cn',
+    period: '窗口 period-range@probe.cn',
+  });
+  Object.assign(batch.candidates[0].metrics.low_return_preference, {
+    niche: '市场 niche-val@probe.cn',
+    category: '类目 cat-val@probe.cn',
+    period: '窗口 period-val@probe.cn',
+  });
+  const png = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFz8AAAAASUVORK5CYII=';
+  batch.candidates[0].presentation.image_data_uri = png;
+  batch.candidates[0].presentation.summary = '公开文档 https://example.com/Users/keepme 与 https://example.com/home/keepme 本地 /Users/alice_secret/doc.txt 共享 \\\\fileserver\\Users\\bob_secret\\quote.txt';
+  batch.candidates[0].discovery = {
+    label: '发现路径',
+    description: '来源说明',
+    leads: [],
+    store_leads: [
+      {
+        lead_id: 'ld-url-keep',
+        phrase_or_title: '保真链接测试',
+        source_channel: 'reddit',
+        source_ref: 'https://example.com/Users/keepme',
+        observed_at: '2026-11-26',
+        disposition: 'product',
+      },
+    ],
+  };
+  batch.candidates[0].sp_api_calibration = {
+    asin: 'B0SPAPI01',
+    stale_dimension_alert: true,
+    stale_dimension_note: '尺寸陈旧 spapi-stale@probe.cn',
+    restrictions: { status: '限售 spapi-rest@probe.cn' },
+  };
+  batch.candidates[0].peer_package_calibration = {
+    valid: true,
+    peer_count: 3,
+    median_pkg: { length_in: 10, width_in: 6, height_in: 4, unit_weight_lb: 1.2 },
+    supplier_borderline_alert: true,
+    sample_warning_tag: '压线 warn-tag@probe.cn',
+    supplier_borderline_note: '压线注 peer-note@probe.cn',
+  };
+  batch.candidates[0].review_notes = [
+    '复核字符串 revnote-str@probe.cn',
+    { kind: 'CALIBRATION_NOTE', reviewer: 'Alice Reviewer', note: '复核对象 revnote-obj@probe.cn' },
+  ];
+
+  const scored = scoreBatch(batch, profile);
+  const demandItem = scored.candidates[0].items.find(i => i.id === 'purchase_demand_scale');
+  demandItem.reason = '分项说明 item-reason@probe.cn（旺旺核对）';
+
+  const bidItem = scored.candidates[0].items.find(i => i.id === 'relevant_purchase_entry_bid');
+  bidItem.unbid_after_all_tiers = true;
+  bidItem.deduction_note = '扣分说明 bid-deduct@probe.cn';
+  bidItem.long_tail_opportunistic_terms = [{ query: 'longtail-q@probe.cn', volume: 120 }];
+  bidItem.entries[0].query = 'entry-q@probe.cn';
+  bidItem.entries[0].combined_point = 1.15;
+  bidItem.entries[0].low_exposure_baseline = true;
+  bidItem.entries[0].low_exposure_note = '低曝光 lowexp@probe.cn';
+  bidItem.entries.push({
+    query: 'entry2-q@probe.cn',
+    volume: 200,
+    source_label: 'sif_only',
+    combined_point: null,
+    sources: {
+      sellersprite: { point: null },
+      sif: {
+        point: null,
+        reason: 'SIF缺值 reading-reason@probe.cn',
+        strategy_fallback_note: '策略回退 strat-fb@probe.cn',
+      },
+    },
+  });
+
+  const q31Item = scored.candidates[0].items.find(i => i.id === 'low_rating_sales_performance');
+  q31Item.absence_note = '无新品 q31-abs@probe.cn';
+  q31Item.rolling_source_disclosure = '滚动披露 q31-roll@probe.cn';
+  q31Item.stratified_disclosure = '分层披露 q31-strat@probe.cn';
+  q31Item.stratified_note = '分层附注 q31-stratnote@probe.cn';
+
+  const nc = scored.candidates[0].diagnostics.newcomers;
+  nc.no_qualifying_examples = true;
+  nc.absence_note = '无样板 nc-abs@probe.cn';
+  nc.lone_newcomer_alert = true;
+  nc.lone_newcomer_note = '孤例预警 q31-lone@probe.cn';
+  nc.stratification = {
+    applied: true,
+    disclosure: '分层披露 nc-strat@probe.cn',
+    active_pool_size: 8,
+    sampled_count: 5,
+    unsampled_count: 3,
+    stratified_bounds: [1, 3],
+    natural_stratified_note: '自然分层注 nc-stratnote@probe.cn',
+    strata: [],
+  };
+  if (nc.examples?.[0]) {
+    nc.examples[0].natural.score = null;
+    nc.examples[0].natural.reason = '自然缺因 nc-natreason@probe.cn';
+    nc.examples[0].natural.coverage_exposure_mismatch = true;
+    nc.examples[0].natural.coverage_exposure_diagnosis = '自然诊断 nc-natdiag@probe.cn';
+    const matchingMember = nc.members.find(m => m.family_id === nc.examples[0].family_id && m.asin === nc.examples[0].asin);
+    if (matchingMember) {
+      matchingMember.reason = '纳入理由 nc-rawreason@probe.cn';
+      matchingMember.review_origin_breakdown = { display_zh: '评论构成 nc-revorigin@probe.cn' };
+    }
+  }
+  nc.members.push({
+    family_id: 'fam-excl-probe',
+    asin: 'B0EXCLPROBE',
+    effective_status: 'excluded',
+    reason: '排除理由 nc-memreason@probe.cn',
+  });
+
+  const seasonalCand = structuredClone(scored.candidates[0]);
+  seasonalCand.candidate_id = 'seasonal-probe-1';
+  seasonalCand.label = '分季探测款';
+  seasonalCand.queue = 'seasonal_review';
+  seasonalCand.operating_periods = [
+    {
+      id: 'off_peak',
+      label: '淡季 2–9 月',
+      months: [2, 3, 4, 5, 6, 7, 8, 9],
+      queue: 'comparable',
+      unpublished_peak_note: '旺季待定 unpub-peak@probe.cn',
+      diagnostics: { economics: { scenarios: [] } },
+      items: [],
+      screening: { conditions: [] },
+      supported_range: [50, 60],
+      covered_weight: 80,
+      total_range: [50, 60],
+    },
+  ];
+  scored.candidates.push(seasonalCand);
+  const seasonalOrig = structuredClone(batch.candidates[0]);
+  seasonalOrig.id = 'seasonal-probe-1';
+  batch.candidates.push(seasonalOrig);
+
+  const html59 = renderReport(scored, batch);
+  const scored58 = structuredClone(scored);
+  scored58.profile_revision = 58;
+  scored58.candidates.forEach(c => { c.profile_revision = 58; });
+  const html58 = renderReport(scored58, batch);
+
+  const leakedProbes = [
+    'bib-link@probe.cn',
+    'range-basis@probe.cn',
+    'niche-range@probe.cn',
+    'period-range@probe.cn',
+    'niche-val@probe.cn',
+    'cat-val@probe.cn',
+    'period-val@probe.cn',
+    'spapi-stale@probe.cn',
+    'spapi-rest@probe.cn',
+    'warn-tag@probe.cn',
+    'peer-note@probe.cn',
+    'revnote-str@probe.cn',
+    'revnote-obj@probe.cn',
+    'item-reason@probe.cn',
+    'bid-deduct@probe.cn',
+    'longtail-q@probe.cn',
+    'entry-q@probe.cn',
+    'lowexp@probe.cn',
+    'reading-reason@probe.cn',
+    'strat-fb@probe.cn',
+    'q31-abs@probe.cn',
+    'q31-roll@probe.cn',
+    'q31-strat@probe.cn',
+    'q31-stratnote@probe.cn',
+    'q31-lone@probe.cn',
+    'nc-abs@probe.cn',
+    'nc-strat@probe.cn',
+    'nc-stratnote@probe.cn',
+    'nc-natreason@probe.cn',
+    'nc-natdiag@probe.cn',
+    'nc-rawreason@probe.cn',
+    'nc-revorigin@probe.cn',
+    'nc-memreason@probe.cn',
+    'unpub-peak@probe.cn',
+    'alice_secret',
+    'bob_secret',
+  ];
+  for (const token of leakedProbes) {
+    assert.equal(html59.includes(token), false, `token ${token} must not leak into r59 HTML`);
+  }
+  assert.equal(html58.includes('revnote-str@probe.cn'), false, 'r58 review_notes string must be scrubbed');
+  assert.equal(html58.includes('revnote-obj@probe.cn'), false, 'r58 review_notes object must be scrubbed');
+  assert.equal(html58.includes('Alice Reviewer'), false, 'r58 review_notes reviewer PII must be redacted');
+  assert.doesNotMatch(html59, /旺旺/);
+  assert.match(html59, /1688 问厂核对/);
+  assert.ok(html59.includes('https://example.com/Users/keepme'), 'https:// URL with /Users/ segment must be preserved');
+  assert.ok(html59.includes('https://example.com/home/keepme'), 'https:// URL with /home/ segment must be preserved');
+  assert.ok(html59.includes(png), 'data:image/png;base64 URI must be preserved untouched');
+  assert.match(html59, /依据：<a href="#candidate-1-e0">来源 \[REDACTED_EMAIL\] \[1\]<\/a>/);
+  assert.match(html59, /旺季待定 \[REDACTED_EMAIL\]/);
+});
+

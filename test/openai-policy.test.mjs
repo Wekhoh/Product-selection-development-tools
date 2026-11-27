@@ -304,3 +304,57 @@ test('background response ID and single cancel dispatch survive independent open
   assert.equal(ledger.getAttemptById(attempt.attempt_id).background_cancel_dispatched_at, `${MONTH}-15T00:00:00.000Z`);
   assert.equal(ledger.getMonthlySummary().effective_committed_cents, 0);
 });
+
+test('fresh blank DB configures and reserves directly without legacy reconciliation deadlock (Ray 4)', (t) => {
+  const { dbPath } = createFixture(t);
+  const blankLedger = new OpenAiBudgetLedger(dbPath, { testMode: false });
+  try {
+    const policy = blankLedger.configurePolicy({
+      enabled: true,
+      autoRechargeOffConfirmed: true,
+      hardMonthlyLimitConfirmed: true,
+    });
+    assert.equal(policy.enabled, true);
+    assert.equal(policy.monthly_limit_cents, 20_000);
+    assert.equal(policy.legacy_reconciled, false);
+
+    const curMonth = new Date().toISOString().slice(0, 7);
+    const attempt = blankLedger.reserveBillableRequest({
+      endpoint: '/v1/responses',
+      model: MODEL,
+      logicalRequestId: 'blank-db-direct-01',
+      reservedCents: 12,
+      payloadSha256: DIGEST,
+    });
+    assert.equal(attempt.reserved_cents, 12);
+    assert.equal(blankLedger.getMonthlySummary({ monthUtc: curMonth }).active_attempt_count, 1);
+    blankLedger.reconcileAttempt(attempt.attempt_id, {
+      status: 'completed',
+      usageCostMicros: 120_000,
+      note: 'Settled realized cost on blank DB',
+    });
+    assert.equal(blankLedger.getMonthlySummary({ monthUtc: curMonth }).remaining_cents, 20_000 - 12);
+  } finally {
+    blankLedger.close();
+  }
+});
+
+test('openai_legacy_carryover ($15.50) and usage_cost_micros aggregate accurately in getMonthlySummary', (t) => {
+  const { dbPath, openLedger } = createFixture(t);
+  const ledger = openLedger(dbPath);
+  ledger.configurePolicy({
+    enabled: true,
+    autoRechargeOffConfirmed: true,
+    hardMonthlyLimitConfirmed: true,
+    monthlyLimitCents: 20_000,
+  });
+  ledger.db.prepare(`
+    INSERT INTO openai_legacy_carryover (account_scope, month_utc, carryover_cents, source_sha256, summary_json, reconciled_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run('openai-default', MONTH, 1550, DIGEST, '{}', `${MONTH}-01T00:00:00Z`);
+
+  const summary = ledger.getMonthlySummary({ monthUtc: MONTH });
+  assert.equal(summary.legacy_carryover_cents, 1550);
+  assert.equal(summary.effective_committed_cents, 1550);
+  assert.equal(summary.remaining_cents, 18_450);
+});
