@@ -9,8 +9,8 @@ Status: development process, updated 2026-11-26. The bounded native-research, of
 | [AGENTS.md](../AGENTS.md) | Ownership, independence, privacy and engineering constraints |
 | [SPEC.md](SPEC.md) | Single active business specification, 4-step workflow blueprint, model boundaries, and permanent Non-Goals |
 | [Architecture decision records](adr/0001-decouple-steady-state-freight-from-100-set-sourcing.md) | Concise records of hard-to-reverse architectural and business-boundary tradeoffs (options, rationale, consequences) |
-| [PRODUCT.md](PRODUCT.md) | Product purpose, owner experience and historical requirements baseline |
-| [Design decisions](design/DECISIONS.md) | Dated decision chronology, confirmed choices, superseded proposals and open questions |
+| [Archived PRODUCT.md](archive/PRODUCT.md) | Frozen historical product requirements baseline (superseded by `SPEC.md`) |
+| [Archived DECISIONS.md](archive/DECISIONS.md) | Frozen dated decision chronology, Q1–Q32 history, and superseded proposals (superseded by `SPEC.md` + `adr/`) |
 | [Domain glossary](../GLOSSARY.md) | Pure domain meanings (no implementation details or second task list) |
 | [Active reference profile (`r59`)](design/reference-profile.r59.draft.json) | Sole active runtime profile: 21 item mappings, 100-point budget, unified 85-pt core ranking, 3-Tier Progressive Bids, crossing-`30%` slope extension, and 36-category/Bulky/Oversize 2027 FBA schedules (`r50–r58` frozen replay archived on Git tag `archive/r50-r58-frozen-replay-20261125` and [reference-profile.r58.archived.json](archive/design/reference-profile.r58.archived.json)) |
 | [Business thresholds registry](../src/business-thresholds.mjs) | Single audited frozen registry of all owner-confirmed business cutoffs with `confirmed_at` dates and provenance |

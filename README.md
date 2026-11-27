@@ -19,7 +19,7 @@ Serve and preview rendered HTML reports locally via `serve-report` (`http://127.
 node src/phase2-cli.mjs serve-report --dir outputs/example --port 4179
 ```
 
-These cards are explicitly synthetic. For genuine research use the [archived input contract](docs/archive/design/TRIAL-INPUT.md) and [decisions](docs/design/DECISIONS.md), keep batches, databases, ledgers, and outputs in ignored local directories (`.local/`, `data/`, `outputs/`), and retain original evidence. A missing total stays unknown; supported points are not scaled to 100.
+These cards are explicitly synthetic. For genuine research use the [active specification](docs/SPEC.md), [archived input contract](docs/archive/design/TRIAL-INPUT.md), and [archived decisions](docs/archive/DECISIONS.md), keep batches, databases, ledgers, and outputs in ignored local directories (`.local/`, `data/`, `outputs/`), and retain original evidence. A missing total stays unknown; supported points are not scaled to 100.
 
 To include the reviewed source-word-to-form trail, add the optional discovery bundle:
 
@@ -66,7 +66,7 @@ For a fresh selection run, `node src/phase2-cli.mjs --help` lists all operator c
 | [Architecture decisions](docs/adr/0001-decouple-steady-state-freight-from-100-set-sourcing.md) | Concise records of hard-to-reverse architectural and business-boundary tradeoffs (`ADR-0001..0004`) |
 | [Current state](docs/STATE.md) | Single current outcome, evidence, blockers, and next step |
 | [Context router](docs/CONTEXT-ROUTER.md) | Causal history, code/test map, and private source routing |
-| [Product requirements](docs/PRODUCT.md) and [decisions](docs/design/DECISIONS.md) | Confirmed business rules, 4 hard kill lines, 2027 FBA rules, and history |
+| [Archived requirements & decisions](docs/archive/PRODUCT.md) | Frozen historical [PRODUCT.md](docs/archive/PRODUCT.md) and [DECISIONS.md](docs/archive/DECISIONS.md) ledgers (superseded by `docs/SPEC.md`) |
 | [Active scoring profile (`r59`)](docs/design/reference-profile.r59.draft.json) | 21 item mappings, 100-point budget, 85-pt core ranking, and 3-tier USD CPC curves |
 | [Business thresholds registry](src/business-thresholds.mjs) | Single audited frozen source of truth for all owner-confirmed business cutoffs |
 | [Provider & OpenAI routing](docs/API-MIGRATION.md) | Scheme A `src/openai/` + subscription `Codex CLI` routing and `$200/month` guardrails |

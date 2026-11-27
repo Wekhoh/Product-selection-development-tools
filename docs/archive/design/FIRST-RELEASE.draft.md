@@ -113,7 +113,7 @@ The runner reads local inputs, writes JSON plus Chinese HTML cards and a measure
 
 Acceptance: a fresh sourced discovery path and the saved real cohort are traceable through research to cards; all 21 items are attempted with an actual value or an evidence-backed specific blocker. Fully scored cards and partial cards are counted separately. Focused tests exercise ordinary mapping boundaries, invalid/missing data, shared cohorts/scenarios and ranking. Repeated offline computation is stable, a clean checkout runs the synthetic fixture, local desktop/mobile layouts are readable, and the exact publishable set passes privacy plus independent economics/recovery review. Actual native calls, data coverage, stage timing and unresolved gaps are recorded separately from source adoption or business usefulness. Failure to obtain a required metric remains an open product gap, not a silent waiver or a claim of completed full-score acceptance.
 
-Discovery coverage readback: retain the five source routes and three opportunity types in [PRODUCT](../../PRODUCT.md#discovery-and-analysis). Record each batch's attempted routes, exact source filters/windows, lead origins, actual follow-through and untested coverage. Include social-first discovery as a possible origin, not only a check after keyword selection. Stable demand need not pass a growth filter, and a supply-gap hypothesis must be tested against existing solutions and buying evidence. A single native mode or successful source query validates only that component. Do not impose a route quota, require all routes per card, treat optional upstream methods as enabled, or interpret this clarification as a new scoring interview.
+Discovery coverage readback: retain the five source routes and three opportunity types in [PRODUCT](../PRODUCT.md#discovery-and-analysis). Record each batch's attempted routes, exact source filters/windows, lead origins, actual follow-through and untested coverage. Include social-first discovery as a possible origin, not only a check after keyword selection. Stable demand need not pass a growth filter, and a supply-gap hypothesis must be tested against existing solutions and buying evidence. A single native mode or successful source query validates only that component. Do not impose a route quota, require all routes per card, treat optional upstream methods as enabled, or interpret this clarification as a new scoring interview.
 
 Current scoring checkpoint (2026-11-13, profile revision 50): all 21 item mappings and the coherent shared total/interval/missingness/order package are accepted for trial, including the revised native-market 3/2 reference, current-basis 4/1 comparison, stable exemplar ties and two-source keyword corroboration. The owner directs continuation from saved real products. Weights, curves and exclusions remain unchanged; acquisition/judgment, calibration, whole-flow performance and business effects remain unverified, with production/import activation false.
 
@@ -123,7 +123,7 @@ Earlier seller-scope checkpoint (2026-11-13, profile revision 42; its weight sna
 
 Earlier whole-product checkpoint (2026-11-13): broader implementation and acceptance choices remained open. The bounded slice above supersedes that readiness restriction only for its stated scope; it does not establish complete real-card or scheduler acceptance.
 
-本文承接 [产品要求](../../PRODUCT.md)、[已定与待定决策](../../design/DECISIONS.md)、[试评配置草案](reference-profile.r58.archived.json) 和 [领域术语](../../../GLOSSARY.md)。唯一任务与恢复记录是 [STATE.md](../../STATE.md)。下面区分已经确定的需求与仍需设计的实现，不要求主人重新批准旧决定。
+本文承接 [产品要求](../PRODUCT.md)、[已定与待定决策](../DECISIONS.md)、[试评配置草案](reference-profile.r58.archived.json) 和 [领域术语](../../../GLOSSARY.md)。唯一任务与恢复记录是 [STATE.md](../../STATE.md)。下面区分已经确定的需求与仍需设计的实现，不要求主人重新批准旧决定。
 
 Latest staging clarification (2026-11-13): after the trial definitions, run a bounded real workflow to expose time/data/judgment obstacles. Suitable deeper checks may move after owner retention if they hinder useful card output. Keep initial evidence, material gaps and exclusions visible; this is not a blanket waiver; revision 50 separately adopts the shared ordering rules. Measure fully supported and partially scored cards separately without hiding the latter or calling either business acceptance.
 
@@ -291,7 +291,7 @@ Traceability means recovering the adopted evidence, judgment and formula; it doe
 - 权利冲突按具体款处理，疑似或未查不能称安全；材质或带电标签不直接淘汰。现阶段暂缓强节日/日期依赖款，不排除普通淡旺季。
 - 初选无需先询价、拿样或实际发货。后续 1688 询价须先审具体对象与完整话术，主人明确准发后才能发送。评分不构成采购、广告或店铺操作授权。
 
-这份摘要不替代完整 [决策与例外](../../design/DECISIONS.md) 和 [参考口径](reference-profile.r58.archived.json)。未知不填 0 或 50，已知权重不放大到 100；部分分、区间与完整总分按修订50分别展示与排序，未知总分不填数。
+这份摘要不替代完整 [决策与例外](../DECISIONS.md) 和 [参考口径](reference-profile.r58.archived.json)。未知不填 0 或 50，已知权重不放大到 100；部分分、区间与完整总分按修订50分别展示与排序，未知总分不填数。
 
 Q31 修订50已确认前3／2分使用同一相关原生市场报告及三个月新品参数，替代旧的榜内同细分比例输入，不能混用或择高。少评价4分的合格参照包括当前在榜和仍符合条件的已退出新品，其他榜外记录保留相应竞争、销量与后续观察用途。历史轨迹按实际覆盖记录，不要求找全。跨材质按实际替代关系和必要性能判断。卡片保留卖家精灵原生三个月新品占比的真实样本口径和可得细分观察；相关视图不新增分数。多来源佐证与趋势观察分别标记；共用底层数据不冒充独立来源，同一时点多处一致不证明趋势。实际样本核实与来源充分性待测，已确认的换分规则不重问，详见 [Q31 草案](Q31-NORMAL-NEWCOMER.draft.md)。
 
