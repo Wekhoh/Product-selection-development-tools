@@ -21,27 +21,9 @@ const REPO_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
 // Ratchet rule: this ceiling may only decrease (prune dead branches), never increase.
 const RESIDUAL_R50_R58_MAX = 0;
 
-// Baseline allowlist of chronicle test files in test/ (M1 PR A1).
-// Ratchet rule: new issue-*/batch-*/stage*/r59-* files are forbidden; M3 shrinks this list as tests consolidate.
-const CHRONICLE_TEST_ALLOWLIST = new Set([
-  'batch-a1-pricing-keepa-channel-fixes.test.mjs',
-  'batch-a2-report-ad-dedup-fixes.test.mjs',
-  'batch-a3-batch-cli-resume-fixes.test.mjs',
-  'issue-11-price-band-veteran-threshold.test.mjs',
-  'issue-23-steady-state-bare-goods.test.mjs',
-  'issue-28-1688-luna-ranking-anti-false-kill.test.mjs',
-  'issue-33-dated-keepa-sp-api-calibration.test.mjs',
-  'issue-5-carton-weight-headhaul.test.mjs',
-  'issue-6-sourcing-parity-and-guardrails.test.mjs',
-  'issue-8-review-dispute-scenario-linkage.test.mjs',
-  'issue-9-calibration-tracking-separation.test.mjs',
-  'r59-round1-round2-upgrades.test.mjs',
-  'r59-round3-closure.test.mjs',
-  'r59-step2-ranking-evergreen.test.mjs',
-  'r59-step3-daily-entrypoints.test.mjs',
-  'r59-step4-signoff-regressions.test.mjs',
-  'stage5a-return-inquiry.test.mjs',
-]);
+// Baseline allowlist of chronicle test files in test/ (cleared to 0 in M3 PR A3).
+// Ratchet rule: new issue-*/batch-*/stage*/r59-* files anywhere under test/ are forbidden.
+const CHRONICLE_TEST_ALLOWLIST = new Set();
 
 // Duplicate utility declarations in src/ outside src/utils/ (and src/contracts.mjs for assertNonemptyString): 0 allowed.
 const DUPLICATE_UTIL_ALLOWLIST = new Set();
@@ -545,9 +527,8 @@ test('hygiene rule 2b (negative & boundary): catches broken relative .md links i
 const CHRONICLE_TEST_NAME_RE = /^(?:issue-|batch-|stage|r59-).*\.test\.mjs$/i;
 
 function assertChronicleTestAllowlist(testDir, allowlist = CHRONICLE_TEST_ALLOWLIST) {
-  const matching = readdirSync(testDir, { withFileTypes: true })
-    .filter(e => e.isFile() && CHRONICLE_TEST_NAME_RE.test(e.name))
-    .map(e => e.name)
+  const matching = walkFiles(testDir, (_, name) => CHRONICLE_TEST_NAME_RE.test(name))
+    .map(f => toPosixRel(testDir, f))
     .sort();
   const matchingSet = new Set(matching);
 
@@ -567,12 +548,12 @@ function assertChronicleTestAllowlist(testDir, allowlist = CHRONICLE_TEST_ALLOWL
   return matching.length;
 }
 
-test('hygiene rule 4 (live): test/ contains only the exact 17 allowlisted chronicle test files', () => {
+test('hygiene rule 4 (live): test/ contains 0 allowlisted chronicle test files', () => {
   const count = assertChronicleTestAllowlist(join(REPO_ROOT, 'test'));
-  assert.equal(count, 17);
+  assert.equal(count, 0);
 });
 
-test('hygiene rule 4 (negative & boundary): forbids new issue-/batch-/stage/r59- test files and catches stale allowlist entries', () => {
+test('hygiene rule 4 (negative & boundary): forbids new issue-/batch-/stage/r59- test files (including nested) and catches stale allowlist entries', () => {
   const dir = mkdtempSync(join(tmpdir(), 'hygiene-r4-'));
   try {
     writeFileSync(join(dir, 'scoring.test.mjs'), '// domain test\n', 'utf8');
@@ -590,6 +571,15 @@ test('hygiene rule 4 (negative & boundary): forbids new issue-/batch-/stage/r59-
       );
       rmSync(badPath);
     }
+
+    mkdirSync(join(dir, 'sub'), { recursive: true });
+    const nestedBadPath = join(dir, 'sub', 'issue-99-new.test.mjs');
+    writeFileSync(nestedBadPath, '// nested fragmented test\n', 'utf8');
+    assert.throws(
+      () => assertChronicleTestAllowlist(dir, allowlist),
+      /Unexpected new chronicle test file\(s\) detected.*sub\/issue-99-new\.test\.mjs/,
+    );
+    rmSync(nestedBadPath);
 
     rmSync(join(dir, 'issue-5-carton-weight-headhaul.test.mjs'));
     assert.throws(

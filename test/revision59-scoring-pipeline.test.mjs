@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { makeOffPeakDeclaredScreenInputs } from './helpers/test-fixtures.mjs';
 import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -817,29 +818,13 @@ test('Astra Round-1 Regressions (Scoring & Pipeline): BLOCKER 3 multi-quote Stag
       profile_revision: 59,
       as_of_date: '2026-11-22',
       early_screen_builder: () => g1aCliffOnly2.declared_scenarios.map(d => ({
-        profile_revision: 59,
-        id: d.id,
-        saleable_unit: '1 unit',
-        price_usd: d.price_usd,
-        fx_cny_per_usd: d.fx_cny_per_usd,
+        ...makeOffPeakDeclaredScreenInputs(d),
         pkg: baseSc.pkg,
-        headhaul: { usd_per_unit: d.headhaul_usd, bond_included: true },
-        refund_fraction: 0.04,
-        physical_return_fraction: 0.04,
-        return_threshold: 0.081,
-        returns_processing_usd: 0,
-        is_apparel_or_shoes: false,
         referral_terms: baseSc.referral_terms,
-        fulfillment_usd: d.fulfillment_usd,
-        placement_usd: d.placement_range_usd[1],
         storage: { cubic_feet_per_unit: cuFtBase, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
-        operating_period: 'off_peak',
         operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
         fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'p1', sales: baseSc.sales_window, storage: baseSc.storage_window, inbound: baseSc.inbound_window },
         collection_rate: 0.005,
-        other_applicable_usd: 0,
-        specific_rights_conflict: 'unknown',
-        strong_date_dependency: false,
       })),
     });
     assert.equal(g1bCliff.status, 'gate1b_pending', 'Interior $50.00 cliff must NOT be gate1b_rejected');
@@ -1034,29 +1019,13 @@ test('Astra Round-1 Regressions (Scoring & Pipeline): BLOCKER 3 multi-quote Stag
         const g1aRec = JSON.parse(store.getCandidateForm(f.form_id).gate1a_result_json);
         const d = g1aRec.declared_scenarios[0];
         return {
-          profile_revision: 59,
-          id: d.id,
-          saleable_unit: '1 unit',
-          price_usd: d.price_usd,
-          fx_cny_per_usd: d.fx_cny_per_usd,
+          ...makeOffPeakDeclaredScreenInputs(d),
           pkg: baseSc.pkg,
-          headhaul: { usd_per_unit: d.headhaul_usd, bond_included: true },
-          refund_fraction: 0.04,
-          physical_return_fraction: 0.04,
-          return_threshold: 0.081,
-          returns_processing_usd: 0,
-          is_apparel_or_shoes: false,
           referral_terms: baseSc.referral_terms,
-          fulfillment_usd: d.fulfillment_usd,
-          placement_usd: d.placement_range_usd[1],
           storage: { cubic_feet_per_unit: cuFtBase, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
-          operating_period: 'off_peak',
           operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
           fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'p1', sales: baseSc.sales_window, storage: baseSc.storage_window, inbound: baseSc.inbound_window },
           collection_rate: 0.005,
-          other_applicable_usd: 0,
-          specific_rights_conflict: 'unknown',
-          strong_date_dependency: false,
         };
       };
       item.allow_crossing_to_gate2_3 = true;
@@ -1314,29 +1283,13 @@ test('Astra Round-2 CLI & Bid Contradiction Regressions: phase2-cli gate1b --pro
     const decl = JSON.parse(r1a.stdout).result.declared_scenarios[0];
     const cuFt = (12 * 8 * 4) / 1728;
     const earlyScreen = {
-      profile_revision: 59,
-      id: decl.id,
-      saleable_unit: '1 unit',
-      price_usd: decl.price_usd,
-      fx_cny_per_usd: decl.fx_cny_per_usd,
+      ...makeOffPeakDeclaredScreenInputs(decl),
       pkg,
-      headhaul: { usd_per_unit: decl.headhaul_usd, bond_included: true },
-      refund_fraction: 0.04,
-      physical_return_fraction: 0.04,
-      return_threshold: 0.081,
-      returns_processing_usd: 0,
-      is_apparel_or_shoes: false,
       referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5, minimum_referral_usd: 0.3 },
-      fulfillment_usd: decl.fulfillment_usd,
-      placement_usd: decl.placement_range_usd[1],
       storage: { cubic_feet_per_unit: cuFt, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
-      operating_period: 'off_peak',
       operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
       fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'p1', sales: { from: '2027-02-01', through: '2027-09-30' }, storage: { from: '2027-02-01', through: '2027-09-30' }, inbound: { from: '2027-01-15', through: '2027-01-15' } },
       collection_rate: 0.005,
-      other_applicable_usd: 0,
-      specific_rights_conflict: 'unknown',
-      strong_date_dependency: false,
     };
 
     // Quote WITHOUT ui_readback MUST be rejected by gate1b --profile-revision 59!
@@ -1588,29 +1541,13 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
       profile_revision: 59,
       as_of_date: '2026-11-22',
       early_screen_builder: () => g1aDiffHh.declared_scenarios.map(d => ({
-        profile_revision: 59,
-        id: d.id,
-        saleable_unit: '1 unit',
-        price_usd: d.price_usd,
-        fx_cny_per_usd: d.fx_cny_per_usd,
+        ...makeOffPeakDeclaredScreenInputs(d),
         pkg,
-        headhaul: { usd_per_unit: d.headhaul_usd, bond_included: true },
-        refund_fraction: 0.04,
-        physical_return_fraction: 0.04,
-        return_threshold: 0.081,
-        returns_processing_usd: 0,
-        is_apparel_or_shoes: false,
         referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-        fulfillment_usd: d.fulfillment_usd,
-        placement_usd: d.placement_range_usd[1],
         storage: { cubic_feet_per_unit: cuFt, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
-        operating_period: 'off_peak',
         operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
         fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'p1', sales: { from: '2027-02-01', through: '2027-09-30' }, storage: { from: '2027-02-01', through: '2027-09-30' }, inbound: { from: '2027-01-15', through: '2027-01-15' } },
         collection_rate: 0.005,
-        other_applicable_usd: 0,
-        specific_rights_conflict: 'unknown',
-        strong_date_dependency: false,
       })),
     });
     assert.equal(g1bDiff.margin_interval_verdict, 'crosses_30pct');
@@ -1713,29 +1650,13 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
         early_screen_builder: ({ form: f }) => {
           const d = JSON.parse(store.getCandidateForm(f.form_id).gate1a_result_json).declared_scenarios[0];
           return {
-            profile_revision: 59,
-            id: d.id,
-            saleable_unit: '1 unit',
-            price_usd: d.price_usd,
-            fx_cny_per_usd: d.fx_cny_per_usd,
+            ...makeOffPeakDeclaredScreenInputs(d),
             pkg,
-            headhaul: { usd_per_unit: d.headhaul_usd, bond_included: true },
-            refund_fraction: 0.04,
-            physical_return_fraction: 0.04,
-            return_threshold: 0.081,
-            returns_processing_usd: 0,
-            is_apparel_or_shoes: false,
             referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5 },
-            fulfillment_usd: d.fulfillment_usd,
-            placement_usd: d.placement_range_usd[1],
             storage: { cubic_feet_per_unit: cuFt, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
-            operating_period: 'off_peak',
             operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
             fee_context: { marketplace: 'US', currency: 'USD', package_ref: 'p1', sales: { from: '2027-02-01', through: '2027-09-30' }, storage: { from: '2027-02-01', through: '2027-09-30' }, inbound: { from: '2027-01-15', through: '2027-01-15' } },
             collection_rate: 0.005,
-            other_applicable_usd: 0,
-            specific_rights_conflict: 'unknown',
-            strong_date_dependency: false,
           };
         },
         deep_research_executor: async ({ form: f, quotes }) => {
@@ -1996,23 +1917,10 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
     });
     assert.equal(g1aDip.proceed_to_gate1b, true);
     const toScreenFromDecl = d => ({
-      profile_revision: 59,
-      id: d.id,
-      saleable_unit: '1 unit',
-      price_usd: d.price_usd,
-      fx_cny_per_usd: d.fx_cny_per_usd,
+      ...makeOffPeakDeclaredScreenInputs(d),
       pkg: pkgR4,
-      headhaul: { usd_per_unit: d.headhaul_usd, bond_included: true },
-      refund_fraction: 0.04,
-      physical_return_fraction: 0.04,
-      return_threshold: 0.081,
-      returns_processing_usd: 0,
-      is_apparel_or_shoes: false,
       referral_terms: { referral_fraction: 0.15, refund_admin_fraction: 0.2, refund_admin_cap_usd: 5, minimum_referral_usd: 0.3 },
-      fulfillment_usd: d.fulfillment_usd,
-      placement_usd: d.placement_range_usd[1],
       storage: { cubic_feet_per_unit: (12 * 8 * 4) / 1728, rate_usd_per_cuft_month: 0.78, average_inventory_days: 45 },
-      operating_period: 'off_peak',
       operating_months: [2, 3, 4, 5, 6, 7, 8, 9],
       fee_context: {
         marketplace: 'US',
@@ -2023,9 +1931,6 @@ test('Astra Round-3 Regressions (Scoring & Pipeline): re-sourcing after expired 
         inbound: { from: '2027-01-15', through: '2027-01-25' },
       },
       collection_rate: 0.005,
-      other_applicable_usd: 0,
-      specific_rights_conflict: 'unknown',
-      strong_date_dependency: false,
     });
     const uiFullR4 = {
       logged_in: true,
