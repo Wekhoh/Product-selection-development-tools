@@ -613,14 +613,21 @@ export function calculateEconomics(input, options = {}) {
     }
   }
 
+  const couponCampaignUnits = Number.isSafeInteger(input.coupon_campaign_units) && input.coupon_campaign_units > 0
+    ? input.coupon_campaign_units
+    : 100;
+  const includeCouponCampaignFlat = input.include_coupon_campaign_flat !== false;
+  const couponBasisLabel = includeCouponCampaignFlat
+    ? `Amazon ongoing coupon redemption fee ($5/${couponCampaignUnits} + 2.5%)`
+    : 'Amazon ongoing coupon redemption fee (2.5% variable; $5 campaign flat excluded)';
   const computedCouponFeeR59 = isR59Plus
     ? computeAmazonCouponRedemptionFee2027({
       net_effective_price_usd: p,
       ongoing_coupon_usd: input.ongoing_coupon_usd,
       ongoing_coupon_pct: input.ongoing_coupon_pct,
       coupon_redemption_share: input.coupon_redemption_share ?? 1,
-      coupon_campaign_units: input.coupon_campaign_units ?? (Number.isSafeInteger(input.order_units) && input.order_units > 0 ? input.order_units : 100),
-      include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
+      coupon_campaign_units: couponCampaignUnits,
+      include_campaign_flat_usd: includeCouponCampaignFlat,
     })
     : { applicable: false, per_unit_usd: 0, exact_usd_rational: { n: 0n, d: 1n } };
   const explicitCouponFeeUsd = isR59Plus && finite(input.coupon_redemption_fee_usd) && input.coupon_redemption_fee_usd > 0
@@ -646,6 +653,10 @@ export function calculateEconomics(input, options = {}) {
       finite(otherLine.amount_usd) &&
       otherLine.amount_usd >= couponFeeR59.per_unit_usd - 1e-6,
     );
+    if (otherLine && alreadyHasCoupon) {
+      otherLine.coupon_campaign_units = otherLine.coupon_campaign_units ?? couponCampaignUnits;
+      otherLine.include_coupon_campaign_flat = otherLine.include_coupon_campaign_flat ?? includeCouponCampaignFlat;
+    }
     if (alreadyHasCoupon && otherLine.payee !== 'amazon') {
       extraCouponAmazonDeductionUsd = finite(otherLine.amazon_portion_usd) && otherLine.amazon_portion_usd > 0
         ? otherLine.amazon_portion_usd
@@ -656,9 +667,11 @@ export function calculateEconomics(input, options = {}) {
       otherLine.amount_usd = round(prevAmt + couponFeeR59.per_unit_usd);
       otherLine.status = 'estimated';
       otherLine.coupon_fee_included = true;
+      otherLine.coupon_campaign_units = couponCampaignUnits;
+      otherLine.include_coupon_campaign_flat = includeCouponCampaignFlat;
       otherLine.basis = prevAmt > 0
-        ? `${otherLine.basis}; plus Amazon ongoing coupon redemption fee ($5/100 + 2.5%)`
-        : 'Amazon ongoing coupon redemption fee ($5/100 + 2.5%)';
+        ? `${otherLine.basis}; plus ${couponBasisLabel}`
+        : couponBasisLabel;
       otherLine.components = [...new Set([...(Array.isArray(otherLine.components) ? otherLine.components : []), 'coupon_redemption'])];
       if (priorExternalAmt === 0) {
         otherLine.payee = 'amazon';
@@ -824,6 +837,10 @@ export function calculateEconomics(input, options = {}) {
       ...(isBareGoodsLedger ? {
         cost_basis: 'bare_goods_1688',
         bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH,
+      } : {}),
+      ...(couponFeeR59.applicable && couponFeeR59.per_unit_usd > 0 ? {
+        coupon_campaign_units: couponCampaignUnits,
+        include_coupon_campaign_flat: includeCouponCampaignFlat,
       } : {}),
     } : {}),
     ...(r59KitCheck ? { single_factory_complete_kit: r59KitCheck } : {}),
@@ -1362,25 +1379,57 @@ export function evaluateEarlyScreen(input, options = {}) {
     registeredIds = new Set(evidence.map(e => (typeof e === 'string' ? e : e?.id)).filter(text));
   }
 
+  const hasTotalAdvisoryCny = bareGoodsMode && finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0;
+  const hasPerUnitAdvisoryCny = bareGoodsMode && finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0;
+  const advisoryDomesticConflict = Boolean(
+    hasTotalAdvisoryCny &&
+    hasPerUnitAdvisoryCny &&
+    finite(order_units) &&
+    order_units > 0 &&
+    Math.abs(domestic_freight_cny_total - domestic_freight_cny_per_unit * order_units) > 0.01,
+  );
   const advisoryDomesticFreightCny = finite(domestic_freight_advisory_cny_total) && domestic_freight_advisory_cny_total >= 0
     ? domestic_freight_advisory_cny_total
-    : (bareGoodsMode && finite(domestic_freight_cny_total) && domestic_freight_cny_total >= 0
+    : (hasTotalAdvisoryCny
       ? domestic_freight_cny_total
-      : (bareGoodsMode && finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0 && finite(order_units) && order_units > 0
+      : (hasPerUnitAdvisoryCny && finite(order_units) && order_units > 0
         ? round(domestic_freight_cny_per_unit * order_units, 4)
         : null));
-  const advisoryDomesticCnyPerUnit = bareGoodsMode
-    ? (finite(domestic_freight_cny_per_unit) && domestic_freight_cny_per_unit >= 0
+  const advisoryDomesticCnyPerUnit = bareGoodsMode && !advisoryDomesticConflict
+    ? (hasPerUnitAdvisoryCny
       ? domestic_freight_cny_per_unit
       : (advisoryDomesticFreightCny !== null && finite(order_units) && order_units > 0
         ? round(advisoryDomesticFreightCny / order_units, 6)
         : null))
     : null;
-  const advisoryDomesticUsdPerUnit = bareGoodsMode
+  const advisoryDomesticUsdPerUnit = bareGoodsMode && !advisoryDomesticConflict
     ? (advisoryDomesticCnyPerUnit !== null && finite(fx) && fx > 0
       ? round(advisoryDomesticCnyPerUnit / fx, 6)
       : (finite(rawDomesticUsd) && rawDomesticUsd >= 0 ? round(rawDomesticUsd, 6) : null))
     : null;
+  const buildDomesticFreightAdvisory = (contributionUsd, netRevenueUsd) => {
+    if (!bareGoodsMode) return null;
+    if (advisoryDomesticFreightCny === null && advisoryDomesticCnyPerUnit === null && advisoryDomesticUsdPerUnit === null && !advisoryDomesticConflict) {
+      return null;
+    }
+    return {
+      advisory_only: true,
+      excluded_from_bare_goods_margin: true,
+      cny_total: advisoryDomesticFreightCny,
+      cny_per_unit: advisoryDomesticCnyPerUnit,
+      usd_per_unit: advisoryDomesticUsdPerUnit,
+      ...(advisoryDomesticConflict ? { conflict_detected: true } : {}),
+      landed_contribution_usd_if_incurred: !advisoryDomesticConflict && finite(contributionUsd) && advisoryDomesticUsdPerUnit !== null
+        ? round(contributionUsd - advisoryDomesticUsdPerUnit, 6)
+        : null,
+      landed_margin_if_incurred: !advisoryDomesticConflict && finite(contributionUsd) && finite(netRevenueUsd) && netRevenueUsd > 0 && advisoryDomesticUsdPerUnit !== null
+        ? round((contributionUsd - advisoryDomesticUsdPerUnit) / netRevenueUsd, 6)
+        : null,
+      note_zh: advisoryDomesticConflict
+        ? '旁路国内运费冲突（domestic_freight_cny_total 与 domestic_freight_cny_per_unit * order_units 不一致），含运旁路毛利置空待核；裸货初筛本身不受影响。'
+        : '仅旁路参考：1688 初筛默认按裸货价核算，可见国内运费不扣减初筛毛利，大货物流另谈。',
+    };
+  };
 
   let domesticUsd = null;
   let domCnyDerivation = null;
@@ -1573,6 +1622,7 @@ export function evaluateEarlyScreen(input, options = {}) {
       cost_basis: bareGoodsMode ? 'bare_goods_1688' : 'landed_domestic_explicit',
       ...(bareGoodsMode ? { bare_goods_disclosure: BARE_GOODS_DISCLOSURE_ZH } : {}),
       ...(advisoryDomesticFreightCny !== null ? { domestic_freight_advisory_cny_total: advisoryDomesticFreightCny } : {}),
+      ...(buildDomesticFreightAdvisory(null, null) ? { domestic_freight_advisory: buildDomesticFreightAdvisory(null, null) } : {}),
       ...(headhaulRes.advisory_replenishment_note ? { advisory_replenishment_note: headhaulRes.advisory_replenishment_note } : {}),
       reasons,
       checks: {
@@ -1749,13 +1799,20 @@ export function evaluateEarlyScreen(input, options = {}) {
     }
   }
 
+  const couponCampaignUnits = Number.isSafeInteger(input.coupon_campaign_units) && input.coupon_campaign_units > 0
+    ? input.coupon_campaign_units
+    : 100;
+  const includeCouponCampaignFlat = input.include_coupon_campaign_flat !== false;
+  const couponBasisLabel = includeCouponCampaignFlat
+    ? `Amazon ongoing coupon redemption fee ($5/${couponCampaignUnits} + 2.5%)`
+    : 'Amazon ongoing coupon redemption fee (2.5% variable; $5 campaign flat excluded)';
   const computedCouponFeeR59 = computeAmazonCouponRedemptionFee2027({
     net_effective_price_usd: price_usd,
     ongoing_coupon_usd,
     ongoing_coupon_pct,
     coupon_redemption_share: input.coupon_redemption_share ?? 1,
-    coupon_campaign_units: input.coupon_campaign_units ?? (Number.isSafeInteger(order_units) && order_units >= 100 ? order_units : 100),
-    include_campaign_flat_usd: input.include_coupon_campaign_flat !== false,
+    coupon_campaign_units: couponCampaignUnits,
+    include_campaign_flat_usd: includeCouponCampaignFlat,
   });
   const explicitCouponFeeUsd = finite(input.coupon_redemption_fee_usd) && input.coupon_redemption_fee_usd > 0
     ? round(input.coupon_redemption_fee_usd)
@@ -1840,10 +1897,12 @@ export function evaluateEarlyScreen(input, options = {}) {
     line('collection', payout ? payout.collection_usd : null, collectionRateValid ? 'Collection fee on estimated Amazon disbursement' : 'Missing collection rate'),
     {
       ...line('other_applicable', effectiveOtherWithCoupon,
-        effectiveOtherWithCoupon === 0 ? 'Declared ordinary scenario has no extra conditional charge' : effectiveOtherWithCoupon === null ? 'Missing other_applicable_usd declaration' : (requiredCouponFeeUsd > 0 ? 'Amazon ongoing coupon redemption fee ($5/100 + 2.5%) plus declared conditional charges' : 'Additional applicable charge'),
+        effectiveOtherWithCoupon === 0 ? 'Declared ordinary scenario has no extra conditional charge' : effectiveOtherWithCoupon === null ? 'Missing other_applicable_usd declaration' : (requiredCouponFeeUsd > 0 ? `${couponBasisLabel} plus declared conditional charges` : 'Additional applicable charge'),
         effectiveOtherWithCoupon === 0 ? 'not_applicable' : effectiveOtherWithCoupon === null ? 'pending' : 'estimated'),
       ...(requiredCouponFeeUsd > 0 ? {
         coupon_fee_included: true,
+        coupon_campaign_units: couponCampaignUnits,
+        include_coupon_campaign_flat: includeCouponCampaignFlat,
         ...(other_payee === 'amazon' || (couponFeeUsd > 0 && (resolvedOtherApplicable ?? 0) === 0)
           ? { payee: 'amazon' }
           : { payee: other_payee, amazon_portion_usd: requiredCouponFeeUsd }),
@@ -1868,6 +1927,8 @@ export function evaluateEarlyScreen(input, options = {}) {
         : (earlyKitCheck.resolved_factory_id ? { factory_id: earlyKitCheck.resolved_factory_id } : {})),
       ...(requiredCouponFeeUsd > 0 ? {
         coupon_redemption_fee_usd: requiredCouponFeeUsd,
+        coupon_campaign_units: couponCampaignUnits,
+        include_coupon_campaign_flat: includeCouponCampaignFlat,
         coupon_fee_already_in_other: true,
       } : {}),
       ...(hasExplicitPhysical ? { physical_return_fraction } : {}),
@@ -2004,26 +2065,7 @@ export function evaluateEarlyScreen(input, options = {}) {
     packagingRedesignShortlist = pkgCheck;
   }
 
-  const domesticFreightAdvisory = bareGoodsMode && (
-    advisoryDomesticFreightCny !== null ||
-    advisoryDomesticCnyPerUnit !== null ||
-    advisoryDomesticUsdPerUnit !== null
-  )
-    ? {
-      advisory_only: true,
-      excluded_from_bare_goods_margin: true,
-      cny_total: advisoryDomesticFreightCny,
-      cny_per_unit: advisoryDomesticCnyPerUnit,
-      usd_per_unit: advisoryDomesticUsdPerUnit,
-      landed_contribution_usd_if_incurred: ledger.contribution_usd !== null && advisoryDomesticUsdPerUnit !== null
-        ? round(ledger.contribution_usd - advisoryDomesticUsdPerUnit, 6)
-        : null,
-      landed_margin_if_incurred: ledger.contribution_usd !== null && ledger.net_revenue_usd > 0 && advisoryDomesticUsdPerUnit !== null
-        ? round((ledger.contribution_usd - advisoryDomesticUsdPerUnit) / ledger.net_revenue_usd, 6)
-        : null,
-      note_zh: '仅旁路参考：1688 初筛默认按裸货价核算，可见国内运费不扣减初筛毛利，大货物流另谈。',
-    }
-    : null;
+  const domesticFreightAdvisory = buildDomesticFreightAdvisory(ledger.contribution_usd, ledger.net_revenue_usd);
 
   return {
     gate_status: gateStatus,

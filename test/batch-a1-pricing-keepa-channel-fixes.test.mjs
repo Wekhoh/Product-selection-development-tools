@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { evaluateEarlyScreen } from '../src/economics.mjs';
+import { calculateEconomics, evaluateEarlyScreen } from '../src/economics.mjs';
 import {
   analyzeMainstreamPriceBand,
   evaluateGate0CategoryBoundary,
@@ -19,11 +19,14 @@ import {
   planDiscoveryBatch,
   resolveChannelMeta,
 } from '../src/discovery-channels.mjs';
+import { runGate1AForForm } from '../src/pipeline.mjs';
 import { openSelectionStore } from '../src/store.mjs';
 import {
   STAGE4_AS_OF_DATE,
   makeDatedKeepaReceipt,
+  makeGate1AScenario,
   makeSteadyPeer,
+  registerStage4Form,
 } from './helpers/stage4-fixtures.mjs';
 
 const STD_PKG = { length_in: 12, width_in: 8, height_in: 3, unit_weight_lb: 1.5 };
@@ -496,5 +499,304 @@ test('Batch A1 Req 5: retires ss_vine_sustained_traction from planDiscoveryBatch
     }
   } finally {
     store.close();
+  }
+});
+
+test('Batch A1 Round-1 Astra Regressions (#1–#14): Gate-0 caregiver/0-2 range, strict Keepa summary/gap/promo/age/scalar guards, upper-band anchor noise, coupon denominator, multi-receipt review merge, missing-price older peer, and conflicting advisory freight', () => {
+  // #1: Adult caregiver products with crib / 1-2y supplies pass, while 0-2 years old child toy is blocked
+  assert.equal(evaluateGate0CategoryBoundary({ title: 'Baby Monitor Crib Mount for Parents', age_group: 'adult' }).passed, true);
+  assert.equal(evaluateGate0CategoryBoundary({ title: 'Diaper Bag for 1-2 years old supplies', age_group: 'adult' }).passed, true);
+  assert.equal(evaluateGate0CategoryBoundary({ title: 'Diaper Bag for 0-2 years old supplies', age_group: 'adult' }).passed, true);
+  const child02 = evaluateGate0CategoryBoundary({ title: 'Wooden Shape Sorter for Children 0-2 years old', age_group: 'adult' });
+  assert.equal(child02.passed, false);
+  assert.equal(child02.metadata_conflict, true);
+
+  // #3: High-price peer with bare legacy boolean keeps veteran_missing_keepa_steady_evidence as reason_code -> Gate 1A holds for verification (not hard-rejected!)
+  const store = openSelectionStore(':memory:');
+  try {
+    const formId = registerStage4Form(store, { formId: 'form-a1-r1-reason' });
+    const lowSteady = makeSteadyPeer({ asin: 'B0SYNLOW25', priceUsd: 25.00, ageDays: 420 });
+    const highLegacyBool = {
+      asin: 'B0SYNHIG49',
+      parent_asin: 'P0SYNHIG49',
+      title: 'Desk Tray High Legacy',
+      fulfillment: 'FBA',
+      price_usd: 49.00,
+      monthly_units: 120,
+      age_days: 420,
+      keepa_price_steady: true,
+    };
+    const g1aHold = runGate1AForForm(store, {
+      form_id: formId,
+      profile_revision: 59,
+      price_band_analysis: { listings: [lowSteady, highLegacyBool], options: { as_of_date: STAGE4_AS_OF_DATE } },
+      scenarios: [makeGate1AScenario({ asin: 'B0SYNLOW25', priceUsd: 25.00, ageDays: 420 })],
+    });
+    assert.equal(g1aHold.gate_status, 'gate1a_needs_verification');
+    const directStrict = analyzeMainstreamPriceBand([lowSteady, highLegacyBool], {
+      as_of_date: STAGE4_AS_OF_DATE,
+      require_keepa_steady_evidence: true,
+    });
+    const oobHigh = directStrict.observed_out_of_band_peers.find(p => p.asin === 'B0SYNHIG49');
+    assert.equal(oobHigh?.reason_code, 'veteran_missing_keepa_steady_evidence');
+    assert.equal(
+      directStrict.spiral_watch.find(w => w.asin === 'B0SYNHIG49')?.watch_reasons.includes('legacy_keepa_steady_boolean_without_dated_curve'),
+      true,
+    );
+  } finally {
+    store.close();
+  }
+
+  // #4: Undated, stale (ended 2026-03-31 vs 2026-11-27), and wrong-ASIN keepa_peer_facts MUST be rejected in strict mode
+  const undatedFactsPeer = {
+    asin: 'B0SYNUNDF1', title: 'Undated Facts', fulfillment: 'FBA', price_usd: 49.00, monthly_units: 120, age_days: 420,
+    keepa_peer_facts: { has_timestamps: true, keepa_90d_steady: true },
+  };
+  assert.equal(analyzeMainstreamPriceBand([undatedFactsPeer], { as_of_date: STAGE4_AS_OF_DATE, require_keepa_steady_evidence: true }).mature_regular_band, null);
+
+  const staleParsed = parseSellerSpriteKeepaPayload(
+    makeDatedKeepaReceipt({ asin: 'B0SYNSTAL1', startDate: '2026-01-01', days: 90, priceUsd: 49.00 }),
+    { as_of_date: '2026-03-31' },
+  );
+  const staleFactsPeer = {
+    asin: 'B0SYNSTAL1', title: 'Stale Facts', fulfillment: 'FBA', price_usd: 49.00, monthly_units: 120, age_days: 420,
+    keepa_peer_facts: buildKeepaPeerFactsForMarketJudge(staleParsed),
+  };
+  assert.equal(analyzeMainstreamPriceBand([staleFactsPeer], { as_of_date: STAGE4_AS_OF_DATE, require_keepa_steady_evidence: true }).mature_regular_band, null);
+
+  const currentOtherParsed = parseSellerSpriteKeepaPayload(
+    makeDatedKeepaReceipt({ asin: 'B0SYNOTHR1', startDate: '2026-08-30', days: 90, priceUsd: 49.00 }),
+    { as_of_date: STAGE4_AS_OF_DATE },
+  );
+  const wrongAsinFactsPeer = {
+    asin: 'B0SYNWRNG1', title: 'Wrong ASIN Facts', fulfillment: 'FBA', price_usd: 49.00, monthly_units: 120, age_days: 420,
+    keepa_peer_facts: buildKeepaPeerFactsForMarketJudge(currentOtherParsed),
+  };
+  assert.equal(analyzeMainstreamPriceBand([wrongAsinFactsPeer], { as_of_date: STAGE4_AS_OF_DATE, require_keepa_steady_evidence: true }).mature_regular_band, null);
+
+  // #5 & #12: temporary_event_promo: true MUST NOT bypass $49.00 -> $48.99 unsteady curve, and ai_reason_zh preserves factual delta detail
+  const tinyShift = makeDatedKeepaReceipt({
+    asin: 'B0SYNTMP01', startDate: '2026-08-30', days: 90,
+    prices: [...Array(45).fill(49.00), ...Array(45).fill(48.99)],
+  });
+  const promoUnsteadyBand = analyzeMainstreamPriceBand([{
+    asin: 'B0SYNTMP01', title: 'Promo Unsteady', fulfillment: 'FBA', price_usd: 48.99, monthly_units: 120, age_days: 420,
+    temporary_event_promo: true,
+    ai_reason_zh: '常规微调观察',
+    keepa_trend: tinyShift.keepa_trend,
+  }], { as_of_date: STAGE4_AS_OF_DATE, require_keepa_steady_evidence: true });
+  assert.equal(promoUnsteadyBand.mature_regular_band, null);
+  const oobPromo = promoUnsteadyBand.observed_out_of_band_peers.find(p => p.asin === 'B0SYNTMP01');
+  assert.match(oobPromo?.reason_zh ?? '', /常规微调观察/);
+  assert.match(oobPromo?.reason_zh ?? '', /0\.01/);
+  assert.match(oobPromo?.reason_zh ?? '', /2026-08-30/);
+
+  // #6: Missing age_days + flat dated 90d Keepa MUST NOT claim veteran_ge_365d_keepa_steady
+  const unagedFlatBand = analyzeMainstreamPriceBand([{
+    asin: 'B0SYNUNAG1', title: 'Unaged Flat', fulfillment: 'FBA', price_usd: 49.00, monthly_units: 120,
+    keepa_trend: makeDatedKeepaReceipt({ asin: 'B0SYNUNAG1', startDate: '2026-08-30', days: 90, priceUsd: 49.00 }).keepa_trend,
+  }], { as_of_date: STAGE4_AS_OF_DATE, require_keepa_steady_evidence: true });
+  assert.equal(unagedFlatBand.mature_regular_band?.basis, 'unaged_keepa_90d_steady_reference');
+
+  // #7: Undated scalar keepa_90d_median_usd: 50 MUST NOT lift heavy-coupon newcomer $35 -> $50 or emit ex_heavy_coupon
+  const heavyScalarBand = analyzeMainstreamPriceBand([{
+    asin: 'B0SYNHVSC1', title: 'Heavy Coupon Scalar', fulfillment: 'FBA', price_usd: 50.00, coupon: '30%',
+    monthly_units: 90, age_days: 65, keepa_90d_median_usd: 50.00,
+  }], { as_of_date: STAGE4_AS_OF_DATE, require_keepa_steady_evidence: true });
+  assert.equal(heavyScalarBand.mature_regular_band?.p50_usd, 35.00);
+  assert.equal(heavyScalarBand.mature_regular_band?.conditional_post_coupon_observation, true);
+  assert.equal(heavyScalarBand.mature_regular_band?.heavy_coupon_excluded, false);
+  assert.doesNotMatch(heavyScalarBand.mature_regular_band?.basis ?? '', /ex_heavy_coupon/);
+
+  // #8: Normal multi-parent pool ($38/$39/$40 with sales 180/180/10, P75=$39) MUST NOT fire high_price_single_parent_anchor_warning
+  const normalPool = analyzeMainstreamPriceBand([
+    makeSteadyPeer({ asin: 'B0SYNNRM01', parent_asin: 'P0SYNNRM01', priceUsd: 38.00, monthlyUnits: 180, ageDays: 420 }),
+    makeSteadyPeer({ asin: 'B0SYNNRM02', parent_asin: 'P0SYNNRM02', priceUsd: 39.00, monthlyUnits: 180, ageDays: 450 }),
+    makeSteadyPeer({ asin: 'B0SYNNRM03', parent_asin: 'P0SYNNRM03', priceUsd: 40.00, monthlyUnits: 10, ageDays: 480 }),
+  ], { as_of_date: STAGE4_AS_OF_DATE, require_keepa_steady_evidence: true });
+  assert.equal(normalPool.mature_regular_band?.p75_usd, 39.00);
+  assert.equal(normalPool.mature_regular_band?.high_price_single_parent_anchor_warning, false);
+  assert.equal(normalPool.guardrail.high_price_single_parent_anchor_warning, false);
+
+  // #9: Coupon $5 fixed-fee denominator stays decoupled from procurement order_units (100 vs 500 identical when coupon_campaign_units omitted!)
+  const couponOrder100 = evaluateEarlyScreen(makeBareGoodsProbeInput({
+    list_price_usd: 54.99, ongoing_coupon_usd: 10.00, price_usd: 44.99, order_units: 100,
+  }));
+  const couponOrder500 = evaluateEarlyScreen(makeBareGoodsProbeInput({
+    list_price_usd: 54.99, ongoing_coupon_usd: 10.00, price_usd: 44.99, order_units: 500,
+  }));
+  assert.equal(couponOrder100.metrics.margin, couponOrder500.metrics.margin);
+  const otherLine500 = couponOrder500.ledger.lines.find(l => l.id === 'other_applicable');
+  assert.equal(otherLine500?.coupon_campaign_units, 100);
+  assert.equal(otherLine500?.include_coupon_campaign_flat, true);
+
+  const couponNoFlat = evaluateEarlyScreen(makeBareGoodsProbeInput({
+    list_price_usd: 54.99, ongoing_coupon_usd: 10.00, price_usd: 44.99, order_units: 500, include_coupon_campaign_flat: false,
+  }));
+  assert.equal(couponNoFlat.ledger.lines.find(l => l.id === 'other_applicable')?.include_coupon_campaign_flat, false);
+  assert.equal(couponNoFlat.ledger.include_coupon_campaign_flat, false);
+
+  const calcCoupon500 = calculateEconomics({
+    id: 'syn-calc-coupon', saleable_unit: '1 unit', assumptions: ['synthetic'],
+    list_price_usd: 54.99, ongoing_coupon_usd: 10.00, price_usd: 44.99,
+    refund_fraction: 0.04, order_units: 500, bare_goods_screening: true,
+    lines: [
+      { id: 'procurement', amount_usd: 12, status: 'estimated', basis: 'goods' },
+      { id: 'headhaul', amount_usd: 1.5, status: 'estimated', basis: 'sea' },
+      { id: 'referral', amount_usd: 6.53, status: 'estimated', basis: 'ref' },
+      { id: 'fulfillment', amount_usd: 5.5, status: 'estimated', basis: 'fba' },
+      { id: 'placement', amount_usd: 0.3, status: 'estimated', basis: 'pl' },
+      { id: 'storage', amount_usd: 0.1, status: 'estimated', basis: 'st' },
+      { id: 'returns_processing', amount_usd: 0, status: 'not_applicable', basis: 'ret' },
+      { id: 'returns_disposal', amount_usd: null, status: 'deferred', basis: 'def' },
+      { id: 'collection', amount_usd: 0.18, status: 'estimated', basis: 'col' },
+      { id: 'other_applicable', amount_usd: 0, status: 'not_applicable', basis: 'none' },
+      { id: 'recovery_credit', amount_usd: null, status: 'deferred', basis: 'def' },
+    ],
+  }, { profileRevision: 59 });
+  assert.equal(calcCoupon500.coupon_campaign_units, 100);
+  assert.equal(calcCoupon500.lines.find(l => l.id === 'other_applicable')?.coupon_campaign_units, 100);
+
+  // #10: 2-endpoint 88-day-gap Keepa curve MUST fail keepa_90d_steady just like 88-null curve
+  const twoEndpointParsed = parseSellerSpriteKeepaPayload({
+    asin: 'B0SYNGAP01',
+    keepa_trend: {
+      ts: ['2026-08-30', '2026-11-27'],
+      series: { price: [49.00, 49.00] },
+    },
+  }, { as_of_date: STAGE4_AS_OF_DATE });
+  assert.equal(twoEndpointParsed.keepa_90d_steady, false);
+  assert.equal(twoEndpointParsed.regular_median_usd, null);
+
+  // #13: Missing-price >90d matched FBA peer suppresses false "全员 90 天内新品蓝海" banner
+  const missingPriceOlder = analyzeMainstreamPriceBand([
+    { asin: 'B0SYNNW30A', parent_asin: 'P0SYNNW30A', title: 'Desk Tray New', fulfillment: 'FBA', price_usd: 49.00, monthly_units: 80, age_days: 30 },
+    { asin: 'B0SYNMP600', parent_asin: 'P0SYNMP600', title: 'Desk Tray Missing Price Older', fulfillment: 'FBA', price_usd: null, monthly_units: 40, age_days: 600 },
+  ], { as_of_date: STAGE4_AS_OF_DATE });
+  assert.equal(missingPriceOlder.all_under_90d_blue_ocean, false);
+  assert.doesNotMatch(missingPriceOlder.top_amber_banner_zh ?? '', /全员 90 天内新品蓝海/);
+  assert.equal(missingPriceOlder.excluded_older_peers?.some(p => p.asin === 'B0SYNMP600' && p.reason_code === 'excluded_invalid_price'), true);
+
+  // #14: Conflicting domestic_freight_cny_total vs domestic_freight_cny_per_unit leaves advisory landed margin null + conflict flag; missing refund keeps advisory object
+  const conflictingFreight = evaluateEarlyScreen(makeBareGoodsProbeInput({
+    domestic_freight_cny_total: 500,
+    domestic_freight_cny_per_unit: 0,
+  }));
+  assert.equal(conflictingFreight.gate_status, 'pass');
+  assert.equal(conflictingFreight.domestic_freight_advisory?.conflict_detected, true);
+  assert.equal(conflictingFreight.domestic_freight_advisory?.cny_per_unit, null);
+  assert.equal(conflictingFreight.domestic_freight_advisory?.landed_margin_if_incurred, null);
+
+  const missingRefundAdvisory = evaluateEarlyScreen(makeBareGoodsProbeInput({ refund_fraction: undefined }));
+  assert.equal(missingRefundAdvisory.gate_status, 'pending');
+  assert.equal(missingRefundAdvisory.domestic_freight_advisory?.cny_total, 500);
+  assert.equal(missingRefundAdvisory.domestic_freight_advisory?.advisory_only, true);
+
+  // #2 & #11: raw-ingest equal-ASIN multi-receipt review merge (order-invariant), empty []/{} backfill, custom-events summary consistency, and strict quantile check
+  const r59Profile = JSON.parse(
+    readFileSync(new URL('../docs/design/reference-profile.r59.draft.json', import.meta.url), 'utf8'),
+  );
+  const tmpDir = mkdtempSync(join(tmpdir(), 'batch-a1-r1-merge-'));
+  try {
+    const revOnly = {
+      asin: 'B0SYNMRG01',
+      keepa_trend: {
+        ts: ['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04'],
+        series: { price: [45, 45, 45, 45], reviews: [0, null, 5, 1] },
+      },
+    };
+    const priceOnly = makeDatedKeepaReceipt({ asin: 'B0SYNMRG01', startDate: '2026-08-30', days: 90, priceUsd: 45.00 });
+    writeFileSync(join(tmpDir, 'rev-only.json'), JSON.stringify(revOnly), 'utf8');
+    writeFileSync(join(tmpDir, 'price-only.json'), JSON.stringify(priceOnly), 'utf8');
+    const makeSpec = files => ({
+      profile_revision: 59,
+      as_of_date: STAGE4_AS_OF_DATE,
+      raw_receipt_files: files,
+      candidates: [{
+        id: 'cand-mrg',
+        label: 'Multi Receipt Merge',
+        newcomer_cohort: {
+          members: [
+            {
+              asin: 'B0SYNMRG01',
+              parent_asin: 'P0SYNMRG01',
+              age_days: 45,
+              monthly_units: 80,
+              rating: 4.5,
+              reviews: 1,
+              keepa_review_drop_detected: false,
+              keepa_review_jump_detected: false,
+              keepa_review_anomaly_events: [],
+              keepa_review_anomaly_summary: {},
+            },
+            {
+              asin: 'B0SYNMRG01',
+              parent_asin: 'P0SYNMRG01',
+              age_days: 45,
+              monthly_units: 80,
+              rating: 4.5,
+              reviews: 1,
+              keepa_review_anomaly_events: [{ direction: 'jump', delta: 1, from_count: 0, to_count: 1, date_from: '2026-10-01', date_to: '2026-10-02', asin: 'B0SYNMRG01' }],
+            },
+          ],
+        },
+      }],
+    });
+    const orderAB = ingestTrialSpecification(makeSpec(['rev-only.json', 'price-only.json']), r59Profile, { baseDir: tmpDir });
+    const orderBA = ingestTrialSpecification(makeSpec(['price-only.json', 'rev-only.json']), r59Profile, { baseDir: tmpDir });
+    for (const run of [orderAB, orderBA]) {
+      const m0 = run.batch.candidates[0].newcomer_cohort.members[0];
+      assert.equal(m0.keepa_review_jump_detected, true);
+      assert.equal(m0.keepa_review_drop_detected, true);
+      assert.equal(m0.keepa_review_anomaly_events.length, 2);
+      assert.equal(m0.keepa_review_anomaly_summary.max_jump_delta, 5);
+      assert.equal(m0.keepa_review_anomaly_summary.max_drop_delta, -4);
+      const m1 = run.batch.candidates[0].newcomer_cohort.members[1];
+      assert.equal(m1.keepa_review_anomaly_summary.event_count, 1, 'Summary must stay consistent with existing non-empty events[]');
+      assert.equal(m1.keepa_review_anomaly_summary.max_jump_delta, 1);
+    }
+
+    // #2: raw-ingest extractQuantileSupportedPricesFromPayloads enforces require_keepa_steady_evidence: true
+    // so bare legacy Keepa booleans in raw search items cannot validate an unreferenced $59 scenario price
+    const rawSearchLegacyPath = join(tmpDir, 'search-legacy-bool.json');
+    writeFileSync(rawSearchLegacyPath, JSON.stringify({
+      items: [
+        { asin: 'B0SYNLQ001', title: 'Desk Tray A', fulfillment: 'FBA', price_usd: 49.00, monthlySales: 120, age_days: 400, keepa_90d_steady: true },
+        { asin: 'B0SYNLQ002', title: 'Desk Tray B', fulfillment: 'FBA', price_usd: 59.00, monthlySales: 120, age_days: 400, keepa_90d_steady: true },
+      ],
+    }), 'utf8');
+    assert.throws(
+      () => ingestTrialSpecification({
+        profile_revision: 59,
+        as_of_date: STAGE4_AS_OF_DATE,
+        raw_receipt_files: ['search-legacy-bool.json'],
+        evidence: [{ id: 'ev-lq', source_type: 'sellersprite', observed_at: STAGE4_AS_OF_DATE, summary: 'Raw search' }],
+        candidates: [{
+          id: 'cand-lq-strict',
+          label: 'Legacy Quantile Reject',
+          screening: {
+            reference_price_usd: { value: 59.00, supported_price_range: [49.00, 59.00], unit: 'USD', matched_spec: true, evidence: ['ev-lq'] },
+          },
+          economics: {
+            saleable_unit: '1 unit',
+            scenarios: [{
+              id: 'sc-59',
+              label: 'Unverified 59',
+              price_anchor: { value: 59.00, unit: 'USD', matched_spec: true, fulfillment_channel: 'FBA', evidence: ['ev-lq'] },
+              cost_ledger: {
+                id: 'sc-59', saleable_unit: '1 unit', price_usd: 59.00, refund_fraction: 0.04,
+                lines: [
+                  { id: 'procurement', amount_usd: 15, status: 'estimated', basis: 'goods' },
+                  { id: 'domestic_freight', amount_usd: 0, status: 'not_applicable', basis: 'bare' },
+                ],
+              },
+            }],
+          },
+        }],
+      }, r59Profile, { baseDir: tmpDir }),
+      /not backed by any referenced comparable ASIN or denoised P25\/P50\/P75 quantile/i,
+    );
+  } finally {
+    rmSync(tmpDir, { recursive: true, force: true });
   }
 });

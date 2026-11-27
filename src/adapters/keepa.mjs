@@ -583,7 +583,10 @@ export function parseSellerSpriteKeepaPayload(rawPayload, { age_days = null, as_
     }
   }
 
-  const coversFull90dWindow = window90dCalendarSpanDays >= BUSINESS_THRESHOLDS.newcomer_max_age_days;
+  const coversFull90dWindow = Boolean(
+    window90dCalendarSpanDays >= BUSINESS_THRESHOLDS.newcomer_max_age_days &&
+    (window90dRange?.sampled_days ?? 0) >= BUSINESS_THRESHOLDS.newcomer_max_age_days,
+  );
   const continuousHeavyCoupon90d = Boolean(heavyCouponDays90d > 0 && nonHeavyDays90dCount === 0);
   const realizedNet90dMedianUsd = realizedNet90dVals.length > 0
     ? (() => {
