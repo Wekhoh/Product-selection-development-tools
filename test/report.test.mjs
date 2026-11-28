@@ -1715,7 +1715,8 @@ test('Step 2 preview dedup: folds >180-char English patent/compliance text once 
   pendingBatch.candidates = [pendingCand];
   const pendingHtml = renderReport(scoreBatch(pendingBatch, profile), pendingBatch);
   const leftPending = pendingHtml.match(/<div class="left-wing">([\s\S]*?)<div class="stage-hairline"/)?.[1] ?? '';
-  assert.ok(leftPending.includes('需要解决的缺口'));
+  assert.equal(leftPending.includes('需要解决的缺口'), false);
+  assert.equal(leftPending.split('PATENT-MAIN-GAP-DEDUP').length - 1, 1);
   assert.ok(leftPending.includes('<details class="quiet-fold"><summary>查看英文合规/专利原文</summary>'));
   assert.ok(leftPending.includes('详情见上方缺口说明'));
   assert.ok(pendingHtml.includes('区间跨线待核'));
@@ -1743,4 +1744,50 @@ test('Step 2 preview dedup: folds >180-char English patent/compliance text once 
   assert.equal(seasonalHtml.includes('Supported scenarios cross the 30% floor'), false);
   assert.ok(seasonalHtml.includes('公开准入／禁售合规'));
 });
+
+test('non-qualifying pending_evidence and crossing_30pct_interval cards deduplicate remaining-15 blocks (1x on left wing) and fold >180-char English in screenGaps', () => {
+  const longPatent = 'NONQUAL-PATENT-DEDUP patent search identifies US-D999999 design patent claims covering magnetic interlocking groove rails and beveled outer walls requiring factory tooling verification prior to ordering. '.padEnd(230, 'p');
+  const longCompliance = 'NONQUAL-COMPLIANCE-DEDUP US Lacey Act timber species genus declaration and California Prop 65 surface finish verification required before commercial US customs clearance and Amazon FBA intake. '.padEnd(230, 'c');
+
+  // 1. pending_evidence with >3 core-85 gaps + >180-char specific_design_rights & applicable_public_requirements
+  const batch = structuredClone(fixture);
+  const cand = structuredClone(batch.candidates[1]);
+  cand.id = 'syn-nonqual-pending-ev';
+  cand.metrics.purchase_demand_scale = { value: null, reason: 'Synthetic missing demand' };
+  cand.metrics.low_return_preference = { value: null, reason: 'Synthetic missing return ratio' };
+  cand.bids.entries = [];
+  cand.judgments.specific_design_rights = { anchor: null, reason: longPatent, evidence: [] };
+  cand.judgments.applicable_public_requirements = { anchor: null, reason: longCompliance, evidence: [] };
+  batch.candidates = [cand];
+  const html = renderReport(scoreBatch(batch, profile), batch);
+  const left = html.match(/<div class="left-wing">([\s\S]*?)<div class="stage-hairline"/)?.[1] ?? '';
+  const screenLine = left.split('<div class="muted coverage-line">筛选状态：')[1] ?? '';
+  assert.equal(left.split('NONQUAL-PATENT-DEDUP').length - 1, 1);
+  assert.equal(left.split('NONQUAL-COMPLIANCE-DEDUP').length - 1, 1);
+  assert.ok(left.includes('需要解决的缺口'));
+  assert.ok(screenLine.includes('具体款式权利待补证：详情见上方缺口说明'));
+  assert.equal(screenLine.includes('NONQUAL-PATENT-DEDUP'), false);
+
+  // 2. crossing_30pct_interval with blockers non-empty / fail fallback in screenGaps must fold >180-char English inside quiet-fold
+  const failBatch = structuredClone(fixture);
+  const failCand = structuredClone(failBatch.candidates[1]);
+  failCand.id = 'syn-nonqual-fail-fold';
+  failCand.economics.scenarios[1].margin.value = 0.20;
+  failCand.economics.scenarios[1].contribution_usd.value = 6.5;
+  failCand.economics.scenarios[1].cost_ledger.lines.find(l => l.id === 'procurement').amount_usd += 8;
+  failCand.judgments.specific_design_rights = { anchor: 0, proven_conflict: true, reason: longPatent.replace(/NONQUAL-PATENT-DEDUP/g, 'FAIL-FOLD-PATENT'), evidence: ['ev1'] };
+  failCand.judgments.applicable_public_requirements = { anchor: 0, hard_ban: true, reason: longCompliance.replace(/NONQUAL-COMPLIANCE-DEDUP/g, 'FAIL-FOLD-COMPLIANCE'), evidence: ['ev1'] };
+  failBatch.candidates = [failCand];
+  const failHtml = renderReport(scoreBatch(failBatch, profile), failBatch);
+  const failLeft = failHtml.match(/<div class="left-wing">([\s\S]*?)<div class="stage-hairline"/)?.[1] ?? '';
+  const failScreen = failLeft.split('<div class="muted coverage-line">筛选状态：')[1] ?? '';
+  assert.ok(failScreen.includes('<details class="quiet-fold"><summary>查看英文合规/专利原文</summary><div class="fold-body">'));
+  assert.ok(failScreen.includes('FAIL-FOLD-PATENT'));
+  assert.ok(failScreen.includes('FAIL-FOLD-COMPLIANCE'));
+  // Ensure neither long English block sits outside <details class="quiet-fold"> inside 筛选状态
+  const strippedScreen = failScreen.replace(/<details class="quiet-fold">[\s\S]*?<\/details>/g, '');
+  assert.equal(strippedScreen.includes('FAIL-FOLD-PATENT'), false);
+  assert.equal(strippedScreen.includes('FAIL-FOLD-COMPLIANCE'), false);
+});
+
 
