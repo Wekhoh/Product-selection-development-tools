@@ -3137,11 +3137,12 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
   const prefix = `candidate-${index + 1}`;
   const snapshot = extractMetricsSnapshot(result, rev, original);
   const sampleIds = rev >= 59 ? new Set(array(snapshot.sampleCheckItems).map(it => it?.id).filter(Boolean)) : new Set();
+  const extraPendingRemIds = rev >= 59 ? new Set(array(snapshot.remaining15Summary?.pending_items).map(it => it?.id).filter(id => id && !sampleIds.has(id))) : new Set();
   const blockers = array(presentation.blockers).filter(row => typeof row?.problem === 'string');
   const gaps = array(result.items).filter(item => item.status === 'needs_evidence');
-  const gapItemsForMain = (rev >= 59 && blockers.length === 0 ? gaps.filter(item => !sampleIds.has(item.id)) : gaps).slice(0, 3);
+  const gapItemsForMain = (rev >= 59 && blockers.length === 0 ? gaps.filter(item => !sampleIds.has(item.id) && !extraPendingRemIds.has(item.id)) : gaps).slice(0, 3);
   const mainGaps = blockers.length ? blockers : gapItemsForMain.map(item => ({ id: item.id, head: ITEM_LABELS[item.id] ?? item.id, reason: reasonText(item.reason), next_step: '补齐对应来源和适用口径后重新计算。' }));
-  const shownLeftIds = new Set([...sampleIds, ...(blockers.length === 0 ? gapItemsForMain.map(item => item.id).filter(Boolean) : [])]);
+  const shownLeftIds = new Set([...sampleIds, ...extraPendingRemIds, ...(blockers.length === 0 ? gapItemsForMain.map(item => item.id).filter(Boolean) : [])]);
   const screenGaps = array(result.screening?.conditions).filter(condition => condition.status !== 'pass');
   const queue = Object.hasOwn(QUEUES, result.queue) ? result.queue : 'pending';
   const isCrossingR59 = rev >= 59 && result?.diagnostics?.economics?.crossing_margin_floor === true;
@@ -3189,7 +3190,13 @@ function r58SingleCard(result, original, index, rev = 59, reportOptions = {}, im
           ${r57BriefList('后续核查事项', presentation.next_checks, rev)}
           ${mainGaps.length ? `<div class="brief-col"><h3>${queue === 'excluded' && gaps.length === 0 ? '排除原因与后续处理' : '需要解决的缺口'}</h3><ul class="brief-list">${mainGaps.map(row => `<li>${row.head !== undefined ? `<strong>${escape(row.head)}</strong>${renderFoldableReason(row.reason, '：')}` : `<strong>${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.problem) : row.problem)}</strong>`}${typeof row.next_step === 'string' ? `<p class="muted">下一步：${escape(rev >= 59 ? unifyFactoryInquiryLabel(row.next_step) : row.next_step)}</p>` : ''}</li>`).join('')}</ul></div>` : ''}
         </section>` : ''}${renderR58EvidenceReview(result, original, reportOptions, rev)}${r57ReviewNotes(result, original, rev)}${r57OperationalDisclosures(result, rev)}
-        ${screenGaps.length ? `<p class="muted coverage-line">筛选状态：${screenGaps.map(condition => { const condLookupId = condition.id === 'specific_form_rights' ? 'specific_design_rights' : condition.id; const condNote = condition.status !== 'fail' && shownLeftIds.has(condLookupId) ? (sampleIds.has(condLookupId) ? '详情见上方拿样待核清单' : '详情见上方缺口说明') : reasonText(condition.reason); return `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖', public_compliance_or_category_ban: '公开准入／禁售合规' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}：${escape(condNote)}`; }).join('；')}</p>` : '<p class="muted coverage-line">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}${qualReasonNote}
+        ${screenGaps.length ? `<div class="muted coverage-line">筛选状态：${screenGaps.map(condition => {
+          const condLookupId = condition.id === 'specific_form_rights' ? 'specific_design_rights' : condition.id === 'public_compliance_or_category_ban' ? 'applicable_public_requirements' : condition.id;
+          const head = `${escape({ reference_price: '参考售价', margin: '毛利条件', specific_form_rights: '具体款式权利', strong_date_dependency: '日期依赖', public_compliance_or_category_ban: '公开准入／禁售合规' }[condition.id] ?? condition.id)}${escape(STATES[condition.status] ?? condition.status)}`;
+          return condition.status !== 'fail' && shownLeftIds.has(condLookupId)
+            ? `${head}：${sampleIds.has(condLookupId) ? '详情见上方拿样待核清单' : '详情见上方缺口说明'}`
+            : `${head}${renderFoldableReason(reasonText(condition.reason), '：')}`;
+        }).join('；')}</div>` : '<p class="muted coverage-line">初筛条件已得到有据判断；这不是采购批准或供应验证。</p>'}${qualReasonNote}
       </div>
       <div class="stage-hairline" aria-hidden="true"></div>
       <div class="right-wing">
